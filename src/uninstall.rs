@@ -8,7 +8,7 @@ const CONFIG_PATH: &str = "/etc/twinstor/twinstor.toml";
 const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 
 pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> Result<()> {
-    println!("TWINSTOR uninstall\n");
+    println!("TwinStor uninstall\n");
     println!("this will:");
     println!("  1. disable XHA");
     println!("  2. unplug PBDs and destroy the twinstor SR");

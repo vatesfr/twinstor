@@ -80,7 +80,7 @@ impl Diagnosis {
         match self.quiescent() {
             Some(false) => {
                 return Some(
-                    "storage is still healing — this is not a pure toolstack knot (gate 1)".into(),
+                    "storage is still healing, so this is not a pure toolstack knot (gate 1)".into(),
                 );
             }
             None => {
@@ -92,7 +92,7 @@ impl Diagnosis {
         }
         if let Some(h) = &self.heal {
             return Some(format!(
-                "an auto-heal episode is in progress: {} — {} (gate 2)",
+                "an auto-heal episode is in progress: {}, {} (gate 2)",
                 h.stage, h.summary
             ));
         }
@@ -184,7 +184,7 @@ fn ago(started_unix: u64) -> String {
 }
 
 fn print_report(d: &Diagnosis) {
-    println!("twinstor doctor — post-incident toolstack check\n");
+    println!("twinstor doctor: post-incident toolstack check\n");
 
     match &d.sr_uuid {
         Some(sr) => {
@@ -197,7 +197,7 @@ fn print_report(d: &Diagnosis) {
                 println!("twinstor SR: {sr} ({src})\n");
             } else {
                 println!(
-                    "twinstor SR: {sr} ({src}, but NOT found in XAPI -- stale; run `twinstor sr record`)\n"
+                    "twinstor SR: {sr} ({src}, but not found in XAPI, so it is stale; run `twinstor sr record`)\n"
                 );
             }
         }
@@ -209,10 +209,10 @@ fn print_report(d: &Diagnosis) {
         Some(pv) if pv == local_ver => println!("versions:    local {local_ver}, peer {pv}\n"),
         Some(pv) => match crate::xapi::mixed_release_note(local_ver, pv) {
             Some(note) => println!(
-                "versions:    local {local_ver}, peer {pv} (MIXED RELEASES -- the peer runs {note})\n"
+                "versions:    local {local_ver}, peer {pv} (mixed releases: the peer runs {note})\n"
             ),
             None => println!(
-                "versions:    local {local_ver}, peer {pv} (version skew -- finish the rolling upgrade; both nodes should be on {local_ver})\n"
+                "versions:    local {local_ver}, peer {pv} (version skew: finish the rolling upgrade; both nodes should be on {local_ver})\n"
             ),
         },
         None => {
@@ -225,8 +225,8 @@ fn print_report(d: &Diagnosis) {
     use crate::reboot_drain::GuardState;
     match d.reboot_guard {
         GuardState::Armed if d.reboot_guard_unit_ok == Some(false) => println!(
-            "reboot guard: armed, but the installed unit looks STALE (missing After=xapi.service \
-             or has DefaultDependencies=no) -- it may not fire on a real reboot. Reinstall from \
+            "reboot guard: armed, but the installed unit looks stale (missing After=xapi.service \
+             or has DefaultDependencies=no), so it may not fire on a real reboot. Reinstall from \
              the current bundle (./install.sh).\n"
         ),
         GuardState::Armed => println!("reboot guard: armed\n"),
@@ -235,10 +235,10 @@ fn print_report(d: &Diagnosis) {
         }
         GuardState::NotArmed => match d.reboot_guard_unit_ok {
             None => println!(
-                "reboot guard: NOT installed -- reinstall from the current bundle (./install.sh) to arm it.\n"
+                "reboot guard: not installed; reinstall from the current bundle (./install.sh) to arm it.\n"
             ),
             Some(_) => println!(
-                "reboot guard: NOT armed -- arm it with: systemctl enable --now twinstor-reboot-drain.service\n"
+                "reboot guard: not armed; arm it with: systemctl enable --now twinstor-reboot-drain.service\n"
             ),
         },
     }
@@ -249,7 +249,7 @@ fn print_report(d: &Diagnosis) {
         let recommended = crate::setup::ha_timeout_secs(d.arbitrated);
         match d.ha_timeout {
             Some(t) if t < recommended => println!(
-                "HA timeout:  {t}s -- {recommended}s recommended for this mode: a replication split \
+                "HA timeout:  {t}s; {recommended}s recommended for this mode: a replication split \
                  that heals within the timeout does not get a host rebooted by XHA (cost: a \
                  slower VM failover on a real host death). In a maintenance window, from the \
                  pool master: xe pool-ha-disable; xe pool-ha-enable heartbeat-sr-uuids={} \
@@ -270,7 +270,7 @@ fn print_report(d: &Diagnosis) {
                 "internal shutdown: pool HA does not restart a VM shut down from inside (ha-reboot-vm-on-internal-shutdown=false, as freeze mode wants)\n"
             ),
             Some((true, Some(true))) => println!(
-                "internal shutdown: {WARN} pool ha-reboot-vm-on-internal-shutdown is ON again (twinstor turned it off once and \
+                "internal shutdown: {WARN} pool ha-reboot-vm-on-internal-shutdown is on again (twinstor turned it off once and \
                  does not change it twice). With it on, guests a losing pool master stops can be restarted by HA on that \
                  host and left halted. To turn it off: xe pool-param-set uuid=<pool> ha-reboot-vm-on-internal-shutdown=false\n"
             ),
@@ -285,7 +285,7 @@ fn print_report(d: &Diagnosis) {
         }
     } else if d.arbitrated && matches!(d.internal_shutdown, Some((false, _))) {
         println!(
-            "internal shutdown: {WARN} pool ha-reboot-vm-on-internal-shutdown is OFF on an arbitrated pool: the isolated \
+            "internal shutdown: {WARN} pool ha-reboot-vm-on-internal-shutdown is off on an arbitrated pool: the isolated \
              stand-downs stop their guests at the hypervisor and rely on pool HA to restart them on the peer, which it \
              then does not. Turn it on: xe pool-param-set uuid=<pool> ha-reboot-vm-on-internal-shutdown=true\n"
         );
@@ -323,24 +323,24 @@ fn print_report(d: &Diagnosis) {
             println!("  {OK} storage quiescent (Connected, UpToDate/UpToDate, no resync)")
         }
         Some(false) => {
-            println!("  {BAD} storage is NOT quiescent — it is healing, not a toolstack knot")
+            println!("  {BAD} storage is not quiescent: it is healing, not a toolstack knot")
         }
         None => println!("  {WARN} storage state unknown (drbdadm status did not answer)"),
     }
     match &d.heal {
         None => println!("  {OK} no auto-heal episode in progress"),
         Some(h) => println!(
-            "  {BAD} auto-heal IN PROGRESS: {} — {} (since {})",
+            "  {BAD} auto-heal in progress: {}, {} (since {})",
             h.stage,
             h.summary,
             ago(h.started_unix)
         ),
     }
     if d.daemon_active {
-        println!("  {OK} daemon running — it clears these on its own; prefer letting it");
+        println!("  {OK} daemon running: it clears these on its own; prefer letting it");
     } else {
         println!(
-            "  {WARN} daemon NOT running (masked/stopped) — auto-heal will not act; this is the fallback case"
+            "  {WARN} daemon not running (masked/stopped): auto-heal will not act; this is the fallback case"
         );
     }
 
@@ -351,7 +351,7 @@ fn print_report(d: &Diagnosis) {
     }
     match d.fix_block_reason() {
         Some(reason) => {
-            println!("Verdict: a knot is present, but a fix is NOT safe right now:");
+            println!("Verdict: a knot is present, but a fix is not safe right now:");
             println!("         {reason}.");
             println!("         Let the automatic path run and re-check with `twinstor doctor`.");
         }
@@ -361,7 +361,7 @@ fn print_report(d: &Diagnosis) {
             );
             if d.daemon_active {
                 println!(
-                    "         The daemon is running and normally clears these itself — give it a few"
+                    "         The daemon is running and normally clears these itself; give it a few"
                 );
                 println!(
                     "         minutes first. If it persists, `twinstor doctor --fix` clears it (with confirmation)."
@@ -469,7 +469,7 @@ async fn fix_activating_locks(d: &Diagnosis) -> Result<bool> {
             return Ok(false);
         }
         println!(
-            "Unchanged after {STABLE_SECS}s — the daemon is not clearing them; safe to step in."
+            "Unchanged after {STABLE_SECS}s: the daemon is not clearing them; safe to step in."
         );
     }
     if !crate::wizard::ask_yes_no(
@@ -488,7 +488,7 @@ async fn fix_activating_locks(d: &Diagnosis) -> Result<bool> {
             println!("  cleared {u}");
             cleared += 1;
         } else {
-            println!("  FAILED to clear {u} (it may have resolved, or needs manual attention)");
+            println!("  Failed to clear {u} (it may have resolved, or needs manual attention)");
         }
     }
     println!("Cleared {cleared}/{} lock(s).", d.activating.len());
@@ -498,7 +498,7 @@ async fn fix_activating_locks(d: &Diagnosis) -> Result<bool> {
 async fn fix_ha_disagreement() -> Result<bool> {
     println!("\n-- HA-state disagreement (pool HA on, this host disarmed) --");
     println!(
-        "The daemon does NOT auto-fix this (cycling pool HA is disruptive and pool-wide). \
+        "The daemon does not auto-fix this (cycling pool HA is disruptive and pool-wide). \
          The reset must run from the pool master; a host-level toolstack restart does not clear it."
     );
     let sr = crate::xapi::twinstor_sr_uuid()
@@ -513,8 +513,8 @@ async fn fix_ha_disagreement() -> Result<bool> {
     let on_master = crate::xapi::is_pool_master_resilient().await == Some(true);
     if !on_master {
         println!(
-            "NOTE: this host is not the pool master. The reset proxies to the master via xe, \
-             which usually works — but if this host's xe is in emergency mode it will fail; \
+            "Note: this host is not the pool master. The reset proxies to the master via xe, \
+             which usually works, but if this host's xe is in emergency mode it will fail; \
              then run the two commands below on the master."
         );
     }
@@ -532,7 +532,7 @@ async fn fix_ha_disagreement() -> Result<bool> {
     if let Err(e) = crate::cmd::run_cmd_for("xe", &["pool-ha-disable"], 90).await {
         println!("  pool-ha-disable failed: {e}");
         println!(
-            "  Run the two commands above on the POOL MASTER instead (this host's xe is likely in emergency mode)."
+            "  Run the two commands above on the pool master instead (this host's xe is likely in emergency mode)."
         );
         return Ok(false);
     }
@@ -549,7 +549,7 @@ async fn fix_ha_disagreement() -> Result<bool> {
     .await
     {
         println!("  pool-ha-enable failed: {e}");
-        println!("  HA is now DISABLED pool-wide. Re-enable it from the master:");
+        println!("  HA is now disabled pool-wide. Re-enable it from the master:");
         println!("    xe pool-ha-enable heartbeat-sr-uuids={sr} ha-config:timeout={timeout}");
         return Ok(false);
     }

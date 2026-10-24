@@ -70,7 +70,7 @@ pub fn degradation(h: &PathHealth) -> Option<String> {
     }
     if h.local_path_active == Some(false) {
         return Some(
-            "active multipath path is the REMOTE one (local-path priority not in effect)"
+            "active multipath path is the remote one (local-path priority not in effect)"
                 .to_string(),
         );
     }
@@ -776,7 +776,7 @@ mod tests {
             local_path_active: Some(false),
             ..healthy()
         };
-        assert!(degradation(&h).unwrap().contains("REMOTE"));
+        assert!(degradation(&h).unwrap().contains("remote"));
     }
 
     #[test]

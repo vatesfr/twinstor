@@ -349,7 +349,7 @@ fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
         ));
     }
     s.push_str(
-        "To reuse such a disk for TWINSTOR, free it on this node first:\n\
+        "To reuse such a disk for TwinStor, free it on this node first:\n\
         \x20 - destroy the SR and its data:  xe sr-destroy uuid=<uuid>\n\
         \x20   (detach it first if needed:   xe pbd-unplug uuid=<pbd>)\n\
         \x20 - or keep the data: xe sr-forget uuid=<uuid>, then wipe the leftover\n\
@@ -798,11 +798,11 @@ fn direct_link_instructions(device: &str) -> String {
     // peer's NIC name may differ, so each host resolves its own.
     format!(
         "\"{device}\" has a cable/carrier but no IP. Give it a static point-to-point\n\
-         address on BOTH hosts (XAPI-managed so it survives reboots), then re-run\n\
+         address on both hosts (XAPI-managed so it survives reboots), then re-run\n\
          setup and choose arbitrated mode. Use 10.99.99.1 on the first node and\n\
          10.99.99.2 on the second; pick another /30 if that range is already in use.\n\n\
-         \x20 # on EACH host, for ITS interface on the cable (the device name MAY\n\
-         \x20 # DIFFER between hosts; do NOT reconfigure the management NIC):\n\
+         \x20 # on each host, for its interface on the cable (the device name may\n\
+         \x20 # differ between hosts; do not reconfigure the management NIC):\n\
          \x20 PIF=$(xe pif-list device={device} host-uuid=$(xe host-list hostname=$(hostname) --minimal) --minimal)\n\
          \x20 xe pif-reconfigure-ip uuid=$PIF mode=static IP=10.99.99.1 netmask={DIRECT_LINK_NETMASK}\n"
     )
@@ -930,8 +930,8 @@ async fn resolve_direct_link(
             // The operator must confirm which network is the direct link: a
             // switched second path is not a valid direct link (it shares fate
             // with the first), so we can't auto-pick even when there's one.
-            println!("Which network is the back-to-back DIRECT LINK (a host-to-host");
-            println!("cable, NOT a switched network)?");
+            println!("Which network is the back-to-back direct link (a host-to-host");
+            println!("cable, not a switched network)?");
             for (i, n) in ready.iter().enumerate() {
                 let hint = if n.point_to_point {
                     "  (looks point-to-point)"
@@ -965,7 +965,7 @@ async fn resolve_direct_link(
             if ask_yes_no(&format!("Configure {device} as the direct link now?"), true)? {
                 println!(
                     "This host takes one end of a point-to-point /30; the peer takes the\n\
-                     other. Use 10.99.99.1 on the FIRST node and 10.99.99.2 on the SECOND\n\
+                     other. Use 10.99.99.1 on the first node and 10.99.99.2 on the second\n\
                      (match what the first node printed)."
                 );
                 let local_dl = loop {
@@ -990,7 +990,7 @@ async fn resolve_direct_link(
                 let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
                 configure_direct_link(&device, local_dl).await?;
                 println!("  configured {device} = {local_dl}/30; the peer's end is {peer_dl}.");
-                println!("  when you run setup on the PEER, give its end {peer_dl}.");
+                println!("  when you run setup on the peer, give its end {peer_dl}.");
                 Ok(Some(IpAddr::V4(peer_dl)))
             } else {
                 println!("\n{}", direct_link_instructions(&device));
@@ -1015,7 +1015,7 @@ async fn resolve_direct_link(
 
 /// Show the current installation: persisted settings plus a quick live view.
 async fn show_current_install() {
-    println!("TWINSTOR is already installed on this node.\n");
+    println!("TwinStor is already installed on this node.\n");
     if let Ok(cfg) =
         crate::config::Config::load(std::path::Path::new("/etc/twinstor/twinstor.toml"))
     {
@@ -1061,10 +1061,10 @@ async fn show_current_install() {
 pub async fn run() -> Result<Option<SetupParams>> {
     if std::path::Path::new("/etc/twinstor/twinstor.toml").exists() {
         show_current_install().await;
-        println!("  q) quit — leave everything as it is");
-        println!("  u) uninstall — remove TWINSTOR from this node");
+        println!("  q) quit: leave everything as it is");
+        println!("  u) uninstall: remove TwinStor from this node");
         println!(
-            "  r) reconfigure — uninstall is NOT run; setup re-runs and WIPES the backing device"
+            "  r) reconfigure: uninstall is not run; setup re-runs and wipes the backing device"
         );
         let choice = ask("Choice", Some("q"))?;
         match choice.to_lowercase().as_str() {
@@ -1087,7 +1087,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
     }
 
     print_banner();
-    println!("TWINSTOR interactive setup — press Enter to accept defaults.\n");
+    println!("TwinStor interactive setup. Press Enter to accept defaults.\n");
 
     // 1. The other node and the network that carries replication + iSCSI.
     // TwinStor mirrors storage between the two hosts, so it needs the address of
@@ -1175,7 +1175,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // DRBD-port probe when there is none (e.g. the key was already cleared).
     let peer_already_up = inherited.is_some() || peer_drbd_listening(peer_ip).await;
     if peer_already_up {
-        println!("The other node is already running TWINSTOR and waiting for this one.");
+        println!("The other node is already running TwinStor and waiting for this one.");
         println!("This node joins it as the second node and creates the shared SR.");
         if inherited.is_some() {
             println!("Shared settings are inherited from it; you only choose this host's disk");
@@ -1232,13 +1232,13 @@ pub async fn run() -> Result<Option<SetupParams>> {
         if let Some((disk, start, end, size)) = system_disk_free_region() {
             let size_gb = size / 1_000_000_000;
             println!("\nNo spare disk or free partition was found, but the system disk");
-            println!("/dev/{disk} has {size_gb} GB of unallocated free space — the usual");
+            println!("/dev/{disk} has {size_gb} GB of unallocated free space, the usual");
             println!("layout when local storage is skipped at install time.");
-            println!("\nTWINSTOR can carve a {size_gb} GB backing partition from it. This puts");
-            println!("the replicated storage on the SAME disk as dom0, which is fine for a");
+            println!("\nTwinStor can carve a {size_gb} GB backing partition from it. This puts");
+            println!("the replicated storage on the same disk as dom0, which is fine for a");
             println!("single-box edge or demo deployment but has trade-offs to know:");
             println!("  - dom0 and the storage share this disk's I/O and bandwidth");
-            println!("  - TWINSTOR disables the disk's volatile write cache for durability,");
+            println!("  - TwinStor disables the disk's volatile write cache for durability,");
             println!("    which then also applies to dom0's own writes on this disk");
             println!("  - a failure of this disk takes out the OS and the local replica at");
             println!("    once (the peer node still holds a full copy)");
@@ -1273,7 +1273,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
                 let _ = run_cmd("udevadm", &["settle"]).await;
                 disks = candidate_disks();
             } else {
-                println!("Skipped — no partition created.");
+                println!("Skipped: no partition created.");
             }
         }
     }
@@ -1286,7 +1286,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
             "no free disk or partition found for the backing device. Either:\n\
              - dedicate a spare disk, or create a free partition on a data disk, or\n\
              - to use free space on the system disk, create a partition there and\n\
-               label it for TWINSTOR, e.g.:\n\
+               label it for TwinStor, e.g.:\n\
                parted /dev/<systemdisk> mkpart twinstor-data <start> <end>\n\
              then re-run setup.{hint}"
         );
@@ -1294,13 +1294,13 @@ pub async fn run() -> Result<Option<SetupParams>> {
     if let Some(note) = &sr_note {
         println!("\n{note}");
     }
-    println!("\nBacking device (ALL DATA ON THE CHOSEN TARGET WILL BE ERASED):");
+    println!("\nBacking device (all data on the chosen target will be erased):");
     for (i, d) in disks.iter().enumerate() {
         let id = d
             .by_id
             .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "no stable id — not recommended".into());
+            .unwrap_or_else(|| "no stable id, not recommended".into());
         let kind = if d.is_partition { "partition" } else { "disk" };
         let contents = if d.fstype.is_empty() {
             "empty".to_string()
@@ -1359,7 +1359,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
     let chap_prompt = if peer_already_up {
         "CHAP password (paste the one shown on node A)"
     } else {
-        "CHAP password (Enter to auto-generate on the FIRST node; paste node A's on the SECOND)"
+        "CHAP password (Enter to auto-generate on the first node; paste node A's on the second)"
     };
     let chap = ask(chap_prompt, Some(""))?;
     let chap_password = if chap.is_empty() { None } else { Some(chap) };
@@ -1371,7 +1371,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
         // second node's setup on a decision already taken.
         if inh.ping_targets.is_empty() && crate::setup::detect_default_gateway().await.is_none() {
             println!(
-                "\nWARNING: inheriting a deployment with NO partition tiebreaker (no ping\n\
+                "\nWARNING: inheriting a deployment with no partition tiebreaker (no ping\n\
                  targets and no default gateway). Any replication interruption freezes\n\
                  storage until both nodes are back."
             );
@@ -1386,8 +1386,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
             ),
             None => println!(
                 "\nWARNING: no default gateway detected. The fence-peer handler will have\n\
-                 NOTHING to probe unless you add a local target below, and would then\n\
-                 freeze this node's storage on ANY replication interruption, including\n\
+                 nothing to probe unless you add a local target below, and would then\n\
+                 freeze this node's storage on any replication interruption, including\n\
                  the peer host simply dying (a 1-node failure becomes a full outage)."
             ),
         }
@@ -1396,13 +1396,13 @@ pub async fn run() -> Result<Option<SetupParams>> {
             let prompt = if gateway.is_some() {
                 "Extra always-on local IPs to also probe, space-separated (optional)"
             } else {
-                "Always-on local IPs to probe, space-separated (REQUIRED here; or type \
+                "Always-on local IPs to probe, space-separated (required here; or type \
                  'no-tiebreaker' to accept freeze-on-disconnect)"
             };
             let ping_raw = ask(prompt, Some(""))?;
             if gateway.is_none() && ping_raw.trim() == "no-tiebreaker" {
                 println!(
-                    "  Accepted: with no tiebreaker, ANY replication interruption freezes\n\
+                    "  Accepted: with no tiebreaker, any replication interruption freezes\n\
                      \x20 this node's storage until the peer returns; HA will not restart\n\
                      \x20 VMs anywhere."
                 );
@@ -1433,7 +1433,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
         Some(d) => println!("  mode:    arbitrated (direct link via peer {d})"),
         None => println!("  mode:    fate-shared (single path)"),
     }
-    println!("  device:  {} (WILL BE WIPED)", backing_device.display());
+    println!("  device:  {} (will be wiped)", backing_device.display());
     println!(
         "  sync:    {}",
         if full_sync {

@@ -1234,7 +1234,7 @@ async fn establish_inner(
     let who = side.label();
     let hold = |step: Step, detail: String, stopped: Vec<GuestRef>| {
         warn!(heal_event = "loser_crash_boundary", step = step.as_str(), detail = %detail,
-              "{who}: crash boundary NOT established; holding both copies intact");
+              "{who}: crash boundary not established; holding both copies intact");
         BoundaryOutcome::Hold {
             step,
             detail,

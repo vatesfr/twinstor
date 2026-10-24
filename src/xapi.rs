@@ -1164,10 +1164,10 @@ pub async fn send_no_tiebreaker_alert(body: &str) -> bool {
 /// Returns whether it was delivered (retry on a later tick if not).
 pub async fn send_peer_daemon_down_alert(peer: &str, minutes: u64) -> bool {
     let body = format!(
-        "TWINSTOR: the twinstor daemon on {peer} has not reported liveness for \
+        "TwinStor: the twinstor daemon on {peer} has not reported liveness for \
          ~{minutes} minutes although the host itself is up. Storage keeps being \
          served by the kernel, but that node's safety layer (failure handling, \
-         split-brain resolution, alerting) is NOT running: the next incident will \
+         split-brain resolution, alerting) is not running: the next incident will \
          hit it unprotected. On {peer} run: systemctl status twinstor; \
          journalctl -u twinstor -n 100; then systemctl restart twinstor."
     );
@@ -1393,13 +1393,13 @@ pub async fn send_split_brain_alert_keyed(key: &str, body: &str) -> bool {
 /// Returns whether it was delivered (retry on a later tick if not).
 pub async fn send_ha_disarmed_alert(minutes: u64) -> bool {
     let body = format!(
-        "TWINSTOR: pool HA has been disabled for ~{minutes} min. Two consequences: \
-         (1) your HA-protected VMs will NOT be restarted automatically after a host \
-         failure until HA is re-armed; (2) TWINSTOR runs DRBD dual-primary, and \
+        "TwinStor: pool HA has been disabled for ~{minutes} min. Two consequences: \
+         (1) your HA-protected VMs will not be restarted automatically after a host \
+         failure until HA is re-armed; (2) TwinStor runs DRBD dual-primary, and \
          without HA armed there is no fencing, so a network partition can cause \
          split-brain and data corruption. If maintenance (e.g. a rolling pool \
          update) is complete, re-arm HA with the explicit form (a bare pool-ha-enable \
-         resets the timeout to 30s): xe pool-ha-enable \
+         uses the pool default_ha_timeout, or 60 s if unset): xe pool-ha-enable \
          heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout=<120 fate-shared | 90 arbitrated>"
     );
     // One condition, re-sent with its current figures: one held message.
@@ -1413,8 +1413,8 @@ pub async fn send_ha_disarmed_alert(minutes: u64) -> bool {
 /// tick if not).
 pub async fn send_flap_storm_alert(episodes: usize, window_min: u64, peer: &str) -> bool {
     let body = format!(
-        "TWINSTOR: {episodes} split-brain episodes were auto-resolved in the last \
-         ~{window_min} min. This pattern means a REPEATEDLY FLAPPING network link (bad \
+        "TwinStor: {episodes} split-brain episodes were auto-resolved in the last \
+         ~{window_min} min. This pattern means a repeatedly flapping network link (bad \
          cable, NIC, or switch port) between this node and {peer}, not independent \
          failures. Every episode discards a few seconds of the losing node's writes and \
          crash-restarts its VMs. Runbook (see FAQ, 'What if a link keeps flapping'): \
@@ -1451,8 +1451,8 @@ pub async fn send_split_brain_diverged_alert(key: &str, body: &str) -> bool {
 /// was delivered.
 pub async fn send_host_held_isolated_alert(minutes: u64) -> bool {
     let body = format!(
-        "TWINSTOR: this host has been disabled with healthy storage but an unreachable \
-         client network (default gateway) for ~{minutes} min, so TWINSTOR is NOT \
+        "TwinStor: this host has been disabled with healthy storage but an unreachable \
+         client network (default gateway) for ~{minutes} min, so TwinStor is not \
          auto-enabling it (enabling would run VMs clients cannot reach; if it is an \
          isolated master its VMs have moved to the reachable peer). If this host is in \
          fact reachable by clients and only its gateway does not answer ping, enable it \
@@ -1504,12 +1504,12 @@ pub async fn send_reboot_unsafe_alert(body: &str) -> bool {
 /// recovery. Returns whether it was delivered (retry on a later tick if not).
 pub async fn send_backing_missing_alert(device: &str) -> bool {
     let body = format!(
-        "TWINSTOR: the configured DRBD backing device {device} no longer exists on this \
+        "TwinStor: the configured DRBD backing device {device} no longer exists on this \
          node. DRBD cannot attach a local replica to a device that is not there, so this \
-         node is NOT resyncing and provides NO local redundancy (it can only serve through \
+         node is not resyncing and provides no local redundancy (it can only serve through \
          the peer, and only while the peer is healthy). A second failure would then lose \
          data. This is the shape a replaced disk or a recreated mdadm array leaves behind: \
-         the disk/array came back under a NEW /dev/disk/by-id path, so the stored reference \
+         the disk/array came back under a new /dev/disk/by-id path, so the stored reference \
          no longer resolves. To fix, re-point twinstor at the replacement in one step: run \
          `twinstor replace-backing <new-device>` (it updates backing_device in \
          twinstor.toml, regenerates the DRBD resource, and attaches the new disk so the \
@@ -1539,10 +1539,10 @@ pub async fn send_ha_wedge_alert(body: &str) -> bool {
 /// not).
 pub async fn send_replication_fallback_alert(direct_peer: &str, failback_why: &str) -> bool {
     let body = format!(
-        "TWINSTOR: replication is running on the switch FALLBACK path instead of the \
+        "TwinStor: replication is running on the switch fallback path instead of the \
          direct link (peer direct address {direct_peer}). Data is safe and stays \
          replicated, but writes now share the switch with all other traffic and the \
-         switch is temporarily a single point of failure for the pool: do NOT take \
+         switch is temporarily a single point of failure for the pool: do not take \
          the switch down for maintenance until `twinstor status` shows `repl path: \
          direct link`.{failback_why} Check the direct cable and NICs on both hosts \
          (carrier, link speed). Once the link is stable the daemon fails back by \
@@ -1887,7 +1887,7 @@ fn kmsg_fallback(name: &str, body: &str) {
         cut -= 1;
     }
     msg.truncate(cut);
-    let line = format!("<1>twinstor: UNDELIVERED ALERT ({name}): {msg}\n");
+    let line = format!("<1>twinstor: undelivered alert ({name}): {msg}\n");
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
         let _ = f.write_all(line.as_bytes());

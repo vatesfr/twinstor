@@ -370,7 +370,7 @@ impl Cli {
                             return Err(crate::render::CliError::new(
                                 "--peer-ip is required when other setup flags are given",
                                 "add --peer-ip <IP> to this command, or run `twinstor setup` \
-                                 with NO arguments on a terminal for the interactive wizard",
+                                 with no arguments on a terminal for the interactive wizard",
                             )
                             .explain(
                                 "partial flags are ambiguous: the wizard only runs when \
@@ -420,7 +420,7 @@ impl Cli {
                 let config = Arc::new(Config::load(&self.config).map_err(|e| {
                     crate::render::CliError::new(
                         format!("cannot load this node's config ({})", self.config.display()),
-                        "if TWINSTOR is not set up on this node yet, run `twinstor setup`; \
+                        "if TwinStor is not set up on this node yet, run `twinstor setup`; \
                          otherwise point at the right file with -c <path>",
                     )
                     .caused_by(e)
@@ -574,7 +574,7 @@ async fn run_sr(config: Arc<Config>, action: SrAction) -> Result<()> {
                     println!("{u} (recorded)");
                 } else {
                     println!(
-                        "{u} (recorded, but NOT found in XAPI -- stale; run `twinstor sr record`)"
+                        "{u} (recorded, but not found in XAPI, so it is stale; run `twinstor sr record`)"
                     );
                 }
             } else if let Some(u) = crate::xapi::twinstor_sr_uuid().await {
@@ -634,7 +634,7 @@ fn discard_refusal(
     }
     if lineage_keeps_local == Some(true) && !discard_kept_copy {
         return Some((
-            "the DRBD generation lineage says THIS node holds the copy to keep (it is ahead of the \
+            "the DRBD generation lineage says this node holds the copy to keep (it is ahead of the \
              peer, or holds more of the writes made during the split); discarding it here loses \
              those writes"
                 .into(),
@@ -645,7 +645,7 @@ fn discard_refusal(
     }
     match scan {
         Err(e) => Some((
-            format!("cannot tell which VMs on this host use the TWINSTOR SR ({e})"),
+            format!("cannot tell which VMs on this host use the TwinStor SR ({e})"),
             "check `xl list` and stop every VM on this host that uses the SR, then retry".into(),
         )),
         Ok(scan) if !scan.on_sr.is_empty() => {
@@ -656,7 +656,7 @@ fn discard_refusal(
                 .collect();
             Some((
                 format!(
-                    "VMs on this host still use the TWINSTOR SR: {}",
+                    "VMs on this host still use the TwinStor SR: {}",
                     ids.join(", ")
                 ),
                 "stop them first (xe vm-shutdown --force uuid=<uuid>) so none keeps running on a \
@@ -724,7 +724,7 @@ async fn run_discard_and_resync(
         }
     );
     println!(
-        "\nTHIS node's copy will be DISCARDED and resynced from {}: every write on this node that \
+        "\nThis node's copy will be discarded and resynced from {}: every write on this node that \
          {} does not have is lost for good. Run this only on the node whose copy you decided to \
          give up.\n",
         config.node.peer, config.node.peer
@@ -835,7 +835,7 @@ async fn run_discard_and_resync(
         match crate::loser_boundary::operator_lift_check(&guests).await {
             Err(why) => {
                 return Err(crate::render::CliError::new(
-                    format!("{why}; this copy's I/O stays suspended and NOT discarding"),
+                    format!("{why}; this copy's I/O stays suspended and not discarding"),
                     format!(
                         "stop that VM (xe vm-shutdown --force uuid=<vm>), or wait for its start to \
                              finish and stop it, then retry; {armed}"
@@ -904,7 +904,7 @@ async fn run_discard_and_resync(
                      disk metadata onto the peer's copy, the one that is kept. Bring this node's target \
                      and loopback session back (start the daemon without the discard request: delete \
                      {m}), then retry. Release a handle as it is (`{}`) only if it was opened on the \
-                     peer's history AND every VM using that disk is halted on every host of the pool \
+                     peer's history and every VM using that disk is halted on every host of the pool \
                      (`xe vm-list power-state=running` shows none of them): a VM started again on the \
                      peer would have its disk metadata overwritten; {armed}",
                     crate::xapi_storage::destroy_command("vbd/<domid>/<device>"),
@@ -920,7 +920,7 @@ async fn run_discard_and_resync(
             };
             return Err(crate::render::CliError::new(
                 format!(
-                    "could not release the disk handles left open on the SR ({e}); NOT discarding"
+                    "could not release the disk handles left open on the SR ({e}); not discarding"
                 ),
                 fix,
             )
@@ -941,7 +941,7 @@ async fn run_discard_and_resync(
             println!("WARNING: could not suspend this copy's I/O again ({se})");
         }
         return Err(crate::render::CliError::new(
-            format!("the SR is in use on this host again ({e}); NOT discarding"),
+            format!("the SR is in use on this host again ({e}); not discarding"),
             format!(
                 "stop those VMs (and close what they left open, as above), then retry; {armed}"
             ),
@@ -961,7 +961,7 @@ async fn run_discard_and_resync(
         // this copy to a session that survived.
         Ok(Err(e)) => {
             return Err(crate::render::CliError::new(
-                format!("the iSCSI backstore is still exported ({e}); NOT discarding"),
+                format!("the iSCSI backstore is still exported ({e}); not discarding"),
                 format!("check `targetcli ls` on this host and remove the twinstor backstore, then retry; {armed}"),
             )
             .into())
@@ -1016,7 +1016,7 @@ async fn run_discard_and_resync(
     println!(
         "\nnot connected yet: the discard is armed and the resync starts as soon as {} accepts \
          the connection (if its daemon holds it StandAlone, run `drbdadm connect {}` there). \
-         Start the daemon again: systemctl start twinstor — it keeps this node down (Secondary, \
+         Start the daemon again: systemctl start twinstor. It keeps this node down (Secondary, \
          no target) and re-arms the discard until the resync has started{}. To cancel instead, \
          delete {}.",
         config.node.peer,
@@ -1222,21 +1222,21 @@ async fn run_upgrade_apply(
             .iter()
             .map(|b| match b {
                 UpgradeBlocker::NotConnected => format!(
-                    "DRBD is not Connected (state: {:?}) -- the peer is unreachable or itself \
+                    "DRBD is not Connected (state: {:?}): the peer is unreachable or itself \
                      mid-restart",
                     st.connection
                 ),
                 UpgradeBlocker::NotUpToDate => format!(
-                    "DRBD is not both-UpToDate (local: {:?}, peer: {:?}) -- a resync is in flight",
+                    "DRBD is not both-UpToDate (local: {:?}, peer: {:?}): a resync is in flight",
                     st.disk, st.peer_disk
                 ),
                 UpgradeBlocker::EpisodeOpen => {
-                    "a heal episode is open (/var/lib/twinstor/open-episode) -- an incident is \
+                    "a heal episode is open (/var/lib/twinstor/open-episode): an incident is \
                      resolving"
                         .to_string()
                 }
                 UpgradeBlocker::PeerNotAlive => format!(
-                    "the PEER daemon ({}) is not alive (twinstor-alive stamp stale or missing) -- \
+                    "the peer daemon ({}) is not alive (twinstor-alive stamp stale or missing): \
                      it may be mid-restart; restarting now would risk a dual-master",
                     config.node.peer
                 ),
@@ -1244,8 +1244,8 @@ async fn run_upgrade_apply(
             .collect::<Vec<_>>();
         return Err(crate::render::CliError::new(
             "refusing to restart the daemon: it is not safe on this node right now",
-            "wait until `twinstor status` is healthy on BOTH nodes (Connected + UpToDate, no \
-             incident), then re-run. Upgrade ONE node at a time -- never restart both close together.",
+            "wait until `twinstor status` is healthy on both nodes (Connected + UpToDate, no \
+             incident), then re-run. Upgrade one node at a time; never restart both close together.",
         )
         .explain(format!("blocking condition(s):\n  - {}", detail.join("\n  - ")))
         .into());
@@ -1282,15 +1282,15 @@ async fn run_upgrade_apply(
             if skip_config {
                 println!(
                     "\nnote: DRBD .res is at template version {v} (current {cur}); --skip-config \
-                     is set, so upgrade-apply will leave it as-is. SAFE either way -- the daemon \
+                     is set, so upgrade-apply will leave it as-is. Safe either way: the daemon \
                      enforces the split-brain safety policies live regardless of .res version."
                 );
             } else {
                 println!(
                     "\nnote: DRBD .res is at template version {v} (current {cur}); upgrade-apply \
                      will migrate it live (drbdadm adjust) after the gate. If the change needs a \
-                     connection reset it rolls back to a maintenance-window note -- either way it \
-                     is SAFE and does not block the upgrade."
+                     connection reset it rolls back to a maintenance-window note. Either way it \
+                     is safe and does not block the upgrade."
                 );
             }
         }
@@ -1298,7 +1298,7 @@ async fn run_upgrade_apply(
     }
 
     // 2. Confirm.
-    println!("TWINSTOR upgrade-apply on this node ({})", config.node.name);
+    println!("TwinStor upgrade-apply on this node ({})", config.node.name);
     println!("  DRBD: Connected, both UpToDate");
     println!(
         "  peer daemon ({}): alive{}",
@@ -1349,10 +1349,10 @@ async fn run_upgrade_apply(
             );
             if let Err(e) = run_regenerate_config(config.clone(), true, false).await {
                 println!(
-                    "\ncould not migrate the .res live: {e}\n  This is SAFE and does NOT hold the \
-                     upgrade -- the running daemon enforces the split-brain safety policies \
+                    "\ncould not migrate the .res live: {e}\n  This is safe and does not hold the \
+                     upgrade: the running daemon enforces the split-brain safety policies \
                      regardless of template version. To adopt the new template later, do it in a \
-                     maintenance window ONE node at a time: `twinstor regenerate-config \
+                     maintenance window one node at a time: `twinstor regenerate-config \
                      --persist-only --yes` then reboot that node, waiting for Connected + both \
                      UpToDate before the other.\n"
                 );
@@ -1406,7 +1406,7 @@ async fn run_upgrade_apply(
             let local_ver = env!("CARGO_PKG_VERSION");
             let tail = match peer_version.as_deref() {
                 Some(pv) if pv == local_ver => {
-                    format!("Both nodes are now on {local_ver} -- rolling upgrade complete.")
+                    format!("Both nodes are now on {local_ver}; rolling upgrade complete.")
                 }
                 Some(pv) => match crate::xapi::mixed_release_note(local_ver, pv) {
                     Some(note) => format!(
@@ -1432,7 +1432,7 @@ async fn run_upgrade_apply(
         if start.elapsed() >= deadline {
             return Err(crate::render::CliError::new(
                 format!("daemon restarted but did not reconverge within {timeout}s"),
-                "check `twinstor status` and /var/log/twinstor.log on THIS node before touching \
+                "check `twinstor status` and /var/log/twinstor.log on this node before touching \
                  the peer",
             )
             .explain(format!(
@@ -2015,11 +2015,11 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         }
         Some(pv) => match crate::xapi::mixed_release_note(env!("CARGO_PKG_VERSION"), pv) {
             Some(note) => println!(
-                "{}peer version: {pv}  (MIXED RELEASES -- the peer runs {note})",
+                "{}peer version: {pv}  (mixed releases: the peer runs {note})",
                 st.marker(Sev::Warn)
             ),
             None => println!(
-                "{}peer version: {pv}  (version skew -- finish the rolling upgrade; both nodes should be on {})",
+                "{}peer version: {pv}  (version skew: finish the rolling upgrade; both nodes should be on {})",
                 st.marker(Sev::Warn),
                 env!("CARGO_PKG_VERSION")
             ),
@@ -2045,7 +2045,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             )
         }
         crate::reboot_drain::GuardState::NotArmed => println!(
-            "{}reboot guard: NOT armed -- run: systemctl enable --now twinstor-reboot-drain",
+            "{}reboot guard: not armed; run: systemctl enable --now twinstor-reboot-drain",
             st.marker(Sev::Warn)
         ),
     }
@@ -2074,7 +2074,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             "{g}pool HA:     {}",
             st.paint(
                 Sev::Warn,
-                "DISABLED -- no automatic host failover (enable HA for failover)"
+                "disabled: no automatic host failover (enable HA for failover)"
             )
         ),
         None => {
@@ -2089,7 +2089,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             "{g}ha re-arm:   {}",
             st.paint(
                 Sev::Warn,
-                "pending -- TwinStor disarmed HA itself and is re-arming it automatically (no action needed)"
+                "pending: TwinStor disarmed HA itself and is re-arming it automatically (no action needed)"
             )
         );
     }
@@ -2127,8 +2127,8 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
                     println!("{sub}repl path:  direct link ({peer})");
                 } else {
                     println!(
-                        "{sub}repl path:  switch ({peer}) -- {}",
-                        st.paint(Sev::Warn, "FALLBACK")
+                        "{sub}repl path:  switch ({peer}), {}",
+                        st.paint(Sev::Warn, "fallback")
                     );
                     match crate::failback_state::read() {
                         Some(fb) if fb.mode == "holding" => println!(
@@ -2137,7 +2137,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
                             fb.eta_secs
                         ),
                         Some(fb) => println!(
-                            "{sub}failback:   {} -- {}",
+                            "{sub}failback:   {}: {}",
                             st.paint(Sev::Warn, &fb.mode),
                             fb.reason
                         ),
@@ -2170,7 +2170,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         }
         other => {
             println!(
-                "{}readiness:   {} -- {}",
+                "{}readiness:   {}: {}",
                 st.marker(readiness_sev),
                 st.paint(readiness_sev, other.label()),
                 other.reason()
@@ -2208,7 +2208,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         }
         println!(
             "{cont}{}",
-            st.bold("auto-recovery in progress; do NOT run manual drbdadm/xe recovery commands")
+            st.bold("auto-recovery in progress; do not run manual drbdadm/xe recovery commands")
         );
     }
 
@@ -2220,7 +2220,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             st.paint(
                 Sev::Warn,
                 &format!(
-                    "DRBD resource file format v{}, this binary generates v{} -- the \
+                    "DRBD resource file format v{}, this binary generates v{}; the \
                      file keeps its setup-time settings; handler scripts are auto-refreshed at \
                      daemon start (see release notes for whether the .res needs regenerating)",
                     res_version.unwrap_or(0),
@@ -2262,7 +2262,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         Some(info) => {
             let summary = match &path_degraded {
                 None => st.paint(Sev::Good, "ok"),
-                Some(r) => st.paint(mp_sev, &format!("DEGRADED: {r}")),
+                Some(r) => st.paint(mp_sev, &format!("degraded: {r}")),
             };
             println!("{}multipath:   {}", st.marker(mp_sev), summary);
             for line in info.lines() {
@@ -2277,9 +2277,9 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             };
             match &path_degraded {
                 Some(r) => println!(
-                    "{}multipath:   {what} -- {}",
+                    "{}multipath:   {what}; {}",
                     st.marker(mp_sev),
-                    st.paint(mp_sev, &format!("DEGRADED: {r}"))
+                    st.paint(mp_sev, &format!("degraded: {r}"))
                 ),
                 None => println!("{}multipath:   {what}", st.marker(mp_sev)),
             }
@@ -2294,7 +2294,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             st.paint(
                 Sev::Bad,
                 &format!(
-                    "NONE (no default gateway, no ping targets) -- any replication \
+                    "none (no default gateway, no ping targets): any replication \
                      interruption freezes this node; add an always-on local IP to {}",
                     crate::setup::PING_TARGETS_PATH
                 )
@@ -2316,7 +2316,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             st.paint(
                 Sev::Bad,
                 &format!(
-                    "installed kernel(s) WITHOUT a DRBD module: {} -- rebooting \
+                    "installed kernel(s) without a DRBD module: {}; rebooting \
                      into one of these bricks this node's storage; install a matching \
                      kmod-drbd first",
                     missing_kernels.join(", ")
@@ -3267,17 +3267,17 @@ async fn run_replace_backing(
     let new_res = rebuild_res_text(&config, &old_res, Some(&new_backing)).await?;
 
     // 3. Summarize and confirm.
-    println!("TWINSTOR replace-backing\n");
+    println!("TwinStor replace-backing\n");
     println!("this will, on this node ({}):", config.node.name);
     println!("  1. set backing_device in {} to:", config_path.display());
     println!("       {old_backing}");
     println!("     -> {new_backing}");
     println!("  2. regenerate {res_path} with the new local disk");
-    println!("  3. INITIALIZE {new_backing} with fresh DRBD metadata");
-    println!("     (drbdadm create-md --force): ANY existing content on that device");
-    println!("     is discarded -- this is meant for a blank replacement disk");
+    println!("  3. Initialize {new_backing} with fresh DRBD metadata");
+    println!("     (drbdadm create-md --force): any existing content on that device");
+    println!("     is discarded (this is meant for a blank replacement disk)");
     println!("  4. drbdadm adjust {res} (+ attach): DRBD attaches the new disk and");
-    println!("     the FULL resync from the peer begins\n");
+    println!("     the full resync from the peer begins\n");
     if episode_open {
         println!("WARNING: a heal episode is open; --yes given, proceeding anyway.\n");
     }
@@ -3387,7 +3387,7 @@ async fn run_replace_backing(
             );
             if s.disk == crate::drbd::DiskState::Diskless {
                 println!(
-                    "WARNING: the resource is still Diskless -- the attach did not take \
+                    "WARNING: the resource is still Diskless: the attach did not take \
                      (see the notes above). The config and .res are already updated; fix \
                      the device, then run `drbdadm attach {res}` to start the resync."
                 );
@@ -3399,7 +3399,7 @@ async fn run_replace_backing(
             }
         }
         Err(_) => println!(
-            "done, but DRBD status was unreadable -- verify with `twinstor status` that \
+            "done, but DRBD status was unreadable; verify with `twinstor status` that \
              the disk is attached and resyncing before trusting redundancy."
         ),
     }
@@ -3687,8 +3687,8 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
     if !yes {
         if let Some(reason) = &topo {
             println!(
-                "\nNOTE: this is a DRBD connection-topology change ({reason}). It must be \
-                 applied to BOTH nodes TOGETHER in a maintenance window -- NOT one node at a \
+                "\nNote: this is a DRBD connection-topology change ({reason}). It must be \
+                 applied to both nodes together in a maintenance window, not one node at a \
                  time (a node reconfigured alone hangs in Connecting against the old-topology \
                  peer)."
             );
@@ -3703,20 +3703,20 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
     // old one. There is no safe one-node live apply, so point to the joint
     // maintenance procedure instead.
     if let (false, Some(reason)) = (persist_only, &topo) {
-        println!("\n{path} was left UNCHANGED -- not applied.");
+        println!("\n{path} was left unchanged: not applied.");
         println!(
             "this update changes the DRBD connection topology ({reason}), which the peer \
-             must match to connect. It CANNOT be applied one node at a time: a node \
+             must match to connect. It cannot be applied one node at a time: a node \
              reconfigured alone cannot reconnect to a peer still on the old topology (it \
-             hangs in `Connecting`, observed live)."
+             hangs in `Connecting`)."
         );
         println!(
-            "apply it in a MAINTENANCE WINDOW on BOTH nodes together: on EACH node run \
-             `twinstor regenerate-config --persist-only --yes`, then restart BOTH nodes \
-             TOGETHER (reboot both, or `drbdadm down twinstor-{res_short}` then \
+            "apply it in a maintenance window on both nodes together: on each node run \
+             `twinstor regenerate-config --persist-only --yes`, then restart both nodes \
+             together (reboot both, or `drbdadm down twinstor-{res_short}` then \
              `drbdadm up twinstor-{res_short}` on both close together) so they come up \
              matched. The SR is briefly unavailable during the joint restart, so stop or \
-             pause the VMs first. You are SAFE meanwhile on the current config; the safety \
+             pause the VMs first. You are safe meanwhile on the current config; the safety \
              policies are enforced live regardless of the .res version.",
             res_short = config.storage.drbd_resource,
         );
@@ -3739,33 +3739,33 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
         // (`drbdadm adjust`) would hit the same del-peer refusal each tick. So the
         // operator must reboot this node promptly, and must not stage the peer
         // until this node is back healthy on the new file.
-        println!("\nstaged {path} (backup at {bak}); NOT applied live (--persist-only).");
+        println!("\nstaged {path} (backup at {bak}); not applied live (--persist-only).");
         if let Some(reason) = &topo {
             // A connection-topology change needs the opposite of the usual
             // one-at-a-time sequence: both nodes must switch together, because a
             // node that reboots alone onto the new topology cannot reconnect to
             // the old-topology peer.
             println!(
-                "TOPOLOGY CHANGE ({reason}): the peer must match this to connect, so this is \
-                 NOT a one-node-at-a-time change. Stage the PEER too \
-                 (`twinstor regenerate-config --persist-only --yes` there), then restart BOTH \
-                 nodes TOGETHER (reboot both, or `drbdadm down` then `up` on both close \
-                 together). Do NOT reboot this node alone -- it will hang in `Connecting` \
-                 against the old-topology peer (observed live). The SR is briefly unavailable \
+                "topology change ({reason}): the peer must match this to connect, so this is \
+                 not a one-node-at-a-time change. Stage the peer too \
+                 (`twinstor regenerate-config --persist-only --yes` there), then restart both \
+                 nodes together (reboot both, or `drbdadm down` then `up` on both close \
+                 together). Do not reboot this node alone: it will hang in `Connecting` \
+                 against the old-topology peer. The SR is briefly unavailable \
                  during the joint restart, so stop/pause the VMs first. Undo: cp {bak} {path}"
             );
         } else {
             println!(
-                "WARNING: the on-disk file is now AHEAD of the running kernel. Do NOT leave it \
-                 this way: reboot THIS node now to load it (`drbdadm up` on boot applies it \
-                 cleanly). Until you reboot, avoid any direct-link/failback event -- the daemon's \
+                "WARNING: the on-disk file is now ahead of the running kernel. Do not leave it \
+                 this way: reboot this node now to load it (`drbdadm up` on boot applies it \
+                 cleanly). Until you reboot, avoid any direct-link/failback event: the daemon's \
                  path-restore would fail against the staged file."
             );
             println!(
-                "sequence for the pair: stage + reboot ONE node, wait until `twinstor status` shows \
-                 Connected with both UpToDate again, THEN stage + reboot the other. Staging BOTH nodes \
-                 before rebooting either leaves both files ahead of both kernels -- a direct-link event \
-                 then fails path-restore on BOTH sides and sets up a split-brain, so do NOT do it. \
+                "sequence for the pair: stage + reboot one node, wait until `twinstor status` shows \
+                 Connected with both UpToDate again, then stage + reboot the other. Staging both nodes \
+                 before rebooting either leaves both files ahead of both kernels; a direct-link event \
+                 then fails path-restore on both sides and sets up a split-brain, so do not do it. \
                  If you change your mind, restore the old file: cp {bak} {path}"
             );
         }
@@ -3812,10 +3812,10 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
                 reassert_live_safety(res, local, peer).await;
                 if let Err(ce) = rolled_back {
                     return Err(crate::render::CliError::new(
-                        format!("the live reconfigure was refused ({e}); then restoring {bak} FAILED ({ce})"),
+                        format!("the live reconfigure was refused ({e}); then restoring {bak} failed ({ce})"),
                         format!(
-                            "CRITICAL: {path} may still hold the NEW template while the kernel runs \
-                             the old topology -- restore it now: `cp {bak} {path}`. Until you do, the \
+                            "CRITICAL: {path} may still hold the new template while the kernel runs \
+                             the old topology; restore it now: `cp {bak} {path}`. Until you do, the \
                              daemon's path-restore will fail on this resource on the next \
                              failback/reconnect."
                         ),
@@ -3824,26 +3824,26 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
                 }
                 println!("\n{path} was left unchanged (restored from {bak}).");
                 println!(
-                    "the new template could NOT be applied live: the pair is a connected, \
+                    "the new template could not be applied live: the pair is a connected, \
                      serving dual-Primary, so DRBD refuses to reset the peer connection while \
                      both nodes are Primary/UpToDate. Leaving the new file on disk while the \
                      kernel runs the old topology would break the daemon's own path-restore, \
                      so the old file was kept."
                 );
                 println!(
-                    "you are SAFE meanwhile: the split-brain data-safety policies (after-sb \
-                     disconnect, on-no-data-accessible suspend-io) are enforced LIVE by the \
+                    "you are safe meanwhile: the split-brain data-safety policies (after-sb \
+                     disconnect, on-no-data-accessible suspend-io) are enforced live by the \
                      daemon regardless of the .res version, so the `config outdated` line in \
                      `twinstor status` is informational here, not a risk."
                 );
                 println!(
-                    "to persist the new template you must STAGE it first, then reboot -- this \
-                     live attempt just RESTORED the old file, so a bare reboot reloads the OLD \
-                     one (nothing changed on disk). In a maintenance window, ONE node at a time: \
+                    "to persist the new template you must stage it first, then reboot: this \
+                     live attempt just restored the old file, so a bare reboot reloads the old \
+                     one (nothing changed on disk). In a maintenance window, one node at a time: \
                      run `twinstor regenerate-config --persist-only --yes` (writes the new .res \
-                     WITHOUT touching the running kernel), reboot that node so `drbdadm up` loads \
+                     without touching the running kernel), reboot that node so `drbdadm up` loads \
                      it cleanly, wait until `twinstor status` shows Connected with both UpToDate, \
-                     THEN repeat on the other node. (Alternatively, re-run this live path while \
+                     then repeat on the other node. (Alternatively, re-run this live path while \
                      the peer is briefly Secondary+Outdated.)"
                 );
                 return Ok(());
@@ -3857,9 +3857,9 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
             if let Err(ce) = rolled_back {
                 reassert_live_safety(res, local, peer).await;
                 return Err(crate::render::CliError::new(
-                    format!("drbdadm adjust failed ({e}); AND restoring {bak} failed ({ce})"),
+                    format!("drbdadm adjust failed ({e}); and restoring {bak} failed ({ce})"),
                     format!(
-                        "CRITICAL: restore {path} manually now: `cp {bak} {path}` -- the on-disk \
+                        "CRITICAL: restore {path} manually now: `cp {bak} {path}`; the on-disk \
                          file may be the new template while the kernel runs the old one."
                     ),
                 )
@@ -3894,7 +3894,7 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
         if let Err(ce) = tokio::fs::copy(&bak, &path).await {
             reassert_live_safety(res, local, peer).await;
             return Err(crate::render::CliError::new(
-                format!("post-adjust verification failed; AND restoring {bak} failed ({ce})"),
+                format!("post-adjust verification failed; and restoring {bak} failed ({ce})"),
                 format!(
                     "CRITICAL: restore {path} manually: `cp {bak} {path}`, then check \
                      `twinstor status` on both nodes."

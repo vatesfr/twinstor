@@ -44,12 +44,14 @@ const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 /// interactive wizard and the non-interactive CLI path so the operator makes
 /// this choice with the known scope in front of them.
 pub const ARBITRATED_MODE_NOTE: &str = "\
-NOTE: arbitrated (direct-link) mode adds a second DRBD replication path so
-replication survives a switch-path drop. It does NOT make a full switch failure
-a clean event: under armed HA the XHA statefile keeps writing during the ~10s
-reconnect gap, so a switch death is still a clean full-pool outage (no data
-corruption) plus one fence reboot per node, not a transparent failover. The
-direct link protects the east-west STORAGE path only. See
+Note: arbitrated (direct-link) mode replicates over the back-to-back cable,
+with the switched network as a fallback path, so a switch failure does not
+split DRBD. If the whole switch dies, each host reads over the cable that its
+peer lost the gateway too; after 15 s both disarm local XHA fencing and keep
+their VMs running (unreachable by clients until the switch returns), then
+re-arm HA. A host that loses only its own switch link is stood down after a
+confirmation window, so its VMs restart on the other host. The direct link
+protects the storage path, not the guest network. See
 NETWORK_TOPOLOGY_SAFETY.md for the full analysis.";
 
 pub struct SetupParams {
@@ -184,7 +186,7 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
         cmd
     };
 
-    println!("TWINSTOR setup");
+    println!("TwinStor setup");
     println!("  local:   {local_name} ({local_ip})");
     println!("  peer:    {peer_name} ({})", params.peer_ip);
     println!("  device:  {}", backing.display());
@@ -275,7 +277,7 @@ initiator_iqns = [{iqn_list}]
             AlreadyDisabled => println!("  cache:   {disk}: volatile write cache already disabled"),
             Disabled => println!("  cache:   {disk}: volatile write cache disabled"),
             ZvolDelegated => println!(
-                "  cache:   {disk}: ZFS zvol — flush durability is ZFS's job; keep the\n\
+                "  cache:   {disk}: ZFS zvol; flush durability is ZFS's job; keep the\n\
                  \x20          dataset's sync property at 'standard' (never 'disabled')"
             ),
             Failed(e) => println!(
@@ -410,11 +412,11 @@ initiator_iqns = [{iqn_list}]
     .unwrap_or(false);
     if backing_wipe_blocked(twinstor_sr_exists, params.full_sync) {
         bail!(
-            "a live twinstor SR already exists, so re-running setup would WIPE this \
+            "a live twinstor SR already exists, so re-running setup would wipe this \
              node's backing device ({}) and destroy its copy of the data. If you are \
-             rejoining or re-initialising THIS node (the peer holds the good copy and \
+             rejoining or re-initialising this node (the peer holds the good copy and \
              this node will resync a fresh one), re-run with --full-sync to accept the \
-             wipe. If you did not mean to re-run setup, stop now -- your data is intact.",
+             wipe. If you did not mean to re-run setup, stop now: your data is intact.",
             backing.display()
         );
     }
@@ -520,23 +522,23 @@ initiator_iqns = [{iqn_list}]
         // unknown from here). The only thing the operator must carry across is
         // the CHAP password, so it gets its own line, ready to copy.
         println!("\n======================================================================");
-        println!("  ACTION REQUIRED: now set up the OTHER node ({peer_name}).");
+        println!("  Action required: now set up the other node ({peer_name}).");
         println!("======================================================================");
-        println!("  This node is configured and is now WAITING for {peer_name} to connect.");
+        println!("  This node is configured and is now waiting for {peer_name} to connect.");
         println!("  Nothing else happens until you set it up.");
         println!();
         println!("  On {peer_name}, simply run:");
         println!();
         println!("      twinstor setup");
         println!();
-        println!("  The wizard detects THIS node automatically, picks {peer_name}'s own");
+        println!("  The wizard detects this node automatically, picks {peer_name}'s own");
         println!("  backing disk, then asks for the CHAP password. Paste this one in:");
         println!();
         println!("      CHAP password:  {chap_password}");
         println!();
         println!("  {peer_name} then creates the shared SR and finishes the cluster.");
         println!();
-        println!("  (Non-interactive alternative, substituting {peer_name}'s OWN disk:");
+        println!("  (Non-interactive alternative, substituting {peer_name}'s own disk:");
         println!("      {peer_cmd} --backing-device <disk-on-peer> )");
         println!("  (use --full-sync to promote this node immediately and sync later instead)");
         println!("======================================================================\n");
@@ -591,7 +593,7 @@ initiator_iqns = [{iqn_list}]
         println!("\nsetup complete on {local_name}.\n");
         println!("CHAP password (you need it on the peer): {chap_password}\n");
         println!("on the peer node ({peer_name}), run setup with that CHAP password and");
-        println!("the peer's OWN backing device:");
+        println!("the peer's own backing device:");
         println!("  {peer_cmd} --backing-device <disk-on-peer>");
         println!("  (or just run `twinstor setup` on the peer to pick its disk interactively)");
         println!("\nthe second node creates the SR and finishes the cluster.");
@@ -609,8 +611,8 @@ initiator_iqns = [{iqn_list}]
 fn validate_node_names(local: &str, peer: &str) -> Result<()> {
     if local == peer {
         bail!(
-            "both hosts are named '{local}'. TWINSTOR keys the DRBD config, the \
-             node-id assignment and its recovery tiebreaks on UNIQUE hostnames; \
+            "both hosts are named '{local}'. TwinStor keys the DRBD config, the \
+             node-id assignment and its recovery tiebreaks on unique hostnames; \
              duplicate names break storage at the next reboot. Rename one host first:\n\
              \x20 xe host-set-hostname-live host-uuid=<uuid> host-name=<new-name>\n\
              then make /etc/hostname match and re-run setup."
@@ -681,8 +683,8 @@ fn tiebreaker_gate(
     }
     if allow_no_tiebreaker {
         println!(
-            "  OVERRIDE (--allow-no-tiebreaker): with no gateway and no ping targets, ANY\n\
-             \x20 replication interruption, including the peer simply dying, FREEZES this\n\
+            "  Override (--allow-no-tiebreaker): with no gateway and no ping targets, any\n\
+             \x20 replication interruption, including the peer simply dying, freezes this\n\
              \x20 node's storage until the peer returns. HA will not restart VMs anywhere."
         );
         return Ok(());
@@ -690,7 +692,7 @@ fn tiebreaker_gate(
     bail!(
         "no partition tiebreaker: no default gateway detected and no --ping-target \
          given. The fence-peer handler would have nothing to probe and would freeze \
-         this node on ANY replication interruption, including a plain peer host \
+         this node on any replication interruption, including a plain peer host \
          death: a 1-node failure would take down the whole pool. Add at least one \
          always-on local IP with --ping-target <ip> (a managed switch, a router, any \
          device that proves this node can still serve clients). If this site \
@@ -711,11 +713,11 @@ async fn write_ping_targets(targets: &[IpAddr]) -> Result<()> {
     let mut body = String::from(
         "# TWINSTOR fence-peer ping targets (any-of-N partition tiebreaker).\n\
          # The default gateway is always probed automatically; the entries below\n\
-         # are additional LOCAL always-on IPs (e.g. your managed switch's\n\
+         # are additional local always-on IPs (e.g. your managed switch's\n\
          # management address, a second router). One IP per line; '#' comments.\n\
          #\n\
          # Probing more local targets makes a node less likely to self-fence on a\n\
-         # single flaky device. Prefer LOCAL targets that prove you can still\n\
+         # single flaky device. Prefer local targets that prove you can still\n\
          # serve clients, not an internet host (which is only reachable via the\n\
          # gateway anyway).\n",
     );
@@ -966,7 +968,7 @@ async fn stable_device_path(dev: &Path) -> Result<PathBuf> {
         match alias {
             Some(p) => {
                 println!(
-                    "  device:  {} is a ZFS zvol — community-supported. Flush durability\n\
+                    "  device:  {} is a ZFS zvol (community-supported). Flush durability\n\
                      \x20          is governed by ZFS below DRBD: keep the dataset's sync\n\
                      \x20          property at 'standard' (never 'disabled').",
                     p.display()
@@ -1017,7 +1019,7 @@ async fn stable_device_path(dev: &Path) -> Result<PathBuf> {
     match best {
         Some((_, p)) => Ok(p),
         None => bail!(
-            "no stable /dev/disk/by-id alias found for {} — refusing to write a volatile \
+            "no stable /dev/disk/by-id alias found for {}; refusing to write a volatile \
              device name into the DRBD config (device enumeration can change across boots \
              and point DRBD at a different disk)",
             dev.display()
@@ -1040,9 +1042,9 @@ pub(crate) fn render_res_file(
 resource {res} {{
     protocol C;
     options {{
-        # When a Primary has no up-to-date data reachable -- local Inconsistent
+        # When a Primary has no up-to-date data reachable (local Inconsistent
         # mid-resync while the peer is momentarily unreachable, e.g. a node
-        # mid split-brain loser-resolution -- SUSPEND I/O instead of returning a
+        # mid split-brain loser-resolution), suspend I/O instead of returning a
         # hard error. A hard error propagates through the still-live iSCSI /
         # multipath path (which queue_if_no_path cannot hold: it only queues on
         # *no path*, not on an error returned via a live path) straight to the
@@ -1050,7 +1052,7 @@ resource {res} {{
         # guest's filesystem on a torn write. suspend-io blocks the bio and
         # resumes transparently the instant data is accessible again (~1s once
         # resync completes); Linux blkfront waits on the ring, Windows xenvbd
-        # tolerates its 120s disk timeout -- both ride the stall.
+        # tolerates its 120s disk timeout; both ride the stall.
         on-no-data-accessible suspend-io;
     }}
     handlers {{
@@ -1058,8 +1060,8 @@ resource {res} {{
         split-brain "/usr/lib/drbd/twinstor-split-brain.sh";
     }}
     startup {{
-        # Honour a startup connection-wait before the daemon promotes
-        # (Solution B for the staggered-double-reboot split-brain). DRBD
+        # Honour a startup connection-wait before the daemon promotes, so a
+        # staggered double reboot does not split the pair. DRBD
         # selects the budget from its persisted metadata for free: a node
         # that was a healthy pair when it went down boots non-degraded and
         # waits wfc-timeout (long enough for the peer to finish booting, so
@@ -1078,9 +1080,9 @@ resource {res} {{
         fencing {fencing_policy};
         # Resync controller (SyncTarget side). c-fill-target unlocks fast links
         # (the DRBD default caps resync near ~95 MiB/s regardless of link speed);
-        # c-max-rate is the ceiling. c-min-rate is the REDUNDANCY-FIRST fix:
+        # c-max-rate is the ceiling. c-min-rate is the redundancy-first fix:
         # DRBD's 250k default is the resync-vs-application-I/O floor and collapses
-        # the resync under app I/O (observed live at ~6 MB/s during a rolling
+        # the resync under app I/O (down to ~6 MB/s during a rolling
         # update), leaving the pool single-copy far too long and nearly capping the
         # reboot-drain hold. Raised, topology-scaled (see resync_min_rate() and
         # NETWORK_TOPOLOGY_SAFETY.md), so the resync keeps making real progress under
@@ -1095,9 +1097,9 @@ resource {res} {{
         ping-int 2;
         ping-timeout 5;
         ko-count 3;
-        # Never let DRBD silently auto-discard a diverged copy. In ALL split-brain
-        # cases -- INCLUDING 0-primary (both nodes Secondary at reconnect, which the
-        # heal/demote path transiently creates) -- DRBD disconnects and fires the
+        # Never let DRBD silently auto-discard a diverged copy. In all split-brain
+        # cases, including 0-primary (both nodes Secondary at reconnect, which the
+        # heal/demote path transiently creates), DRBD disconnects and fires the
         # split-brain handler; twinstor then resolves deterministically, loudly, and
         # freshness-aware (never rolls back the fresher copy). The old
         # `after-sb-0pri discard-zero-changes` let DRBD auto-pick a winner with no
@@ -1107,13 +1109,13 @@ resource {res} {{
         after-sb-1pri disconnect;
         after-sb-2pri disconnect;
         # Online-verify checksum: without it every
-        # `drbdadm verify` fails "Need a verify algorithm" -- and after any
+        # `drbdadm verify` fails "Need a verify algorithm", and after any
         # lopsided recovery (rebuilt backing, force-promote) an online verify
         # is exactly the right integrity check, so it must work out of the
         # box. crc32c: hardware-accelerated, ample for scrub-grade detection.
-        # NOTE the verify-findings repair is `drbdsetup invalidate-remote
-        # <res> <peer> 0 --reset-bitmap=no` from the verify INITIATOR (a plain
-        # disconnect/connect DISCARDS the findings -- lab-proven).
+        # Note: the verify-findings repair is `drbdsetup invalidate-remote
+        # <res> <peer> 0 --reset-bitmap=no` from the verify initiator (a plain
+        # disconnect/connect discards the findings).
         verify-alg crc32c;
     }}
 {topology}
@@ -1977,7 +1979,7 @@ async fn get_initiator_iqns() -> Result<Vec<String>> {
                  (e.g. iqn.2026-06.com.example:host). XCP-ng generates this from the host's \
                  DNS domain, so a single-label domain (e.g. '.home') produces an invalid one.\n\
                  An iSCSI SR already exists on this pool, so setup did not rewrite the IQN \
-                 automatically (that could break those sessions). Fix on EACH affected host, \
+                 automatically (that could break those sessions). Fix on each affected host, \
                  then re-run setup:\n\
                  \x20  echo 'InitiatorName=iqn.2026-06.lab.example:<hostname>' > /etc/iscsi/initiatorname.iscsi\n\
                  \x20  xe host-param-set uuid=<host-uuid> other-config:iscsi_iqn=iqn.2026-06.lab.example:<hostname>\n\
@@ -2198,20 +2200,20 @@ pub(crate) fn drbd_topology(
     }}
     connection {{
         # Arbitrated mode: two replication paths, the back-to-back direct link
-        # and the switched network, in DRBD's DEFAULT active-backup mode (one
+        # and the switched network, in DRBD's default active-backup mode (one
         # path active, the other a hot standby). Losing the active path fails
-        # over to the standby via a RECONNECT: under active dual-primary
+        # over to the standby via a reconnect: under active dual-primary
         # writes that reconnect always sees unacknowledged in-flights on both
         # sides (bitmap-both), so the fence-peer tiebreak resolves it
         # deterministically (lower hostname serves throughout; the other side
         # yields frozen and resyncs; the discard is only never-acked
-        # in-flights). Losing the standby is a no-op. We deliberately do NOT set
-        # `load-balance-paths` here: that is a THROUGHPUT feature (lb-tcp
+        # in-flights). Losing the standby is a no-op. We deliberately do not set
+        # `load-balance-paths` here: that is a throughput feature (lb-tcp
         # stripes one stream across all paths) and any single path state change
-        # -- down OR up -- resets the whole connection (StandAlone/resync),
+        # (down or up) resets the whole connection (StandAlone/resync),
         # which on a dual-Primary pair opens a split-brain window.
         #
-        # The DIRECT link is declared FIRST on purpose: replication
+        # The direct link is declared first on purpose: replication
         # belongs on the dedicated cable in steady state. It keeps synchronous
         # writes and resync storms off the switch, and it means switch faults
         # (the common ones) never touch replication. The switch path is the

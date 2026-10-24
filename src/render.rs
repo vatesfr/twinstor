@@ -130,9 +130,9 @@ impl Style {
             } else {
                 ("●".to_string(), word.to_string())
             };
-            format!("{dot} {word} -- {reason}")
+            format!("{dot} {word}: {reason}")
         } else {
-            format!("health: {word} -- {reason}")
+            format!("health: {word} ({reason})")
         }
     }
 }

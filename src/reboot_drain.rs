@@ -228,7 +228,7 @@ fn reboot_alert_body() -> Option<String> {
         _ => "an unexpected reason",
     };
     Some(format!(
-        "TWINSTOR: the last reboot of this host proceeded while it was the last UpToDate \
+        "TwinStor: the last reboot of this host proceeded while it was the last UpToDate \
          replica and {where_at}. The reboot was allowed because {why}. During that window \
          the pool may have had no current copy online and the peer's rebuild was stranded \
          until this host returned. If this reboot was deliberate, no action is needed. \
@@ -392,8 +392,8 @@ pub async fn run(config: &Config) -> Result<()> {
             // The peer's disk is not visible while disconnected, so do not claim it
             // holds no copy, only that no current copy is confirmed reachable.
             warn!(
-                "reboot-drain: this host holds an UpToDate replica and the peer is not connected \
-                 -- rebooting may leave no reachable current copy online, and a wait cannot help \
+                "reboot-drain: this host holds an UpToDate replica and the peer is not connected; \
+                 rebooting may leave no reachable current copy online, and a wait cannot help \
                  while the peer is unreachable. Proceeding."
             );
             write_breadcrumb(Outcome::ForcedNoPeer, status.resync_done);
@@ -418,7 +418,7 @@ async fn hold_for_resync(drbd: &DrbdController, initial: &DrbdStatus, max_secs: 
     let cap = Duration::from_secs(cap_secs);
     let start = Instant::now();
     warn!(
-        "reboot-drain: HOLDING this host's reboot -- it holds the only UpToDate replica and the \
+        "reboot-drain: holding this host's reboot: it holds the only UpToDate replica and the \
          peer is still resyncing ({}). Rebooting now would drop all guest I/O and strand the \
          rebuild. Waiting up to {cap_secs}s for the peer to become UpToDate. Override: touch {OVERRIDE_PATH}",
         pct(initial)
@@ -451,7 +451,7 @@ async fn hold_for_resync(drbd: &DrbdController, initial: &DrbdStatus, max_secs: 
         match reboot_safety(&s) {
             RebootSafety::Safe => {
                 info!(
-                    "reboot-drain: peer reached UpToDate after {}s; a full replica now survives -- proceeding",
+                    "reboot-drain: peer reached UpToDate after {}s; a full replica now survives; proceeding",
                     start.elapsed().as_secs()
                 );
                 return Ok(());
@@ -483,7 +483,7 @@ async fn hold_for_resync(drbd: &DrbdController, initial: &DrbdStatus, max_secs: 
                 if is_active_resync(&s) {
                     stall_polls = 0;
                     info!(
-                        "reboot-drain: still holding -- {} ({}s / {cap_secs}s)",
+                        "reboot-drain: still holding: {} ({}s / {cap_secs}s)",
                         pct(&s),
                         start.elapsed().as_secs()
                     );
@@ -499,7 +499,7 @@ async fn hold_for_resync(drbd: &DrbdController, initial: &DrbdStatus, max_secs: 
                         return Ok(());
                     }
                     info!(
-                        "reboot-drain: holding -- peer Connected but no active resync yet ({stall_polls}/{STALL_GRACE_POLLS} grace polls)"
+                        "reboot-drain: holding, peer Connected but no active resync yet ({stall_polls}/{STALL_GRACE_POLLS} grace polls)"
                     );
                 }
             }

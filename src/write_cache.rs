@@ -41,7 +41,7 @@ impl CacheState {
     pub fn label(&self) -> &str {
         match self {
             CacheState::NoVolatileCache => "none (durable on completion)",
-            CacheState::Enabled => "ENABLED (not durable on host reset)",
+            CacheState::Enabled => "enabled (not durable on host reset)",
             CacheState::Disabled => "disabled (durable)",
             CacheState::Unknown(_) => "unknown",
         }

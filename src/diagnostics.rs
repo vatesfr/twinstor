@@ -193,14 +193,14 @@ fn readme(redactions: &[&str]) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "TWINSTOR support bundle\n\
+        "TwinStor support bundle\n\
          =======================\n\n\
          This archive contains logs, configuration, and a point-in-time\n\
          snapshot of this node's storage state, collected by\n\
          `twinstor support-bundle`. It is meant to be attached to a problem\n\
          report so the issue can be diagnosed offline.\n\n\
-         TWINSTOR runs on two nodes. Please also run `twinstor support-bundle`\n\
-         on the PEER node and attach that file too: most issues (split-brain,\n\
+         TwinStor runs on two nodes. Please also run `twinstor support-bundle`\n\
+         on the peer node and attach that file too: most issues (split-brain,\n\
          fencing, failover) can only be understood by looking at both sides.\n\n\
          Layout:\n\
          \x20 manifest.json   bundle metadata (version, node identity, contents)\n\

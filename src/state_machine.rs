@@ -2305,29 +2305,29 @@ impl HaltVerdict {
 
     fn alert_text(self, uuid: &str) -> String {
         match self {
-            Self::Start => "XAPI still marks it to always run, so its HA restart attempts ran out; TWINSTOR \
+            Self::Start => "XAPI still marks it to always run, so its HA restart attempts ran out; TwinStor \
                             starts it (restart_halted_protected_vms; at most once an hour per VM)."
                 .to_string(),
             Self::Disabled => format!(
                 "XAPI still marks it to always run, so its HA restart attempts ran out; start it with `xe \
-                 vm-start uuid={uuid}` (TWINSTOR can do it: [ha] restart_halted_protected_vms = true)."
+                 vm-start uuid={uuid}` (TwinStor can do it: [ha] restart_halted_protected_vms = true)."
             ),
             Self::NotOrphan => format!(
-                "XAPI still marks it to always run but it halted while the pool was healthy, so TWINSTOR \
+                "XAPI still marks it to always run but it halted while the pool was healthy, so TwinStor \
                  leaves it: start it with `xe vm-start uuid={uuid}`, or remove its ha-restart-priority if \
                  it is down on purpose."
             ),
             Self::NotAlwaysRun => "shut down through XAPI, or stopped while the pool's \
                                    ha-reboot-vm-on-internal-shutdown is off (a shutdown from inside the \
                                    guest, or a split-brain loser stopping it, whose restart that host owes): \
-                                   TWINSTOR never starts it. If it should run and is not back within a few \
+                                   TwinStor never starts it. If it should run and is not back within a few \
                                    minutes, start it once the pair has converged."
                 .to_string(),
             Self::Suspect => "caught running across a split-brain discard, its disks are suspect: check \
                               them as the split-brain alert says before starting it."
                 .to_string(),
             Self::Unknown => format!(
-                "TWINSTOR could not read from XAPI whether it is still protected (ha-always-run) or \
+                "TwinStor could not read from XAPI whether it is still protected (ha-always-run) or \
                  marked disks-suspect, so it does not start it now; start it with `xe vm-start \
                  uuid={uuid}` if it should run."
             ),
@@ -4057,7 +4057,7 @@ fn boot_gate_texts(decision: BootGate, held: Duration) -> (String, String) {
                 (BOOT_GATE_BOOTING_CEILING + BOOT_GATE_CLEAR_GRACE).as_secs() / 60
             ),
             format!(
-                "TWINSTOR: this node cannot reach its peer over the replication path. The peer's \
+                "TwinStor: this node cannot reach its peer over the replication path. The peer's \
                  daemon answers but it is not serving storage yet, so this node (not the keeper) \
                  waits for the keeper to serve first rather than both bringing up diverging \
                  copies. If the peer never serves, this wait ends after about {} minutes and the \
@@ -4075,7 +4075,7 @@ fn boot_gate_texts(decision: BootGate, held: Duration) -> (String, String) {
                 "boot gate: the peer was alive moments ago; confirming it is gone before serving alone (held {mins} min)"
             ),
             format!(
-                "TWINSTOR: this node cannot reach its peer over the replication path. The peer \
+                "TwinStor: this node cannot reach its peer over the replication path. The peer \
                  was alive until moments ago; this node waits {} s without any sign of it before \
                  serving its own copy alone. Held {mins} min.",
                 BOOT_GATE_CLEAR_GRACE.as_secs()
@@ -4086,8 +4086,8 @@ fn boot_gate_texts(decision: BootGate, held: Duration) -> (String, String) {
                 "boot gate: the peer is alive (serving storage or live in HA); not serving alone, waiting to rejoin as sync target (held {mins} min)"
             ),
             format!(
-                "TWINSTOR: this node cannot reach its peer over the replication path, but the \
-                 peer is alive (serving storage or live in HA). It is NOT serving its own copy \
+                "TwinStor: this node cannot reach its peer over the replication path, but the \
+                 peer is alive (serving storage or live in HA). It is not serving its own copy \
                  alone, which would create a second, diverging copy; it waits to rejoin as a \
                  sync target and resyncs automatically once replication returns. A \
                  replication-path fault (cable, NIC, switch port, firewall on the DRBD port) is \
@@ -4107,12 +4107,12 @@ fn boot_gate_served_before_texts(held: Duration, peer: &str, drbd_res: &str) -> 
              this node's copy may be behind, so it will not serve alone (held {mins} min)"
         ),
         format!(
-            "TWINSTOR: this node cannot reach {peer} over the replication path. {peer} was seen \
-             SERVING earlier, and the two have not been connected since, so this node's copy may \
-             be BEHIND {peer}'s. It does not serve its copy alone, which could roll back writes \
+            "TwinStor: this node cannot reach {peer} over the replication path. {peer} was seen \
+             serving earlier, and the two have not been connected since, so this node's copy may \
+             be behind {peer}'s. It does not serve its copy alone, which could roll back writes \
              made on {peer}; it rejoins automatically as soon as replication returns. If {peer} \
-             is permanently lost (its disks are gone for good), make THIS node serve by running \
-             on it: `drbdadm primary --force {drbd_res}` -- the daemon then brings storage up \
+             is permanently lost (its disks are gone for good), make this node serve by running \
+             on it: `drbdadm primary --force {drbd_res}`. The daemon then brings storage up \
              from this copy, and any writes made only on {peer} are lost. Held {mins} min."
         ),
     )
@@ -4455,18 +4455,18 @@ const YIELD_FENCE_AFTER_HOLDS: u32 = 8;
 /// when the spurious master is freshly-booted and VM-less; the alert covers the
 /// cases it cannot (both hosts run VMs, the peer is briefly unreachable, or an old
 /// binary on the peer).
-const WEDGE_ALERT_BODY: &str = "TWINSTOR DUAL-MASTER WEDGE: both hosts believe they are the pool master \
-     after a partition, so DRBD cannot auto-resolve and is stuck StandAlone. Data is NOT \
+const WEDGE_ALERT_BODY: &str = "TwinStor dual-master wedge: both hosts believe they are the pool master \
+     after a partition, so DRBD cannot auto-resolve and is stuck StandAlone. Data is not \
      being discarded (safe). To collapse the pool back to one master: identify the \
-     spurious second master -- the host that rebooted during the partition and runs no \
-     VMs (the survivor kept serving) -- and on THAT host run 'xe-toolstack-restart'. It \
+     spurious second master (the host that rebooted during the partition and runs no \
+     VMs; the survivor kept serving) and on that host run 'xe-toolstack-restart'. It \
      demotes to slave of the survivor with HA left armed (no pool-emergency-reset-master, \
      no HA disable) and resyncs automatically. Verify a single master results \
      ('xe pool-list params=master') and DRBD returns to Connected/UpToDate. The daemon \
      attempts this automatically on the spurious master when it is freshly-booted and \
-     VM-less. If a toolstack restart does NOT demote it (its xapi came back wedged and \
+     VM-less. If a toolstack restart does not demote it (its xapi came back wedged and \
      still reports itself master), reset HA to rebuild a consistent state: on the \
-     SURVIVING master run 'xe pool-ha-disable' then 'xe pool-ha-enable \
+     surviving master run 'xe pool-ha-disable' then 'xe pool-ha-enable \
      heartbeat-sr-uuids=<twinstor SR uuid>'. See FAQ: 'a fenced host came back stuck in \
      maintenance'.";
 
@@ -4826,15 +4826,15 @@ fn backing_missing_decision(
 /// be delivered (XAPI down or mid-election).
 fn diskless_alert_body(peer_serves: bool) -> &'static str {
     if peer_serves {
-        "twinstor: local disk FAILED on this node. The cluster keeps serving: I/O is \
+        "twinstor: local disk failed on this node. The cluster keeps serving: I/O is \
          forwarded to the peer's disk (DRBD diskless mode), VMs are unaffected but the \
-         pool is running WITHOUT redundancy and with higher I/O latency on this node. \
+         pool is running without redundancy and with higher I/O latency on this node. \
          A second failure would cause data loss. If the device returns, twinstor \
          re-attaches and resyncs automatically; a replaced disk needs the manual \
          procedure in the docs."
     } else {
-        "twinstor: local disk FAILED and the peer is not reachable/healthy — this node \
-         cannot serve storage AT ALL and its iSCSI target has been stopped. URGENT \
+        "twinstor: local disk failed and the peer is not reachable/healthy: this node \
+         cannot serve storage at all and its iSCSI target has been stopped. Urgent \
          manual intervention required."
     }
 }
@@ -5030,7 +5030,7 @@ fn cannot_go_online_alert_body(err: &str, kernel: &str, minutes: u64) -> String 
         format!("last error: {err}")
     };
     format!(
-        "TWINSTOR: this node has been UNABLE to bring its storage online for \
+        "TwinStor: this node has been unable to bring its storage online for \
          ~{minutes} minutes and keeps retrying. Cause: {cause} Until this is fixed \
          the node serves nothing and the pool runs without redundancy."
     )
@@ -7293,8 +7293,8 @@ impl StateMachine {
                                     info!(
                                         heal_event = "whole_switch_guard_release",
                                         "fast fence-guard: whole-switch over (client gateway \
-                                           back, or the peer now serves its gateway UP); cleared \
-                                           the disarm latch -- the main tick re-arms HA once"
+                                           back, or the peer now serves its gateway up); cleared \
+                                           the disarm latch; the main tick re-arms HA once"
                                     );
                                 }
                                 GuardAction::None => {}
@@ -7302,7 +7302,7 @@ impl StateMachine {
                             tokio::time::sleep(WHOLE_SWITCH_GUARD_INTERVAL).await;
                         }
                     });
-                    info!("0.6.1 direct-link gateway beacon started");
+                    info!("direct-link gateway beacon started");
                 }
             }
         }
@@ -8324,7 +8324,7 @@ impl StateMachine {
                             // Consumers would lose their only path; hold and
                             // keep the plain retries below.
                             warn!(
-                                "stale serving Primary detected but the peer's iSCSI                                  portal is unreachable; holding the demote (consumers                                  need the peer path during the dance)"
+                                "stale serving Primary detected but the peer's iSCSI portal is unreachable; holding the demote (consumers need the peer path during the dance)"
                             );
                         }
                     }
@@ -8420,7 +8420,7 @@ impl StateMachine {
                     .susp_fencing_alert_at
                     .is_none_or(|t| t.elapsed() >= CANNOT_ONLINE_REALERT_AFTER)
                 && xapi::send_xapi_alert(
-                    "TWINSTOR: this node's storage I/O has been SUSPENDED by DRBD fencing \
+                    "TwinStor: this node's storage I/O has been suspended by DRBD fencing \
                      for over 2 minutes with replication disconnected. If the peer does \
                      not reconnect, guest I/O through this node stays frozen. Check the \
                      peer node and the replication link.",
@@ -8548,12 +8548,12 @@ impl StateMachine {
                     attempt = self.wfb_attempts + 1,
                     held_secs = self.wfb_since.map(|t| t.elapsed().as_secs()).unwrap_or(0),
                     "replication stuck in bitmap exchange (WFBitMap) with the connection \
-                     up -- the promote-race wedge; bouncing the connection to clear it \
+                     up (the promote-race wedge); bouncing the connection to clear it \
                      (bracketed: fencing disarmed + bounce advertised to the peer for \
                      the seconds it takes; a disconnect discards nothing)"
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: replication was stuck mid-handshake (WFBitMap) and has been \
+                    "TwinStor: replication was stuck mid-handshake (WFBitMap) and has been \
                      automatically bounced to restore two-way replication. No data was \
                      discarded. If this alert repeats, collect a support bundle.",
                 )
@@ -8578,11 +8578,11 @@ impl StateMachine {
                     .wfb_alert_at
                     .is_none_or(|t| t.elapsed() >= CANNOT_ONLINE_REALERT_AFTER)
                     && xapi::send_xapi_alert(
-                        "TWINSTOR: replication is stuck mid-handshake (WFBitMap) and \
-                         automatic reconnects did NOT clear it. Replication may be \
+                        "TwinStor: replication is stuck mid-handshake (WFBitMap) and \
+                         automatic reconnects did not clear it. Replication may be \
                          one-way. Manual intervention needed: collect a support bundle \
                          and contact support; the interim remedy is a maintenance-window \
-                         `drbdadm disconnect --force` + `connect` on THIS node with the \
+                         `drbdadm disconnect --force` + `connect` on this node with the \
                          fencing bracket per the runbook.",
                     )
                     .await
@@ -8627,7 +8627,7 @@ impl StateMachine {
         if !peer_ok {
             warn!(
                 "bounce aborted: the peer does not speak the line-format beacon (older \
-                 daemon or unreachable) -- its fence script would not stand down and the \
+                 daemon or unreachable): its fence script would not stand down and the \
                  reconnect could roll back un-replicated writes; upgrade the peer first"
             );
             return false;
@@ -8654,7 +8654,7 @@ impl StateMachine {
         if !flag_served {
             warn!(
                 "bounce aborted: our own beacon is not serving the bounce flag (responder \
-                 not bound / firewall) -- the peer's fence handler would not stand down"
+                 not bound / firewall), so the peer's fence handler would not stand down"
             );
             self.beacon.set_bouncing(false);
             return false;
@@ -8895,7 +8895,7 @@ impl StateMachine {
         let peer_serves = status.connection == crate::drbd::ConnectionState::Connected
             && status.peer_disk == Some(DiskState::UpToDate);
         if peer_serves {
-            error!("local disk failed; serving THROUGH the peer (DRBD diskless), target stays up");
+            error!("local disk failed; serving through the peer (DRBD diskless), target stays up");
             self.set_state(NodeState::Degraded);
         } else {
             error!("local disk failed and no healthy peer reachable; stopping iSCSI");
@@ -8963,8 +8963,8 @@ impl StateMachine {
                 let hours = at.elapsed().as_secs() / 3600;
                 warn!(hours, "still degraded, re-raising the alert");
                 if xapi::send_xapi_alert_keyed("degraded-realert", &format!(
-                    "twinstor: the cluster has been running DEGRADED (no local disk on this node, \
-                     serving through the peer) for over {hours} hours. There is NO redundancy: a \
+                    "twinstor: the cluster has been running degraded (no local disk on this node, \
+                     serving through the peer) for over {hours} hours. There is no redundancy: a \
                      single further failure loses data. Replace the failed disk."
                 ))
                 .await
@@ -9018,7 +9018,7 @@ impl StateMachine {
             RedundancyAction::Alert if self.tick_quiet => {}
             RedundancyAction::Alert => {
                 if self.redundancy_alert_at.is_none() {
-                    warn!("serving WITHOUT redundancy (peer is not a healthy copy); alerting");
+                    warn!("serving without redundancy (peer is not a healthy copy); alerting");
                 } else {
                     let hours = self
                         .peer_lost_since
@@ -9036,8 +9036,8 @@ impl StateMachine {
                 // gets the alert to the operator once the election settles.
                 self.redundancy_alert_attempt_at = Some(now);
                 if xapi::send_xapi_alert(
-                    "twinstor: this node is serving WITHOUT redundancy: the peer is down or not \
-                     a healthy replica, so the pool is running on a SINGLE copy. VMs are \
+                    "twinstor: this node is serving without redundancy: the peer is down or not \
+                     a healthy replica, so the pool is running on a single copy. VMs are \
                      unaffected, but a single further failure now loses data. Bring the peer back \
                      (it resyncs automatically on return) or investigate why it is not connecting.",
                 )
@@ -9098,9 +9098,9 @@ impl StateMachine {
         );
         // Latch on delivery only: keep trying on the cadence until it is heard.
         if xapi::send_xapi_alert(&format!(
-            "TWINSTOR: this host's kernel hostname is now '{live}', but twinstor was \
+            "TwinStor: this host's kernel hostname is now '{live}', but twinstor was \
              configured for node name '{configured}'. DRBD identifies nodes by hostname \
-             (the on-<name> sections in the .res), so at the NEXT REBOOT this node's \
+             (the on-<name> sections in the .res), so at the next reboot this node's \
              storage will fail to come up. Restore the hostname to '{configured}' \
              (hostnamectl set-hostname {configured}) or re-run twinstor setup to re-key \
              the configuration."
@@ -9177,9 +9177,9 @@ impl StateMachine {
                 if xapi::send_xapi_alert_keyed(
                     "resync-stall",
                     &format!(
-                        "TWINSTOR: a DRBD resync has been STALLED at {pct:.2}% for over {mins} \
+                        "TwinStor: a DRBD resync has been stalled at {pct:.2}% for over {mins} \
                      minutes. The pool is serving from a single up-to-date copy and its \
-                     redundancy is NOT being restored — the next node failure would lose \
+                     redundancy is not being restored: the next node failure would lose \
                      data. Check the replication link and DRBD state (drbdadm status data)."
                     ),
                 )
@@ -9279,7 +9279,7 @@ impl StateMachine {
                 if xapi::send_xapi_alert_keyed(
                     "capacity",
                     &format!(
-                        "TWINSTOR: the twinstor SR is {p}% full ({sev}). When it fills, \
+                        "TwinStor: the twinstor SR is {p}% full ({sev}). When it fills, \
                      guest VMs hit ENOSPC / I/O errors. Free space (remove unused \
                      VDIs or snapshots) or add capacity."
                     ),
@@ -9341,7 +9341,7 @@ impl StateMachine {
                 if self.backing_alert_at.is_none() {
                     warn!(
                         device = %device.display(),
-                        "configured backing device MISSING past grace (replaced disk / \
+                        "configured backing device missing past grace (replaced disk / \
                          recreated array?); alerting"
                     );
                 } else {
@@ -9415,9 +9415,9 @@ impl StateMachine {
                 local_ha_armed = ?xapi::local_ha_armed(),
                 readmit_suspect = self.readmission_suspect_since.is_some(),
                 episode = ?self.episode.as_deref(),
-                "stranded-master toolstack yield DEFERRED: node participates in XHA \
+                "stranded-master toolstack yield deferred: node participates in XHA \
                  (liveset member / mid-readmission); collapsing via restart now would abort \
-                 the re-admission -- holding"
+                 the re-admission; holding"
             );
         }
         let mut action = stranded_master_decision(
@@ -9486,11 +9486,11 @@ impl StateMachine {
                      this node to slave of the real master (non-destructive; never asserts master)"
                 );
                 let _ = xapi::send_ha_wedge_alert(
-                    "TWINSTOR stranded-master auto-heal: after an isolated-master stand-down \
+                    "TwinStor stranded-master auto-heal: after an isolated-master stand-down \
                      and reconnect, this host came back still believing it is the pool master while \
                      the peer is the real master. It is restarting its toolstack so xapi demotes it \
                      to a slave; HA re-arms once it is a live member again. If it does not rejoin \
-                     after a few attempts, on THIS host run 'xe pool-emergency-reset-master \
+                     after a few attempts, on this host run 'xe pool-emergency-reset-master \
                      master-address=<survivor-ip>', then 'xe pool-recover-slaves' on the survivor."
                 ).await;
                 if !cfg!(test) {
@@ -9527,7 +9527,7 @@ impl StateMachine {
                         heal_event = "stranded_master_force_reset_deferred",
                         "stranded former-master: ready to force the demote, but the real \
                          master's management IP is unreachable (this host is still \
-                         network-isolated); holding -- pool-emergency-reset-master cannot \
+                         network-isolated); holding, since pool-emergency-reset-master cannot \
                          contact the master. Will act once the network returns."
                     );
                     // Do not increment the attempt counter: waiting on the network must not
@@ -9547,7 +9547,7 @@ impl StateMachine {
                      + restarts the toolstack)"
                 );
                 let _ = xapi::send_ha_wedge_alert(
-                    "TWINSTOR stranded-master auto-heal: a returning former-master stayed \
+                    "TwinStor stranded-master auto-heal: a returning former-master stayed \
                      a second pool master and gentle toolstack restarts did not demote it. \
                      The peer is the real serving master, so this host is auto-running \
                      pool-emergency-reset-master to demote itself to a slave and collapse \
@@ -9587,13 +9587,13 @@ impl StateMachine {
                 warn!(
                     peer = %self.config.node.peer,
                     heal_event = "stranded_master_reclaim",
-                    "dual-master with a NON-serving peer (it is DRBD Secondary, e.g. a \
+                    "dual-master with a non-serving peer (it is DRBD Secondary, e.g. a \
                      stood-down isolated master): holding mastership as the sole serving \
                      node and restarting the orphaned protected VMs here, rather than \
                      yielding to a master that cannot serve"
                 );
                 let _ = xapi::send_ha_wedge_alert(
-                    "TWINSTOR isolated-keeper recovery: this host is the sole serving copy \
+                    "TwinStor isolated-keeper recovery: this host is the sole serving copy \
                      and its peer is a stood-down / non-serving master. Holding mastership \
                      and restarting the protected VMs here instead of yielding to a peer \
                      that cannot serve.",
@@ -9614,8 +9614,8 @@ impl StateMachine {
                          cap; an operator reset-master is needed"
                     );
                     let _ = xapi::send_ha_wedge_alert(
-                        "TWINSTOR stranded-master: automatic toolstack restarts did not \
-                         demote this host to slave. Recover manually: on THIS host \
+                        "TwinStor stranded-master: automatic toolstack restarts did not \
+                         demote this host to slave. Recover manually: on this host \
                          'xe pool-emergency-reset-master master-address=<survivor-ip>', then on the \
                          survivor 'xe pool-recover-slaves', then re-arm HA."
                     ).await;
@@ -9708,7 +9708,7 @@ impl StateMachine {
                 local_ha_armed = ?xapi::local_ha_armed(),
                 readmit_suspect = self.readmission_suspect_since.is_some(),
                 episode = ?self.episode.as_deref(),
-                "returning-slave toolstack restart DEFERRED: node participates in XHA \
+                "returning-slave toolstack restart deferred: node participates in XHA \
                  (liveset member / mid-readmission), so the unreadable slave->master xe is \
                  HA-handled contention, not a wedge; leaving the re-admission to settle"
             );
@@ -9770,7 +9770,7 @@ impl StateMachine {
                     attempt = self.slave_rejoin_restarts,
                     heal_event = "slave_rejoin_reconnect",
                     "returning slave: restarting the local toolstack to re-establish the \
-                     slave->master XAPI link (non-destructive; never asserts master -- PBD-plug \
+                     slave->master XAPI link (non-destructive; never asserts master; PBD-plug \
                      and HA re-arm resume once connected)"
                 );
                 if !cfg!(test) {
@@ -9794,10 +9794,10 @@ impl StateMachine {
                          XAPI link past the cap; operator intervention needed"
                     );
                     let _ = xapi::send_ha_wedge_alert(
-                        "TWINSTOR returning-slave rejoin: a host that came back as a pool slave \
+                        "TwinStor returning-slave rejoin: a host that came back as a pool slave \
                          cannot reach the pool master over XAPI, and automatic toolstack restarts \
                          did not fix it. On the survivor run 'xe pool-recover-slaves'; if that \
-                         fails, on THIS host 'xe pool-emergency-reset-master \
+                         fails, on this host 'xe pool-emergency-reset-master \
                          master-address=<survivor-ip>'.",
                     )
                     .await;
@@ -9947,11 +9947,11 @@ impl StateMachine {
                      chain so the good copy serves and the stale peer resyncs as slave"
                 );
                 let _ = xapi::send_ha_wedge_alert(
-                    "TWINSTOR wrongly-demoted survivor: this host holds the only UpToDate storage \
+                    "TwinStor wrongly-demoted survivor: this host holds the only UpToDate storage \
                      copy but XHA demoted it to slave of a peer whose disk is stale (Inconsistent) \
                      after that peer rebooted as master. Re-asserting pool mastership so the good \
                      copy serves and the stale peer resyncs as a slave. If it does not stick, on \
-                     THIS host run 'xe pool-emergency-transition-to-master' then 'xe \
+                     this host run 'xe pool-emergency-transition-to-master' then 'xe \
                      pool-recover-slaves', and re-arm HA.",
                 )
                 .await;
@@ -9972,8 +9972,8 @@ impl StateMachine {
                          mastership past the cap; operator intervention needed"
                     );
                     let _ = xapi::send_ha_wedge_alert(
-                        "TWINSTOR wrongly-demoted survivor: automatic re-assertion of pool \
-                         mastership did not stick. On THIS host (it holds the UpToDate copy) run \
+                        "TwinStor wrongly-demoted survivor: automatic re-assertion of pool \
+                         mastership did not stick. On this host (it holds the UpToDate copy) run \
                          'xe pool-emergency-transition-to-master', then 'xe pool-recover-slaves', \
                          then re-arm HA.",
                     )
@@ -10085,14 +10085,14 @@ impl StateMachine {
                         warn!(
                             heal_event = "failback_latched",
                             "direct link flapped back {FAILBACK_MAX_STRIKES} times; \
-                             automatic failback is now LATCHED OFF until an operator \
+                             automatic failback is now latched off until an operator \
                              runs `twinstor failback-replication` (fix the cable first)"
                         );
                     }
                 }
                 warn!(
                     established = %established,
-                    "replication is running on the switch FALLBACK path (direct link \
+                    "replication is running on the switch fallback path (direct link \
                      down or not chosen); will alert if it persists"
                 );
                 self.fallback_since = Some(now);
@@ -10188,7 +10188,7 @@ impl StateMachine {
                     FailbackBlock::Latched => (
                         "latched",
                         format!(
-                            "direct link flapped back {}x; manual-only -- fix the link, then \
+                            "direct link flapped back {}x; manual-only: fix the link, then \
                              run `twinstor failback-replication`",
                             self.failback_strikes
                         ),
@@ -10531,7 +10531,7 @@ impl StateMachine {
                         {
                             self.offer_set_withdraw.2 = true;
                             let _ = xapi::send_xapi_alert(&format!(
-                                "TWINSTOR: this node still carries a --discard-my-data offer from an earlier \
+                                "TwinStor: this node still carries a --discard-my-data offer from an earlier \
                                  split-brain round although it keeps its copy, and has failed to withdraw it \
                                  for 10 minutes ({e}). It does not reconnect meanwhile (the offer could make \
                                  its copy the sync target): replication stays down. Check `drbdadm status` and \
@@ -11431,7 +11431,7 @@ impl StateMachine {
             // split-brain cycle. Log, verify the standby actually returned, and keep
             // retrying on later ticks rather than clearing after one try.
             if let Err(e) = self.drbd.restore_paths().await {
-                warn!(error = %e, "steering: standby path restore FAILED; retrying next tick");
+                warn!(error = %e, "steering: standby path restore failed; retrying next tick");
                 return;
             }
             match self.drbd.paths().await {
@@ -11586,13 +11586,13 @@ impl StateMachine {
             // up, only the online-verify algorithm is missing.
             let (log_what, alert_what) = if deployed >= 5 {
                 (
-                    "the on-disk .res predates the online-verify template                      (verify-alg); safety policies already persisted",
-                    "TwinStor: the on-disk DRBD config predates this binary's template                      (it lacks the online-verify algorithm; all data-safety policies are                      already persisted and active). Run `twinstor regenerate-config` on                      each node to enable `drbdadm verify` out of the box.",
+                    "the on-disk .res predates the online-verify template (verify-alg); safety policies already persisted",
+                    "TwinStor: the on-disk DRBD config predates this binary's template (it lacks the online-verify algorithm; all data-safety policies are already persisted and active). Run `twinstor regenerate-config` on each node to enable `drbdadm verify` out of the box.",
                 )
             } else {
                 (
-                    "split-brain safety policies (after-sb-0pri disconnect,                      on-no-data-accessible suspend-io) enforced LIVE because the on-disk                      .res is stale — the fix IS ACTIVE now",
-                    "TwinStor: after upgrading, the split-brain data-safety policies were                      applied live because the on-disk DRBD config is stale. The fix is                      active now; run `twinstor regenerate-config` on each node to persist                      it across reboots.",
+                    "split-brain safety policies (after-sb-0pri disconnect, on-no-data-accessible suspend-io) enforced live because the on-disk .res is stale; the fix is active now",
+                    "TwinStor: after upgrading, the split-brain data-safety policies were applied live because the on-disk DRBD config is stale. The fix is active now; run `twinstor regenerate-config` on each node to persist it across reboots.",
                 )
             };
             if !self.config_upgrade_alerted {
@@ -11600,7 +11600,7 @@ impl StateMachine {
                 warn!(
                     deployed,
                     expected = crate::setup::CONFIG_VERSION,
-                    "CONFIG UPGRADE: {log_what}. Run `twinstor regenerate-config` on each \
+                    "config upgrade: {log_what}. Run `twinstor regenerate-config` on each \
                      node."
                 );
                 let _ = crate::xapi::send_xapi_alert(alert_what).await;
@@ -11753,7 +11753,7 @@ impl StateMachine {
                     warn!(
                         heal_event = "consistent_diskless_force",
                         configured = %self.config.node.name, kernel = ?kernel,
-                        "REFUSING the sole-survivor force-promote: configured node.name does \
+                        "refusing the sole-survivor force-promote: configured node.name does \
                          not match this host's kernel hostname (likely a cloned/stale config); \
                          manual review needed"
                     );
@@ -11797,18 +11797,18 @@ impl StateMachine {
                     heal_event = "consistent_diskless_force",
                     shape_held_secs = shape_since.elapsed().as_secs(),
                     "sole-survivor deadlock: local copy Consistent, peer Diskless and its \
-                     daemon ATTESTS its backing device carries no DRBD metadata (no replica \
+                     daemon attests its backing device carries no DRBD metadata (no replica \
                      exists), local metadata shows this node crashed as the last writer this \
-                     node witnessed — force-promoting the only known copy to end the outage"
+                     node witnessed; force-promoting the only known copy to end the outage"
                 );
                 // Best-effort pre-alert. After the promote, the degraded
                 // watchdog (serving without redundancy) retries its own alert
                 // until xapi is back, so the operator is told eventually.
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: automatic recovery — this node held the only data copy \
-                     (peer's backing device verified EMPTY by its own daemon) and its disk \
+                    "TwinStor: automatic recovery: this node held the only data copy \
+                     (peer's backing device verified empty by its own daemon) and its disk \
                      was stuck Consistent after a crash. Force-promoting to restore service. \
-                     Storage runs WITHOUT redundancy until the peer's backing is rebuilt \
+                     Storage runs without redundancy until the peer's backing is rebuilt \
                      (twinstor replace-backing).",
                 )
                 .await;
@@ -11846,16 +11846,16 @@ impl StateMachine {
         let res = format!("twinstor-{}", self.config.storage.drbd_resource);
         let (why, guidance) = match peer_backing {
             PeerBacking::Absent => (
-                "the peer's backing device node is MISSING — its data may still be intact \
+                "the peer's backing device node is missing; its data may still be intact \
                  (unassembled RAID array, unenumerated disk)",
-                "FIRST try to restore the peer's backing device (reassemble the array / reseat \
+                "first try to restore the peer's backing device (reassemble the array / reseat \
                  the disk); it will rejoin automatically and this node revalidates with no \
                  forced action. Only if the peer's data is confirmed lost",
             ),
             PeerBacking::Detached => (
-                "the peer has INTACT DRBD metadata on its backing device (a real replica, \
+                "the peer has intact DRBD metadata on its backing device (a real replica, \
                  currently detached)",
-                "fix the peer's attach (check its daemon log / `drbdadm attach` there) — do NOT \
+                "fix the peer's attach (check its daemon log / `drbdadm attach` there); do not \
                  force anything while a real replica exists. Only if that copy is confirmed lost",
             ),
             _ => (
@@ -11866,8 +11866,8 @@ impl StateMachine {
             ),
         };
         let stale_note = if status.disk == crate::drbd::DiskState::Outdated {
-            " CAUTION: this node's copy is marked Outdated — newer data existed elsewhere, so \
-             serving it is a KNOWN rollback; consider restoring from backup instead."
+            " Caution: this node's copy is marked Outdated: newer data existed elsewhere, so \
+             serving it is a known rollback; consider restoring from backup instead."
         } else {
             ""
         };
@@ -11879,9 +11879,9 @@ impl StateMachine {
              raising the guided-manual alert"
         );
         let body = format!(
-            "TWINSTOR: storage cannot come online without a decision. This node's copy is \
-             {:?} and the peer is Diskless; {why}. {guidance}, run on THIS node: \
-             `drbdadm primary --force {res}` — the daemon then brings the target and SR up \
+            "TwinStor: storage cannot come online without a decision. This node's copy is \
+             {:?} and the peer is Diskless; {why}. {guidance}, run on this node: \
+             `drbdadm primary --force {res}`. The daemon then brings the target and SR up \
              automatically, and the peer is rebuilt with `twinstor replace-backing` once its \
              device is replaced.{stale_note}",
             status.disk
@@ -12123,7 +12123,7 @@ impl StateMachine {
                     warn!(
                         heal_event = "both_outdated_tiebreak",
                         "both replicas Outdated but node name == peer name: cannot elect a keeper; \
-                         NOT running the tiebreak. Fix the node/peer names in twinstor.toml"
+                         not running the tiebreak. Fix the node/peer names in twinstor.toml"
                     );
                 }
             } else {
@@ -12165,11 +12165,11 @@ impl StateMachine {
                         if kernel.as_deref() != Some(self.config.node.name.as_str()) {
                             warn!(heal_event = "both_outdated_tiebreak",
                                   configured = %self.config.node.name, kernel = ?kernel,
-                                  "REFUSING keeper force-promote: configured node.name does not \
-                                   match this host's kernel hostname -- the keeper election cannot \
+                                  "refusing keeper force-promote: configured node.name does not \
+                                   match this host's kernel hostname, so the keeper election cannot \
                                    be trusted (likely a cloned/stale config); manual review needed");
                             let _ = xapi::send_xapi_alert(
-                                "TWINSTOR: refused an automatic both-Outdated force-promote because \
+                                "TwinStor: refused an automatic both-Outdated force-promote because \
                                  this host's configured twinstor node name does not match its \
                                  kernel hostname. The keeper tiebreak cannot be trusted (likely a \
                                  cloned or stale config). Correct the node name / re-run setup.",
@@ -12306,7 +12306,7 @@ impl StateMachine {
                         .is_none_or(|t| t.elapsed() >= CANNOT_ONLINE_REALERT_AFTER)
                     {
                         let delivered = xapi::send_xapi_alert_keyed("lone-peer-hold", &format!(
-                            "TWINSTOR: this node lost its peer {} minutes ago and holds its storage. \
+                            "TwinStor: this node lost its peer {} minutes ago and holds its storage. \
                              No gateway or ping-target is configured, so it cannot tell whether it \
                              is isolated or the peer died, and it will not serve alone on its own. \
                              If the peer is permanently lost, run `{force}` on this node; the \
@@ -12332,7 +12332,7 @@ impl StateMachine {
                         isolated_secs = isolated_since.elapsed().as_secs(),
                         "fate-shared lone-survivor hold expired but this node reaches neither \
                          its gateway nor any ping-target: it is the isolated side, not the \
-                         survivor. NOT promoting; holding storage and restarting the hold window."
+                         survivor. Not promoting; holding storage and restarting the hold window."
                     );
                     self.heal_state_update(
                         "fateshared_isolated",
@@ -12345,8 +12345,8 @@ impl StateMachine {
                         .is_none_or(|t| t.elapsed() >= CANNOT_ONLINE_REALERT_AFTER)
                     {
                         let delivered = xapi::send_xapi_alert_keyed("fs-isolated", &format!(
-                            "TWINSTOR: this node is ISOLATED: it reaches neither its peer nor its \
-                             gateway or ping-targets. It holds its storage and will NOT promote \
+                            "TwinStor: this node is isolated: it reaches neither its peer nor its \
+                             gateway or ping-targets. It holds its storage and will not promote \
                              while isolated (the peer may be serving). Once the network is back \
                              it rejoins the peer, or serves alone after a fresh {}-minute hold if \
                              the peer is really gone. Isolated for {} min.",
@@ -12376,7 +12376,7 @@ impl StateMachine {
                             warn!(
                                 heal_event = "fateshared_lone_survivor_hold",
                                 held_secs = held.as_secs(),
-                                "fate-shared lone-survivor promote HELD to avoid a VM double-run: \
+                                "fate-shared lone-survivor promote held to avoid a VM double-run: \
                                  the peer is unreachable and, with no direct link, cannot be told \
                                  apart from an isolated-but-alive peer. Holding storage instead of \
                                  promoting; check the peer node and the network."
@@ -12388,7 +12388,7 @@ impl StateMachine {
                         let now = std::time::Instant::now();
                         if self.fs_serve_hold_alert_retry.due(now) {
                             let delivered = xapi::send_xapi_alert_keyed("fs-serve-hold", &format!(
-                                "TWINSTOR: this node lost contact with its peer and is HOLDING its \
+                                "TwinStor: this node lost contact with its peer and is holding its \
                                  storage instead of promoting, to avoid a VM double-run (fate-shared \
                                  mode cannot tell an isolated-but-alive peer from a dead one). If the \
                                  peer is truly down this node serves alone automatically after ~{} \
@@ -12422,7 +12422,7 @@ impl StateMachine {
                     "try_go_online: fate-shared lone-survivor promote-hold expired with \
                      the peer still absent and the local network reachable; promoting now \
                      (assuming a real peer death). If the peer was only isolated a \
-                     double-run is possible -- see alert."
+                     double-run is possible; see alert."
                 );
                 self.fs_serve_hold_since = None;
                 self.fs_serve_hold_alert_at = None;
@@ -12504,7 +12504,7 @@ impl StateMachine {
         if let crate::readiness::Readiness::ServingWithoutRedundancy { reason } = &readiness {
             warn!(
                 reason = %reason,
-                "try_go_online: serving WITHOUT redundancy; safe only if the peer is fenced (XHA)"
+                "try_go_online: serving without redundancy; safe only if the peer is fenced (XHA)"
             );
         }
 
@@ -12583,7 +12583,7 @@ impl StateMachine {
         let budget = self.connect_wait_budget;
         info!(
             ceiling_secs = budget.as_secs(),
-            "try_go_online: DRBD still Connecting, deferring promote to let the peer connect (Solution B)"
+            "try_go_online: DRBD still Connecting, deferring promote to let the peer connect"
         );
         self.connect_wait = Some(tokio::spawn(async move {
             // wait-connect honours startup{wfc-timeout/degr-wfc-timeout} from
@@ -13063,7 +13063,7 @@ impl StateMachine {
             }
             info!(
                 disk = ?status.disk,
-                "init: verdict fell through with a non-promotable disk;                  attempting a non-destructive reconnect instead of a doomed                  promote loop (verdict re-sampled next round)"
+                "init: verdict fell through with a non-promotable disk; attempting a non-destructive reconnect instead of a doomed promote loop (verdict re-sampled next round)"
             );
             self.sa_reconnect_attempted = true;
             self.steered_connect(false).await;
@@ -13131,7 +13131,7 @@ impl StateMachine {
             warn!(
                 heal_event = "init_loser_inconsistent",
                 "init: split-brain with a local Inconsistent replica (interrupted \
-                 resync); resolving as the loser automatically — the local copy is \
+                 resync); resolving as the loser automatically; the local copy is \
                  already invalid, a discard loses nothing"
             );
             self.init_loser_inconsistent = true;
@@ -13232,7 +13232,7 @@ impl StateMachine {
         if self.sb_flip_winner {
             info!(
                 "init: the peer refused an earlier discard (it also claims loser); \
-                 this node's data may win — leaving resolution to the promote path \
+                 this node's data may win; leaving resolution to the promote path \
                  and the Online resolver"
             );
             return false;
@@ -13266,9 +13266,9 @@ impl StateMachine {
                             peer_fork_bits = fork_bits(&hs.peer, &hs.local),
                             local_crashed_primary = hs.local.crashed_primary(),
                             peer_crashed_primary = hs.peer.crashed_primary(),
-                            "init: split-brain is a TRUE fork; this node holds fewer \
+                            "init: split-brain is a true fork; this node holds fewer \
                              un-replicated writes, resolving as the loser and rolling back its \
-                             diverged writes — this loses committed data on this node, alerting"
+                             diverged writes; this loses committed data on this node, alerting"
                         );
                         // Once per episode: an Init-side crash boundary spreads
                         // its work over many rounds, each of which passes here.
@@ -13285,7 +13285,7 @@ impl StateMachine {
                             keeps_local = false,
                             local_current = %format!("{:016X}", hs.local.current),
                             peer_current = %format!("{:016X}", hs.peer.current),
-                            "init: split-brain resolved by DRBD generation lineage — this node \
+                            "init: split-brain resolved by DRBD generation lineage: this node \
                              is behind the peer, resolving as the loser (a discard loses nothing)"
                         );
                     }
@@ -13313,7 +13313,7 @@ impl StateMachine {
                         local_current = %format!("{:016X}", hs.local.current),
                         peer_current = %format!("{:016X}", hs.peer.current),
                         "init: DRBD generation lineage shows this node holds the superset of \
-                         committed writes; NOT discarding from bring-up — deferring to the \
+                         committed writes; not discarding from bring-up, deferring to the \
                          promote path and the Online resolver so it keeps as the sync source"
                     );
                     log_resolver_decision(
@@ -13832,12 +13832,12 @@ impl StateMachine {
         );
         let body = match &mixed_note {
             Some(note) => format!(
-                "TWINSTOR: the two nodes are running DIFFERENT twinstor releases -- this node is \
-                 {local}, the peer is {peer} -- and have been for over 30 minutes. The peer runs {note}."
+                "TwinStor: the two nodes are running different twinstor releases (this node is \
+                 {local}, the peer is {peer}) and have been for over 30 minutes. The peer runs {note}."
             ),
             None => format!(
-                "TWINSTOR: the two nodes are running DIFFERENT twinstor versions -- this node is \
-                 {local}, the peer is {peer} -- and have been for over an hour. A partial or \
+                "TwinStor: the two nodes are running different twinstor versions (this node is \
+                 {local}, the peer is {peer}) and have been for over an hour. A partial or \
                  rolling upgrade left the pair mixed, and mixed versions can fail to reconnect. \
                  Finish the upgrade so both nodes run the same version."
             ),
@@ -13986,16 +13986,16 @@ impl StateMachine {
             return;
         }
         let body = if targets.is_empty() {
-            "TWINSTOR: the fence-peer partition tiebreaker set is EMPTY (no default \
+            "TwinStor: the fence-peer partition tiebreaker set is empty (no default \
              gateway on the routing table and no entries in /etc/twinstor/ping-targets). \
-             On ANY replication interruption, including the peer host simply dying, this \
+             On any replication interruption, including the peer host simply dying, this \
              node will freeze its storage instead of serving alone: a 1-node failure \
              becomes a full-pool outage. Restore the default route or add an always-on \
              local IP to /etc/twinstor/ping-targets."
                 .to_string()
         } else {
             format!(
-                "TWINSTOR: every fence-peer tiebreaker target ({}) has been unreachable \
+                "TwinStor: every fence-peer tiebreaker target ({}) has been unreachable \
                  for ~30 minutes. If a partition happens while this persists, this node \
                  will freeze its storage instead of serving alone. Check the gateway / \
                  the targets in /etc/twinstor/ping-targets (was the router replaced or \
@@ -14110,15 +14110,15 @@ impl StateMachine {
             HaDeadlockAction::Act => {
                 self.ha_deadlock_action_at = Some(now);
                 warn!(
-                    scenario = "TSHA-8",
+                    scenario = "ha_deadlock_exit",
                     heal_event = "ha_deadlock_exit",
                     peer = %self.config.node.peer,
                     "isolated-master dual-master HA deadlock (data-safe): yielding as the \
-                     returned/forked node — local toolstack restart demotes us to slave of \
+                     returned/forked node: local toolstack restart demotes us to slave of \
                      the survivor, un-forking the pool DB so HA re-arms. Storage untouched."
                 );
                 let _ = xapi::send_ha_wedge_alert(
-                    "TWINSTOR TSHA-8 auto-exit: an isolated-master dual-master left pool HA \
+                    "TwinStor HA-deadlock exit: an isolated-master dual-master left pool HA \
                      wedged (armed while a host was disarmed). This host (the returned node) is \
                      restarting its toolstack to demote to slave of the survivor; HA re-arms \
                      automatically once the pool is single-master. No data was at risk.",
@@ -14212,13 +14212,13 @@ impl StateMachine {
                     self.episode_close("readmission-recovered");
                 }
                 info!(
-                    scenario = "TSHA-3",
+                    scenario = "xha_join_deadlock",
                     heal_event = "ha_readmission_recovered",
                     "the peer rejoined the liveset after the synchronized HA \
-                       restart — join-deadlock recovery confirmed"
+                       restart; join-deadlock recovery confirmed"
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: XHA was stuck in the post-fence-storm join deadlock \
+                    "TwinStor: XHA was stuck in the post-fence-storm join deadlock \
                      and was recovered automatically; the peer has rejoined and \
                      pool HA is re-armed. No action needed.",
                 )
@@ -14226,16 +14226,16 @@ impl StateMachine {
             } else if now.duration_since(since) >= READMISSION_CONFIRM_AFTER {
                 self.readmission_confirm_since = None;
                 warn!(
-                    scenario = "TSHA-3",
+                    scenario = "xha_join_deadlock",
                     heal_event = "readmission_recover_unconfirmed",
                     "the synchronized HA restart re-armed pool HA but the peer \
                        did not rejoin the liveset within the confirmation window; \
                        escalating (the peer likely needs a local emergency-disable)"
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: the automated XHA join-deadlock recovery re-armed \
+                    "TwinStor: the automated XHA join-deadlock recovery re-armed \
                      pool HA, but the peer host did not rejoin the liveset. Recover \
-                     it ON THE PEER host: 'xe host-emergency-ha-disable --force', \
+                     it on the peer host: 'xe host-emergency-ha-disable --force', \
                      after which it rejoins and HA re-arms. Storage is healthy and \
                      VMs are unaffected.",
                 )
@@ -14321,17 +14321,17 @@ impl StateMachine {
                 warn!(
                     heal_event = "ha_readmission_storm",
                     "XHA cannot rejoin and the storm is still active (statefile \
-                     errors / storage not healthy); fix STORAGE first — the \
+                     errors / storage not healthy); fix storage first (the \
                      replication link, or a node that cannot bring its copy \
-                     online (see other alerts) — HA recovery is futile until \
+                     online, see other alerts); HA recovery is futile until \
                      storage heals"
                 );
                 self.readmission_alert(
-                    "TWINSTOR: XHA cannot re-form the liveset AND the underlying \
+                    "TwinStor: XHA cannot re-form the liveset and the underlying \
                      storm is still active (statefile write errors / storage not \
-                     healthy). Fix storage first — a flapping replication link, \
+                     healthy). Fix storage first: a flapping replication link, \
                      or a node that cannot bring its copy online (see the other \
-                     TWINSTOR alerts for the exact blocker); HA recovery keeps \
+                     TwinStor alerts for the exact blocker); HA recovery keeps \
                      failing until storage heals.",
                     now,
                 )
@@ -14343,17 +14343,17 @@ impl StateMachine {
                     heal_event = "ha_readmission_stuck",
                     embrace = self.readmission_signals.embrace,
                     "XHA re-admission stuck; automated recovery unavailable \
-                     (disabled, capped, or preconditions failed) — manual \
-                     runbook: stop xhad on BOTH hosts for 90s, then re-arm"
+                     (disabled, capped, or preconditions failed); manual \
+                     runbook: stop xhad on both hosts for 90s, then re-arm"
                 );
                 self.readmission_alert(
-                    "TWINSTOR: the XHA daemon has been unable to rejoin the \
+                    "TwinStor: the XHA daemon has been unable to rejoin the \
                      liveset for over 5 minutes. If it is simply not running \
                      (calldaemon gethoststate reports nothing), restart it \
                      first: 'systemctl restart attach-static-vdis' then \
                      'PATH=/usr/libexec/xapi/cluster-stack/xhad:$PATH \
                      ha_start_daemon'. For the join \
-                     deadlock (the post-fence-storm embrace): on BOTH hosts run \
+                     deadlock (the post-fence-storm embrace): on both hosts run \
                      'xe host-emergency-ha-disable --force', wait 90 seconds, \
                      then on the master: 'xe pool-ha-disable' and re-arm with \
                      'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
@@ -14374,8 +14374,8 @@ impl StateMachine {
                 warn!(
                     heal_event = "ha_readmission_revive",
                     "XHA daemon is dead with nothing retrying it (xha.log silent \
-                     all window) while storage is healthy — the boot-time \
-                     statefile-race signature; restarting it locally"
+                     all window) while storage is healthy (the boot-time \
+                     statefile-race signature); restarting it locally"
                 );
                 self.run_xha_revive().await;
             }
@@ -14392,7 +14392,7 @@ impl StateMachine {
                     sync_point = t,
                     "XHA join deadlock detected (both sides' stale liveset \
                      claims re-poisoning each other); scheduling the \
-                     quiesce-and-sync-start recovery — the peer daemon \
+                     quiesce-and-sync-start recovery; the peer daemon \
                      computes the same wall-clock point independently"
                 );
                 self.readmission_dance_t = Some(t);
@@ -14458,11 +14458,11 @@ impl StateMachine {
         }
         let Some(sr) = xapi::twinstor_sr_uuid().await else {
             warn!(
-                "re-admission dance: cannot resolve the heartbeat SR uuid; NOT \
-                   re-arming blindly — manual re-arm needed"
+                "re-admission dance: cannot resolve the heartbeat SR uuid; not \
+                   re-arming blindly; manual re-arm needed"
             );
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: the automated XHA recovery quiesced both HA daemons but \
+                "TwinStor: the automated XHA recovery quiesced both HA daemons but \
                  could not resolve the heartbeat SR uuid to re-arm. Re-arm manually: \
                  xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
                  ha-config:timeout=<120 fate-shared | 90 arbitrated>.",
@@ -14501,15 +14501,15 @@ impl StateMachine {
             // success; the confirmation poll is in check_ha_readmission.
             self.readmission_confirm_since = Some(std::time::Instant::now());
             warn!(
-                scenario = "TSHA-3",
+                scenario = "xha_join_deadlock",
                 heal_event = "readmission_rearm_issued",
                 "synchronized HA restart done and pool HA re-armed; confirming \
                    the peer rejoined the liveset before declaring recovery"
             );
         } else {
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: the automated XHA recovery ran but HA could not be \
-                 confirmed re-armed yet. TWINSTOR keeps retrying automatically \
+                "TwinStor: the automated XHA recovery ran but HA could not be \
+                 confirmed re-armed yet. TwinStor keeps retrying automatically \
                  every few minutes until it succeeds; to intentionally keep HA \
                  off instead, remove /var/lib/twinstor/ha-rearm-obligation.",
             )
@@ -14555,7 +14555,7 @@ impl StateMachine {
                  restored"
             );
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: the XHA daemon on this host had died during boot \
+                "TwinStor: the XHA daemon on this host had died during boot \
                  (storage was not yet reachable when it started) and has been \
                  restarted automatically. It rejoined the liveset; HA \
                  protection is restored. No action needed.",
@@ -14571,7 +14571,7 @@ impl StateMachine {
                  runbook alert armed (next automatic attempt in an hour)"
             );
             self.readmission_alert(
-                "TWINSTOR: the XHA daemon on this host is dead and an automatic \
+                "TwinStor: the XHA daemon on this host is dead and an automatic \
                  restart did not bring it back Online. Investigate \
                  /var/log/xha.log; to retry manually run 'systemctl restart \
                  attach-static-vdis' then 'PATH=/usr/libexec/xapi/\
@@ -14751,7 +14751,7 @@ impl StateMachine {
                 self.standdown_guest_stop_alerted_at = Some(now);
                 warn!(
                     heal_event = "standdown_guest_stop_blocked",
-                    "isolated stand-down HELD: could not confirm the local guest domains \
+                    "isolated stand-down held: could not confirm the local guest domains \
                      are stopped, so refusing to tear storage down under a live guest \
                      (that would wedge it unrecoverably); holding and retrying"
                 );
@@ -14763,7 +14763,7 @@ impl StateMachine {
                     Some("check `xl list` on this host for a stuck guest domain"),
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: an isolated-master stand-down is HELD because a local guest \
+                    "TwinStor: an isolated-master stand-down is held because a local guest \
                      domain could not be confirmed stopped. Storage is deliberately kept up \
                      to avoid wedging that VM; the node stays in its current isolated state \
                      and retries. Check `xl list` on this host for a stuck domain.",
@@ -14778,8 +14778,8 @@ impl StateMachine {
         if fence_to_failover {
             warn!(
                 heal_event = "isolated_standdown",
-                "isolated SLAVE past the stand-down window with the master reachable and \
-                 UpToDate: leaving xhad ARMED and making local storage unavailable (local \
+                "isolated slave past the stand-down window with the master reachable and \
+                 UpToDate: leaving xhad armed and making local storage unavailable (local \
                  guests hard-stopped, target off, both initiator sessions out, Secondary) so \
                  the HA statefile heartbeat stops. The local StateFileWatchdog self-fences \
                  this node once; the master's XHA then restarts my VMs on the reachable host. \
@@ -14841,7 +14841,7 @@ impl StateMachine {
             Some("reconnect this host's client network; it rejoins and re-promotes on its own"),
         );
         let _ = xapi::send_xapi_alert(
-            "TWINSTOR: this pool master was isolated from the client network while the peer \
+            "TwinStor: this pool master was isolated from the client network while the peer \
              stayed alive and UpToDate on the replication link. To avoid a dual-master, it \
              has made its own storage unavailable so its (already-unreachable) VMs restart on \
              the reachable peer; it stays parked until its client network returns, then \
@@ -15011,7 +15011,7 @@ impl StateMachine {
         info!(
             heal_event = "isolated_rejoin",
             "client network stably returned and the peer is reachable on replication; \
-               restoring storage bottom-up and rejoining (still UpToDate — stayed Connected \
+               restoring storage bottom-up and rejoining (still UpToDate: stayed Connected \
                as Secondary)"
         );
         // Restore storage bottom-up, without depending on XAPI, before
@@ -15231,7 +15231,7 @@ impl StateMachine {
                 warn!(
                     heal_event = "whole_switch_hold",
                     "both hosts are isolated from the client network (whole-switch outage): \
-                       the peer's gateway is ALSO down over the direct link. Holding -- \
+                       the peer's gateway is also down over the direct link. Holding: \
                        ha-disabling to suppress the XHA state-file fence and keeping VMs \
                        running where they are (moving them to an equally-unreachable peer \
                        would be pointless). Auto-recovers when the switch returns."
@@ -15251,7 +15251,7 @@ impl StateMachine {
                 self.heal_state_update(
                     "whole_switch_hold",
                     "whole-switch outage: both hosts isolated; holding with VMs running \
-                     (no failover -- the peer is equally unreachable)",
+                     (no failover: the peer is equally unreachable)",
                     Some("restore the client/switch network; HA re-arms automatically"),
                 );
             }
@@ -15372,14 +15372,14 @@ impl StateMachine {
                 };
                 if realert {
                     warn!(heal_event = "standdown_suppressed_ha_off", local_ha_armed = ?ha,
-                          "isolated SLAVE past the stand-down window with VMs here, but pool HA \
-                           is NOT enabled: suppressing the fence-to-failover (with no XHA there \
-                           is nothing to restart the VMs on the master -- fencing would only \
+                          "isolated slave past the stand-down window with VMs here, but pool HA \
+                           is not enabled: suppressing the fence-to-failover (with no XHA there \
+                           is nothing to restart the VMs on the master; fencing would only \
                            strand them). Keeping storage up. Enable pool HA for failover.");
                     self.standdown_ha_off_alerted_at = Some(now);
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: this pool member is isolated from the client network while the \
-                         master stays reachable, but pool HA is DISABLED. TWINSTOR did NOT stand \
+                        "TwinStor: this pool member is isolated from the client network while the \
+                         master stays reachable, but pool HA is disabled. TwinStor did not stand \
                          its storage down (with HA off, that would strand its VMs rather than fail \
                          them over). Storage keeps replicating over the direct link and no data is \
                          at risk. Enable pool HA so an isolated member can fail its VMs over.",
@@ -15388,7 +15388,7 @@ impl StateMachine {
                 }
                 self.heal_state_update(
                     "standdown_suppressed_ha_off",
-                    "isolated member, but pool HA is off — stand-down suppressed to avoid \
+                    "isolated member, but pool HA is off; stand-down suppressed to avoid \
                      stranding VMs; keeping storage up",
                     Some("enable pool HA, or reconnect this host's client network"),
                 );
@@ -15399,8 +15399,8 @@ impl StateMachine {
             }
             warn!(
                 heal_event = "isolated_slave_standdown",
-                "this SLAVE is cut off from the client network while the master is reachable \
-                   with its gateway UP over the direct link (single-host isolation) and runs VMs \
+                "this slave is cut off from the client network while the master is reachable \
+                   with its gateway up over the direct link (single-host isolation) and runs VMs \
                    here: standing my storage down so my HA state-file heartbeat stops and the \
                    master's XHA restarts my VMs on the reachable host. Rejoins when my client \
                    network returns."
@@ -15540,13 +15540,13 @@ impl StateMachine {
                         if realert {
                             warn!(heal_event = "standdown_suppressed_ha_off", ha_enabled = ?ha,
                                   "isolated master past the stand-down window, but pool HA is \
-                                   NOT enabled: suppressing the storage stand-down (with no XHA \
-                                   there is nothing to fail the VMs over — demoting would only \
+                                   not enabled: suppressing the storage stand-down (with no XHA \
+                                   there is nothing to fail the VMs over; demoting would only \
                                    strand them). Keeping storage up. Enable pool HA for failover.");
                             self.standdown_ha_off_alerted_at = Some(now);
                             let _ = xapi::send_xapi_alert(
-                                "TWINSTOR: this pool master is isolated from the client network, \
-                                 but pool HA is DISABLED. TWINSTOR did NOT stand its storage down \
+                                "TwinStor: this pool master is isolated from the client network, \
+                                 but pool HA is disabled. TwinStor did not stand its storage down \
                                  (with HA off, that would strand its VMs rather than fail them \
                                  over). Storage keeps replicating over the direct link and no data \
                                  is at risk. Enable pool HA so an isolated master can fail its VMs \
@@ -15556,7 +15556,7 @@ impl StateMachine {
                         }
                         self.heal_state_update(
                             "standdown_suppressed_ha_off",
-                            "isolated master, but pool HA is off — stand-down suppressed to avoid \
+                            "isolated master, but pool HA is off; stand-down suppressed to avoid \
                              stranding VMs; keeping storage up",
                             Some("enable pool HA, or reconnect this host's client network"),
                         );
@@ -15568,7 +15568,7 @@ impl StateMachine {
                     warn!(
                         heal_event = "master_isolated",
                         running_vms = vms,
-                        "this MASTER is cut off from the client network while the \
+                        "this master is cut off from the client network while the \
                            peer is alive on the replication link: any VMs here are \
                            likely unreachable to clients. Reconnect this host's \
                            network, or transition mastership on the peer and migrate"
@@ -15579,7 +15579,7 @@ impl StateMachine {
                         Some("reconnect this host's network (preferred), or recover on the peer"),
                     );
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: this pool master is isolated from the client \
+                        "TwinStor: this pool master is isolated from the client \
                          network while storage replication continues over the direct \
                          link. VMs running here are likely unreachable to clients. \
                          Reconnect this host's network cable/switch port; the pool \
@@ -15729,7 +15729,7 @@ impl StateMachine {
                     Some("reconnect the master's switch path; emergency-transition here only if it cannot be revived"),
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: the pool master is isolated from the client network \
+                    "TwinStor: the pool master is isolated from the client network \
                      (its daemon is alive on the replication link, storage is safe). \
                      VMs it runs are likely unreachable to clients. Reconnect its \
                      network; the pool reunifies on its own. To fail service over \
@@ -15794,20 +15794,20 @@ impl StateMachine {
                 warn!(
                     heal_event = "yield_hold",
                     "yielded and frozen while the gateway is healthy and the peer \
-                       stays unreachable: THIS NEEDS AN OPERATOR DECISION"
+                       stays unreachable: this needs an operator decision"
                 );
                 self.heal_state_update(
                     "yield_hold",
-                    "yielded, frozen, gateway healthy, peer absent — operator decision needed",
+                    "yielded, frozen, gateway healthy, peer absent: operator decision needed",
                     Some("verify the peer is truly dead, then clear the yield to serve"),
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR is holding this node FROZEN: it yielded during a real \
+                    "TwinStor is holding this node frozen: it yielded during a real \
                      isolation, the network has since recovered, but the peer never \
                      returned. It cannot tell a dead peer from a partitioned one, so it \
                      will not serve on its own. If the peer is confirmed dead or off: \
                      rm /run/twinstor/fence-yielded /var/lib/twinstor/yield-loser-latched; \
-                     drbdadm resume-io <res>; systemctl restart twinstor — the node then \
+                     drbdadm resume-io <res>; systemctl restart twinstor. The node then \
                      serves alone. If the peer may still be running somewhere, fix its \
                      network instead; the pair heals itself on reconnect. Doing nothing \
                      is safe but serves nobody.",
@@ -15899,14 +15899,14 @@ impl StateMachine {
                 self.episode_open("masterless");
                 warn!(
                     heal_event = "pool_mutual_slave",
-                    "POOL IS MASTERLESS (mutual-slave): this node follows the peer \
-                       and the peer PROVABLY follows this node; xe is dead pool-wide. \
+                    "pool is masterless (mutual-slave): this node follows the peer \
+                       and the peer provably follows this node; xe is dead pool-wide. \
                        Automatic recovery follows if the state persists"
                 );
             }
             MasterlessAction::Recover => {
                 warn!(
-                    scenario = "TSHA-4",
+                    scenario = "masterless_pool",
                     heal_event = "masterless_recover",
                     via = "mutual_slave",
                     "starting the emergency master transition to break the \
@@ -15938,7 +15938,7 @@ impl StateMachine {
             self.masterless_since = Some(now);
             warn!(
                 heal_event = "pool_masterless_suspect",
-                "pool.conf says this node is a slave of ITSELF; watching \
+                "pool.conf says this node is a slave of itself; watching \
                    (xapi may still be transitioning)"
             );
         }
@@ -16056,16 +16056,16 @@ impl StateMachine {
                 self.masterless_alerted = true;
                 warn!(
                     heal_event = "pool_masterless",
-                    "POOL IS MASTERLESS: this node's pool.conf points at \
+                    "pool is masterless: this node's pool.conf points at \
                        itself as the master it should follow; xe is wedged \
                        pool-wide and HA cannot restart VMs. Automatic \
                        recovery follows if the state persists"
                 );
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: the pool has NO master (this node's pool.conf \
+                    "TwinStor: the pool has no master (this node's pool.conf \
                      says it is a slave of itself, a known aftermath of a \
                      master power-loss under HA). xe commands will hang and \
-                     HA cannot restart VMs. TWINSTOR will attempt the \
+                     HA cannot restart VMs. TwinStor will attempt the \
                      emergency master transition automatically shortly.",
                 )
                 .await;
@@ -16089,9 +16089,9 @@ impl StateMachine {
                 if !self.masterless_deferred {
                     self.masterless_deferred = true;
                     warn!(
-                        scenario = "TSHA-4",
+                        scenario = "masterless_pool",
                         heal_event = "masterless_defer_to_master",
-                        "pool.conf says slave-of-self, but the peer is a LIVE \
+                        "pool.conf says slave-of-self, but the peer is a live \
                            master: deferring (no transition) and rejoining as \
                            its slave. This is the normal aftermath of a master \
                            self-fencing and returning under HA"
@@ -16099,7 +16099,7 @@ impl StateMachine {
                     self.heal_state_update(
                         "masterless_defer",
                         "slave-of-self while the peer is a live master; deferring, will rejoin as its slave",
-                        Some("no operator action needed; TWINSTOR rejoins this node as the master's slave"),
+                        Some("no operator action needed; TwinStor rejoins this node as the master's slave"),
                     );
                 }
                 // Deferring passively can strand this node: recover-slaves does
@@ -16128,7 +16128,7 @@ impl StateMachine {
                         let peer = self.config.network.peer_address.to_string();
                         warn!(
                             attempt = self.masterless_defer_rejoins,
-                            scenario = "TSHA-4",
+                            scenario = "masterless_pool",
                             heal_event = "masterless_defer_active_rejoin",
                             "slave-of-self persisted past the grace window without \
                                re-admission; repointing pool.conf at the peer master \
@@ -16153,19 +16153,19 @@ impl StateMachine {
                             .is_none_or(|t| now.duration_since(t) >= DEGRADED_REALERT_AFTER)
                         {
                             warn!(
-                                scenario = "TSHA-4",
+                                scenario = "masterless_pool",
                                 heal_event = "masterless_defer_stuck",
                                 "slave-of-self did not rejoin after repeated \
                                    repoints; operator intervention needed"
                             );
                             let _ = xapi::send_xapi_alert(
-                                "TWINSTOR: a returning node is stuck following ITSELF \
+                                "TwinStor: a returning node is stuck following itself \
                                  while the peer is the live master, and automatic \
                                  rejoin did not take. On the stuck host, set \
                                  /etc/xensource/pool.conf to 'slave:<peer-ip>' and \
                                  run xe-toolstack-restart; if it then reports HA \
                                  disabled, the master runs 'xe pool-ha-disable' once \
-                                 and TWINSTOR re-arms.",
+                                 and TwinStor re-arms.",
                             )
                             .await;
                         }
@@ -16234,9 +16234,9 @@ impl StateMachine {
             )
         {
             info!(
-                scenario = "TSHA-4",
+                scenario = "masterless_pool",
                 heal_event = "masterless_defer_to_master",
-                "masterless recovery: the peer is a LIVE master at the moment \
+                "masterless recovery: the peer is a live master at the moment \
                    of action; standing down and rejoining as its slave instead \
                    of transitioning (no second master)"
             );
@@ -16255,7 +16255,7 @@ impl StateMachine {
         // unaffected.
         if require_peer_dead && self.peer_dead_via_liveset().await != Some(true) {
             info!(
-                scenario = "TSHA-4",
+                scenario = "masterless_pool",
                 heal_event = "masterless_defer_peer_returned",
                 "masterless recovery: the peer no longer reads confirmed-dead in \
                    the local liveset at the moment of action; standing down rather \
@@ -16264,7 +16264,7 @@ impl StateMachine {
             return;
         }
         warn!(
-            scenario = "TSHA-4",
+            scenario = "masterless_pool",
             heal_event = "masterless_recover",
             "starting the emergency master transition (HA emergency \
                disable, transition-to-master, recover-slaves, HA re-arm)"
@@ -16284,13 +16284,13 @@ impl StateMachine {
         }
         if !role_master {
             warn!(
-                scenario = "TSHA-4",
+                scenario = "masterless_pool",
                 heal_event = "masterless_recover_failed",
                 "pool.conf did not flip to master within the window; \
                    manual recovery needed (see the masterless alert)"
             );
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: the automatic emergency master transition did not \
+                "TwinStor: the automatic emergency master transition did not \
                  complete. Recover manually on this host: \
                  xe host-emergency-ha-disable --force; \
                  xe pool-emergency-transition-to-master; \
@@ -16354,31 +16354,31 @@ impl StateMachine {
             xapi::PeerXapiRole::Master
         ) {
             warn!(
-                scenario = "TSHA-4",
+                scenario = "masterless_pool",
                 heal_event = "masterless_recover_unconfirmed",
                 "emergency master transition done but the peer still reads as \
-                   pool MASTER -- the slave-recovery demotion did not take; not \
+                   pool master; the slave-recovery demotion did not take; not \
                    declaring recovered, leaving it for the dual-master heal"
             );
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: after an automatic emergency master transition the \
+                "TwinStor: after an automatic emergency master transition the \
                  peer host still reports itself as pool master (a dual-master). \
-                 TWINSTOR is resolving it automatically; if it persists, run \
+                 TwinStor is resolving it automatically; if it persists, run \
                  'xe pool-recover-slaves' from this host or reboot the peer.",
             )
             .await;
             return;
         }
         info!(
-            scenario = "TSHA-4",
+            scenario = "masterless_pool",
             heal_event = "masterless_recovered",
             "emergency master transition complete; this node is master \
                again and the peer is demoted / gone"
         );
         let _ = xapi::send_xapi_alert(
-            "TWINSTOR: the masterless pool was recovered automatically \
+            "TwinStor: the masterless pool was recovered automatically \
              (emergency master transition + slave recovery). Check that HA \
-             is armed and protected VMs are running; TWINSTOR keeps \
+             is armed and protected VMs are running; TwinStor keeps \
              retrying the HA re-arm if it did not stick.",
         )
         .await;
@@ -16451,7 +16451,7 @@ impl StateMachine {
                 info!(
                     heal_event = "host_auto_enable_held_isolated",
                     "not auto-enabling this disabled host: replication is healthy but the \
-                       client network is unreachable -- it is isolated; enabling would run \
+                       client network is unreachable, so it is isolated; enabling would run \
                        VMs clients cannot reach. Holding until the client network returns."
                 );
             }
@@ -16524,13 +16524,13 @@ impl StateMachine {
                     self.host_enable_hold_logged = Some(REASON);
                     // Held (and delivered later) if XAPI cannot take it now.
                     let _ = xapi::send_xapi_alert_keyed("host-enable-leaked", &format!(
-                        "TWINSTOR: this host stays disabled because XAPI's storage layer still holds \
+                        "TwinStor: this host stays disabled because XAPI's storage layer still holds \
                          datapaths of guests destroyed during a split-brain resolution; a VM started or \
-                         migrated here could reuse a stale disk attachment. TWINSTOR retries the release \
+                         migrated here could reuse a stale disk attachment. TwinStor retries the release \
                          while its restart step runs (not while this copy's I/O is suspended), and once \
                          none is left its host-enable check enables the host on its own. To release one by hand: list them with `{}` (look for ** LEAKED, or a \
                          vbd/<domid>/ of a domain `xl list` no longer shows) and release each with `{}`; \
-                         TWINSTOR notices it on its next retry. Once that list shows none, `xe \
+                         TwinStor notices it on its next retry. Once that list shows none, `xe \
                          host-enable uuid=<this host>` enables the host at once.",
                         crate::xapi_storage::diagnostics_command(),
                         crate::xapi_storage::destroy_command("vbd/<domid>/<device>")
@@ -16552,7 +16552,7 @@ impl StateMachine {
                         "host enabled; HA placement restored"
                     );
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: this host had booted into maintenance mode \
+                        "TwinStor: this host had booted into maintenance mode \
                          (XAPI's enable raced storage recovery) and has been \
                          enabled automatically. HA VM placement is restored. To \
                          keep a host in maintenance on purpose, set \
@@ -16567,7 +16567,7 @@ impl StateMachine {
                            cooldown (manual: xe host-enable)"
                     );
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: this host is stuck disabled (maintenance \
+                        "TwinStor: this host is stuck disabled (maintenance \
                          mode) and the automatic enable failed. HA will not \
                          restart VMs on it. Manual: xe host-enable \
                          host=<hostname>.",
@@ -16806,7 +16806,7 @@ impl StateMachine {
         }
         if !to_alert.is_empty() {
             let mut body = String::from(
-                "TWINSTOR: VMs with ha-restart-priority=restart are HALTED while this host can run them \
+                "TwinStor: VMs with ha-restart-priority=restart are halted while this host can run them \
                  (its storage copy is UpToDate and it is the sole serving copy):\n",
             );
             for (u, verdict) in &to_alert {
@@ -16888,7 +16888,7 @@ impl StateMachine {
                       "could not start a halted protected VM; retrying after a back-off");
                 if fails == PROTECTED_VM_FAIL_ALERT_AT {
                     let _ = xapi::send_xapi_alert(&format!(
-                        "TWINSTOR: the halted HA-protected VM {u} could not be started after {fails} \
+                        "TwinStor: the halted HA-protected VM {u} could not be started after {fails} \
                          attempts (restart_halted_protected_vms); still retrying, at most every {} \
                          minutes. `xe vm-start uuid={u}` shows the reason.",
                         PROTECTED_VM_RETRY_MAX.as_secs() / 60
@@ -16991,7 +16991,7 @@ impl StateMachine {
                            pool HA on the loser"
                     );
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: fate-shared freeze mode turned the pool setting \
+                        "TwinStor: fate-shared freeze mode turned the pool setting \
                          ha-reboot-vm-on-internal-shutdown off (it was on). A split's losing host stops its \
                          guests before discarding its copy; when that host is the pool master, XAPI reads \
                          those stops as the guests' own shutdowns, and with the setting on, pool HA could \
@@ -17091,7 +17091,7 @@ impl StateMachine {
                 "stale activating locks cleared"
             );
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: stale VDI activation locks (leftovers of a host \
+                "TwinStor: stale VDI activation locks (leftovers of a host \
                  reset during VM start) were detected and cleared \
                  automatically. Affected VMs can start normally again.",
             )
@@ -17128,18 +17128,18 @@ impl StateMachine {
                 warn!(
                     heal_event = "ha_armed_mismatch",
                     master,
-                    "this host is LOCALLY HA-disarmed while pool HA is \
+                    "this host is locally HA-disarmed while pool HA is \
                        enabled; its next reboot springs an xapi trap"
                 );
                 let body = if master {
-                    "TWINSTOR: this host (the pool master) is locally \
+                    "TwinStor: this host (the pool master) is locally \
                      HA-disarmed while pool HA is enabled. At its next \
-                     reboot, xapi will SILENTLY DISABLE pool HA (upstream \
+                     reboot, xapi will silently disable pool HA (upstream \
                      behavior). Re-align now: xe pool-ha-disable, then \
                      xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR> \
                      ha-config:timeout=<120 fate-shared | 90 arbitrated>."
                 } else {
-                    "TWINSTOR: this host is locally HA-disarmed while pool \
+                    "TwinStor: this host is locally HA-disarmed while pool \
                      HA is enabled. At its next reboot, xapi will wedge it \
                      in emergency mode (xe unusable, storage attach blocked; \
                      upstream behavior). Re-align now: on the master run \
@@ -17180,16 +17180,16 @@ impl StateMachine {
             warn!(
                 heal_event = "ha_readmission_flap",
                 "returning node rejoined the XHA liveset but has stayed locally \
-                   HA-disarmed past the grace -- XAPI is stuck re-admitting it (the \
+                   HA-disarmed past the grace: XAPI is stuck re-admitting it (the \
                    slave->master read keeps flapping). The rejoin toolstack self-heals \
                    are held (they would only abort the readmission); a pool-HA cycle is \
                    needed to clear it"
             );
             let _ = xapi::send_xapi_alert(
-                "TWINSTOR: a returning host rejoined the XHA liveset but has not \
-                 completed readmission -- it stays locally HA-disarmed while its \
+                "TwinStor: a returning host rejoined the XHA liveset but has not \
+                 completed readmission: it stays locally HA-disarmed while its \
                  slave->master XAPI intermittently fails, and it will not clear on its \
-                 own. Storage is SAFE (dual-Primary, UpToDate) and VMs are unaffected, \
+                 own. Storage is safe (dual-Primary, UpToDate) and VMs are unaffected, \
                  but pool HA will not fully protect this node until it readmits. \
                  Re-align it: on the pool master run 'xe pool-ha-disable', then \
                  'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
@@ -17266,9 +17266,9 @@ impl StateMachine {
                 PeerConfirmAction::Confirming => {}
                 PeerConfirmAction::Confirmed => {
                     info!(
-                        scenario = "TSHA-1",
+                        scenario = "peer_emergency",
                         heal_event = "peer_emergency_resolved",
-                        "peer is live again after the pool-level HA reset — \
+                        "peer is live again after the pool-level HA reset; \
                            the emergency-mode wedge is cleared"
                     );
                     self.peer_emergency_resolve_at = None;
@@ -17277,7 +17277,7 @@ impl StateMachine {
                     self.peer_liveset_wedge_since = None;
                     self.peer_emergency_confirm_alerted_at = None;
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: the peer host was wedged in xapi emergency \
+                        "TwinStor: the peer host was wedged in xapi emergency \
                          mode (HA-armed mismatch after a reboot); an automatic \
                          pool-level HA reset freed it and the peer has \
                          rejoined. No action needed.",
@@ -17286,11 +17286,11 @@ impl StateMachine {
                 }
                 PeerConfirmAction::Failed => {
                     warn!(
-                        scenario = "TSHA-1",
+                        scenario = "peer_emergency",
                         heal_event = "peer_emergency_resolve_failed",
-                        "the automatic pool-level HA reset did NOT bring the \
-                           peer back — its xhad could not rejoin the liveset. \
-                           It needs a LOCAL 'xe host-emergency-ha-disable \
+                        "the automatic pool-level HA reset did not bring the \
+                           peer back: its xhad could not rejoin the liveset. \
+                           It needs a local 'xe host-emergency-ha-disable \
                            --force' on the peer host. Holding for the cooldown \
                            rather than re-cycling pool HA (which cannot recruit \
                            a cycling xhad)."
@@ -17302,10 +17302,10 @@ impl StateMachine {
                     {
                         self.peer_emergency_confirm_alerted_at = Some(now);
                         let _ = xapi::send_xapi_alert(
-                            "TWINSTOR: a peer host is stuck in xapi HA \
+                            "TwinStor: a peer host is stuck in xapi HA \
                              emergency mode and the automatic pool-level HA \
                              reset did not recruit it (its xhad keeps cycling). \
-                             Recover it ON THE PEER host: 'xe \
+                             Recover it on the peer host: 'xe \
                              host-emergency-ha-disable --force'; it will then \
                              rejoin and HA re-arms on its own. Storage is \
                              healthy and VMs are unaffected.",
@@ -17321,7 +17321,7 @@ impl StateMachine {
         if signature && self.peer_emergency_since.is_none() {
             self.peer_emergency_since = Some(now);
             warn!(
-                scenario = "TSHA-1",
+                scenario = "peer_emergency",
                 heal_event = "peer_emergency_suspect",
                 "peer xapi reports not-live while its daemon answers on the \
                    replication network and pool HA is armed: suspected \
@@ -17363,10 +17363,10 @@ impl StateMachine {
             if self.peer_liveset_wedge_since.is_none() {
                 self.peer_liveset_wedge_since = Some(now);
                 info!(
-                    scenario = "TSHA-1",
+                    scenario = "peer_emergency",
                     heal_event = "peer_emergency_wedge_confirmed",
                     "peer rejoined this host's xhad liveset while the HA-armed-mismatch \
-                       signature persists (peer xapi raw-not-live) — arming the fast-path \
+                       signature persists (peer xapi raw-not-live); arming the fast-path \
                        resolve on the short confirm grace instead of the blind timer"
                 );
             }
@@ -17401,7 +17401,7 @@ impl StateMachine {
                         .due("peer_emergency_no_sr", Duration::from_secs(600))
                     {
                         warn!(
-                            scenario = "TSHA-1",
+                            scenario = "peer_emergency",
                             heal_event = "peer_emergency_resolve",
                             step = "sr_unresolved",
                             "peer emergency resolve: cannot resolve the SR uuid; holding, retried next pass"
@@ -17414,7 +17414,7 @@ impl StateMachine {
                 // reset futile and piles up more: hold and retry in
                 // `PEER_EMERGENCY_RETRY`.
                 if let Some(pending) = xapi::pending_pool_ha_task().await {
-                    warn!(scenario = "TSHA-1", heal_event = "peer_emergency_resolve", step = "ha_task_pending",
+                    warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve", step = "ha_task_pending",
                           task = %pending,
                           "peer emergency resolve: an earlier pool HA operation is still pending in XAPI; \
                            not issuing another reset (retried later)");
@@ -17423,7 +17423,7 @@ impl StateMachine {
                         .due("peer_emergency_task_alert", Duration::from_secs(3600))
                     {
                         let _ = xapi::send_xapi_alert(&format!(
-                            "TWINSTOR: the peer host looks stuck in xapi HA emergency mode, and the \
+                            "TwinStor: the peer host looks stuck in xapi HA emergency mode, and the \
                              automatic pool-level HA reset that frees it is held: a pool HA operation \
                              ({pending}) is still pending in XAPI. Check `xe task-list status=pending` \
                              on the pool master."
@@ -17435,7 +17435,7 @@ impl StateMachine {
                     );
                     return;
                 }
-                warn!(scenario = "TSHA-1", heal_event = "peer_emergency_resolve",
+                warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve",
                       signature_secs = ?self.peer_emergency_since.map(|t| now.duration_since(t).as_secs()),
                       liveset_wedge_secs = ?self.peer_liveset_wedge_since.map(|t| now.duration_since(t).as_secs()),
                       storage_safe_to_cycle, peer_in_liveset, peer_live = ?live, peer_live_raw = ?live_raw,
@@ -17463,7 +17463,7 @@ impl StateMachine {
                         // obligation stays and the HA watchdog re-arms if it
                         // does. No reset was issued: the cooldown is not taken,
                         // only a short retry pace.
-                        warn!(scenario = "TSHA-1", heal_event = "peer_emergency_resolve", step = "disable_failed",
+                        warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve", step = "disable_failed",
                               error = %e,
                               "peer emergency resolve: pool-ha-disable failed or timed out; no reset \
                                issued (the re-arm obligation stays; retried later)");
@@ -17491,7 +17491,7 @@ impl StateMachine {
                     )
                     .await
                     {
-                        warn!(scenario = "TSHA-1", heal_event = "peer_emergency_resolve", step = "enable_failed",
+                        warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve", step = "enable_failed",
                               error = %e,
                               "peer emergency resolve: pool-ha-enable failed; the re-arm obligation \
                                stays and the HA watchdog retries it");
@@ -17505,7 +17505,7 @@ impl StateMachine {
                     self.peer_emergency_resolve_at = Some(std::time::Instant::now());
                     self.peer_emergency_confirm_alerted_at = None;
                     info!(
-                        scenario = "TSHA-1",
+                        scenario = "peer_emergency",
                         heal_event = "peer_emergency_reset_issued",
                         "pool-level HA reset issued; confirming the peer \
                            rejoins the liveset before declaring it resolved"
@@ -17577,7 +17577,7 @@ impl StateMachine {
                 {
                     self.self_unwedge_miss_alerted_at = Some(now);
                     warn!(
-                        scenario = "TSHA-2",
+                        scenario = "local_emergency_wedge",
                         heal_event = "self_unwedge_signature_miss",
                         "the core wedge holds (disarmed, xhad not joined, \
                            storage healthy, peer is master) but no invalid-state \
@@ -17591,7 +17591,7 @@ impl StateMachine {
             self.self_unwedge_since = Some(now);
             self.self_unwedge_miss_alerted_at = None;
             warn!(
-                scenario = "TSHA-2",
+                scenario = "local_emergency_wedge",
                 heal_event = "self_unwedge_suspect",
                 "local HA is disarmed while pool HA is armed and my xhad is \
                    stuck in the invalid-state cycle with the peer serving as \
@@ -17615,7 +17615,7 @@ impl StateMachine {
                 self.self_unwedge_last_action = Some(now);
                 self.self_unwedge_since = None;
                 warn!(
-                    scenario = "TSHA-2",
+                    scenario = "local_emergency_wedge",
                     heal_event = "self_unwedge_clear",
                     "breaking my own HA emergency wedge: the peer's \
                        pool-level reset cannot recruit a cycling xhad, so \
@@ -17629,7 +17629,7 @@ impl StateMachine {
                 )
                 .await;
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: this host was stuck in xapi HA emergency mode \
+                    "TwinStor: this host was stuck in xapi HA emergency mode \
                      (its xhad could not rejoin the liveset after the \
                      pool-level reset). It cleared its own local HA state \
                      automatically; HA re-arms on rejoin. Storage was healthy \
@@ -17815,7 +17815,7 @@ impl StateMachine {
                 info!(
                     heal_event = "ha_rearm_held_maintenance",
                     "a re-arm obligation is pending but a host is in operator \
-                       maintenance (MAINTENANCE_MODE) -- or the toolstack did not \
+                       maintenance (MAINTENANCE_MODE), or the toolstack did not \
                        answer, which is treated the same (fail closed); holding HA \
                        off until it clears"
                 );
@@ -17867,7 +17867,7 @@ impl StateMachine {
                 self.rearm_attempt = 0;
                 ha_rearm_ts_clear();
                 let _ = xapi::send_xapi_alert(
-                    "TWINSTOR: pool HA is armed again after a daemon-initiated \
+                    "TwinStor: pool HA is armed again after a daemon-initiated \
                      recovery disable. No action needed.",
                 )
                 .await;
@@ -17991,8 +17991,8 @@ impl StateMachine {
         if self.xhad_present().await {
             warn!(
                 heal_event = "xha_orphan_stop_failed",
-                "ha_stop_daemon did NOT reap the local xhad; NOT force-killing it (a \
-                   SIGKILL skips the watchdog disarm and would self-fence this master) -- \
+                "ha_stop_daemon did not reap the local xhad; not force-killing it (a \
+                   SIGKILL skips the watchdog disarm and would self-fence this master); \
                    holding for the re-arm toolstack-restart backstop to recover"
             );
         }
@@ -18226,7 +18226,7 @@ impl StateMachine {
                 info!(
                     heal_event = "ha_rearm_skipped_operator_disable",
                     "peer rejoined with pool HA off, but HA was already off while the peer \
-                       was alive -- treating this as a deliberate operator pool-ha-disable, not \
+                       was alive, so treating this as a deliberate operator pool-ha-disable, not \
                        a fence; leaving HA off (run pool-ha-enable to re-arm when you want it)"
                 );
             }
@@ -18291,7 +18291,7 @@ impl StateMachine {
         self.heal_state_update(
             "splitbrain_thrash",
             "split-brain resolution is not converging (repeated cycles); auto-resolve paused, \
-             holding both copies safely — operator review needed",
+             holding both copies safely; operator review needed",
             Some(
                 "resumes automatically if the pool settles; check the replication link and \
                   the pool master, or resolve manually per the FAQ",
@@ -18303,10 +18303,10 @@ impl StateMachine {
         };
         if realert
             && xapi::send_xapi_alert(
-                "TWINSTOR split-brain resolution is NOT converging: the two nodes keep \
-                 re-entering resolution without settling. Auto-resolve has been PAUSED and both \
-                 copies are held intact (nothing is being discarded). THIS NEEDS OPERATOR \
-                 REVIEW: check the replication link and the pool master; resolve manually per \
+                "TwinStor split-brain resolution is not converging: the two nodes keep \
+                 re-entering resolution without settling. Auto-resolve has been paused and both \
+                 copies are held intact (nothing is being discarded). This needs operator \
+                 review: check the replication link and the pool master; resolve manually per \
                  the FAQ 'Split-brain recovery' if it does not clear on its own.",
             )
             .await
@@ -18491,9 +18491,9 @@ impl StateMachine {
                         peer_crashed_primary = hs.peer.crashed_primary(),
                         local_current = %format!("{:016X}", hs.local.current),
                         peer_current = %format!("{:016X}", hs.peer.current),
-                        "split-brain is a TRUE fork (both nodes wrote while disconnected); \
+                        "split-brain is a true fork (both nodes wrote while disconnected); \
                          converging on the copy with more un-replicated writes and rolling \
-                         back the other — this loses committed data on the discarded side, \
+                         back the other; this loses committed data on the discarded side, \
                          alerting"
                     );
                     // While a loser crash-boundary hold retries, the rounds repeat
@@ -18555,7 +18555,7 @@ impl StateMachine {
                     is_keeper,
                     keeps = w,
                     "split-brain: neither node could read a live pool master (control plane \
-                     wedged); breaking the tie deterministically by node-id — the keeper \
+                     wedged); breaking the tie deterministically by node-id: the keeper \
                      keeps as the single sync source, the non-keeper discards and resyncs \
                      (converges in one pass, no mutual discard)"
                 );
@@ -18576,7 +18576,7 @@ impl StateMachine {
                 from_live,
                 reason,
                 "split-brain: freshness gate overrode the data-blind role/keeper verdict to \
-                 protect data currency — the fresher (UpToDate) copy is never rolled back"
+                 protect data currency: the fresher (UpToDate) copy is never rolled back"
             );
         }
         let source = verdict_source(override_reason, tiebreak.is_some(), from_live, winner);
@@ -18735,10 +18735,10 @@ impl StateMachine {
         {
             let delivered = xapi::send_xapi_alert_keyed(
                 "yield-latch-hold",
-                "TWINSTOR: this node yielded during a split-brain and is latched as the loser of \
+                "TwinStor: this node yielded during a split-brain and is latched as the loser of \
                  that fork, so it does not promote on its own: the peer may hold the newer copy \
                  and may already serve it. It waits for the peer to reconnect, then resyncs from \
-                 it. If the peer is gone for good and THIS copy must serve: rm -f \
+                 it. If the peer is gone for good and this copy must serve: rm -f \
                  /var/lib/twinstor/yield-loser-latched /run/twinstor/fence-yielded; systemctl \
                  restart twinstor. The node then serves its own copy, without the writes the \
                  peer made after the split.",
@@ -19681,7 +19681,7 @@ impl StateMachine {
                     // block each pass up to the send bound).
                     self.arb_yield_hold_alerted = true;
                     let _ = xapi::send_xapi_alert(
-                        "TWINSTOR: this node yielded during a network split and its storage copy is \
+                        "TwinStor: this node yielded during a network split and its storage copy is \
                          behind the peer's. Its guests stay frozen until the peer's iSCSI portal \
                          answers, then they are stopped and restarted on the peer and this copy \
                          resyncs. The peer's DRBD answers but its portal has not for 5 minutes: check \
@@ -19830,11 +19830,11 @@ impl StateMachine {
             .map_or("unknown".to_string(), |s| format!("{:?}", s.disk));
         let yielded = std::path::Path::new(&self.yield_path).exists() || self.yield_latched();
         let body = format!(
-            "TWINSTOR split-brain wedge on {node} (this node: disk {disk}, {yielded}): both nodes \
+            "TwinStor split-brain wedge on {node} (this node: disk {disk}, {yielded}): both nodes \
              hold as the split-brain loser and refuse each other's discard, so neither serves \
              the SR. Nothing is discarded while this lasts. Pick the node whose copy should win: \
-             normally the one that did NOT yield, never one whose disk is not UpToDate. On THAT \
-             node only: (1) systemctl stop twinstor; (2) drbdadm -d adjust {res} -- if it prints \
+             normally the one that did not yield, never one whose disk is not UpToDate. On that \
+             node only: (1) systemctl stop twinstor; (2) drbdadm -d adjust {res}; if it prints \
              anything other than 'drbdsetup connect' or 'drbdsetup new-path' lines, stop here and \
              get support; (3) drbdsetup del-peer {res} <peer-node-id> (read it on that node: \
              drbdsetup events2 --now {res} | grep -o 'peer-node-id:[0-9]*' | head -1); \
@@ -19969,7 +19969,7 @@ impl StateMachine {
                             self.winner_exposure_check().await;
                             if !self.sb_resolved_alerted {
                                 self.sb_resolved_alerted = xapi::send_split_brain_alert(
-                                    "TWINSTOR split-brain auto-resolved: THIS node won the \
+                                    "TwinStor split-brain auto-resolved: this node won the \
                                      resolution, kept its data and is the sync source. The peer's \
                                      diverged writes were discarded. Verify any VMs that were \
                                      running on the peer during the partition.",
@@ -20084,9 +20084,9 @@ impl StateMachine {
                                 attempts = self.sb_keepdata_stuck,
                                 restarts = self.auto_heal_restarts,
                                 holds = self.auto_heal_holds,
-                                "DUAL-MASTER wedge: yield candidate holding \
+                                "dual-master wedge: yield candidate holding \
                                  (peer not reachable yet, or a fired restart has not \
-                                 demoted us yet); NOT discarding."
+                                 demoted us yet); not discarding."
                             );
                             let capped = self.auto_heal_restarts >= AUTOHEAL_MAX_RESTARTS;
                             self.heal_state_update(
@@ -20118,9 +20118,9 @@ impl StateMachine {
                                 warn!(
                                     heal_event = "yield_fence",
                                     holds = self.auto_heal_holds,
-                                    "DUAL-MASTER wedge: restart budget exhausted and \
+                                    "dual-master wedge: restart budget exhausted and \
                                      the survivor's escalation window has passed; \
-                                     self-fencing this VM-less spurious master — a \
+                                     self-fencing this VM-less spurious master; a \
                                      fresh boot joins as slave cleanly"
                                 );
                                 self.self_fence(
@@ -20141,9 +20141,9 @@ impl StateMachine {
                             heal_event = "keep_and_alert",
                             attempts = self.sb_keepdata_stuck,
                             "split-brain: peer reachable but will not resync; suspected \
-                             DUAL-MASTER wedge. This node is the survivor or the \
+                             dual-master wedge. This node is the survivor or the \
                              case is ambiguous (has VMs / not freshly booted / tiebreak \
-                             keeper); keeping data, NOT discarding."
+                             keeper); keeping data, not discarding."
                         );
                         if !self.sb_wedge_alerted {
                             self.sb_wedge_alerted =
@@ -20252,15 +20252,15 @@ impl StateMachine {
                 );
                 if !self.sb_undecidable_alerted {
                     self.sb_undecidable_alerted = xapi::send_split_brain_alert(
-                        "TWINSTOR detected DRBD split-brain but could NOT decide which node keeps \
-                         its data. To avoid discarding good data, the cluster is NOT auto-resolving; \
-                         both copies are intact and preserved. THIS NEEDS AN OPERATOR DECISION: \
+                        "TwinStor detected DRBD split-brain but could not decide which node keeps \
+                         its data. To avoid discarding good data, the cluster is not auto-resolving; \
+                         both copies are intact and preserved. This needs an operator decision: \
                          pick the authoritative node (usually the one whose VMs kept serving / has \
-                         the writes you want). Then, on the OTHER node only: stop its VMs on \
-                         the TWINSTOR SR, stop the twinstor daemon there, run `twinstor \
+                         the writes you want). Then, on the other node only: stop its VMs on \
+                         the TwinStor SR, stop the twinstor daemon there, run `twinstor \
                          discard-and-resync`, and start the daemon again. Full procedure: FAQ, \
                          'Split-brain recovery'. Doing nothing \
-                         is safe -- the cluster holds both copies until you decide.",
+                         is safe: the cluster holds both copies until you decide.",
                     ).await;
                 }
                 // Leave the marker in place; retry on a later tick.
@@ -20294,7 +20294,7 @@ impl StateMachine {
             "self-fencing: forcing a reboot to clear a wedged resolution"
         );
         let _ = xapi::send_split_brain_alert(&format!(
-            "TWINSTOR self-fenced (forced reboot) to recover from a wedged split-brain \
+            "TwinStor self-fenced (forced reboot) to recover from a wedged split-brain \
              resolution: {reason}. This node is the split-brain loser; its diverged \
              writes are being discarded and its VMs are restarted on the winner. It \
              will rejoin and resync automatically."
@@ -20411,10 +20411,10 @@ impl StateMachine {
         warn!(
             aborted_reconnects = self.sa_aborted_reconnects,
             heal_event = "stale_primary_demote",
-            "serving Primary is the handshake-agreed stale side (kernel keeps refusing              SyncTarget-while-Primary); demoting in place so the catch-up resync can              run — consumers ride the peer path during the dance"
+            "serving Primary is the handshake-agreed stale side (kernel keeps refusing SyncTarget-while-Primary); demoting in place so the catch-up resync can run; consumers ride the peer path during the dance"
         );
         let _ = xapi::send_xapi_alert(
-            "TWINSTOR is auto-recovering this node: it promoted during a window when              the peer was unreachable, wrote nothing, and the peer meanwhile moved              ahead — DRBD refuses to resync into a serving node. It is being demoted              in place for a catch-up resync from the peer; nothing is discarded and              consumers keep their storage over the peer's path.",
+            "TwinStor is auto-recovering this node: it promoted during a window when the peer was unreachable, wrote nothing, and the peer meanwhile moved ahead, and DRBD refuses to resync into a serving node. It is being demoted in place for a catch-up resync from the peer; nothing is discarded and consumers keep their storage over the peer's path.",
         ).await;
         self.demote_stuck_suspended_primary_body().await;
     }
@@ -20439,7 +20439,7 @@ impl StateMachine {
              reconnect); demoting in place so the resync can proceed"
         );
         let _ = xapi::send_xapi_alert(
-            "TWINSTOR is auto-recovering this node: it came out of a link disturbance as \
+            "TwinStor is auto-recovering this node: it came out of a link disturbance as \
              a suspended, non-serving Primary whose reconnects the peer kept refusing \
              (its data is behind the peer's). It is being demoted in place and will \
              resync from the peer; nothing is discarded.",
@@ -20579,7 +20579,7 @@ impl StateMachine {
              recover"
         );
         let _ = xapi::send_xapi_alert(
-            "TWINSTOR self-fenced (forced reboot) to recover a stuck suspended Primary: \
+            "TwinStor self-fenced (forced reboot) to recover a stuck suspended Primary: \
              the in-place demote wedged on the suspended I/O. The node rejoins and \
              resyncs from the peer on boot; nothing is discarded.",
         )
@@ -20607,7 +20607,7 @@ impl StateMachine {
             return;
         }
         if xapi::send_xapi_alert(
-            "TWINSTOR is holding a stuck node: it is a suspended Primary whose \
+            "TwinStor is holding a stuck node: it is a suspended Primary whose \
              reconnects the peer keeps refusing, an in-place demote could not complete, \
              and a self-fence reboot was already taken recently without clearing the \
              state. Investigate the replication link and the peer, then reboot this \
@@ -20676,13 +20676,13 @@ impl StateMachine {
         warn!(
             heal_event = "yield",
             path = "gentle",
-            "DUAL-MASTER auto-heal: this node is the freshly-rebooted, VM-less \
+            "dual-master auto-heal: this node is the freshly-rebooted, VM-less \
                spurious master; restarting the local toolstack so xapi demotes it to slave \
                of the survivor (HA stays armed: no reset-master, no HA disable). The ordinary \
                split-brain loser path then discards our empty copy and resyncs."
         );
         let _ = xapi::send_ha_wedge_alert(
-            "TWINSTOR dual-master auto-heal: this node rebooted into a split-brain as a second \
+            "TwinStor dual-master auto-heal: this node rebooted into a split-brain as a second \
              pool master with no VMs. It is restarting its toolstack so xapi collapses the pool \
              back to a single master (the survivor), with HA left armed; it then discards its \
              empty diverged copy and resyncs. Verify a single master results.",
@@ -21723,12 +21723,12 @@ impl StateMachine {
                 {
                     error!(heal_event = "loser_crash_boundary", step = "record_unreadable",
                            path = %self.boundary_path, error = %e,
-                           "the crash boundary's record cannot be read: owed guest restarts are NOT run \
+                           "the crash boundary's record cannot be read: owed guest restarts are not run \
                             automatically (start the halted VMs by hand, then delete the record)");
                 }
                 if !self.boundary_record_alerted {
                     self.boundary_record_alerted = xapi::send_split_brain_alert_keyed("boundary-record-unreadable", &format!(
-                        "TWINSTOR: the record of the VMs this node stopped before a split-brain \
+                        "TwinStor: the record of the VMs this node stopped before a split-brain \
                          discard cannot be read ({e}), so they cannot be restarted automatically. \
                          Check which VMs are halted and start them by hand, then delete {}.",
                         self.boundary_path
@@ -21761,7 +21761,7 @@ impl StateMachine {
                               retry_mins = BOUNDARY_RESTART_SLOW.as_secs() / 60,
                               "an owed guest restart keeps failing: alerted, retried at a slower pace");
                         let _ = xapi::send_split_brain_alert(&format!(
-                            "TWINSTOR split-brain: the VM {} that this node stopped before its \
+                            "TwinStor split-brain: the VM {} that this node stopped before its \
                              discard has still not been started on {host_label} after \
                              {MAX_START_ATTEMPTS} attempts ({reason}). It keeps being retried every \
                              {} minutes; start it by hand if it should run.",
@@ -21905,7 +21905,7 @@ impl StateMachine {
                 // the portal close. Never discard under it: keep the copy, leave
                 // the marker, and let the next resolver round tear down again.
                 error!(error = %e, heal_event = "loser_teardown_incomplete",
-                       "split-brain: the iSCSI backstore is still exported; NOT discarding \
+                       "split-brain: the iSCSI backstore is still exported; not discarding \
                         this round (retrying the teardown on the next resolver round)");
                 self.heal_state_update(
                     "loser_teardown_incomplete",
@@ -21930,7 +21930,7 @@ impl StateMachine {
             // --discard-my-data, whose refusal (StandAlone) would then be read
             // as the peer refusing and could flip this condemned copy to winner.
             error!(error = %e, heal_event = "loser_teardown_incomplete",
-                   "split-brain: could not demote this node to Secondary; NOT offering the discard \
+                   "split-brain: could not demote this node to Secondary; not offering the discard \
                     this round (retrying on the next resolver round)");
             self.heal_state_update(
                 "loser_teardown_incomplete",
@@ -22083,7 +22083,7 @@ impl StateMachine {
                     peer_won,
                     local_uptodate = local_ud,
                     "split-brain: the peer also refused the discard (symmetric mutual-loser). \
-                       Not flipping to a second serving master -- holding down (Secondary, target \
+                       Not flipping to a second serving master; holding down (Secondary, target \
                        off) with the discard offer parked; the node entitled to the win (the \
                        keeper, or the side whose peer yielded) serves and this node converges \
                        on it when it reconnects"
@@ -22305,17 +22305,17 @@ impl StateMachine {
                 };
                 if realert {
                     let delivered = xapi::send_split_brain_alert(
-                        "TWINSTOR split-brain loser is holding down (Secondary, target off) \
+                        "TwinStor split-brain loser is holding down (Secondary, target off) \
                          with its discard offer parked, waiting for the winner to reconnect. \
                          The pool is served by the winner alone. If this persists, check why \
                          the peer node is not reconnecting (daemon down? replication link?). \
-                         SPECIAL CASE needing an operator decision: if BOTH nodes show this \
+                         Special case needing an operator decision: if both nodes show this \
                          alert, both yielded to each other (mutual yield) and neither will \
                          serve. Pick the survivor (the node with the data you want), remove \
                          its yield markers (rm /run/twinstor/fence-yielded \
                          /var/lib/twinstor/yield-loser-latched), and it promotes; the other \
                          resyncs from it automatically. Full procedure: FAQ, 'Both nodes yielded'. \
-                         Doing nothing is safe -- no data is discarded while holding.",
+                         Doing nothing is safe: no data is discarded while holding.",
                     )
                     .await;
                     if delivered {
@@ -22587,10 +22587,10 @@ fn boundary_discard_alert_body(
     winner: &str,
 ) -> String {
     let tail = if stopped.is_empty() {
-        String::from("No VM on this host was using the TWINSTOR SR, so no VM had to be stopped.")
+        String::from("No VM on this host was using the TwinStor SR, so no VM had to be stopped.")
     } else {
         format!(
-            "Before discarding, the VMs on this host that use the TWINSTOR SR were stopped (a \
+            "Before discarding, the VMs on this host that use the TwinStor SR were stopped (a \
              hard power-off) so that none keeps running on a disk rolled back underneath it; \
              they are being started on {winner} from the authoritative copy, and their writes \
              made during the split were rolled back: {}. Verify them.",
@@ -22598,8 +22598,8 @@ fn boundary_discard_alert_body(
         )
     };
     format!(
-        "TWINSTOR split-brain auto-resolved: both copies were written while the hosts could not \
-         see each other, and THIS node holds the copy that is discarded. It is resyncing from \
+        "TwinStor split-brain auto-resolved: both copies were written while the hosts could not \
+         see each other, and this node holds the copy that is discarded. It is resyncing from \
          {winner}. {tail}"
     )
 }
@@ -22660,26 +22660,26 @@ fn boundary_hold_alert_body(
     } else {
         format!(
             "Already stopped, and kept stopped because the divergence could not be read (the \
-             winner is not proven): {}.",
+             winner is not established): {}.",
             guest_names(stopped)
         )
     };
     format!(
-        "TWINSTOR split-brain: THIS node lost the resolution (both copies were written), but it \
+        "TwinStor split-brain: this node lost the resolution (both copies were written), but it \
          {blocked} (failed step: {}: {detail}). To avoid rolling disks back underneath running \
-         VMs, NOTHING was discarded: both copies are intact and this node keeps serving its own \
+         VMs, nothing was discarded: both copies are intact and this node keeps serving its own \
          copy. {completes} To resolve by hand: force-shutdown every VM on this host that uses \
-         the TWINSTOR SR, stop the twinstor daemon on this node, run `twinstor \
+         the TwinStor SR, stop the twinstor daemon on this node, run `twinstor \
          discard-and-resync` here, then start the daemon again. {already}",
         step.as_str()
     )
 }
 
 /// Sent when a discard round flips to winner after the discard alert went out.
-const FLIP_CORRECTION_ALERT: &str = "TWINSTOR split-brain, CORRECTION to the previous alert: the peer \
-     refused this node's discard, so THIS node keeps its copy after all and is the sync source; \
-     nothing was discarded here. The VMs this node stopped are started again on THIS host once \
-     the episode ends. Do NOT start them on the peer: its copy is the one replaced.";
+const FLIP_CORRECTION_ALERT: &str = "TwinStor split-brain, correction to the previous alert: the peer \
+     refused this node's discard, so this node keeps its copy after all and is the sync source; \
+     nothing was discarded here. The VMs this node stopped are started again on this host once \
+     the episode ends. Do not start them on the peer: its copy is the one replaced.";
 
 /// The bring-up winner's crash-boundary hold alert: it keeps its copy, so
 /// the operator is sent to stop VMs, never to discard.
@@ -22730,15 +22730,15 @@ fn winner_boundary_hold_alert_body(
     } else {
         (
             completes,
-            "force-shutdown every VM on this host that uses the TWINSTOR SR; it then completes by itself",
+            "force-shutdown every VM on this host that uses the TwinStor SR; it then completes by itself",
         )
     };
     format!(
-        "TWINSTOR split-brain: THIS node WON the resolution at bring-up and holds the copy that \
-         is kept. Before the peer resyncs from it, the VMs on this host that use the TWINSTOR SR \
+        "TwinStor split-brain: this node won the resolution at bring-up and holds the copy that \
+         is kept. Before the peer resyncs from it, the VMs on this host that use the TwinStor SR \
          must be stopped (they run on the peer's copy, which is about to be replaced), but it \
          {blocked} (failed step: {}: {detail}). Nothing was discarded and this node does not \
-         serve yet. {completes} To resolve by hand: {by_hand}. Do NOT run `twinstor \
+         serve yet. {completes} To resolve by hand: {by_hand}. Do not run `twinstor \
          discard-and-resync` on this node: it would discard the copy that must be kept. {already}",
         step.as_str()
     )
@@ -22768,14 +22768,14 @@ fn boundary_restart_alert_body(
         parts.push(format!("already running: {}", guest_names(already_running)));
     }
     format!(
-        "TWINSTOR split-brain: every VM stopped by the losing node before its discard is back — {}.",
+        "TwinStor split-brain: every VM stopped by the losing node before its discard is back: {}.",
         parts.join("; ")
     )
 }
 
 fn winner_exposure_alert_body(vms: Option<&str>) -> String {
     format!(
-        "TWINSTOR split-brain resolved in this node's favor, but during the split this host's \
+        "TwinStor split-brain resolved in this node's favor, but during the split this host's \
          local storage path was not confirmed as the active one, so a VM here may have read or \
          written the discarded copy through the peer's portal. Check these VMs (a reboot clears \
          any stale cached state): {}.",
@@ -22798,7 +22798,7 @@ fn loser_discard_alert_body(
     let tail = match affected {
         Some(list) if !list.is_empty() => format!(
             "These VMs were running on this node and are being restarted by HA on the winner's \
-             data; their recent writes to the TWINSTOR SR were rolled back: {list}. Verify them."
+             data; their recent writes to the TwinStor SR were rolled back: {list}. Verify them."
         ),
         Some(_) if matches!(evidence, ForkEvidence::Diverged | ForkEvidence::Unknown) => {
             String::from(
@@ -22819,7 +22819,7 @@ fn loser_discard_alert_body(
         ),
     };
     format!(
-        "TWINSTOR split-brain auto-resolved: THIS node lost the resolution (it held the older \
+        "TwinStor split-brain auto-resolved: this node lost the resolution (it held the older \
          copy, or the fewer writes made during the split, or it lost the tiebreak). Its diverged \
          writes are being discarded and it is resyncing from the peer, the winner. {tail}"
     )
@@ -22846,7 +22846,7 @@ fn diverged_alert_body(
              activity-log marks DRBD sets at restart rather than writes made during the split, \
              and its count cannot tell the two apart. Weighed without that allowance, the kept \
              copy holds ~{kept_w} blocks against ~{lost_w} on {rolled_back_host} (raw counts {} \
-             vs {}). Up to ~{} blocks on {rolled_back_host} were DISCARDED; if {rolled_back_host} \
+             vs {}). Up to ~{} blocks on {rolled_back_host} were discarded; if {rolled_back_host} \
              served guest writes after the split and before its crash, those writes are among \
              them.",
             DRBD_DEFAULT_AL_EXTENTS * BITS_PER_AL_EXTENT,
@@ -22862,14 +22862,14 @@ fn diverged_alert_body(
     } else {
         format!(
             "twinstor kept the copy holding the most un-replicated writes (~{} vs ~{} blocks); \
-             ~{} un-replicated blocks written on {rolled_back_host} were DISCARDED.",
+             ~{} un-replicated blocks written on {rolled_back_host} were discarded.",
             kept.bits, lost.bits, lost.bits
         )
     };
     format!(
-        "TWINSTOR: split-brain resolved as a TRUE FORK — both nodes wrote committed data while \
+        "TwinStor: split-brain resolved as a true fork: both nodes wrote committed data while \
          disconnected, so there is no merge. {why} Any VM that was running on {rolled_back_host} \
-         during the partition lost its most recent writes to the TWINSTOR SR — verify those VMs. \
+         during the partition lost its most recent writes to the TwinStor SR; verify those VMs. \
          This happens when both hosts keep serving while they cannot see each other (a \
          replication-only cut while both still reach the gateway), until HA fences one of them."
     )
@@ -23252,7 +23252,7 @@ fn log_lineage_evidence(
             lineage,
             blocks = *blocks,
             local_disk = ?local_disk,
-            "split-brain resolver: no usable lineage evidence — the data-blind \
+            "split-brain resolver: no usable lineage evidence; the data-blind \
              role/keeper/disk-label path decides this episode"
         ),
         Err(e) => warn!(
@@ -23262,7 +23262,7 @@ fn log_lineage_evidence(
             lineage,
             error = %e,
             local_disk = ?local_disk,
-            "split-brain resolver: lineage evidence could not be collected — the \
+            "split-brain resolver: lineage evidence could not be collected; the \
              data-blind role/keeper/disk-label path decides this episode"
         ),
     }
@@ -23470,11 +23470,11 @@ async fn survivor_ha_reset(resource: &str) {
     }
     warn!(
         heal_event = "survivor_ha_reset",
-        "DUAL-MASTER wedge: surviving master briefly disabling pool HA so the wedged peer can \
+        "dual-master wedge: surviving master briefly disabling pool HA so the wedged peer can \
            demote (its emergency_reset_master is blocked by HA_IS_ENABLED), then re-arming HA"
     );
     let _ = xapi::send_ha_wedge_alert(
-        "TWINSTOR dual-master recovery: the surviving master is briefly disabling pool HA so the \
+        "TwinStor dual-master recovery: the surviving master is briefly disabling pool HA so the \
          wedged second master can demote itself, then re-enabling HA. VMs keep running; HA \
          protection is restored automatically once the cluster reconverges.",
     )
@@ -23486,11 +23486,11 @@ async fn survivor_ha_reset(resource: &str) {
         Some(s) => s,
         None => {
             warn!(
-                "survivor_ha_reset: cannot resolve heartbeat SR uuid; NOT disabling HA \
+                "survivor_ha_reset: cannot resolve heartbeat SR uuid; not disabling HA \
                    (cannot guarantee re-arm)"
             );
             let _ = xapi::send_ha_wedge_alert(
-                "TWINSTOR dual-master recovery ABORTED: could not resolve the heartbeat SR uuid, \
+                "TwinStor dual-master recovery aborted: could not resolve the heartbeat SR uuid, \
                  so HA was left armed (the survivor will not disable an HA it cannot re-arm). \
                  Manual review needed: the peer may still be a wedged second master.",
             )
@@ -23636,12 +23636,12 @@ async fn survivor_ha_reset(resource: &str) {
         .await;
         if xapi::is_ha_enabled().await != Some(true) {
             warn!(
-                "survivor_ha_reset: HA STILL not enabled after retry; the re-arm \
+                "survivor_ha_reset: HA still not enabled after retry; the re-arm \
                    obligation stays persisted and the HA watchdog keeps retrying"
             );
             let _ = xapi::send_ha_wedge_alert(
-                "TWINSTOR dual-master recovery: HA could NOT be re-armed after the recovery window \
-                 (the peer was likely still rebooting). TWINSTOR keeps retrying automatically every \
+                "TwinStor dual-master recovery: HA could not be re-armed after the recovery window \
+                 (the peer was likely still rebooting). TwinStor keeps retrying automatically every \
                  few minutes until it succeeds. To intentionally keep HA off instead, remove \
                  /var/lib/twinstor/ha-rearm-obligation on this host."
             ).await;
@@ -23654,7 +23654,7 @@ async fn survivor_ha_reset(resource: &str) {
         info!(
             heal_event = "converged",
             via = "survivor_ha_reset",
-            "DUAL-MASTER wedge: peer demoted and resynced under the HA-off window; HA re-armed"
+            "dual-master wedge: peer demoted and resynced under the HA-off window; HA re-armed"
         );
     } else {
         warn!(
@@ -26938,7 +26938,7 @@ poll_interval_ms = 10
         );
         let (s, a) = boot_gate_texts(BootGate::HoldPeerAlive, Duration::from_secs(60));
         assert!(
-            s.contains("peer is alive") && a.contains("NOT serving its own copy"),
+            s.contains("peer is alive") && a.contains("not serving its own copy"),
             "{s} / {a}"
         );
         let (s, a) = boot_gate_texts(BootGate::HoldClearing, Duration::from_secs(60));
@@ -36684,7 +36684,7 @@ poll_interval_ms = 10
         use crate::loser_boundary::Step;
         let h = boundary_hold_alert_body(Step::ConfirmStopped, "still running: db", &stopped, true);
         assert!(
-            h.contains("NOTHING was discarded")
+            h.contains("nothing was discarded")
                 && h.contains("still running: db")
                 && h.contains("twinstor discard-and-resync")
                 && h.contains("being started on the winner")
@@ -36708,8 +36708,8 @@ poll_interval_ms = 10
         let w =
             winner_boundary_hold_alert_body(Step::ConfirmStopped, "still running: web", &stopped);
         assert!(
-            w.contains("WON the resolution")
-                && w.contains("Do NOT run `twinstor discard-and-resync`")
+            w.contains("won the resolution")
+                && w.contains("Do not run `twinstor discard-and-resync`")
                 && w.contains("still running: web")
                 && w.contains("started again on this host once the pair has converged")
                 && !w.contains("run `twinstor discard-and-resync` here")
