@@ -363,7 +363,7 @@ fn pool_master_from_conf() -> Option<bool> {
 /// This host's pool role from the local `pool.conf` (`Some(true)` master,
 /// `Some(false)` slave, `None` unreadable). A cheap local read used by the
 /// mastership-flap detector to spot the control plane oscillating while storage
-/// is healthy. See CONVERGENCE.md.
+/// is healthy.
 pub fn local_pool_role() -> Option<bool> {
     pool_master_from_conf()
 }
@@ -2602,7 +2602,7 @@ sr-uuid ( RO)       : cccc3333-3333-3333-3333-333333333333
         assert_eq!(parse_pool_role("slave:192.0.2.102\n"), Some(false));
         // The self-referential pool.conf corruption: a slave whose recorded
         // master is its own address is still unambiguously a slave, so resolution
-        // proceeds (see CONVERGENCE.md, resilient mastership read).
+        // proceeds.
         assert_eq!(parse_pool_role("slave:192.0.2.101"), Some(false));
     }
 

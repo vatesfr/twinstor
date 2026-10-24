@@ -4403,7 +4403,7 @@ const KEEPER_BACKSTOP_ATTEMPTS: u32 = 6;
 /// `MASTERSHIP_FLAP_THRESHOLD` times within `MASTERSHIP_FLAP_WINDOW` while DRBD
 /// stays Connected. That pattern is the signature of an XHA re-promotion fight
 /// (the control plane oscillates while storage is healthy), which the
-/// StandAlone-keyed wedge detection cannot see. See CONVERGENCE.md.
+/// StandAlone-keyed wedge detection cannot see.
 const MASTERSHIP_FLAP_THRESHOLD: u32 = 4;
 const MASTERSHIP_FLAP_WINDOW: Duration = Duration::from_secs(300);
 
@@ -4478,8 +4478,7 @@ const WEDGE_ALERT_BODY: &str = "TwinStor dual-master wedge: both hosts believe t
 
 /// What this node should do on its own when it detects the dual-master
 /// wedge. Decided from purely local signals (no peer query: node-to-node SSH is
-/// not available) so it is unit-testable in isolation. See CONVERGENCE.md
-/// (identifying the spurious master) for the full rationale.
+/// not available) so it is unit-testable in isolation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WedgeAction {
     /// Self-demote to the peer and discard: this node is the freshly-rebooted,
@@ -5247,7 +5246,7 @@ enum OfferAction {
 
 /// Decision for the standing discard offer, keyed on the connection state
 /// alone: a parked offer sits in `Connecting` (where a merely absent peer
-/// leaves it, see CONVERGENCE.md), converges through `Connected`, and only a
+/// leaves it), converges through `Connected`, and only a
 /// refusal or intervention lands in `StandAlone`.
 fn standing_offer_decision(armed: bool, conn: ConnectionState) -> OfferAction {
     if !armed {
@@ -12483,8 +12482,7 @@ impl StateMachine {
         }
 
         // Do not advertise the iSCSI target until the local replica is safe
-        // to serve and the toolstack has converged (see
-        // VM_PLACEMENT_SAFETY.md). A node that is still resyncing, detached or
+        // to serve and the toolstack has converged. A node that is still resyncing, detached or
         // initialising is then not a usable multipath path, so placement
         // avoids it without any XAPI hook. Re-read status after the promote
         // so role and disk are current. can_serve() allows the lone-survivor
@@ -13924,11 +13922,8 @@ impl StateMachine {
     /// route) is found at the worst moment: the next partition, when the
     /// handler freezes the node instead of surviving.
     ///
-    /// This probe is alert-only and must never feed fencing decisions.
-    /// NETWORK_TOPOLOGY_SAFETY.md documents "the daemon has no independent
-    /// gateway monitor" as a fencing design choice (gateway loss alone must
-    /// never trigger a fence); an alert-only monitor fits that, wiring it
-    /// into the fence path does not.
+    /// This probe is alert-only and must never feed fencing decisions:
+    /// gateway loss alone must never trigger a fence.
     async fn check_tiebreaker_health(&mut self) {
         // Skipped in tests: this is the one liveness monitor that probes the
         // real network. The decision itself is unit-tested directly.
@@ -14717,8 +14712,8 @@ impl StateMachine {
         let _ = self.drbd.secondary().await;
     }
 
-    /// Execute the durable isolated stand-down (see `master_isolated_decision`
-    /// and NETWORK_TOPOLOGY_SAFETY.md): stand this node's storage down so its
+    /// Execute the durable isolated stand-down (see `master_isolated_decision`):
+    /// stand this node's storage down so its
     /// VMs, already unreachable for clients, run on the peer. Writes the
     /// persistent marker first (so a crash mid-teardown still parks on
     /// reboot), then quiesces storage. Idempotent: while the marker exists a
@@ -18119,7 +18114,7 @@ impl StateMachine {
 
     /// Periodically check that pool HA is armed, and alert once if it has been
     /// disabled for longer than the grace period. Advisory only: TwinStor
-    /// cannot enforce HA (see VM_PLACEMENT_SAFETY.md), and without it the
+    /// cannot enforce HA, and without it the
     /// fencing that dual-primary relies on is gone.
     async fn check_ha_armed(&mut self) {
         let now = std::time::Instant::now();

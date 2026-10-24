@@ -51,8 +51,8 @@ peer lost the gateway too; after 15 s both disarm local XHA fencing and keep
 their VMs running (unreachable by clients until the switch returns), then
 re-arm HA. A host that loses only its own switch link is stood down after a
 confirmation window, so its VMs restart on the other host. The direct link
-protects the storage path, not the guest network. See
-NETWORK_TOPOLOGY_SAFETY.md for the full analysis.";
+protects the storage path, not the guest network. How to choose the mode:
+https://docs.vates.tech/tech-preview/twinstor/installation/";
 
 pub struct SetupParams {
     pub peer_ip: IpAddr,
@@ -67,8 +67,8 @@ pub struct SetupParams {
     /// the direct link is the default active path (declared first, reconnects
     /// steered onto it) and the switched network is the fallback a
     /// cable or NIC failure fails over to (not load-balance, which resets the
-    /// connection on any path change). See NETWORK_TOPOLOGY_SAFETY.md.
-    /// None means single-path fate-shared mode.
+    /// connection on any path change). None means single-path fate-shared
+    /// mode.
     pub direct_ip: Option<IpAddr>,
     /// Accept a deployment with no partition tiebreaker (no default gateway
     /// and no ping targets). The fence-peer handler then has nothing to
@@ -317,8 +317,7 @@ initiator_iqns = [{iqn_list}]
     }
 
     // Topology: a single switched path (fate-shared) or two active-backup
-    // paths (arbitrated mode, --direct-ip). See drbd_topology() and
-    // NETWORK_TOPOLOGY_SAFETY.md.
+    // paths (arbitrated mode, --direct-ip). See drbd_topology().
     if let Some((local_direct, _)) = direct {
         println!(
             "  direct:  arbitrated mode: replication over {local_ip} (switch) + {local_direct} (direct link)"
@@ -1088,8 +1087,8 @@ resource {res} {{
         # DRBD's 250k default is the resync-vs-application-I/O floor and collapses
         # the resync under app I/O (down to ~6 MB/s during a rolling
         # update), leaving the pool single-copy far too long and nearly capping the
-        # reboot-drain hold. Raised, topology-scaled (see resync_min_rate() and
-        # NETWORK_TOPOLOGY_SAFETY.md), so the resync keeps making real progress under
+        # reboot-drain hold. Raised, topology-scaled (see resync_min_rate()),
+        # so the resync keeps making real progress under
         # load and the single-copy window / drain hold stay bounded.
         c-fill-target {fill_target};
         c-max-rate 800M;
@@ -1464,11 +1463,11 @@ async fn create_sr(
         );
     }
 
-    // Enable XHA with the mode's timeout (see ha_timeout_secs and
-    // HA_TIMEOUT_TUNING.md). The pool default is set first, so a later
-    // `pool-ha-enable` without `ha-config:timeout` (by hand, or from Xen
-    // Orchestra) keeps this value instead of XAPI's 60 s. The value found is
-    // recorded so uninstall can put it back.
+    // Enable XHA with the mode's timeout (see ha_timeout_secs). The pool
+    // default is set first, so a later `pool-ha-enable` without
+    // `ha-config:timeout` (by hand, or from Xen Orchestra) keeps this value
+    // instead of XAPI's 60 s. The value found is recorded so uninstall can put
+    // it back.
     let ha_timeout = ha_timeout_secs(arbitrated);
     match crate::xapi::pool_default_ha_timeout().await {
         Some((found, existing)) => {
@@ -2130,9 +2129,8 @@ async fn detect_peer_hostname(peer_ip: IpAddr) -> Result<String> {
 /// of its own choosing, which can be the host running the VMs. 120 s lets a
 /// split of roughly 45-100 s heal without a reboot; 60 s covers only splits up
 /// to about 45 s. Arbitrated mode freezes I/O at the disconnect and rides a
-/// switch fault over the direct link, for which 90 s is enough (see
-/// NETWORK_TOPOLOGY_SAFETY.md). A larger value means a slower failover on a
-/// real host death.
+/// switch fault over the direct link, for which 90 s is enough. A larger value
+/// means a slower failover on a real host death.
 pub(crate) fn ha_timeout_secs(arbitrated: bool) -> u32 {
     if arbitrated { 90 } else { 120 }
 }
@@ -2245,8 +2243,7 @@ pub(crate) fn drbd_topology(
         # writes and resync storms off the switch, and it means switch faults
         # (the common ones) never touch replication. The switch path is the
         # fallback; while replication runs there the topology is temporarily
-        # fate-shared (safer, not less safe) and the daemon alerts. See
-        # NETWORK_TOPOLOGY_SAFETY.md.
+        # fate-shared (safer, not less safe) and the daemon alerts.
         path {{
             host {local_name} address {local_direct}:{port};
             host {peer_name} address {peer_direct}:{port};

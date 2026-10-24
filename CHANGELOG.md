@@ -30,6 +30,9 @@ pool.
   warnings, and says whether the SR forget that follows a failed destroy
   worked.
 
+- The bundle ships the README instead of `INSTALL.md`. The user
+  documentation is at https://docs.vates.tech/tech-preview/twinstor/.
+
 ### Fixed
 - **`twinstor uninstall` could check the wrong SR for running VMs.** The
   recorded SR uuid (`/var/lib/twinstor/sr-uuid`) survived uninstall and
@@ -104,9 +107,9 @@ freeze-mode fixes act only when both run 0.7.1.
 
 ### Known limitations
 - Arbitrated mode: a switch isolation of the pool master that outlasts the
-  XHA timeout can reboot both hosts (BEHAVIOR.md, case 39).
+  XHA timeout can reboot both hosts.
 - Fate-shared mode: a cut longer than about 60 s can end with XHA rebooting
-  either host (BEHAVIOR.md, Known limitations).
+  either host.
 - A guest whose disk handle the crash boundary had to close itself cannot
   start on that host until its datapath is released; the alert names the
   cleanup.

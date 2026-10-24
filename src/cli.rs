@@ -217,8 +217,8 @@ enum Command {
         /// switched network is the automatic fallback a cable/NIC failure
         /// fails over to (loud: alert + `twinstor status` repl path line).
         /// The direct interface must already have a static IP. Omit for the
-        /// default single-path fate-shared mode. See
-        /// NETWORK_TOPOLOGY_SAFETY.md.
+        /// default single-path fate-shared mode. How to choose:
+        /// https://docs.vates.tech/tech-preview/twinstor/installation/
         #[arg(long = "direct-ip")]
         direct_ip: Option<IpAddr>,
         /// Accept a deployment with no partition tiebreaker (no default
@@ -1520,7 +1520,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         // Reboot-safety guard arming (systemd unit enabled and active, plus the
         // config flag), so a guard that is not armed shows up in `status`.
         crate::reboot_drain::reboot_guard_state(&config),
-        // Storage readiness (see VM_PLACEMENT_SAFETY.md): toolstack
+        // Storage readiness: toolstack
         // convergence (host enabled=true) ...
         crate::xapi::is_host_enabled(),
         // ... plus the consumer-side path health (multipath map, sessions,

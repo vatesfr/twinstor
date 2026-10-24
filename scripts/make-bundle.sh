@@ -76,7 +76,7 @@ install -m 0644 config/twinstor-reboot-drain.service "$STAGE/systemd/twinstor-re
 install -m 0644 config/twinstor.toml.example  "$STAGE/twinstor.toml.example"
 install -m 0755 scripts/install.sh            "$STAGE/install.sh"
 install -m 0755 scripts/uninstall.sh          "$STAGE/uninstall.sh"
-install -m 0644 docs/INSTALL.md               "$STAGE/INSTALL.md"
+install -m 0644 README.md                     "$STAGE/README.md"
 install -m 0644 LICENSE                       "$STAGE/LICENSE"
 while read -r _ file; do
   install -m 0644 "$DEPS/$file" "$STAGE/deps/$file"
