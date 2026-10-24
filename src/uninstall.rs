@@ -507,11 +507,11 @@ async fn revert_lvm_filter(backing: &std::path::Path) {
             Err(_) => continue,
         };
         // None: pattern not present (already clean), so this is idempotent.
-        if let Some(patched) = unpatch_lvm_global_filter(&content, &name) {
-            if tokio::fs::write(conf, patched).await.is_ok() {
-                println!("  removed LVM filter for {name} in {conf}");
-                reverted = true;
-            }
+        if let Some(patched) = unpatch_lvm_global_filter(&content, &name)
+            && tokio::fs::write(conf, patched).await.is_ok()
+        {
+            println!("  removed LVM filter for {name} in {conf}");
+            reverted = true;
         }
     }
     if reverted {

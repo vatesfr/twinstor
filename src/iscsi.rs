@@ -521,10 +521,11 @@ pub fn parse_session_disks(text: &str, portal: &str) -> Vec<String> {
         let l = line.trim();
         if let Some(p) = l.strip_prefix("Current Portal:") {
             cur = p.trim().starts_with(portal);
-        } else if cur && let Some(rest) = l.strip_prefix("Attached scsi disk") {
-            if let Some(d) = rest.split_whitespace().next() {
-                v.push(d.to_string());
-            }
+        } else if cur
+            && let Some(rest) = l.strip_prefix("Attached scsi disk")
+            && let Some(d) = rest.split_whitespace().next()
+        {
+            v.push(d.to_string());
         }
     }
     v

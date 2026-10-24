@@ -565,16 +565,19 @@ async fn compute_beacon_claim(
             return beacon_claim(None, win, None);
         }
         current = drbd.local_current_uuid().await;
-        if marker && latch.is_none() && status.suspended_user && current.is_some() {
-            if !yield_had_guests(guests, &p.yield_guests).await {
-                info!(
-                    heal_event = "yield_latched",
-                    "fence-peer yield with no guest on the SR here; latching the loser \
+        if marker
+            && latch.is_none()
+            && status.suspended_user
+            && current.is_some()
+            && !yield_had_guests(guests, &p.yield_guests).await
+        {
+            info!(
+                heal_event = "yield_latched",
+                "fence-peer yield with no guest on the SR here; latching the loser \
                      verdict for this fork and announcing it on the beacon"
-                );
-                write_fork_record(&p.latch, current);
-                latch = Some(current);
-            }
+            );
+            write_fork_record(&p.latch, current);
+            latch = Some(current);
         }
     }
     let frozen_guests = marker
@@ -1366,6 +1369,7 @@ fn yield_hold_decision(
 /// (a single deterministic actor), gated on storage Connected (the probe
 /// proves the peer alive, the storage gate proves the data plane is fit to
 /// inherit).
+#[allow(clippy::too_many_arguments)]
 fn mutual_slave_decision(
     i_follow_peer: bool,
     xe_dead: bool,
@@ -1509,6 +1513,7 @@ fn master_client_isolated_verdict(
 /// Connected side: this node's configured master is unreachable while its own
 /// network is fine and the peer's daemon is alive on the replication link,
 /// and the peer does not claim to be a slave (that is the mutual-slave class).
+#[allow(clippy::too_many_arguments)]
 fn isolated_master_decision(
     i_follow_peer: bool,
     xe_dead: bool,
@@ -1551,6 +1556,7 @@ fn isolated_master_decision(
 ///     `Confirming`;
 ///   * peer unreachable on the direct link: host death, handled by the
 ///     failover path, so `None`.
+///
 /// When the local gateway is back and a hold stands, `Release` (re-arm HA).
 /// Inert in fate-shared mode (no separate direct link to learn the peer's
 /// gateway from).
@@ -4925,10 +4931,10 @@ fn refusals_since_last_disconnect(log: &str, resource: &str) -> Option<u64> {
     {
         if line.contains(CONNECTED_LOST) {
             since = Some(0);
-        } else if line.contains(STALE_TARGET_REFUSAL) {
-            if let Some(n) = since.as_mut() {
-                *n += 1;
-            }
+        } else if line.contains(STALE_TARGET_REFUSAL)
+            && let Some(n) = since.as_mut()
+        {
+            *n += 1;
         }
     }
     since
@@ -5567,6 +5573,9 @@ impl std::fmt::Display for NodeState {
     }
 }
 
+/// Inputs of an HA re-arm hold, kept to log the hold again only on change.
+type HaRearmHoldInputs = (bool, bool, bool, bool, bool, bool, Option<bool>);
+
 pub struct StateMachine {
     config: Arc<Config>,
     drbd: Box<dyn DrbdControl>,
@@ -5898,7 +5907,7 @@ pub struct StateMachine {
     /// try, alerted). See `steered_connect`.
     offer_set_withdraw: (Option<std::time::Instant>, Option<std::time::Instant>, bool),
     /// Inputs of the last HA re-arm hold logged (logged again on change).
-    ha_rearm_hold_logged: Option<(bool, bool, bool, bool, bool, bool, Option<bool>)>,
+    ha_rearm_hold_logged: Option<HaRearmHoldInputs>,
     /// Freeze mode, giving-way side: the frozen peer's generation, published
     /// as `R` only once this node is Secondary (see `resolve_as_loser`).
     freeze_give_way_gen: Option<u64>,
@@ -7172,138 +7181,138 @@ impl StateMachine {
         // over the direct link so an isolated peer can tell single-host isolation
         // from a whole-switch outage. A background updater keeps the value fresh;
         // the responder binds our direct-link address.
-        if !cfg!(test) && self.arbitrated {
-            if let Some(peer_dl) = read_first_direct_peer().await {
-                {
-                    // Firewall and responder for the direct link are set up by the unified
-                    // beacon block above (same port, same beacon); only the gateway updater and
-                    // the whole-switch fence-guard remain here.
-                    let guard_peer_dl = peer_dl.clone();
-                    self.peer_dl_ip = Some(peer_dl);
-                    let beacon = self.beacon.clone();
-                    tokio::spawn(async move {
-                        // Persist "gateway was up this boot" across a daemon restart: a binary
-                        // upgrade must not make us advertise `unknown` mid-outage and defeat the
-                        // peer's whole-switch hold. The marker is in tmpfs (/run), so a reboot
-                        // clears it and a fresh boot starts with ever_up=false.
-                        const MARKER: &str = "/run/twinstor-gateway-confirmed-up";
-                        if std::path::Path::new(MARKER).exists() {
-                            beacon.note_confirmed_up_since_boot();
+        if !cfg!(test)
+            && self.arbitrated
+            && let Some(peer_dl) = read_first_direct_peer().await
+        {
+            {
+                // Firewall and responder for the direct link are set up by the unified
+                // beacon block above (same port, same beacon); only the gateway updater and
+                // the whole-switch fence-guard remain here.
+                let guard_peer_dl = peer_dl.clone();
+                self.peer_dl_ip = Some(peer_dl);
+                let beacon = self.beacon.clone();
+                tokio::spawn(async move {
+                    // Persist "gateway was up this boot" across a daemon restart: a binary
+                    // upgrade must not make us advertise `unknown` mid-outage and defeat the
+                    // peer's whole-switch hold. The marker is in tmpfs (/run), so a reboot
+                    // clears it and a fresh boot starts with ever_up=false.
+                    const MARKER: &str = "/run/twinstor-gateway-confirmed-up";
+                    if std::path::Path::new(MARKER).exists() {
+                        beacon.note_confirmed_up_since_boot();
+                    }
+                    loop {
+                        let ok = ping_default_gateway().await;
+                        beacon.set_gateway(ok);
+                        if ok && !std::path::Path::new(MARKER).exists() {
+                            let _ = std::fs::write(MARKER, b"1");
                         }
-                        loop {
-                            let ok = ping_default_gateway().await;
-                            beacon.set_gateway(ok);
-                            if ok && !std::path::Path::new(MARKER).exists() {
-                                let _ = std::fs::write(MARKER, b"1");
-                            }
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                        }
-                    });
-                    // Fast whole-switch fence-guard: a dedicated task, decoupled from the
-                    // serial tick, that emergency-disarms local XHA fencing as soon as it
-                    // positively confirms a whole-switch outage. A tick stalled on inert
-                    // master-forwarded xapi during the outage then cannot make the disarm miss
-                    // XHA's ~105 s survival budget.
-                    let guard_flag = self.whole_switch_guard.clone();
-                    let guard_ever = self.whole_switch_guard_ever_disarmed.clone();
-                    tokio::spawn(async move {
-                        use std::sync::atomic::Ordering;
-                        let mut gw_down_since: Option<std::time::Instant> = None;
-                        let mut peer_down_since: Option<std::time::Instant> = None;
-                        let mut last_reachable_down: Option<std::time::Instant> = None;
-                        loop {
-                            let now = std::time::Instant::now();
-                            let gateway_ok = ping_default_gateway().await;
-                            // Only probe the peer beacon while we are isolated.
-                            let peer_gw = if gateway_ok {
-                                crate::peer_signal::PeerGateway::Up
-                            } else {
-                                crate::peer_signal::peer_gateway(&guard_peer_dl).await
-                            };
-                            let peer_up_now =
-                                matches!(peer_gw, crate::peer_signal::PeerGateway::Up);
-                            let peer_down_now =
-                                matches!(peer_gw, crate::peer_signal::PeerGateway::Down);
-                            let peer_unknown =
-                                matches!(peer_gw, crate::peer_signal::PeerGateway::Unknown);
-                            // Maturity clocks. gw_down_since follows the stable local "my gateway is
-                            // down" signal. peer_down_since accumulates a confirmed reachable peer
-                            // `Down`; a positive `Up` (healthy or recovered peer) or `Unknown` (booting
-                            // peer) resets it, so a blip or a reboot cannot mature it. It is kept
-                            // across a transient `Unreachable` (a probe starved by DRBD resync load),
-                            // so congestion cannot starve a genuine whole-switch outage.
-                            // last_reachable_down stamps the last reachable `Down`; the decision's
-                            // freshness gate ages out a peer that has gone away (sustained Unreachable)
-                            // so we never disarm on it.
-                            if gateway_ok {
-                                gw_down_since = None;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                });
+                // Fast whole-switch fence-guard: a dedicated task, decoupled from the
+                // serial tick, that emergency-disarms local XHA fencing as soon as it
+                // positively confirms a whole-switch outage. A tick stalled on inert
+                // master-forwarded xapi during the outage then cannot make the disarm miss
+                // XHA's ~105 s survival budget.
+                let guard_flag = self.whole_switch_guard.clone();
+                let guard_ever = self.whole_switch_guard_ever_disarmed.clone();
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering;
+                    let mut gw_down_since: Option<std::time::Instant> = None;
+                    let mut peer_down_since: Option<std::time::Instant> = None;
+                    let mut last_reachable_down: Option<std::time::Instant> = None;
+                    loop {
+                        let now = std::time::Instant::now();
+                        let gateway_ok = ping_default_gateway().await;
+                        // Only probe the peer beacon while we are isolated.
+                        let peer_gw = if gateway_ok {
+                            crate::peer_signal::PeerGateway::Up
+                        } else {
+                            crate::peer_signal::peer_gateway(&guard_peer_dl).await
+                        };
+                        let peer_up_now = matches!(peer_gw, crate::peer_signal::PeerGateway::Up);
+                        let peer_down_now =
+                            matches!(peer_gw, crate::peer_signal::PeerGateway::Down);
+                        let peer_unknown =
+                            matches!(peer_gw, crate::peer_signal::PeerGateway::Unknown);
+                        // Maturity clocks. gw_down_since follows the stable local "my gateway is
+                        // down" signal. peer_down_since accumulates a confirmed reachable peer
+                        // `Down`; a positive `Up` (healthy or recovered peer) or `Unknown` (booting
+                        // peer) resets it, so a blip or a reboot cannot mature it. It is kept
+                        // across a transient `Unreachable` (a probe starved by DRBD resync load),
+                        // so congestion cannot starve a genuine whole-switch outage.
+                        // last_reachable_down stamps the last reachable `Down`; the decision's
+                        // freshness gate ages out a peer that has gone away (sustained Unreachable)
+                        // so we never disarm on it.
+                        if gateway_ok {
+                            gw_down_since = None;
+                            peer_down_since = None;
+                        } else {
+                            gw_down_since.get_or_insert(now);
+                            if peer_down_now {
+                                peer_down_since.get_or_insert(now);
+                                last_reachable_down = Some(now);
+                            } else if peer_up_now || peer_unknown {
                                 peer_down_since = None;
-                            } else {
-                                gw_down_since.get_or_insert(now);
-                                if peer_down_now {
-                                    peer_down_since.get_or_insert(now);
-                                    last_reachable_down = Some(now);
-                                } else if peer_up_now || peer_unknown {
-                                    peer_down_since = None;
-                                }
-                                // Unreachable: preserve both clocks (ambiguous).
                             }
-                            let already_disarmed = guard_flag.load(Ordering::Relaxed);
-                            match whole_switch_guard_decision(
-                                true,
-                                gateway_ok,
-                                peer_up_now,
-                                gw_down_since,
-                                peer_down_since,
-                                last_reachable_down,
-                                already_disarmed,
-                                now,
-                                WHOLE_SWITCH_CONFIRM,
-                                WHOLE_SWITCH_PEER_DOWN_FRESHNESS,
-                            ) {
-                                GuardAction::Disarm => {
-                                    // Emergency-disarm local fencing to beat the XHA
-                                    // state-file survival watchdog. Idempotent with
-                                    // the main tick's ha_disable_local.
-                                    let _ = crate::cmd::cmd_output_for(
-                                        "xe",
-                                        &["host-emergency-ha-disable", "--force"],
-                                        30,
-                                    )
-                                    .await;
-                                    guard_flag.store(true, Ordering::Relaxed);
-                                    guard_ever.store(true, Ordering::Relaxed);
-                                    warn!(
-                                        heal_event = "whole_switch_guard_disarm",
-                                        "fast fence-guard confirmed a whole-switch outage \
+                            // Unreachable: preserve both clocks (ambiguous).
+                        }
+                        let already_disarmed = guard_flag.load(Ordering::Relaxed);
+                        match whole_switch_guard_decision(
+                            true,
+                            gateway_ok,
+                            peer_up_now,
+                            gw_down_since,
+                            peer_down_since,
+                            last_reachable_down,
+                            already_disarmed,
+                            now,
+                            WHOLE_SWITCH_CONFIRM,
+                            WHOLE_SWITCH_PEER_DOWN_FRESHNESS,
+                        ) {
+                            GuardAction::Disarm => {
+                                // Emergency-disarm local fencing to beat the XHA
+                                // state-file survival watchdog. Idempotent with
+                                // the main tick's ha_disable_local.
+                                let _ = crate::cmd::cmd_output_for(
+                                    "xe",
+                                    &["host-emergency-ha-disable", "--force"],
+                                    30,
+                                )
+                                .await;
+                                guard_flag.store(true, Ordering::Relaxed);
+                                guard_ever.store(true, Ordering::Relaxed);
+                                warn!(
+                                    heal_event = "whole_switch_guard_disarm",
+                                    "fast fence-guard confirmed a whole-switch outage \
                                            (my client gateway down + the peer's gateway also \
                                            down over the direct link) and emergency-disarmed \
                                            local XHA fencing ahead of the serial tick, to keep \
                                            VMs running rather than let XHA self-fence. The tick \
                                            adopts the hold and re-arms HA when the switch returns."
-                                    );
-                                }
-                                GuardAction::Rearm => {
-                                    // Only clear the active latch. HA re-arm belongs to the serial tick (its
-                                    // whole_switch_release handler) so xhad is restarted once: re-arming here
-                                    // as well joins a second xhad into the still-settling recovery and XHA
-                                    // self-fences. The `ever_disarmed` latch makes the tick re-arm even for a
-                                    // hold it never saw.
-                                    guard_flag.store(false, Ordering::Relaxed);
-                                    info!(
-                                        heal_event = "whole_switch_guard_release",
-                                        "fast fence-guard: whole-switch over (client gateway \
+                                );
+                            }
+                            GuardAction::Rearm => {
+                                // Only clear the active latch. HA re-arm belongs to the serial tick (its
+                                // whole_switch_release handler) so xhad is restarted once: re-arming here
+                                // as well joins a second xhad into the still-settling recovery and XHA
+                                // self-fences. The `ever_disarmed` latch makes the tick re-arm even for a
+                                // hold it never saw.
+                                guard_flag.store(false, Ordering::Relaxed);
+                                info!(
+                                    heal_event = "whole_switch_guard_release",
+                                    "fast fence-guard: whole-switch over (client gateway \
                                            back, or the peer now serves its gateway up); cleared \
                                            the disarm latch; the main tick re-arms HA once"
-                                    );
-                                }
-                                GuardAction::None => {}
+                                );
                             }
-                            tokio::time::sleep(WHOLE_SWITCH_GUARD_INTERVAL).await;
+                            GuardAction::None => {}
                         }
-                    });
-                    info!("direct-link gateway beacon started");
-                }
+                        tokio::time::sleep(WHOLE_SWITCH_GUARD_INTERVAL).await;
+                    }
+                });
+                info!("direct-link gateway beacon started");
             }
         }
         if !cfg!(test) {
@@ -7718,13 +7727,17 @@ impl StateMachine {
         };
 
         // Log DRBD state changes (disk, peer_disk, connection)
-        if self.last_disk.is_some() && self.last_disk != Some(status.disk) {
-            info!(from = ?self.last_disk.unwrap(), to = ?status.disk, "DRBD disk state changed");
+        if let Some(old) = self.last_disk
+            && old != status.disk
+        {
+            info!(from = ?old, to = ?status.disk, "DRBD disk state changed");
         }
         self.last_disk = Some(status.disk);
 
-        if self.last_peer_disk.is_some() && self.last_peer_disk != Some(status.peer_disk) {
-            match (self.last_peer_disk.unwrap(), status.peer_disk) {
+        if let Some(old_peer) = self.last_peer_disk
+            && old_peer != status.peer_disk
+        {
+            match (old_peer, status.peer_disk) {
                 (Some(old), Some(new)) => {
                     info!(from = ?old, to = ?new, "DRBD peer disk state changed")
                 }
@@ -7853,32 +7866,30 @@ impl StateMachine {
         // control-plane instability can be told apart from a storage problem.
         // Only evaluated while Connected (a flip during a real resolution is
         // expected).
-        if peer_connected {
-            if let Some(role) = xapi::local_pool_role() {
-                if self.last_pool_role.is_some_and(|prev| prev != role) {
-                    let now = std::time::Instant::now();
-                    let within_window = self
-                        .flap_window_start
-                        .is_some_and(|t| now.duration_since(t) < MASTERSHIP_FLAP_WINDOW);
-                    if within_window {
-                        self.flap_count = self.flap_count.saturating_add(1);
-                    } else {
-                        self.flap_window_start = Some(now);
-                        self.flap_count = 1;
-                    }
-                    if self.flap_count >= MASTERSHIP_FLAP_THRESHOLD {
-                        warn!(
-                            heal_event = "mastership_flap",
-                            flips = self.flap_count,
-                            "pool.conf role flapping while DRBD is Connected: suspected XHA \
-                             re-promotion fight (control plane unstable, storage healthy)"
-                        );
-                        self.flap_window_start = Some(now); // re-arm the window
-                        self.flap_count = 0;
-                    }
+        if peer_connected && let Some(role) = xapi::local_pool_role() {
+            if self.last_pool_role.is_some_and(|prev| prev != role) {
+                let now = std::time::Instant::now();
+                let within_window = self
+                    .flap_window_start
+                    .is_some_and(|t| now.duration_since(t) < MASTERSHIP_FLAP_WINDOW);
+                if within_window {
+                    self.flap_count = self.flap_count.saturating_add(1);
+                } else {
+                    self.flap_window_start = Some(now);
+                    self.flap_count = 1;
                 }
-                self.last_pool_role = Some(role);
+                if self.flap_count >= MASTERSHIP_FLAP_THRESHOLD {
+                    warn!(
+                        heal_event = "mastership_flap",
+                        flips = self.flap_count,
+                        "pool.conf role flapping while DRBD is Connected: suspected XHA \
+                             re-promotion fight (control plane unstable, storage healthy)"
+                    );
+                    self.flap_window_start = Some(now); // re-arm the window
+                    self.flap_count = 0;
+                }
             }
+            self.last_pool_role = Some(role);
         }
 
         // Redundancy watchdog. A dead, disconnected or not-UpToDate peer leaves
@@ -8351,27 +8362,25 @@ impl StateMachine {
                     self.resolve_split_brain().await;
                     return;
                 }
-                if let Ok(s) = self.drbd.status().await {
-                    if s.connection == crate::drbd::ConnectionState::Connected {
-                        info!(
-                            waited_secs = i + 1,
-                            "clean reconnect succeeded (no data discarded)"
-                        );
-                        if s.role != crate::drbd::Role::Primary
-                            && !self.promote_after_reconnect().await
-                        {
-                            // The Online tick never promotes: bring-up does.
-                            self.set_state(NodeState::Init);
-                        }
-                        return;
+                if let Ok(s) = self.drbd.status().await
+                    && s.connection == crate::drbd::ConnectionState::Connected
+                {
+                    info!(
+                        waited_secs = i + 1,
+                        "clean reconnect succeeded (no data discarded)"
+                    );
+                    if s.role != crate::drbd::Role::Primary && !self.promote_after_reconnect().await
+                    {
+                        // The Online tick never promotes: bring-up does.
+                        self.set_state(NodeState::Init);
                     }
+                    return;
                 }
             }
             // Not connected and not split-brain: the peer is most likely still
             // down. Leave the resource alone and retry on a later tick. Never
             // discard blindly just because the peer has not come back yet.
             info!("reconnect pending (peer not back yet); will retry, no data discarded");
-            return;
         }
 
         // (Inconsistent = sync in progress: normal during initial sync or a
@@ -11235,10 +11244,10 @@ impl StateMachine {
     /// (this copy's I/O suspended, the peer not Connected). Read at most once
     /// a second: the tick re-checks it before each XAPI-bound step.
     async fn freeze_read(&mut self) -> (bool, bool) {
-        if let Some((at, frozen, disconnected)) = self.io_frozen_read {
-            if at.elapsed() < Duration::from_secs(1) {
-                return (frozen, disconnected);
-            }
+        if let Some((at, frozen, disconnected)) = self.io_frozen_read
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return (frozen, disconnected);
         }
         let (frozen, disconnected) = match self.drbd.status().await {
             Ok(s) => (
@@ -14961,10 +14970,10 @@ impl StateMachine {
             // reboot, disable the armed xhad so it does not re-fence in a loop
             // against the intentionally unavailable statefile. A boot_id change
             // marks the post-fence boot; master-path markers never match.
-            if let Ok(content) = std::fs::read_to_string(ISOLATED_STANDDOWN_MARKER) {
-                if slave_fence_needs_ha_disable(&content, &current_boot_id()) {
-                    self.ha_disable_local().await;
-                }
+            if let Ok(content) = std::fs::read_to_string(ISOLATED_STANDDOWN_MARKER)
+                && slave_fence_needs_ha_disable(&content, &current_boot_id())
+            {
+                self.ha_disable_local().await;
             }
             self.quiesce_storage().await;
             let realert = match self.standdown_hold_alert_at {
@@ -19062,27 +19071,21 @@ impl StateMachine {
         // giver's generation. Re-bind the record while the peer still gives
         // way, so this node's W and its own win record keep matching the fork
         // the resolver reads, instead of falling through to the lineage.
-        if s.connection != ConnectionState::Connected {
-            if let Some(Some(recorded)) = read_fork_record(&self.win_path) {
-                if let Ok(crate::drbd::LineageRead { pair: Some(h), .. }) =
-                    self.drbd.handshake_read().await
-                {
-                    if !same_gen(recorded, h.peer.current)
-                        && matches!(
-                            self.query_peer_claim().await,
-                            crate::peer_signal::PeerClaim::Claim(
-                                crate::peer_signal::ForkClaim::GiveWay(_)
-                            )
-                        )
-                    {
-                        info!(
-                            heal_event = "freeze_win_rebound",
-                            "freeze mode: the giving peer's generation moved; re-binding this node's win to it"
-                        );
-                        write_fork_record(&self.win_path, Some(h.peer.current));
-                    }
-                }
-            }
+        if s.connection != ConnectionState::Connected
+            && let Some(Some(recorded)) = read_fork_record(&self.win_path)
+            && let Ok(crate::drbd::LineageRead { pair: Some(h), .. }) =
+                self.drbd.handshake_read().await
+            && !same_gen(recorded, h.peer.current)
+            && matches!(
+                self.query_peer_claim().await,
+                crate::peer_signal::PeerClaim::Claim(crate::peer_signal::ForkClaim::GiveWay(_))
+            )
+        {
+            info!(
+                heal_event = "freeze_win_rebound",
+                "freeze mode: the giving peer's generation moved; re-binding this node's win to it"
+            );
+            write_fork_record(&self.win_path, Some(h.peer.current));
         }
         if !std::path::Path::new(&self.give_way_path).exists() {
             self.give_way_taken = false;
@@ -19107,20 +19110,21 @@ impl StateMachine {
         }
         // Outside the Online StandAlone step (bring-up after a daemon restart,
         // for one): the giver still offers its discard to a peer that took it.
-        if s.connection == ConnectionState::StandAlone && self.state != NodeState::Online {
-            if matches!(
+        if s.connection == ConnectionState::StandAlone
+            && self.state != NodeState::Online
+            && matches!(
                 self.query_peer_claim().await,
                 crate::peer_signal::PeerClaim::Claim(crate::peer_signal::ForkClaim::Won(_))
-            ) {
-                self.mark_give_way_taken();
-                info!(
-                    heal_event = "freeze_give_way_reoffer",
-                    entry = "bring_up",
-                    "freeze mode: giving way; the peer took it, offering the discard"
-                );
-                self.steered_connect(true).await;
-                return;
-            }
+            )
+        {
+            self.mark_give_way_taken();
+            info!(
+                heal_event = "freeze_give_way_reoffer",
+                entry = "bring_up",
+                "freeze mode: giving way; the peer took it, offering the discard"
+            );
+            self.steered_connect(true).await;
+            return;
         }
         if s.connection == ConnectionState::Connected {
             info!(
@@ -19164,6 +19168,7 @@ impl StateMachine {
     /// - no decision yet: hold up to `FREEZE_DECISION_WAIT`, then step down
     ///   if the peer answers; an unreachable or also-frozen peer keeps the
     ///   old behaviour.
+    ///
     /// Survivor (serving, the peer frozen with guests, `G`): gives way when no
     /// guest on the SR ran here during the split, else keeps (`W`).
     async fn freeze_standalone_step(&mut self, status: &DrbdStatus) -> bool {
@@ -23689,11 +23694,10 @@ async fn plug_and_multipath(config_path: &str) {
                 .output(),
         )
         .await
+            && out.status.success()
         {
-            if out.status.success() {
-                info!(waited_secs = i * 2, "plug_and_multipath: XAPI ready");
-                break;
-            }
+            info!(waited_secs = i * 2, "plug_and_multipath: XAPI ready");
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -23902,7 +23906,7 @@ mod tests {
         // The non-keeper fires the survivor HA-reset first; the keeper only
         // backstops strictly later, so a symmetric no-reboot partition never has
         // both nodes toggle pool HA on the same threshold.
-        assert!(SURVIVOR_HA_RESET_KEEPER_BACKSTOP > SURVIVOR_HA_RESET_ATTEMPTS);
+        const { assert!(SURVIVOR_HA_RESET_KEEPER_BACKSTOP > SURVIVOR_HA_RESET_ATTEMPTS) };
     }
 
     struct MockDrbd {
@@ -35496,7 +35500,7 @@ poll_interval_ms = 10
             "never handed to the stuck-Primary demote"
         );
         assert!(
-            drbd.calls().iter().any(|c| *c == "secondary"),
+            drbd.calls().contains(&"secondary"),
             "calls: {:?}",
             drbd.calls()
         );
@@ -35557,7 +35561,7 @@ poll_interval_ms = 10
         sm.test_refusals = Some(1);
         assert!(sm.arbitrated_yield_step(&status).await);
         assert!(
-            drbd.calls().iter().any(|c| *c == "secondary"),
+            drbd.calls().contains(&"secondary"),
             "stepped down; calls: {:?}",
             drbd.calls()
         );
@@ -35664,7 +35668,7 @@ poll_interval_ms = 10
             if sm.arb_yield_xapi_wait_since.is_some() {
                 assert!(sm.arbitrated_yield_step(&status).await);
                 assert!(
-                    drbd.calls().iter().any(|c| *c == "secondary"),
+                    drbd.calls().contains(&"secondary"),
                     "{case}: calls: {:?}",
                     drbd.calls()
                 );
@@ -35811,7 +35815,7 @@ poll_interval_ms = 10
             assert!(!sm.arbitrated_yield_step(&status).await, "{hs:?}");
         }
         assert!(
-            !drbd.calls().iter().any(|c| *c == "secondary"),
+            !drbd.calls().contains(&"secondary"),
             "calls: {:?}",
             drbd.calls()
         );

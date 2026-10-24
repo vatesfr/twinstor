@@ -805,10 +805,8 @@ pub fn parse_events2_peer_node_id(text: &str) -> Option<u32> {
                 _ => {}
             }
         }
-        if is_connection {
-            if let Some(id) = id {
-                return Some(id);
-            }
+        if is_connection && let Some(id) = id {
+            return Some(id);
         }
     }
     None

@@ -82,7 +82,8 @@ impl Diagnosis {
         match self.quiescent() {
             Some(false) => {
                 return Some(
-                    "storage is still healing, so this is not a pure toolstack knot (gate 1)".into(),
+                    "storage is still healing, so this is not a pure toolstack knot (gate 1)"
+                        .into(),
                 );
             }
             None => {

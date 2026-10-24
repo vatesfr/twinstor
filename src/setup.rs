@@ -1611,10 +1611,9 @@ async fn wait_for_peer(peer_ip: IpAddr, drbd_port: u16, timeout_secs: u64) -> bo
             tokio::net::TcpStream::connect(format!("{peer_ip}:{drbd_port}")),
         )
         .await
+            && stream.is_ok()
         {
-            if stream.is_ok() {
-                return true;
-            }
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -2499,8 +2498,7 @@ mod tests {
             let log = self.log();
             let line = log
                 .lines()
-                .filter(|l| l.contains("started:"))
-                .last()
+                .rfind(|l| l.contains("started:"))
                 .unwrap_or("")
                 .to_string();
             line.rsplit("freeze=[")

@@ -1603,7 +1603,7 @@ pub async fn catch_rebuilt(
     watermark: Option<u32>,
 ) -> Result<Vec<Rebuilt>, String> {
     let scan = ctl.local_scan().await?;
-    let (mut suspect, mut later): (Vec<(u32, String)>, Vec<(u32, String)>) = scan
+    let (mut suspect, mut later): (Vec<_>, Vec<_>) = scan
         .on_sr
         .iter()
         .cloned()
@@ -2638,6 +2638,7 @@ pub enum RestartTick {
 /// a fresh boot on this host reads the winner's history (the resync, or the
 /// winner's portal while this copy is not served), so no running guest ever
 /// sees a history switch.
+#[cfg(test)]
 pub async fn run_restarts(
     ctl: &dyn GuestControl,
     store: &Store,
@@ -6408,7 +6409,7 @@ pid=34235 minor=1 state=0 args=vhd:/dev/VG_XenStorage-5e5e000f-0000-4000-8000-00
         let ask = calls
             .iter()
             .position(|c| c == "xapi-shutdown a,b")
-            .expect(&format!("{calls:?}"));
+            .unwrap_or_else(|| panic!("{calls:?}"));
         let destroy = calls
             .iter()
             .position(|c| c.starts_with("destroy "))
@@ -6462,11 +6463,11 @@ pid=34235 minor=1 state=0 args=vhd:/dev/VG_XenStorage-5e5e000f-0000-4000-8000-00
         let off = calls
             .iter()
             .position(|c| c == "poweroff a,b")
-            .expect(&format!("{calls:?}"));
+            .unwrap_or_else(|| panic!("{calls:?}"));
         let ask = calls
             .iter()
             .position(|c| c == "xapi-shutdown a,b")
-            .expect(&format!("{calls:?}"));
+            .unwrap_or_else(|| panic!("{calls:?}"));
         assert!(off < ask, "XAPI asked after the poweroff: {calls:?}");
         assert_eq!(
             calls
@@ -6499,15 +6500,15 @@ pid=34235 minor=1 state=0 args=vhd:/dev/VG_XenStorage-5e5e000f-0000-4000-8000-00
         let slow = calls
             .iter()
             .position(|c| c == "poweroff slow")
-            .expect(&format!("{calls:?}"));
+            .unwrap_or_else(|| panic!("{calls:?}"));
         let ask = calls
             .iter()
             .position(|c| c == "xapi-shutdown a")
-            .expect(&format!("{calls:?}"));
+            .unwrap_or_else(|| panic!("{calls:?}"));
         let off = calls
             .iter()
             .position(|c| c == "poweroff a")
-            .expect(&format!("{calls:?}"));
+            .unwrap_or_else(|| panic!("{calls:?}"));
         assert!(
             slow < ask && ask < off,
             "asked during the slow call: {calls:?}"
@@ -6773,8 +6774,10 @@ pid=34235 minor=1 state=0 args=vhd:/dev/VG_XenStorage-5e5e000f-0000-4000-8000-00
             RestartTick::Idle
         );
         assert!(ctl.calls().is_empty());
-        let mut ctl2 = FakeGuests::default();
-        ctl2.no_hosts = true;
+        let ctl2 = FakeGuests {
+            no_hosts: true,
+            ..Default::default()
+        };
         s.close_episode().unwrap();
         assert_eq!(
             run_restarts(&ctl2, &s, false, false).await,

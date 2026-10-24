@@ -751,14 +751,12 @@ async fn run_discard_and_resync(
         .status()
         .await
         .is_ok_and(|st| st.suspended_user || st.suspended_fencing);
-    if suspended_now {
-        if let Err(why) = crate::loser_boundary::operator_lift_check(&guests).await {
-            return Err(crate::render::CliError::new(
+    if suspended_now && let Err(why) = crate::loser_boundary::operator_lift_check(&guests).await {
+        return Err(crate::render::CliError::new(
                 format!("{why}; this copy's I/O is suspended and stays suspended, nothing was changed"),
                 "stop that VM (xe vm-shutdown --force uuid=<vm>), or wait for its start to finish and stop it, then retry",
             )
             .into());
-        }
     }
     // Only the enabled flag: a failed maintenance-marker read must not lose it.
     let was_enabled = crate::xapi::is_host_enabled().await;
@@ -2359,479 +2357,6 @@ fn kernels_missing_drbd(root: &std::path::Path) -> Vec<String> {
     missing
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn discard_and_resync_treats_an_unclear_daemon_state_as_running() {
-        use super::daemon_may_be_running;
-        assert!(!daemon_may_be_running(&Ok("inactive\n".into())));
-        assert!(!daemon_may_be_running(&Ok("failed".into())));
-        for s in [
-            "active",
-            "activating",
-            "deactivating",
-            "reloading",
-            "unknown",
-            "",
-        ] {
-            assert!(daemon_may_be_running(&Ok(s.into())), "{s}");
-        }
-        assert!(daemon_may_be_running(&Err(anyhow::anyhow!("timed out"))));
-    }
-
-    #[tokio::test]
-    async fn write_atomic_replaces_the_file_and_keeps_it_private() {
-        use super::write_atomic;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tw-write-atomic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("twinstor.toml");
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-
-        // A new file is created 0600, never with the umask's default.
-        write_atomic(&path, b"one").await.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"one");
-        assert_eq!(mode(&path), 0o600);
-
-        // An existing file keeps its mode and gets the new contents.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        write_atomic(&path, b"two").await.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"two");
-        assert_eq!(mode(&path), 0o640);
-
-        // A temp file left by an interrupted run does not block the next write.
-        std::fs::write(dir.join(".twinstor.toml.tmp"), b"stale").unwrap();
-        write_atomic(&path, b"three").await.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"three");
-        assert!(!dir.join(".twinstor.toml.tmp").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn discard_and_resync_refuses_every_unsafe_state() {
-        use super::discard_refusal;
-        use crate::drbd::ConnectionState::*;
-        use crate::loser_boundary::LocalScan;
-        let clear: std::result::Result<LocalScan, String> = Ok(LocalScan::default());
-        let busy: std::result::Result<LocalScan, String> = Ok(LocalScan {
-            all: vec![(4, "u".into())],
-            on_sr: vec![(4, "u".into())],
-        });
-        let unreadable: std::result::Result<LocalScan, String> = Err("xl failed".into());
-        // The safe case: daemon stopped, StandAlone, no guest on the SR.
-        assert_eq!(
-            discard_refusal(false, Some(StandAlone), false, None, false, false, &clear),
-            None
-        );
-        assert_eq!(
-            discard_refusal(false, Some(Connecting), true, None, false, false, &clear),
-            None,
-            "marker present"
-        );
-        // Each refusal names what is wrong.
-        assert!(
-            discard_refusal(true, Some(StandAlone), true, None, false, false, &clear)
-                .unwrap()
-                .0
-                .contains("daemon is running")
-        );
-        assert!(
-            discard_refusal(false, Some(Connected), false, None, false, false, &clear)
-                .unwrap()
-                .0
-                .contains("no split-brain")
-        );
-        assert!(
-            discard_refusal(false, None, true, None, false, false, &clear)
-                .unwrap()
-                .0
-                .contains("could not be read")
-        );
-        assert!(
-            discard_refusal(false, Some(StandAlone), true, None, false, false, &busy)
-                .unwrap()
-                .0
-                .contains("domid 4")
-        );
-        assert!(
-            discard_refusal(
-                false,
-                Some(StandAlone),
-                true,
-                None,
-                false,
-                false,
-                &unreadable
-            )
-            .unwrap()
-            .0
-            .contains("cannot tell")
-        );
-        // The lineage says this node keeps: refused unless explicitly overridden.
-        let kept = discard_refusal(
-            false,
-            Some(StandAlone),
-            true,
-            Some(true),
-            false,
-            false,
-            &clear,
-        )
-        .unwrap();
-        assert!(
-            kept.0.contains("copy to keep") && kept.1.contains("--discard-kept-copy"),
-            "{kept:?}"
-        );
-        assert_eq!(
-            discard_refusal(
-                false,
-                Some(StandAlone),
-                true,
-                Some(true),
-                false,
-                true,
-                &clear
-            ),
-            None
-        );
-        assert_eq!(
-            discard_refusal(
-                false,
-                Some(StandAlone),
-                true,
-                Some(false),
-                false,
-                false,
-                &clear
-            ),
-            None
-        );
-        // A tie: the lineage cannot pick; refused on either node until the
-        // operator decides, and never told to try the other node.
-        let tie = discard_refusal(
-            false,
-            Some(StandAlone),
-            true,
-            Some(true),
-            true,
-            false,
-            &clear,
-        )
-        .unwrap();
-        assert!(
-            tie.0.contains("cannot tell which copy")
-                && tie.1.contains("--discard-kept-copy")
-                && !tie.1.contains("other node"),
-            "{tie:?}"
-        );
-        assert_eq!(
-            discard_refusal(
-                false,
-                Some(StandAlone),
-                true,
-                Some(true),
-                true,
-                true,
-                &clear
-            ),
-            None
-        );
-    }
-
-    use super::{
-        PEER_ALIVE_STALE_SECS, UpgradeBlocker, adjust_refused_live_reconfigure, iscsi_json,
-        iscsi_sev, iscsi_word, kernels_missing_drbd, node_ids_by_host, parse_res_node_ids,
-        peer_daemon_alive_from_stamp, peer_incompatible_change, probe_output,
-        replace_backing_device_line, upgrade_apply_blockers,
-    };
-
-    // An unanswered iSCSI probe (targetcli wedged on dead backing) renders as
-    // unknown in every output mode, never as "not exported", which would push
-    // the operator to re-export a target that is still there.
-    #[test]
-    fn iscsi_probe_timeout_renders_unknown_not_inactive() {
-        use crate::render::Sev;
-        assert_eq!(iscsi_word(None), "unknown");
-        assert_eq!(iscsi_json(None), "null");
-        assert_eq!(iscsi_sev(None), Sev::Warn);
-        // The two real answers are unchanged.
-        assert_eq!(iscsi_word(Some(true)), "active");
-        assert_eq!(iscsi_json(Some(true)), "true");
-        assert_eq!(iscsi_sev(Some(true)), Sev::Good);
-        assert_eq!(iscsi_word(Some(false)), "inactive");
-        assert_eq!(iscsi_json(Some(false)), "false");
-        assert_eq!(iscsi_sev(Some(false)), Sev::Bad);
-    }
-
-    // A probe whose command wedges (as targetcli, multipath and drbdadm do when
-    // the backing disks are pulled) returns None within its bound instead of
-    // hanging `twinstor status`.
-    #[tokio::test]
-    async fn probe_output_times_out_on_a_wedged_command() {
-        let start = std::time::Instant::now();
-        // `sleep 30` stands in for a probe blocked on dead I/O; the 1s bound must win.
-        let got = probe_output("sleep", &["30"], 1).await;
-        let elapsed = start.elapsed();
-        assert!(
-            got.is_none(),
-            "a wedged probe must report unknown (None), not block"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "probe must return at ~the bound, not run to completion (took {elapsed:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn probe_output_returns_output_for_a_fast_command() {
-        let got = probe_output("true", &[], 5)
-            .await
-            .expect("fast command should return Some");
-        assert!(got.status.success());
-    }
-
-    #[tokio::test]
-    async fn probe_output_none_when_command_missing() {
-        // Spawn failure (no such binary) is unknown, not a panic.
-        assert!(
-            probe_output("twinstor-no-such-binary-xyz", &[], 5)
-                .await
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn peer_incompatible_change_detects_lb_and_nodeids() {
-        // multi-line `on` blocks, as render_res_file / real .res files emit them.
-        let ids = "    on a {\n        node-id 0;\n    }\n    on b {\n        node-id 1;\n    }\n";
-        let lb = format!(
-            "resource r {{\n{ids}    connection {{\n        net {{ load-balance-paths yes; }}\n        path {{ }}\n    }}\n}}\n"
-        );
-        let ab = format!(
-            "resource r {{\n{ids}    connection {{\n        path {{ }}\n        path {{ }}\n    }}\n}}\n"
-        );
-        // Switching load-balance-paths to active-backup is peer-incompatible.
-        assert!(
-            peer_incompatible_change(&lb, &ab)
-                .unwrap()
-                .contains("path transport mode")
-        );
-        // And the reverse.
-        assert!(peer_incompatible_change(&ab, &lb).is_some());
-        // Same path mode and node-ids (a disk-options-only change) is not flagged.
-        assert!(peer_incompatible_change(&ab, &ab).is_none());
-        // A node-id swap is flagged.
-        let swapped =
-            "    on a {\n        node-id 1;\n    }\n    on b {\n        node-id 0;\n    }\n";
-        let ab_sw = format!(
-            "resource r {{\n{swapped}    connection {{\n        path {{ }}\n        path {{ }}\n    }}\n}}\n"
-        );
-        assert!(
-            peer_incompatible_change(&ab, &ab_sw)
-                .unwrap()
-                .contains("node-ids")
-        );
-    }
-
-    #[test]
-    fn node_ids_by_host_parses_pairs() {
-        let res = "    on host-a {\n        node-id 1;\n    }\n    on host-b {\n        node-id 0;\n    }\n";
-        assert_eq!(
-            node_ids_by_host(res),
-            vec![("host-a".to_string(), 1), ("host-b".to_string(), 0)]
-        );
-        // No node-ids (very old .res) gives an empty list, so
-        // peer_incompatible_change does not flag a config that never had them.
-        assert!(node_ids_by_host("    on a {\n        device /dev/drbd0;\n    }").is_empty());
-    }
-
-    #[test]
-    fn parse_res_node_ids_preserves_or_absent() {
-        // Inverted ids (local host-a is node-id 1, peer host-b is 0) happen in
-        // practice; regenerate must re-emit these, never reassign by hostname.
-        let with_ids = "resource twinstor-data {\n\
-            \x20   on host-a {\n        node-id 1;\n        device /dev/drbd0; meta-disk internal;\n    }\n\
-            \x20   on host-b {\n        node-id 0;\n        device /dev/drbd0; meta-disk internal;\n    }\n}\n";
-        assert_eq!(
-            parse_res_node_ids(with_ids, "host-a", "host-b"),
-            Some((1, 0))
-        );
-        // A fate-shared pool with no explicit node-id gives None, so regenerate
-        // keeps it id-less rather than injecting a mismatch.
-        let no_ids = "resource twinstor-data {\n\
-            \x20   on host-a {\n        device /dev/drbd0; address 10.0.0.1:7789; meta-disk internal;\n    }\n\
-            \x20   on host-b {\n        device /dev/drbd0; address 10.0.0.2:7789; meta-disk internal;\n    }\n}\n";
-        assert_eq!(parse_res_node_ids(no_ids, "host-a", "host-b"), None);
-    }
-
-    #[test]
-    fn adjust_refusal_is_classified_narrowly() {
-        // The benign -7 refusal on a connected, serving dual-Primary, full
-        // signature (both phrases).
-        assert!(adjust_refused_live_reconfigure(
-            "drbdadm adjust twinstor-r0: twinstor-r0: State change failed: (-7) \
-             Refusing to be Primary while peer is not outdated"
-        ));
-        // The -7 code plus "not outdated" still classifies as benign, in case
-        // the "Refusing to be Primary" wording changes.
-        assert!(adjust_refused_live_reconfigure(
-            "twinstor-r0: State change failed: (-7): peer is not outdated"
-        ));
-        // A bare "not outdated" without the -7 or "Refusing" signature is too
-        // broad to trust; it takes the reconciling-adjust and hard-error path.
-        assert!(!adjust_refused_live_reconfigure(
-            "Command 'drbdmeta ...': peer is not outdated"
-        ));
-        // A parse error or any other failure is not benign.
-        assert!(!adjust_refused_live_reconfigure(
-            "drbdadm adjust twinstor-r0: Parse error in /etc/drbd.d/twinstor-r0.res line 12"
-        ));
-        // Nor is a del-peer failure for another reason.
-        assert!(!adjust_refused_live_reconfigure(
-            "drbdadm adjust twinstor-r0: del-peer failed: connection has active paths"
-        ));
-    }
-
-    #[test]
-    fn peer_alive_stamp_freshness() {
-        let now = 1_000_000u64;
-        // A fresh stamp means alive.
-        assert!(peer_daemon_alive_from_stamp(Some(now), now));
-        assert!(peer_daemon_alive_from_stamp(
-            Some(now - PEER_ALIVE_STALE_SECS),
-            now
-        ));
-        // Just past the window: not alive (peer daemon down or restarting).
-        assert!(!peer_daemon_alive_from_stamp(
-            Some(now - PEER_ALIVE_STALE_SECS - 1),
-            now
-        ));
-        // No stamp (peer never ran, or xe unreadable): not alive.
-        assert!(!peer_daemon_alive_from_stamp(None, now));
-        // Clock skew (a stamp in the future) must not underflow: alive.
-        assert!(peer_daemon_alive_from_stamp(Some(now + 5), now));
-    }
-
-    #[test]
-    fn upgrade_apply_gate_matrix() {
-        use UpgradeBlocker::*;
-        // All healthy (Connected, UpToDate, no episode, peer alive): no blockers.
-        assert!(upgrade_apply_blockers(true, true, false, true).is_empty());
-        // The serialization interlock: peer daemon not alive (restarting) blocks.
-        assert_eq!(
-            upgrade_apply_blockers(true, true, false, false),
-            vec![PeerNotAlive]
-        );
-        // Storage gates.
-        assert_eq!(
-            upgrade_apply_blockers(false, true, false, true),
-            vec![NotConnected]
-        );
-        assert_eq!(
-            upgrade_apply_blockers(true, false, false, true),
-            vec![NotUpToDate]
-        );
-        assert_eq!(
-            upgrade_apply_blockers(true, true, true, true),
-            vec![EpisodeOpen]
-        );
-        // Double-restart race: a restarting peer takes DRBD to Connecting and
-        // lets its stamp go stale, so both terms fire.
-        assert_eq!(
-            upgrade_apply_blockers(false, true, false, false),
-            vec![NotConnected, PeerNotAlive]
-        );
-        // Everything wrong: all four, in a fixed order.
-        assert_eq!(
-            upgrade_apply_blockers(false, false, true, false),
-            vec![NotConnected, NotUpToDate, EpisodeOpen, PeerNotAlive]
-        );
-    }
-
-    const SAMPLE_CONFIG: &str = r#"[node]
-name = "node-a"
-peer = "node-b"
-
-[storage]
-drbd_resource = "data"
-backing_device = "/dev/disk/by-id/md-uuid-OLD"
-drbd_device = "/dev/drbd0"
-
-[iscsi]
-target_iqn = "iqn.2025-01.com.xcp-ng:twinstor-data"
-chap_password = "s3cr3t"
-"#;
-
-    #[test]
-    fn replace_backing_swaps_only_the_backing_line() {
-        let out =
-            replace_backing_device_line(SAMPLE_CONFIG, "/dev/disk/by-id/md-uuid-NEW").unwrap();
-        assert!(out.contains("backing_device = \"/dev/disk/by-id/md-uuid-NEW\""));
-        assert!(!out.contains("md-uuid-OLD"));
-        // Everything else is preserved verbatim: the CHAP secret, the other
-        // keys, the section headers, and the trailing newline.
-        assert!(out.contains("chap_password = \"s3cr3t\""));
-        assert!(out.contains("drbd_device = \"/dev/drbd0\""));
-        assert!(out.contains("drbd_resource = \"data\""));
-        assert!(out.ends_with('\n'));
-        // Exactly one line changed.
-        let diff = SAMPLE_CONFIG
-            .lines()
-            .zip(out.lines())
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(diff, 1);
-    }
-
-    #[test]
-    fn replace_backing_preserves_indentation() {
-        let toml = "[storage]\n    backing_device = \"/dev/old\"\n";
-        let out = replace_backing_device_line(toml, "/dev/new").unwrap();
-        assert!(out.contains("    backing_device = \"/dev/new\""));
-    }
-
-    #[test]
-    fn replace_backing_is_not_fooled_by_similar_keys() {
-        // A `backing_device_note` key must not be mistaken for the real one.
-        let toml = "backing_device_note = \"x\"\nbacking_device = \"/dev/old\"\n";
-        let out = replace_backing_device_line(toml, "/dev/new").unwrap();
-        assert!(out.contains("backing_device_note = \"x\""));
-        assert!(out.contains("backing_device = \"/dev/new\""));
-    }
-
-    #[test]
-    fn replace_backing_rejects_missing_key() {
-        let toml = "[storage]\ndrbd_device = \"/dev/drbd0\"\n";
-        assert!(replace_backing_device_line(toml, "/dev/new").is_err());
-    }
-
-    #[test]
-    fn replace_backing_rejects_ambiguous_duplicate() {
-        let toml = "backing_device = \"/dev/a\"\nbacking_device = \"/dev/b\"\n";
-        assert!(replace_backing_device_line(toml, "/dev/new").is_err());
-    }
-
-    #[test]
-    fn kernel_module_coverage_scan() {
-        let root = std::env::temp_dir().join("twinstor-test-modules");
-        let _ = std::fs::remove_dir_all(&root);
-        // Kernel A has the kmod in extra/drbd, kernel B has a weak-updates
-        // symlink dir, kernel C has nothing.
-        std::fs::create_dir_all(root.join("4.19.0+a/extra/drbd")).unwrap();
-        std::fs::write(root.join("4.19.0+a/extra/drbd/drbd.ko"), b"x").unwrap();
-        std::fs::create_dir_all(root.join("4.19.0+b/weak-updates/drbd")).unwrap();
-        std::fs::write(root.join("4.19.0+b/weak-updates/drbd/drbd.ko.xz"), b"x").unwrap();
-        std::fs::create_dir_all(root.join("4.19.0+c/kernel")).unwrap();
-
-        assert_eq!(kernels_missing_drbd(&root), vec!["4.19.0+c".to_string()]);
-
-        // Missing root: nothing to report (fail open, this is advisory).
-        assert!(kernels_missing_drbd(std::path::Path::new("/nonexistent-xyz")).is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
-
 fn fmt_field(s: &str) -> String {
     s.to_lowercase()
 }
@@ -2854,7 +2379,6 @@ async fn get_sync_progress(resource: &str) -> Option<(f64, String)> {
                     .split("eta:")
                     .nth(1)
                     .unwrap_or("unknown")
-                    .trim()
                     .split_whitespace()
                     .next()
                     .unwrap_or("unknown")
@@ -3918,4 +3442,477 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
     println!("regenerated {path} (backup at {bak}); replication verified healthy");
     println!("run the same command on {peer} to complete the pair");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn discard_and_resync_treats_an_unclear_daemon_state_as_running() {
+        use super::daemon_may_be_running;
+        assert!(!daemon_may_be_running(&Ok("inactive\n".into())));
+        assert!(!daemon_may_be_running(&Ok("failed".into())));
+        for s in [
+            "active",
+            "activating",
+            "deactivating",
+            "reloading",
+            "unknown",
+            "",
+        ] {
+            assert!(daemon_may_be_running(&Ok(s.into())), "{s}");
+        }
+        assert!(daemon_may_be_running(&Err(anyhow::anyhow!("timed out"))));
+    }
+
+    #[tokio::test]
+    async fn write_atomic_replaces_the_file_and_keeps_it_private() {
+        use super::write_atomic;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tw-write-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("twinstor.toml");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // A new file is created 0600, never with the umask's default.
+        write_atomic(&path, b"one").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        assert_eq!(mode(&path), 0o600);
+
+        // An existing file keeps its mode and gets the new contents.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&path, b"two").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(mode(&path), 0o640);
+
+        // A temp file left by an interrupted run does not block the next write.
+        std::fs::write(dir.join(".twinstor.toml.tmp"), b"stale").unwrap();
+        write_atomic(&path, b"three").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"three");
+        assert!(!dir.join(".twinstor.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_and_resync_refuses_every_unsafe_state() {
+        use super::discard_refusal;
+        use crate::drbd::ConnectionState::*;
+        use crate::loser_boundary::LocalScan;
+        let clear: std::result::Result<LocalScan, String> = Ok(LocalScan::default());
+        let busy: std::result::Result<LocalScan, String> = Ok(LocalScan {
+            all: vec![(4, "u".into())],
+            on_sr: vec![(4, "u".into())],
+        });
+        let unreadable: std::result::Result<LocalScan, String> = Err("xl failed".into());
+        // The safe case: daemon stopped, StandAlone, no guest on the SR.
+        assert_eq!(
+            discard_refusal(false, Some(StandAlone), false, None, false, false, &clear),
+            None
+        );
+        assert_eq!(
+            discard_refusal(false, Some(Connecting), true, None, false, false, &clear),
+            None,
+            "marker present"
+        );
+        // Each refusal names what is wrong.
+        assert!(
+            discard_refusal(true, Some(StandAlone), true, None, false, false, &clear)
+                .unwrap()
+                .0
+                .contains("daemon is running")
+        );
+        assert!(
+            discard_refusal(false, Some(Connected), false, None, false, false, &clear)
+                .unwrap()
+                .0
+                .contains("no split-brain")
+        );
+        assert!(
+            discard_refusal(false, None, true, None, false, false, &clear)
+                .unwrap()
+                .0
+                .contains("could not be read")
+        );
+        assert!(
+            discard_refusal(false, Some(StandAlone), true, None, false, false, &busy)
+                .unwrap()
+                .0
+                .contains("domid 4")
+        );
+        assert!(
+            discard_refusal(
+                false,
+                Some(StandAlone),
+                true,
+                None,
+                false,
+                false,
+                &unreadable
+            )
+            .unwrap()
+            .0
+            .contains("cannot tell")
+        );
+        // The lineage says this node keeps: refused unless explicitly overridden.
+        let kept = discard_refusal(
+            false,
+            Some(StandAlone),
+            true,
+            Some(true),
+            false,
+            false,
+            &clear,
+        )
+        .unwrap();
+        assert!(
+            kept.0.contains("copy to keep") && kept.1.contains("--discard-kept-copy"),
+            "{kept:?}"
+        );
+        assert_eq!(
+            discard_refusal(
+                false,
+                Some(StandAlone),
+                true,
+                Some(true),
+                false,
+                true,
+                &clear
+            ),
+            None
+        );
+        assert_eq!(
+            discard_refusal(
+                false,
+                Some(StandAlone),
+                true,
+                Some(false),
+                false,
+                false,
+                &clear
+            ),
+            None
+        );
+        // A tie: the lineage cannot pick; refused on either node until the
+        // operator decides, and never told to try the other node.
+        let tie = discard_refusal(
+            false,
+            Some(StandAlone),
+            true,
+            Some(true),
+            true,
+            false,
+            &clear,
+        )
+        .unwrap();
+        assert!(
+            tie.0.contains("cannot tell which copy")
+                && tie.1.contains("--discard-kept-copy")
+                && !tie.1.contains("other node"),
+            "{tie:?}"
+        );
+        assert_eq!(
+            discard_refusal(
+                false,
+                Some(StandAlone),
+                true,
+                Some(true),
+                true,
+                true,
+                &clear
+            ),
+            None
+        );
+    }
+
+    use super::{
+        PEER_ALIVE_STALE_SECS, UpgradeBlocker, adjust_refused_live_reconfigure, iscsi_json,
+        iscsi_sev, iscsi_word, kernels_missing_drbd, node_ids_by_host, parse_res_node_ids,
+        peer_daemon_alive_from_stamp, peer_incompatible_change, probe_output,
+        replace_backing_device_line, upgrade_apply_blockers,
+    };
+
+    // An unanswered iSCSI probe (targetcli wedged on dead backing) renders as
+    // unknown in every output mode, never as "not exported", which would push
+    // the operator to re-export a target that is still there.
+    #[test]
+    fn iscsi_probe_timeout_renders_unknown_not_inactive() {
+        use crate::render::Sev;
+        assert_eq!(iscsi_word(None), "unknown");
+        assert_eq!(iscsi_json(None), "null");
+        assert_eq!(iscsi_sev(None), Sev::Warn);
+        // The two real answers are unchanged.
+        assert_eq!(iscsi_word(Some(true)), "active");
+        assert_eq!(iscsi_json(Some(true)), "true");
+        assert_eq!(iscsi_sev(Some(true)), Sev::Good);
+        assert_eq!(iscsi_word(Some(false)), "inactive");
+        assert_eq!(iscsi_json(Some(false)), "false");
+        assert_eq!(iscsi_sev(Some(false)), Sev::Bad);
+    }
+
+    // A probe whose command wedges (as targetcli, multipath and drbdadm do when
+    // the backing disks are pulled) returns None within its bound instead of
+    // hanging `twinstor status`.
+    #[tokio::test]
+    async fn probe_output_times_out_on_a_wedged_command() {
+        let start = std::time::Instant::now();
+        // `sleep 30` stands in for a probe blocked on dead I/O; the 1s bound must win.
+        let got = probe_output("sleep", &["30"], 1).await;
+        let elapsed = start.elapsed();
+        assert!(
+            got.is_none(),
+            "a wedged probe must report unknown (None), not block"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "probe must return at ~the bound, not run to completion (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_output_returns_output_for_a_fast_command() {
+        let got = probe_output("true", &[], 5)
+            .await
+            .expect("fast command should return Some");
+        assert!(got.status.success());
+    }
+
+    #[tokio::test]
+    async fn probe_output_none_when_command_missing() {
+        // Spawn failure (no such binary) is unknown, not a panic.
+        assert!(
+            probe_output("twinstor-no-such-binary-xyz", &[], 5)
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peer_incompatible_change_detects_lb_and_nodeids() {
+        // multi-line `on` blocks, as render_res_file / real .res files emit them.
+        let ids = "    on a {\n        node-id 0;\n    }\n    on b {\n        node-id 1;\n    }\n";
+        let lb = format!(
+            "resource r {{\n{ids}    connection {{\n        net {{ load-balance-paths yes; }}\n        path {{ }}\n    }}\n}}\n"
+        );
+        let ab = format!(
+            "resource r {{\n{ids}    connection {{\n        path {{ }}\n        path {{ }}\n    }}\n}}\n"
+        );
+        // Switching load-balance-paths to active-backup is peer-incompatible.
+        assert!(
+            peer_incompatible_change(&lb, &ab)
+                .unwrap()
+                .contains("path transport mode")
+        );
+        // And the reverse.
+        assert!(peer_incompatible_change(&ab, &lb).is_some());
+        // Same path mode and node-ids (a disk-options-only change) is not flagged.
+        assert!(peer_incompatible_change(&ab, &ab).is_none());
+        // A node-id swap is flagged.
+        let swapped =
+            "    on a {\n        node-id 1;\n    }\n    on b {\n        node-id 0;\n    }\n";
+        let ab_sw = format!(
+            "resource r {{\n{swapped}    connection {{\n        path {{ }}\n        path {{ }}\n    }}\n}}\n"
+        );
+        assert!(
+            peer_incompatible_change(&ab, &ab_sw)
+                .unwrap()
+                .contains("node-ids")
+        );
+    }
+
+    #[test]
+    fn node_ids_by_host_parses_pairs() {
+        let res = "    on host-a {\n        node-id 1;\n    }\n    on host-b {\n        node-id 0;\n    }\n";
+        assert_eq!(
+            node_ids_by_host(res),
+            vec![("host-a".to_string(), 1), ("host-b".to_string(), 0)]
+        );
+        // No node-ids (very old .res) gives an empty list, so
+        // peer_incompatible_change does not flag a config that never had them.
+        assert!(node_ids_by_host("    on a {\n        device /dev/drbd0;\n    }").is_empty());
+    }
+
+    #[test]
+    fn parse_res_node_ids_preserves_or_absent() {
+        // Inverted ids (local host-a is node-id 1, peer host-b is 0) happen in
+        // practice; regenerate must re-emit these, never reassign by hostname.
+        let with_ids = "resource twinstor-data {\n\
+            \x20   on host-a {\n        node-id 1;\n        device /dev/drbd0; meta-disk internal;\n    }\n\
+            \x20   on host-b {\n        node-id 0;\n        device /dev/drbd0; meta-disk internal;\n    }\n}\n";
+        assert_eq!(
+            parse_res_node_ids(with_ids, "host-a", "host-b"),
+            Some((1, 0))
+        );
+        // A fate-shared pool with no explicit node-id gives None, so regenerate
+        // keeps it id-less rather than injecting a mismatch.
+        let no_ids = "resource twinstor-data {\n\
+            \x20   on host-a {\n        device /dev/drbd0; address 10.0.0.1:7789; meta-disk internal;\n    }\n\
+            \x20   on host-b {\n        device /dev/drbd0; address 10.0.0.2:7789; meta-disk internal;\n    }\n}\n";
+        assert_eq!(parse_res_node_ids(no_ids, "host-a", "host-b"), None);
+    }
+
+    #[test]
+    fn adjust_refusal_is_classified_narrowly() {
+        // The benign -7 refusal on a connected, serving dual-Primary, full
+        // signature (both phrases).
+        assert!(adjust_refused_live_reconfigure(
+            "drbdadm adjust twinstor-r0: twinstor-r0: State change failed: (-7) \
+             Refusing to be Primary while peer is not outdated"
+        ));
+        // The -7 code plus "not outdated" still classifies as benign, in case
+        // the "Refusing to be Primary" wording changes.
+        assert!(adjust_refused_live_reconfigure(
+            "twinstor-r0: State change failed: (-7): peer is not outdated"
+        ));
+        // A bare "not outdated" without the -7 or "Refusing" signature is too
+        // broad to trust; it takes the reconciling-adjust and hard-error path.
+        assert!(!adjust_refused_live_reconfigure(
+            "Command 'drbdmeta ...': peer is not outdated"
+        ));
+        // A parse error or any other failure is not benign.
+        assert!(!adjust_refused_live_reconfigure(
+            "drbdadm adjust twinstor-r0: Parse error in /etc/drbd.d/twinstor-r0.res line 12"
+        ));
+        // Nor is a del-peer failure for another reason.
+        assert!(!adjust_refused_live_reconfigure(
+            "drbdadm adjust twinstor-r0: del-peer failed: connection has active paths"
+        ));
+    }
+
+    #[test]
+    fn peer_alive_stamp_freshness() {
+        let now = 1_000_000u64;
+        // A fresh stamp means alive.
+        assert!(peer_daemon_alive_from_stamp(Some(now), now));
+        assert!(peer_daemon_alive_from_stamp(
+            Some(now - PEER_ALIVE_STALE_SECS),
+            now
+        ));
+        // Just past the window: not alive (peer daemon down or restarting).
+        assert!(!peer_daemon_alive_from_stamp(
+            Some(now - PEER_ALIVE_STALE_SECS - 1),
+            now
+        ));
+        // No stamp (peer never ran, or xe unreadable): not alive.
+        assert!(!peer_daemon_alive_from_stamp(None, now));
+        // Clock skew (a stamp in the future) must not underflow: alive.
+        assert!(peer_daemon_alive_from_stamp(Some(now + 5), now));
+    }
+
+    #[test]
+    fn upgrade_apply_gate_matrix() {
+        use UpgradeBlocker::*;
+        // All healthy (Connected, UpToDate, no episode, peer alive): no blockers.
+        assert!(upgrade_apply_blockers(true, true, false, true).is_empty());
+        // The serialization interlock: peer daemon not alive (restarting) blocks.
+        assert_eq!(
+            upgrade_apply_blockers(true, true, false, false),
+            vec![PeerNotAlive]
+        );
+        // Storage gates.
+        assert_eq!(
+            upgrade_apply_blockers(false, true, false, true),
+            vec![NotConnected]
+        );
+        assert_eq!(
+            upgrade_apply_blockers(true, false, false, true),
+            vec![NotUpToDate]
+        );
+        assert_eq!(
+            upgrade_apply_blockers(true, true, true, true),
+            vec![EpisodeOpen]
+        );
+        // Double-restart race: a restarting peer takes DRBD to Connecting and
+        // lets its stamp go stale, so both terms fire.
+        assert_eq!(
+            upgrade_apply_blockers(false, true, false, false),
+            vec![NotConnected, PeerNotAlive]
+        );
+        // Everything wrong: all four, in a fixed order.
+        assert_eq!(
+            upgrade_apply_blockers(false, false, true, false),
+            vec![NotConnected, NotUpToDate, EpisodeOpen, PeerNotAlive]
+        );
+    }
+
+    const SAMPLE_CONFIG: &str = r#"[node]
+name = "node-a"
+peer = "node-b"
+
+[storage]
+drbd_resource = "data"
+backing_device = "/dev/disk/by-id/md-uuid-OLD"
+drbd_device = "/dev/drbd0"
+
+[iscsi]
+target_iqn = "iqn.2025-01.com.xcp-ng:twinstor-data"
+chap_password = "s3cr3t"
+"#;
+
+    #[test]
+    fn replace_backing_swaps_only_the_backing_line() {
+        let out =
+            replace_backing_device_line(SAMPLE_CONFIG, "/dev/disk/by-id/md-uuid-NEW").unwrap();
+        assert!(out.contains("backing_device = \"/dev/disk/by-id/md-uuid-NEW\""));
+        assert!(!out.contains("md-uuid-OLD"));
+        // Everything else is preserved verbatim: the CHAP secret, the other
+        // keys, the section headers, and the trailing newline.
+        assert!(out.contains("chap_password = \"s3cr3t\""));
+        assert!(out.contains("drbd_device = \"/dev/drbd0\""));
+        assert!(out.contains("drbd_resource = \"data\""));
+        assert!(out.ends_with('\n'));
+        // Exactly one line changed.
+        let diff = SAMPLE_CONFIG
+            .lines()
+            .zip(out.lines())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(diff, 1);
+    }
+
+    #[test]
+    fn replace_backing_preserves_indentation() {
+        let toml = "[storage]\n    backing_device = \"/dev/old\"\n";
+        let out = replace_backing_device_line(toml, "/dev/new").unwrap();
+        assert!(out.contains("    backing_device = \"/dev/new\""));
+    }
+
+    #[test]
+    fn replace_backing_is_not_fooled_by_similar_keys() {
+        // A `backing_device_note` key must not be mistaken for the real one.
+        let toml = "backing_device_note = \"x\"\nbacking_device = \"/dev/old\"\n";
+        let out = replace_backing_device_line(toml, "/dev/new").unwrap();
+        assert!(out.contains("backing_device_note = \"x\""));
+        assert!(out.contains("backing_device = \"/dev/new\""));
+    }
+
+    #[test]
+    fn replace_backing_rejects_missing_key() {
+        let toml = "[storage]\ndrbd_device = \"/dev/drbd0\"\n";
+        assert!(replace_backing_device_line(toml, "/dev/new").is_err());
+    }
+
+    #[test]
+    fn replace_backing_rejects_ambiguous_duplicate() {
+        let toml = "backing_device = \"/dev/a\"\nbacking_device = \"/dev/b\"\n";
+        assert!(replace_backing_device_line(toml, "/dev/new").is_err());
+    }
+
+    #[test]
+    fn kernel_module_coverage_scan() {
+        let root = std::env::temp_dir().join("twinstor-test-modules");
+        let _ = std::fs::remove_dir_all(&root);
+        // Kernel A has the kmod in extra/drbd, kernel B has a weak-updates
+        // symlink dir, kernel C has nothing.
+        std::fs::create_dir_all(root.join("4.19.0+a/extra/drbd")).unwrap();
+        std::fs::write(root.join("4.19.0+a/extra/drbd/drbd.ko"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("4.19.0+b/weak-updates/drbd")).unwrap();
+        std::fs::write(root.join("4.19.0+b/weak-updates/drbd/drbd.ko.xz"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("4.19.0+c/kernel")).unwrap();
+
+        assert_eq!(kernels_missing_drbd(&root), vec!["4.19.0+c".to_string()]);
+
+        // Missing root: nothing to report (fail open, this is advisory).
+        assert!(kernels_missing_drbd(std::path::Path::new("/nonexistent-xyz")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

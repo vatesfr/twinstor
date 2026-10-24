@@ -477,7 +477,7 @@ fn candidate_disks() -> Vec<CandidateDisk> {
             }
         }
     }
-    out.sort_by(|a, b| b.size_gb.cmp(&a.size_gb));
+    out.sort_by_key(|d| std::cmp::Reverse(d.size_gb));
     out
 }
 
@@ -500,7 +500,7 @@ fn parse_free_regions(machine_output: &str) -> Vec<(u64, u64, u64)> {
             None
         })
         .collect();
-    regions.sort_by(|a, b| b.2.cmp(&a.2));
+    regions.sort_by_key(|r| std::cmp::Reverse(r.2));
     regions
 }
 
@@ -916,7 +916,7 @@ async fn resolve_direct_link(
         .iter()
         .filter(|n| n.peer_ip != replication_peer_ip)
         .collect();
-    ready.sort_by(|a, b| b.point_to_point.cmp(&a.point_to_point));
+    ready.sort_by_key(|n| std::cmp::Reverse(n.point_to_point));
     let ready_ips: Vec<IpAddr> = ready.iter().map(|n| n.peer_ip).collect();
     // Only probe NICs if there's no ready network to offer.
     let carrier = if ready.is_empty() {
