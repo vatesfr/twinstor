@@ -8,10 +8,9 @@ each failure case, from an administrator's point of view, is in
 ## Problem
 
 A two-host XCP-ng pool with only local disks cannot live-migrate VMs, run
-pool HA (XHA), or use any feature that needs shared storage. The usual
-answers (a SAN, NFS, XOSTOR/LINSTOR) need external infrastructure or a third
-host. TwinStor provides shared block storage from the two hosts and their
-local disks alone.
+pool HA (XHA), or use any feature that needs shared storage. TwinStor
+provides shared block storage from the two hosts and their local disks
+alone, with no external storage and no third host.
 
 ## Scope
 
@@ -985,8 +984,8 @@ remains the authority on which host is alive.
 
 A host that cannot reach the network cannot serve clients. TwinStor uses
 that as the tiebreaker: the host that reaches the gateway keeps serving, the
-isolated host freezes. This is the same idea as the isolation response of
-VMware vSphere HA. The gateway arbitrates without being a cluster member.
+isolated host freezes. The gateway arbitrates without being a cluster
+member.
 
 This relies on **fate-sharing**: in fate-shared mode, replication, the XHA
 heartbeat and client traffic ride the same physical path, so a host is

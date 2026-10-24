@@ -57,8 +57,7 @@ TwinStor uses none of these.
 
 A node that cannot reach the network cannot serve clients. TwinStor uses that
 as the tiebreaker: the node that can reach the gateway survives, and the
-isolated node yields. This is the same approach as VMware vSphere HA's
-"isolation response".
+isolated node yields.
 
 When DRBD finds the peer unreachable, it calls the fence-peer handler. The
 handler pings the default gateway and any targets in
@@ -74,26 +73,6 @@ handler pings the default gateway and any targets in
 
 Each target gets one `ping -c 1 -W 1`, and two more echoes only if the first
 is lost.
-
-#### Comparison with other HA solutions
-
-| Product | Isolation detection | Tiebreaker | Extra infrastructure |
-|---------|---------------------|------------|----------------------|
-| vSphere HA | Ping gateway (up to 10 targets) | Datastore heartbeat | Shared SAN |
-| Pacemaker 2-node | Ping resource (scored) | QDevice on 3rd host | QDevice host |
-| Proxmox VE 2-node | Corosync membership | QDevice on 3rd host | QDevice host |
-| Hyper-V Failover | Heartbeat only | Cloud/File/Disk Witness | Witness resource |
-| LINBIT DRBD 2-node | DRBD quorum | Diskless 3rd node | 3rd node |
-| TwinStor | Ping gateway | Gateway reachability | None (uses the existing router) |
-
-#### Comparison with traditional approaches
-
-| Approach | External infrastructure | Fencing | Split-brain prevention |
-|----------|-------------------------|---------|------------------------|
-| Pacemaker + DRBD | IPMI/BMC required | Remote (must reach the peer's BMC) | Quorum disk or witness node |
-| Ceph (2-node) | Arbiter/tiebreaker monitor | Requires a 3rd node | 3rd monitor process |
-| XOSTOR (2-node) | 3rd XCP-ng host as arbiter | Through XAPI | DRBD/LINSTOR quorum (3 nodes) |
-| TwinStor | None | Self-fencing (Xen watchdog, through XHA) | DRBD fence-peer (the node that reaches the gateway serves); a true split-brain is resolved by DRBD generation lineage |
 
 ### Why a single network path? (fate-sharing)
 
@@ -444,8 +423,8 @@ reliability, add targets to `/etc/twinstor/ping-targets`, one IP per line
 10.0.0.1        # secondary router
 ```
 
-The logic is "any of N", as in vSphere HA: if any target answers, the node is
-considered connected and survives. A single target being briefly unreachable
+The logic is "any of N": if any target answers, the node is considered
+connected and survives. A single target being briefly unreachable
 (a router reboot) then does not make a node yield.
 
 ### Prerequisites
@@ -728,10 +707,8 @@ and keeps both copies until XAPI answers.
 
 What an external monitoring system should watch, per node. Separately, the
 daemon publishes `twinstor-*` keys in XAPI `other_config` (per-host health,
-and the pool master's view of the SR's redundancy and resync state) for Xen
-Orchestra to show storage health and pace rolling updates; Xen Orchestra
-support for reading them is planned. The probes below work with any monitor
-today.
+and the pool master's view of the SR's redundancy and resync state). The
+probes below work with any monitor.
 
 ### Primary probe: `twinstor status --json`
 
@@ -1238,10 +1215,8 @@ holds a host's reboot while it is the last up-to-date copy.
 
 For orchestrators, the pool master also publishes the SR's redundancy state
 as `twinstor-synced` (with a resync percentage, an ETA and a freshness
-stamp) in the SR's `other_config`, so that Xen Orchestra can wait for the SR
-to report fully resynced before it reboots the next host. Xen Orchestra
-support for gating on it is planned; nothing needs to be run by hand either
-way.
+stamp) in the SR's `other_config`, so that an orchestrator can wait for the
+SR to report fully resynced before it reboots the next host.
 
 #### Switch maintenance (reboot, firmware update)
 
