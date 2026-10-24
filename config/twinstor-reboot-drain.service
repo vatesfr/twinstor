@@ -1,0 +1,48 @@
+[Unit]
+Description=twinstor - hold this host's reboot until it is safe for storage
+Documentation=man:twinstor
+# Run the drain during the shutdown transaction, while DRBD and the network are
+# still up (so it can read the peer and let the resync progress while it waits).
+#
+# CRITICAL: do NOT add DefaultDependencies=no. It seems like the right way to run
+# early in shutdown, but on systemd 219 (XCP-ng dom0) it DROPS the automatic
+# Conflicts=shutdown.target, so the unit is not cleanly *stopped* during a real
+# reboot -- it gets SIGKILLed at the final-kill phase and the ExecStop never runs.
+# The drain then silently no-ops on every reboot. (Verified live: with
+# DefaultDependencies=no the ExecStop did not fire on reboot though it fired on
+# `systemctl stop`; removing it made the ExecStop fire, reading a still-Connected
+# peer during the shutdown transaction.) With default deps ON, a normal service
+# gets Conflicts+Before shutdown.target automatically and is stopped (ExecStop run)
+# in the service-stop phase, before local-fs unmount and network teardown -- which
+# is exactly what we need. After=network-online.target keeps the stop ordered
+# before the network goes down.
+#
+# After=xapi.service PINS the stop order relative to the toolstack: systemd stops
+# in reverse start order, so ordering the drain AFTER xapi at start makes it stop
+# BEFORE xapi at shutdown. That guarantees the hold runs while xapi -- and the HA
+# daemon (xhad) it manages, and the guests -- are STILL UP. This is what keeps the
+# HA-on case safe: the held node stays a heartbeating liveset member and DRBD stays
+# Connected, so the peer never declares it dead and never restarts its VMs (no
+# dual-run). Without this ordering the interleaving is left to systemd's scheduler.
+# (Opposite of the daemon unit's Before=xapi.service, deliberately -- different job.)
+After=network-online.target xapi.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ExecStart is a no-op: this unit exists only to arm the ExecStop, which fires
+# when the unit is stopped during shutdown.
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/twinstor --config /etc/twinstor/twinstor.toml reboot-drain
+# HARD cap that backstops the drain's own bounded wait: if the drain (or the
+# system) misbehaves, systemd SIGKILLs the ExecStop after this and proceeds, so a
+# buggy guard can never wedge a reboot forever. The drain clamps its own hold to
+# TimeoutStopSec minus headroom (see CAP_HEADROOM_SECS) so it always cap-proceeds
+# (and records the next-boot alert) BEFORE this SIGKILL. If you raise
+# `[reboot_drain] max_secs` above ~600 to hold longer, RAISE THIS TO MATCH and
+# update UNIT_TIMEOUT_STOP_SECS in reboot_drain.rs, or the hold stays clamped.
+TimeoutStopSec=660
+
+[Install]
+WantedBy=multi-user.target

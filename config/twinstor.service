@@ -1,0 +1,36 @@
+[Unit]
+Description=twinstor - DRBD 9 dual-primary storage for 2-node XCP-ng
+After=network-online.target
+Wants=network-online.target
+Before=xapi.service
+
+[Service]
+ExecStart=/usr/local/bin/twinstor --config /etc/twinstor/twinstor.toml daemon
+Restart=on-failure
+RestartSec=5
+
+# Restart a HUNG daemon, not just a crashed one: the daemon pings the
+# watchdog from its tick loop, so a wedge/livelock that keeps the PID alive
+# still gets recovered. Restart=on-failure alone never notices those.
+# The window must exceed the LONGEST legitimate in-tick operation: recovery
+# ladders (split-brain resolution with its 45s winner sampling, discard
+# waits, the survivor HA-reset's up-to-480s heal window) run inline in one
+# tick by design and send no pings meanwhile. A 90s window was observed
+# killing the daemon mid-resolution on hardware, turning one split-brain
+# episode into a restart loop. 900s clears every bounded ladder while still
+# catching a true forever-hang well before the peer's 15-min daemon-down
+# alert escalates it.
+NotifyAccess=main
+WatchdogSec=900
+
+# Keep DRBD/iSCSI state intact across daemon restarts.
+# The daemon reconnects to existing kernel state on startup.
+KillMode=process
+# On a stop the daemon starts no new storage work, but lets the step in
+# flight finish: a split-brain resolution that has just begun (crash
+# boundary, disk-handle release, discard) takes up to about a minute, and a
+# SIGKILL in the middle leaves it to the next start's recovery. 90s covers it.
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
