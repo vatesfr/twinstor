@@ -9,6 +9,39 @@ pool.
 
 ## [Unreleased]
 
+### Changed
+- **`twinstor setup` sets the pool's default HA timeout** (pool
+  `other-config:default_ha_timeout`) to the mode's value: 90 s arbitrated,
+  120 s fate-shared. A bare `xe pool-ha-enable` without `ha-config:timeout`
+  otherwise arms XHA at 60 s, too short for the mode. Setup records the value
+  it found, and `twinstor uninstall` puts it back if nobody has changed the
+  key since. `twinstor doctor` reports the setting and how to fix it.
+- Log, alert and CLI messages use plain descriptions instead of internal
+  scenario tags. The `scenario` field takes the values `peer_emergency`,
+  `local_emergency_wedge`, `xha_join_deadlock`, `masterless_pool` and
+  `ha_deadlock_exit`; `heal_event` names are unchanged. Update any log filter
+  that matched the old tags.
+- The alert raised when pool HA is left disarmed says which timeout a bare
+  `xe pool-ha-enable` uses (the pool default, or 60 s if unset) instead of
+  30 s.
+- `twinstor uninstall` reports commands that fail as expected (HA already
+  off, no iSCSI session, setup key already gone) on one line instead of as
+  warnings, and says whether the SR forget that follows a failed destroy
+  worked.
+
+### Fixed
+- **`twinstor uninstall` could check the wrong SR for running VMs.** The
+  recorded SR uuid (`/var/lib/twinstor/sr-uuid`) survived uninstall and
+  setup, so after a reinstall the safety check could count the VMs of a
+  deleted SR, find none, and go ahead. Uninstall now removes the record,
+  setup drops a leftover one, and the check prefers the SR it can find in
+  XAPI over a recorded uuid.
+- **The config file is never readable by other users while it is written.**
+  It holds the CHAP secret. `twinstor setup` and `twinstor replace-backing`
+  now write it to a temporary file that already has its final mode (0600
+  for a new config, the existing mode otherwise), sync it before the rename
+  and sync the directory after, so a crash cannot leave an empty config.
+
 ## [0.7.1] - 2026-10-23
 
 First public release. A fix release for 0.7.0, from the fault campaigns run
