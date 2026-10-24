@@ -639,7 +639,7 @@ INFO  twinstor starting version="0.7.1" node=node-a peer=node-b
 INFO  try_go_online: DRBD resource not started, running drbdadm up
 INFO  bringing DRBD resource up resource=twinstor-data
 INFO  try_go_online: DRBD status after up role=Secondary disk=UpToDate conn=Connecting
-INFO  try_go_online: DRBD still Connecting, deferring promote to let the peer connect (Solution B) ceiling_secs=100
+INFO  try_go_online: DRBD still Connecting, deferring promote to let the peer connect ceiling_secs=100
 INFO  try_go_online: promoting to Primary
 INFO  promoting to primary resource=twinstor-data
 INFO  try_go_online: starting iSCSI target
@@ -681,7 +681,7 @@ INFO  heartbeat state=Online drbd_conn=Connected disk=UpToDate peer_disk=Some(Up
 
 ```
 INFO  DRBD disk state changed from=UpToDate to=Diskless
-ERROR local disk failed; serving THROUGH the peer (DRBD diskless), target stays up
+ERROR local disk failed; serving through the peer (DRBD diskless), target stays up
 INFO  state transition from=Online to=Degraded
 INFO  XAPI alert sent alert=twinstor_degraded
   ... (VMs keep running, I/O forwarded to the peer's disk; the target never stops) ...

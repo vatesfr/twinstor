@@ -421,11 +421,13 @@ fn session_line_present(iscsiadm_output: &str, portal: &str) -> bool {
 /// iSCSI session recovery timeout for the TwinStor sessions, in seconds.
 ///
 /// A failed path must be reported to multipath well inside XHA's statefile
-/// timeout (30 s): with two paths, I/O on the failed one is queued until
+/// timeout (the pool's HA timeout: 120 s or 90 s with TwinStor's defaults, as
+/// low as 30 s on a pool tuned down): with two paths, I/O on the failed one is
+/// queued until
 /// session recovery gives up, and if that window plus the noop detection
 /// (noop_out_interval + noop_out_timeout, 5 + 5 s stock) exceeds the XHA
 /// budget, a single path failure freezes the statefile long enough to get
-/// the host self-fenced. 5 + 5 + 5 = 15 s worst case, a 2x margin. The stock
+/// the host self-fenced. 5 + 5 + 5 = 15 s worst case, a 2x margin even at 30 s. The stock
 /// XCP-ng values land past the budget (replacement_timeout 120 in
 /// iscsid.conf, 25 set live on the sessions at PBD plug), which is why the
 /// node records are overridden at discovery and the live value is enforced
