@@ -15,7 +15,8 @@ pool.
   120 s fate-shared. A bare `xe pool-ha-enable` without `ha-config:timeout`
   otherwise arms XHA at 60 s, too short for the mode. Setup records the value
   it found, and `twinstor uninstall` puts it back if nobody has changed the
-  key since. `twinstor doctor` reports the setting and how to fix it.
+  key since. `twinstor upgrade-apply` does the same once on existing pools
+  (see Upgrading). `twinstor doctor` reports the setting and how to fix it.
 - Log, alert and CLI messages use plain descriptions instead of internal
   scenario tags. The `scenario` field takes the values `peer_emergency`,
   `local_emergency_wedge`, `xha_join_deadlock`, `masterless_pool` and
@@ -41,6 +42,13 @@ pool.
   now write it to a temporary file that already has its final mode (0600
   for a new config, the existing mode otherwise), sync it before the rename
   and sync the directory after, so a crash cannot leave an empty config.
+
+### Upgrading
+- `twinstor upgrade-apply` sets the pool's default HA timeout on a pool that
+  has none: to the pool's `ha-config:timeout`, or the mode's value when
+  there is none. A value already there is left alone, as is a pool where
+  the key was removed after TwinStor set it. The setting is recorded the
+  same way as by setup, so uninstall puts it back.
 
 ## [0.7.1] - 2026-10-23
 

@@ -1332,6 +1332,25 @@ pub fn default_ha_timeout_record(
     Some(format!("{set}:{}", found.unwrap_or("")))
 }
 
+/// The pool default HA timeout `upgrade-apply` sets on a pool that predates
+/// setup setting it, as `(value, record)`, or `None` to leave the pool alone.
+/// It acts only when the key is absent and twinstor has no record: a value
+/// already there is the operator's, and a record without the key means the
+/// operator removed what twinstor set. The value is the pool's explicit
+/// `ha-config:timeout` when there is one, else the mode's. Pure.
+pub fn upgrade_default_ha_timeout(
+    current: Option<&str>,
+    record: Option<&str>,
+    ha_config_timeout: Option<u32>,
+    mode_timeout: u32,
+) -> Option<(u32, String)> {
+    if current.is_some() || record.is_some() {
+        return None;
+    }
+    let secs = ha_config_timeout.unwrap_or(mode_timeout);
+    Some((secs, format!("{secs}:")))
+}
+
 /// What uninstall does with the pool default HA timeout.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DefaultHaTimeoutRestore {
@@ -2286,6 +2305,35 @@ mod tests {
         // A setup re-run finds twinstor's own value: the record stays as is.
         assert_eq!(
             default_ha_timeout_record(120, Some("120"), Some("120:")),
+            None
+        );
+    }
+
+    #[test]
+    fn upgrade_sets_the_default_ha_timeout_only_on_an_untouched_pool() {
+        use super::upgrade_default_ha_timeout;
+        // Unset: the pool's explicit timeout wins over the mode's.
+        assert_eq!(
+            upgrade_default_ha_timeout(None, None, Some(180), 120),
+            Some((180, "180:".to_string()))
+        );
+        assert_eq!(
+            upgrade_default_ha_timeout(None, None, None, 90),
+            Some((90, "90:".to_string()))
+        );
+        // The operator's value stays, whatever it is.
+        assert_eq!(
+            upgrade_default_ha_timeout(Some("60"), None, Some(90), 90),
+            None
+        );
+        // Set by setup or an earlier upgrade.
+        assert_eq!(
+            upgrade_default_ha_timeout(Some("120"), Some("120:"), Some(120), 120),
+            None
+        );
+        // The operator removed what twinstor set: not put back.
+        assert_eq!(
+            upgrade_default_ha_timeout(None, Some("90:"), Some(90), 90),
             None
         );
     }

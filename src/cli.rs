@@ -1159,6 +1159,39 @@ fn peer_daemon_alive_from_stamp(stamp: Option<u64>, now: u64) -> bool {
     stamp.is_some_and(|s| now.saturating_sub(s) <= PEER_ALIVE_STALE_SECS)
 }
 
+/// The `upgrade-apply` step that sets the pool default HA timeout when the pool
+/// has none (see `xapi::upgrade_default_ha_timeout`). Never fails the upgrade.
+async fn ensure_pool_default_ha_timeout() {
+    let key = crate::xapi::DEFAULT_HA_TIMEOUT_KEY;
+    let Some((current, record)) = crate::xapi::pool_default_ha_timeout().await else {
+        println!(
+            "could not read the pool's other-config; run `twinstor doctor` later to check the \
+             default HA timeout\n"
+        );
+        return;
+    };
+    let arbitrated = std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists();
+    let Some((secs, rec)) = crate::xapi::upgrade_default_ha_timeout(
+        current.as_deref(),
+        record.as_deref(),
+        crate::xapi::pool_ha_timeout().await,
+        crate::setup::ha_timeout_secs(arbitrated),
+    ) else {
+        return;
+    };
+    if crate::xapi::set_pool_default_ha_timeout(secs, Some(&rec)).await {
+        println!(
+            "pool default HA timeout set to {secs}s, so an HA enable without \
+             ha-config:timeout keeps it\n"
+        );
+    } else {
+        println!(
+            "could not set the pool default HA timeout; run: xe pool-param-set uuid=<pool> \
+             other-config:{key}={secs}\n"
+        );
+    }
+}
+
 /// Which conditions block a rolling-upgrade restart on this node right now;
 /// empty means safe. The peer-alive term serializes the two nodes; the storage
 /// terms ensure a restart cannot strand a resync or interfere with an open
@@ -1358,6 +1391,13 @@ async fn run_upgrade_apply(
             println!();
         }
     }
+
+    // 2c. Set the pool default HA timeout on a pool set up before setup did it,
+    // so an HA enable without ha-config:timeout (by hand, or from Xen
+    // Orchestra) keeps the pool's timeout instead of XAPI's 60 s. Recorded
+    // like setup's, so uninstall puts it back. Pool-wide: the second node finds
+    // it set and does nothing.
+    ensure_pool_default_ha_timeout().await;
 
     // 3. Restart the local daemon. Record the time first: the shutdown clears
     // our twinstor-alive stamp, so a stamp newer than this proves the new daemon

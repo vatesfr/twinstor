@@ -1915,8 +1915,8 @@ unused; use it only when you know no VM depends on it).
    It asks for confirmation (`--yes` skips it), then, in order:
    - disables XHA (and puts back the pool's
      `ha-reboot-vm-on-internal-shutdown` setting if freeze mode had turned
-     it off, and the pool's `other-config:default_ha_timeout` if setup set
-     it and nobody changed it since);
+     it off, and the pool's `other-config:default_ha_timeout` if setup or
+     `upgrade-apply` set it and nobody changed it since);
    - unplugs the PBDs and destroys the TwinStor SR;
    - stops the daemon;
    - clears the iSCSI target and stops DRBD;
