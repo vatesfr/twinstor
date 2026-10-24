@@ -540,9 +540,12 @@ These depend on the mode and on the network invariant. Full analysis:
   to keep is chosen. Freeze mode engages only when both hosts run 0.7.0 or
   later.
 - **With freeze mode off:** both hosts lose the peer and run the fence-peer
-  handler, which first logs the host out of the peer's iSCSI portal (its copy
-  may now diverge, so its guests must not reach the peer's; it logs back in
-  once the pair is Connected). Fate-shared mode fences `resource-only`, so I/O
+  handler, which first fences the path to the peer's iSCSI portal: its copy
+  may now diverge, so its guests must not reach the peer's. A firewall rule
+  rejects this host's traffic to that portal and the disks behind it are set
+  offline, so multipath fails the path at once; the daemon removes the rule
+  once the pair is Connected and the same session recovers, with no new
+  login. Fate-shared mode fences `resource-only`, so I/O
   keeps flowing while the handler decides: the isolated host serves its VMs
   for those seconds (the ping timeouts, about 4 s observed), then finds no
   ping target, freezes and yields. The other host reaches its gateway and
