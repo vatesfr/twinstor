@@ -152,9 +152,10 @@ without a reboot; at 60 s, none longer than about 45 s did. See
   xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout=30
   ```
 
-  To make every later enable use your value without passing it each time,
-  set XAPI's persistent pool default, which a bare enable reads before
-  falling back to 60 s:
+  `twinstor setup` also sets XAPI's persistent pool default,
+  `other-config:default_ha_timeout`, to the mode's value, which a bare enable
+  reads before falling back to 60 s. If you change the timeout, change that
+  default too, so a later bare enable keeps your value:
 
   ```bash
   xe pool-param-set uuid=<pool uuid> other-config:default_ha_timeout=30

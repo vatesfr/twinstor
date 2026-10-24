@@ -120,6 +120,50 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
         }
     }
 
+    // Put back the pool's default HA timeout if setup set it and nobody has
+    // changed it since.
+    match crate::xapi::pool_default_ha_timeout().await {
+        Some((current, record)) => {
+            use crate::xapi::DefaultHaTimeoutRestore;
+            let key = crate::xapi::DEFAULT_HA_TIMEOUT_KEY;
+            let ok = match crate::xapi::default_ha_timeout_restore(
+                record.as_deref(),
+                current.as_deref(),
+            ) {
+                DefaultHaTimeoutRestore::Nothing => true,
+                DefaultHaTimeoutRestore::Restore(found) => {
+                    let msg = match &found {
+                        Some(v) => format!("  pool default HA timeout put back to {v}s"),
+                        None => "  pool default HA timeout removed (setup had set it)".to_string(),
+                    };
+                    let ok = crate::xapi::restore_pool_default_ha_timeout(Some(found)).await;
+                    if ok {
+                        println!("{msg}");
+                    }
+                    ok
+                }
+                DefaultHaTimeoutRestore::DropRecord => {
+                    crate::xapi::restore_pool_default_ha_timeout(None).await
+                }
+            };
+            if !ok {
+                println!(
+                    "  could not restore the pool default HA timeout; check xe pool-param-get \
+                     uuid=<pool> param-name=other-config param-key={key} and drop twinstor's \
+                     record: xe pool-param-remove uuid=<pool> param-name=other-config \
+                     param-key={}",
+                    crate::xapi::DEFAULT_HA_TIMEOUT_PRIOR_KEY
+                );
+            }
+        }
+        None => println!(
+            "  could not read the pool's other-config; if twinstor's record {} is there, \
+             restore other-config:{} by hand",
+            crate::xapi::DEFAULT_HA_TIMEOUT_PRIOR_KEY,
+            crate::xapi::DEFAULT_HA_TIMEOUT_KEY
+        ),
+    }
+
     // Step 2: unplug PBDs and destroy the SR (using the uuid resolved up front,
     // which survives an SR rename that a name-label lookup would miss).
     print_step(2, "destroying twinstor SR");

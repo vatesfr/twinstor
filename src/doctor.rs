@@ -61,6 +61,8 @@ struct Diagnosis {
     ha_timeout: Option<u32>, // pool ha-config:timeout, else the effective xhad.conf value
     // pool ha-reboot-vm-on-internal-shutdown and twinstor's record (None = unreadable / no such field)
     internal_shutdown: Option<(bool, Option<bool>)>,
+    // pool other-config:default_ha_timeout (None = unreadable, Some(None) = unset)
+    default_ha_timeout: Option<Option<String>>,
     freeze_engaged: bool,
 }
 
@@ -140,6 +142,9 @@ async fn diagnose(config: &Config) -> Diagnosis {
         None => crate::setup::effective_xha_timeout(),
     };
     let internal_shutdown = crate::xapi::pool_internal_shutdown_policy().await;
+    let default_ha_timeout = crate::xapi::pool_default_ha_timeout()
+        .await
+        .map(|(current, _)| current);
     // Freeze mode engaged for the pair, by the daemon's own rule.
     let freeze_engaged = crate::state_machine::fs_freeze_engaged(
         arbitrated,
@@ -162,7 +167,32 @@ async fn diagnose(config: &Config) -> Diagnosis {
         arbitrated,
         ha_timeout,
         internal_shutdown,
+        default_ha_timeout,
         freeze_engaged,
+    }
+}
+
+/// The doctor line for the pool's `other-config:default_ha_timeout`, which a
+/// `pool-ha-enable` without `ha-config:timeout` uses (else XAPI's 60 s).
+/// `current` is `None` when unreadable, `Some(None)` when unset; `in_effect` is
+/// the timeout the pool runs with now, the value a bare enable should keep.
+fn default_ha_timeout_advice(current: Option<Option<&str>>, in_effect: u32) -> String {
+    let key = crate::xapi::DEFAULT_HA_TIMEOUT_KEY;
+    let fix = format!("xe pool-param-set uuid=<pool> other-config:{key}={in_effect}");
+    match current {
+        None => "default HA timeout: unknown (could not read the pool's other-config)".to_string(),
+        Some(None) => format!(
+            "default HA timeout: {WARN} not set: an HA enable without ha-config:timeout (by hand \
+             or from Xen Orchestra) would use XAPI's 60 s instead of the pool's {in_effect}s. To \
+             keep {in_effect}s: {fix}"
+        ),
+        Some(Some(v)) if v.trim() == in_effect.to_string() => {
+            format!("default HA timeout: {in_effect}s (a bare HA enable keeps it)")
+        }
+        Some(Some(v)) => format!(
+            "default HA timeout: {WARN} {v}s, while the pool runs {in_effect}s: an HA enable \
+             without ha-config:timeout would switch to {v}s. To keep {in_effect}s: {fix}"
+        ),
     }
 }
 
@@ -260,6 +290,17 @@ fn print_report(d: &Diagnosis) {
             None => println!("HA timeout:  unknown (could not read it)\n"),
         }
     }
+
+    let in_effect = d
+        .ha_timeout
+        .unwrap_or_else(|| crate::setup::ha_timeout_secs(d.arbitrated));
+    println!(
+        "{}\n",
+        default_ha_timeout_advice(
+            d.default_ha_timeout.as_ref().map(|v| v.as_deref()),
+            in_effect
+        )
+    );
 
     // Fate-shared freeze mode wants the pool's ha-reboot-vm-on-internal-shutdown
     // off; the arbitrated stand-downs want it on (see
@@ -562,6 +603,19 @@ mod tests {
     use super::*;
     use crate::drbd::{Replication, Role};
 
+    #[test]
+    fn default_ha_timeout_advice_names_the_value_a_bare_enable_would_use() {
+        let unset = default_ha_timeout_advice(Some(None), 120);
+        assert!(unset.contains(WARN) && unset.contains("60 s"));
+        assert!(unset.contains("other-config:default_ha_timeout=120"));
+        let same = default_ha_timeout_advice(Some(Some("120")), 120);
+        assert!(!same.contains(WARN), "{same}");
+        let other = default_ha_timeout_advice(Some(Some("60")), 90);
+        assert!(other.contains(WARN) && other.contains("switch to 60s"));
+        assert!(other.contains("other-config:default_ha_timeout=90"));
+        assert!(default_ha_timeout_advice(None, 90).contains("unknown"));
+    }
+
     fn healthy() -> DrbdStatus {
         DrbdStatus {
             role: Role::Primary,
@@ -620,6 +674,7 @@ mod tests {
             arbitrated: false,
             ha_timeout: Some(120),
             internal_shutdown: None,
+            default_ha_timeout: None,
             freeze_engaged: false,
         };
         // Quiescent, no episode, and a real knot: safe to fix (no blocker).
@@ -673,6 +728,7 @@ mod tests {
             arbitrated: b.arbitrated,
             ha_timeout: b.ha_timeout,
             internal_shutdown: b.internal_shutdown,
+            default_ha_timeout: b.default_ha_timeout.clone(),
             freeze_engaged: b.freeze_engaged,
         }
     }

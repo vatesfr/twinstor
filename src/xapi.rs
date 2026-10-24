@@ -1303,6 +1303,153 @@ pub async fn restore_pool_internal_shutdown(restore: Option<bool>) -> bool {
     removed || restore.is_some()
 }
 
+/// XAPI's persistent pool default for the HA timeout: a `pool-ha-enable`
+/// without `ha-config:timeout` uses this pool `other-config` key, and only
+/// without it XAPI's built-in 60 s (`Xapi_ha.Timeouts.get_base_t`).
+pub const DEFAULT_HA_TIMEOUT_KEY: &str = "default_ha_timeout";
+
+/// Pool `other-config` key recording that twinstor set `DEFAULT_HA_TIMEOUT_KEY`:
+/// `<value set>:<value found>`, the second part empty when the key was unset.
+pub const DEFAULT_HA_TIMEOUT_PRIOR_KEY: &str = "twinstor-default-ha-timeout-prior";
+
+/// The record to write when setting the pool default to `set`, given the
+/// value found and any existing record. An existing record is kept as it is
+/// (a setup re-run must not record twinstor's own value as the prior one), so
+/// this returns `None` then.
+pub fn default_ha_timeout_record(
+    set: u32,
+    found: Option<&str>,
+    existing: Option<&str>,
+) -> Option<String> {
+    if existing.is_some() {
+        return None;
+    }
+    Some(format!("{set}:{}", found.unwrap_or("")))
+}
+
+/// What uninstall does with the pool default HA timeout.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DefaultHaTimeoutRestore {
+    /// No record: twinstor never set it.
+    Nothing,
+    /// The key still holds what twinstor set: put back the value found
+    /// (`None` removes the key), then drop the record.
+    Restore(Option<String>),
+    /// Someone changed the key since (or the record is unreadable): leave the
+    /// key, drop the record.
+    DropRecord,
+}
+
+/// Decide the uninstall step from twinstor's record and the key's current
+/// value. Pure.
+pub fn default_ha_timeout_restore(
+    record: Option<&str>,
+    current: Option<&str>,
+) -> DefaultHaTimeoutRestore {
+    let Some(record) = record else {
+        return DefaultHaTimeoutRestore::Nothing;
+    };
+    match record.split_once(':') {
+        Some((set, found)) if !set.is_empty() && current == Some(set) => {
+            DefaultHaTimeoutRestore::Restore((!found.is_empty()).then(|| found.to_string()))
+        }
+        _ => DefaultHaTimeoutRestore::DropRecord,
+    }
+}
+
+async fn pool_other_config_key(pool: &str, key: &str) -> Option<String> {
+    xe_minimal(&[
+        "pool-param-get",
+        &format!("uuid={pool}"),
+        "param-name=other-config",
+        &format!("param-key={key}"),
+    ])
+    .await
+    .filter(|v| !v.is_empty())
+}
+
+/// The pool's `default_ha_timeout` and twinstor's record of setting it, as
+/// `(current, record)`. `None` when XAPI does not answer.
+pub async fn pool_default_ha_timeout() -> Option<(Option<String>, Option<String>)> {
+    let pool = xe_minimal(&["pool-list", "params=uuid"]).await?;
+    if pool.is_empty() {
+        return None;
+    }
+    // The map read proves XAPI answers; the exact-key reads then fail only
+    // when a key is absent.
+    xe_minimal(&[
+        "pool-param-get",
+        &format!("uuid={pool}"),
+        "param-name=other-config",
+    ])
+    .await?;
+    Some((
+        pool_other_config_key(&pool, DEFAULT_HA_TIMEOUT_KEY).await,
+        pool_other_config_key(&pool, DEFAULT_HA_TIMEOUT_PRIOR_KEY).await,
+    ))
+}
+
+/// Set the pool's `default_ha_timeout` to `secs`, writing `record` in the same
+/// call when given. `true` when XAPI accepted it.
+pub async fn set_pool_default_ha_timeout(secs: u32, record: Option<&str>) -> bool {
+    let Some(pool) = xe_minimal(&["pool-list", "params=uuid"])
+        .await
+        .filter(|p| !p.is_empty())
+    else {
+        return false;
+    };
+    let mut args = vec![
+        "pool-param-set".to_string(),
+        format!("uuid={pool}"),
+        format!("other-config:{DEFAULT_HA_TIMEOUT_KEY}={secs}"),
+    ];
+    if let Some(r) = record {
+        args.push(format!("other-config:{DEFAULT_HA_TIMEOUT_PRIOR_KEY}={r}"));
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    xe_minimal(&args).await.is_some()
+}
+
+/// Apply an uninstall decision: put the value found back (or remove the key)
+/// when asked, then drop the record. `true` when XAPI accepted every step.
+pub async fn restore_pool_default_ha_timeout(restore: Option<Option<String>>) -> bool {
+    let Some(pool) = xe_minimal(&["pool-list", "params=uuid"])
+        .await
+        .filter(|p| !p.is_empty())
+    else {
+        return false;
+    };
+    let restored = match restore {
+        None => true,
+        Some(Some(v)) => xe_minimal(&[
+            "pool-param-set",
+            &format!("uuid={pool}"),
+            &format!("other-config:{DEFAULT_HA_TIMEOUT_KEY}={v}"),
+        ])
+        .await
+        .is_some(),
+        Some(None) => xe_minimal(&[
+            "pool-param-remove",
+            &format!("uuid={pool}"),
+            "param-name=other-config",
+            &format!("param-key={DEFAULT_HA_TIMEOUT_KEY}"),
+        ])
+        .await
+        .is_some(),
+    };
+    if !restored {
+        return false;
+    }
+    xe_minimal(&[
+        "pool-param-remove",
+        &format!("uuid={pool}"),
+        "param-name=other-config",
+        &format!("param-key={DEFAULT_HA_TIMEOUT_PRIOR_KEY}"),
+    ])
+    .await
+    .is_some()
+}
+
 /// Whether HA is enabled on the pool. `None` if XAPI is unreachable or the
 /// value can't be parsed.
 pub async fn is_ha_enabled() -> Option<bool> {
@@ -2118,6 +2265,50 @@ mod tests {
             pending_ha_task_in("Async.pool.enable_ha"),
             Some("Async.pool.enable_ha".into())
         );
+    }
+
+    #[test]
+    fn default_ha_timeout_record_keeps_the_first_prior_value() {
+        use super::default_ha_timeout_record;
+        assert_eq!(
+            default_ha_timeout_record(120, None, None).as_deref(),
+            Some("120:")
+        );
+        assert_eq!(
+            default_ha_timeout_record(90, Some("75"), None).as_deref(),
+            Some("90:75")
+        );
+        // A setup re-run finds twinstor's own value: the record stays as is.
+        assert_eq!(
+            default_ha_timeout_record(120, Some("120"), Some("120:")),
+            None
+        );
+    }
+
+    #[test]
+    fn default_ha_timeout_restore_never_undoes_an_operator_change() {
+        use super::DefaultHaTimeoutRestore::*;
+        use super::default_ha_timeout_restore;
+        assert_eq!(default_ha_timeout_restore(None, Some("120")), Nothing);
+        assert_eq!(
+            default_ha_timeout_restore(Some("120:"), Some("120")),
+            Restore(None)
+        );
+        assert_eq!(
+            default_ha_timeout_restore(Some("90:75"), Some("90")),
+            Restore(Some("75".into()))
+        );
+        // Changed (or removed) since twinstor set it: leave it alone.
+        assert_eq!(
+            default_ha_timeout_restore(Some("120:"), Some("150")),
+            DropRecord
+        );
+        assert_eq!(default_ha_timeout_restore(Some("120:"), None), DropRecord);
+        assert_eq!(
+            default_ha_timeout_restore(Some("garbage"), Some("120")),
+            DropRecord
+        );
+        assert_eq!(default_ha_timeout_restore(Some(":"), Some("")), DropRecord);
     }
 
     use super::{ALERT_GATE_MAX, ALERT_GATE_MIN, AlertGate, parse_sr_uuid_for_iqn};

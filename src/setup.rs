@@ -1460,12 +1460,35 @@ async fn create_sr(
         );
     }
 
-    // Enable XHA. Fate-shared uses a short timeout (safe because both
-    // iSCSI targets are always local, no storage failover delay). Arbitrated
-    // uses a longer timeout so a switch fault, which DRBD rides over the direct
-    // link, doesn't trip XHA into self-fencing during the path reconnect. See
-    // ha_timeout_secs and NETWORK_TOPOLOGY_SAFETY.md.
+    // Enable XHA with the mode's timeout (see ha_timeout_secs and
+    // HA_TIMEOUT_TUNING.md). The pool default is set first, so a later
+    // `pool-ha-enable` without `ha-config:timeout` (by hand, or from Xen
+    // Orchestra) keeps this value instead of XAPI's 60 s. The value found is
+    // recorded so uninstall can put it back.
     let ha_timeout = ha_timeout_secs(arbitrated);
+    match crate::xapi::pool_default_ha_timeout().await {
+        Some((found, existing)) => {
+            let record = crate::xapi::default_ha_timeout_record(
+                ha_timeout,
+                found.as_deref(),
+                existing.as_deref(),
+            );
+            if crate::xapi::set_pool_default_ha_timeout(ha_timeout, record.as_deref()).await {
+                println!("pool default HA timeout set to {ha_timeout}s");
+            } else {
+                println!(
+                    "could not set the pool default HA timeout; run: xe pool-param-set \
+                     uuid=<pool> other-config:{}={ha_timeout}",
+                    crate::xapi::DEFAULT_HA_TIMEOUT_KEY
+                );
+            }
+        }
+        None => println!(
+            "could not read the pool's other-config; set the default HA timeout later: \
+             xe pool-param-set uuid=<pool> other-config:{}={ha_timeout}",
+            crate::xapi::DEFAULT_HA_TIMEOUT_KEY
+        ),
+    }
     println!("enabling High Availability (timeout={ha_timeout}s)...");
     match run_cmd(
         "xe",
