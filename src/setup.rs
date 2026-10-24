@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::cmd::{cmd_output, run_cmd};
+use crate::cmd::{cmd_output, run_cmd, run_cmd_quiet};
 
 const CONFIG_DIR: &str = "/etc/twinstor";
 const CONFIG_PATH: &str = "/etc/twinstor/twinstor.toml";
@@ -1890,7 +1890,8 @@ pub async fn clear_shared_setup() {
     let Some(pool) = pool_uuid().await else {
         return;
     };
-    let _ = run_cmd(
+    // Fails when the key is already gone, which is the usual case.
+    let _ = run_cmd_quiet(
         "xe",
         &[
             "pool-param-remove",

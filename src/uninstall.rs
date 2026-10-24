@@ -83,9 +83,12 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
 
     // Step 1: disable XHA
     print_step(1, "disabling XHA");
-    match run_cmd("xe", &["pool-ha-disable"]).await {
+    match run_cmd_quiet("xe", &["pool-ha-disable"]).await {
         Ok(()) => println!("  XHA disabled"),
-        Err(e) => println!("  XHA not enabled or already disabled ({e})"),
+        Err(e) => println!(
+            "  XHA not enabled or already disabled ({})",
+            failure_reason(&e)
+        ),
     }
     // Put back the pool's ha-reboot-vm-on-internal-shutdown if fate-shared
     // freeze mode turned it off (it records the value it found).
@@ -193,11 +196,15 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
 
         // Forget (not destroy) the SR: the LV removal handles the data
         print!("  destroying SR {sr_uuid}... ");
-        match run_cmd("xe", &["sr-destroy", &format!("uuid={sr_uuid}")]).await {
+        match run_cmd_quiet("xe", &["sr-destroy", &format!("uuid={sr_uuid}")]).await {
             Ok(()) => println!("ok"),
             Err(e) => {
-                println!("failed ({e}), trying sr-forget");
-                let _ = run_cmd("xe", &["sr-forget", &format!("uuid={sr_uuid}")]).await;
+                println!("failed ({})", failure_reason(&e));
+                print!("  forgetting SR {sr_uuid}... ");
+                match run_cmd_quiet("xe", &["sr-forget", &format!("uuid={sr_uuid}")]).await {
+                    Ok(()) => println!("ok"),
+                    Err(e) => println!("failed ({})", failure_reason(&e)),
+                }
             }
         }
     }
@@ -230,8 +237,9 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
     let iqn = config.as_ref().map(|c| c.iscsi.target_iqn.clone());
     if let Some(iqn) = &iqn {
         println!("  logging out of iSCSI sessions for {iqn}");
-        let _ = run_cmd("iscsiadm", &["-m", "node", "-T", iqn, "--logout"]).await;
-        let _ = run_cmd("iscsiadm", &["-m", "node", "-T", iqn, "-o", "delete"]).await;
+        // Both fail when there is no session or node record, which is normal.
+        let _ = run_cmd_quiet("iscsiadm", &["-m", "node", "-T", iqn, "--logout"]).await;
+        let _ = run_cmd_quiet("iscsiadm", &["-m", "node", "-T", iqn, "-o", "delete"]).await;
     }
 
     // Step 5: wipe the backing device
@@ -595,9 +603,38 @@ async fn remove_firewall_rules() {
     }
 }
 
+/// The tool's own message from a failed command, for a one-line report. The
+/// error is `<command>: exit <code>: <stderr>`; falls back to its first line.
+fn failure_reason(e: &anyhow::Error) -> String {
+    let text = e.to_string();
+    let first = text.lines().next().unwrap_or("").trim();
+    match first
+        .split_once(": exit ")
+        .and_then(|(_, rest)| rest.split_once(": "))
+    {
+        Some((_, reason)) if !reason.trim().is_empty() => reason.trim().to_string(),
+        _ => first.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{tail_zero_seek_mib, unpatch_lvm_global_filter};
+    use super::{failure_reason, tail_zero_seek_mib, unpatch_lvm_global_filter};
+
+    #[test]
+    fn failure_reason_keeps_only_the_tools_message() {
+        let e = anyhow::anyhow!(
+            "xe sr-destroy uuid=x: exit Some(1): The uuid you supplied was invalid.\ntype: SR\nuuid: x\n"
+        );
+        assert_eq!(failure_reason(&e), "The uuid you supplied was invalid.");
+        let e = anyhow::anyhow!("xe pool-ha-disable: timed out after 120s");
+        assert_eq!(
+            failure_reason(&e),
+            "xe pool-ha-disable: timed out after 120s"
+        );
+        let e = anyhow::anyhow!("xe pool-ha-disable: exit Some(1): \n");
+        assert_eq!(failure_reason(&e), "xe pool-ha-disable: exit Some(1):");
+    }
 
     #[test]
     fn tail_seek_targets_last_8_mib() {
