@@ -2936,7 +2936,7 @@ async fn run_replace_backing(
 /// file, never an empty one. The temp file is created with the target's
 /// permissions (0600 for a new file): the config carries the CHAP secret and
 /// must never be readable by others, even briefly.
-async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     use anyhow::Context;
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;

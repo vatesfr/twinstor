@@ -267,6 +267,9 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
         "/var/lib/twinstor/boot-gate-peer-served.tmp",
         "/run/twinstor/discard-offer-parked",
         "/run/twinstor/steer-pending",
+        // The recorded SR uuid: the SR is destroyed above, and a stale record
+        // would mislead the next install's uninstall gate.
+        &crate::xapi::sr_uuid_path(),
         // Split-brain fork records: they describe an episode of this install.
         "/var/lib/twinstor/yield-loser-latched",
         "/var/lib/twinstor/yield-loser-latched.resuming",
@@ -409,18 +412,29 @@ async fn clear_backing_device(backing: &str) {
     println!("  backing device wiped");
 }
 
-/// Resolve the twinstor SR uuid for uninstall: the recorded-file / name-label
-/// resolver first, then (if config is present) the by-IQN discovery that finds a
-/// renamed SR with no recorded file. `None` = could not resolve, which the
-/// safety gate treats as fail-closed.
+/// Resolve the twinstor SR uuid for uninstall: the recorded uuid when that SR
+/// exists, else the SR found by its target IQN (which survives a rename), else
+/// by name. A recorded uuid that resolves to nothing is left by an earlier
+/// install and must not hide the current SR from the VM-safety gate. When no
+/// TwinStor SR exists at all (the other node's uninstall destroyed it), the
+/// recorded uuid is returned and reads as an SR with no VMs. `None` = could
+/// not resolve, which the safety gate treats as fail-closed.
 async fn resolve_sr_uuid(config: Option<&crate::config::Config>) -> Option<String> {
-    if let Some(u) = crate::xapi::twinstor_sr_uuid().await {
+    let recorded = crate::xapi::read_recorded_sr_uuid();
+    if let Some(u) = &recorded
+        && crate::xapi::sr_uuid_exists(u).await
+    {
+        return recorded;
+    }
+    if let Some(c) = config
+        && let Some(u) = crate::xapi::discover_sr_uuid_by_iqn(&c.iscsi.target_iqn).await
+    {
         return Some(u);
     }
-    match config {
-        Some(c) => crate::xapi::discover_sr_uuid_by_iqn(&c.iscsi.target_iqn).await,
-        None => None,
+    if let Some(u) = crate::xapi::twinstor_sr_uuid_by_name().await {
+        return Some(u);
     }
+    recorded
 }
 
 /// Number of VMs with a disk on the twinstor SR (pool-wide), for the resolved

@@ -181,9 +181,14 @@ pub async fn twinstor_sr_uuid() -> Option<String> {
     if let Some(u) = read_recorded_sr_uuid() {
         return Some(u);
     }
-    // Fallback for installs that predate the recording: setup names the SR
-    // "twinstor". If two SRs carry that name, take the first UUID rather than
-    // pass a comma-joined pair to `pool-ha-enable heartbeat-sr-uuids=`.
+    // Fallback for installs that predate the recording.
+    twinstor_sr_uuid_by_name().await
+}
+
+/// The SR setup names "twinstor". If two SRs carry that name, the first UUID,
+/// rather than a comma-joined pair that `pool-ha-enable heartbeat-sr-uuids=`
+/// would reject.
+pub async fn twinstor_sr_uuid_by_name() -> Option<String> {
     let u = xe_minimal(&["sr-list", "name-label=twinstor", "params=uuid"]).await?;
     first_token(&u)
 }

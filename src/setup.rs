@@ -208,10 +208,8 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    tokio::fs::write(
-        CONFIG_PATH,
-        format!(
-            r#"[node]
+    let config_text = format!(
+        r#"[node]
 name = "{local_name}"
 peer = "{peer_name}"
 
@@ -232,18 +230,24 @@ chap_user = "{chap_user}"
 chap_password = "{chap_password}"
 initiator_iqns = [{iqn_list}]
 "#,
-            peer_ip = params.peer_ip,
-            backing = backing.display(),
-            allow_no_tiebreaker = params.allow_no_tiebreaker
-        ),
-    )
-    .await
-    .context("writing config")?;
-    // The config contains the CHAP password: root-only.
+        peer_ip = params.peer_ip,
+        backing = backing.display(),
+        allow_no_tiebreaker = params.allow_no_tiebreaker
+    );
+    // The config contains the CHAP password: created root-only, never readable
+    // by others even briefly (an older config keeps its mode, so set it after).
+    crate::cli::write_atomic(std::path::Path::new(CONFIG_PATH), config_text.as_bytes())
+        .await
+        .context("writing config")?;
     tokio::fs::set_permissions(CONFIG_PATH, std::fs::Permissions::from_mode(0o600))
         .await
         .context("setting config permissions")?;
     println!("wrote {CONFIG_PATH}");
+
+    // A recorded SR uuid left by an earlier install names an SR that is gone.
+    // The node that creates the SR records the new one below; the other
+    // node's daemon records it on its first run.
+    let _ = std::fs::remove_file(crate::xapi::sr_uuid_path());
 
     write_ping_targets(&params.ping_targets).await?;
 
