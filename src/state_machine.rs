@@ -2141,7 +2141,6 @@ enum HostEnableAction {
     Hold,
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Whether a crash-boundary record on this node holds datapaths it could not
 /// release: a start or migration here would reuse a stale attachment, so the
 /// generic watchdog must not enable the host. A host the boundary merely
@@ -2159,6 +2158,7 @@ fn boundary_owns_host_enable(path: &str) -> bool {
         .is_some_and(|r| !r.leaked.is_empty())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn host_enable_decision(
     state: Option<(bool, bool)>,
     since: Option<std::time::Instant>,

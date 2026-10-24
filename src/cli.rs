@@ -2379,6 +2379,35 @@ mod tests {
         assert!(daemon_may_be_running(&Err(anyhow::anyhow!("timed out"))));
     }
 
+    #[tokio::test]
+    async fn write_atomic_replaces_the_file_and_keeps_it_private() {
+        use super::write_atomic;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tw-write-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("twinstor.toml");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // A new file is created 0600, never with the umask's default.
+        write_atomic(&path, b"one").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        assert_eq!(mode(&path), 0o600);
+
+        // An existing file keeps its mode and gets the new contents.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&path, b"two").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(mode(&path), 0o640);
+
+        // A temp file left by an interrupted run does not block the next write.
+        std::fs::write(dir.join(".twinstor.toml.tmp"), b"stale").unwrap();
+        write_atomic(&path, b"three").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"three");
+        assert!(!dir.join(".twinstor.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn discard_and_resync_refuses_every_unsafe_state() {
         use super::discard_refusal;
@@ -3378,13 +3407,19 @@ async fn run_replace_backing(
 }
 
 /// Write `contents` to `path` atomically: a temp file in the same directory
-/// (so the rename is atomic, not cross-device), then renamed over the
-/// target, inheriting the target's permissions when it already exists (the
-/// config is root-only 0600 and carries the CHAP secret).
+/// (so the rename is atomic, not cross-device), synced, then renamed over the
+/// target, and the directory synced, so a crash leaves the old or the new
+/// file, never an empty one. The temp file is created with the target's
+/// permissions (0600 for a new file): the config carries the CHAP secret and
+/// must never be readable by others, even briefly.
 async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     use anyhow::Context;
     use std::os::unix::fs::PermissionsExt;
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    use tokio::io::AsyncWriteExt;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
         path.file_name()
@@ -3393,19 +3428,33 @@ async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     ));
     let mode = tokio::fs::metadata(path)
         .await
-        .ok()
-        .map(|m| m.permissions().mode());
-    tokio::fs::write(&tmp, contents)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o600);
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .await
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    // The umask may have narrowed the creation mode; set it exactly.
+    f.set_permissions(std::fs::Permissions::from_mode(mode))
+        .await
+        .with_context(|| format!("setting permissions on {}", tmp.display()))?;
+    f.write_all(contents)
         .await
         .with_context(|| format!("writing {}", tmp.display()))?;
-    if let Some(mode) = mode {
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-            .await
-            .ok();
-    }
+    f.sync_all()
+        .await
+        .with_context(|| format!("syncing {}", tmp.display()))?;
+    drop(f);
     tokio::fs::rename(&tmp, path)
         .await
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    if let Ok(d) = tokio::fs::File::open(dir).await {
+        let _ = d.sync_all().await;
+    }
     Ok(())
 }
 
