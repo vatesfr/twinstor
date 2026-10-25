@@ -216,6 +216,7 @@ mod tests {
             peer_disk,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }

@@ -93,6 +93,11 @@ pub struct DrbdStatus {
     /// unbounded and invisible to heals keyed on `suspended_user`, so the
     /// daemon must at least see and alert on it.
     pub suspended_fencing: bool,
+    /// I/O suspended for any reason (`suspended:` with any value but `no`):
+    /// user, fencing, and also no-data (`on-no-data-accessible suspend-io`,
+    /// no reachable copy) and quorum. For callers that need "is local I/O
+    /// running at all", not one specific suspend.
+    pub suspended_any: bool,
     /// Replication direction toward the peer, or `None` when no resync is in
     /// progress (idle or Established).
     pub replication: Option<Replication>,
@@ -966,6 +971,7 @@ pub fn parse_drbdadm_text(text: &str) -> Result<DrbdStatus> {
     let mut peer_disk: Option<DiskState> = None;
     let mut suspended_user = false;
     let mut suspended_fencing = false;
+    let mut suspended_any = false;
     let mut replication: Option<Replication> = None;
     let mut resync_done: Option<f64> = None;
     let mut has_peer = false;
@@ -1023,6 +1029,7 @@ pub fn parse_drbdadm_text(text: &str) -> Result<DrbdStatus> {
             // The value can be a comma-joined set ("user,fencing").
             suspended_user = s.split(',').any(|v| v == "user");
             suspended_fencing = s.split(',').any(|v| v == "fencing");
+            suspended_any = s.split(',').any(|v| !v.is_empty() && v != "no");
         }
         // DRBD 9 resync line: "replication:SyncSource ... done:NN.NN"
         if let Some(r) = extract(trimmed, "replication:") {
@@ -1069,6 +1076,7 @@ pub fn parse_drbdadm_text(text: &str) -> Result<DrbdStatus> {
         peer_disk,
         suspended_user,
         suspended_fencing,
+        suspended_any,
         replication,
         resync_done,
     })
@@ -1554,6 +1562,14 @@ mod tests {
         };
         let s = t("fencing");
         assert!(s.suspended_fencing && !s.suspended_user);
+        assert!(s.suspended_any);
+        // no-data (on-no-data-accessible suspend-io) and quorum are neither
+        // user nor fencing, but local I/O is frozen all the same.
+        let s = t("no-data");
+        assert!(s.suspended_any && !s.suspended_fencing && !s.suspended_user);
+        let s = t("quorum");
+        assert!(s.suspended_any);
+        assert!(!t("no").suspended_any);
         let s = t("user,fencing");
         assert!(s.suspended_fencing && s.suspended_user);
         let s = t("user");

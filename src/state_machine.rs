@@ -1615,13 +1615,47 @@ fn whole_switch_decision(
 
 /// Whether a whole-switch `Release` may run now. Its single HA re-arm
 /// restarts xhad, whose statefile watchdog starts at once, and the statefile
-/// lives on this SR. While local DRBD I/O is suspended (a fence-peer or freeze
-/// suspend: typically the peer was cut while the hold stood) statefile writes
-/// block, the watchdog runs out about 105 s later and XHA resets this host
-/// with its VMs, as seen in the lab. So the release waits, hold kept, until
-/// I/O runs; an unreadable DRBD status waits too.
-fn whole_switch_release_ready(io_suspended: Option<bool>) -> bool {
-    io_suspended == Some(false)
+/// lives on this SR. While local DRBD I/O is suspended for any reason (a
+/// fence-peer or freeze suspend when the peer was cut while the hold stood,
+/// or no-data on a Diskless host) statefile writes block, the watchdog runs
+/// out about 105 s later and XHA resets this host with its VMs, as seen in
+/// the lab. I/O running is not enough either: after a step-down the device
+/// path can be gone. So the release also needs a direct read of the
+/// statefile to answer (`statefile_ok`, `None` when its path is unknown).
+/// Otherwise it waits, hold kept; an unreadable DRBD status waits too.
+fn whole_switch_release_ready(io_suspended: Option<bool>, statefile_ok: Option<bool>) -> bool {
+    io_suspended == Some(false) && statefile_ok != Some(false)
+}
+
+/// A deferred whole-switch release is alerted once it has lasted this long:
+/// HA stays disarmed on this host meanwhile.
+const WHOLE_SWITCH_DEFERRED_ALERT_AFTER: Duration = Duration::from_secs(300);
+
+/// Direct read of the HA statefile device (the path in xhad.conf), bounded:
+/// whether an xhad started now could do its statefile I/O. `None` when the
+/// path is not configured.
+async fn statefile_readable() -> Option<bool> {
+    let text = std::fs::read_to_string("/etc/xensource/xhad.conf").ok()?;
+    let start = text.find("<StateFile>")? + "<StateFile>".len();
+    let end = text[start..].find('<')? + start;
+    let path = text[start..end].trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let ok = crate::cmd::cmd_output_for(
+        "dd",
+        &[
+            &format!("if={path}"),
+            "of=/dev/null",
+            "bs=4096",
+            "count=1",
+            "iflag=direct",
+        ],
+        5,
+    )
+    .await
+    .is_ok();
+    Some(ok)
 }
 
 /// The whole-switch fence guard runs on its own task every ~2 s, separate
@@ -3634,13 +3668,61 @@ fn peer_disk_is_stale(peer_disk: Option<DiskState>) -> bool {
 
 /// Whether the demoted-survivor re-assert may run its emergency-transition
 /// chain. The chain starts by emergency-disabling this host's HA. While the
-/// peer is still live in the HA liveset, its XHA then reads this host as failed
-/// and restarts this host's protected VMs on the peer while they still run
-/// here. So it runs only when this host has no guest on the SR, or the local
-/// liveset shows the peer gone; an unreadable answer holds (fails closed) and
-/// the operator is alerted instead.
-fn demoted_survivor_reassert_safe(peer_live: Option<bool>, local_guests: Option<usize>) -> bool {
-    peer_live == Some(false) || local_guests == Some(0)
+/// peer's XHA is alive it then reads this host as failed and restarts this
+/// host's protected VMs on the peer while they still run here. So it runs only
+/// when this host runs no guest at all (`xl list`, any SR), or the local
+/// liveset shows the peer dead (not live and off the statefile); an unreadable
+/// answer holds (fails closed) and the operator is alerted instead. In the
+/// heal's own scenario the survivor usually runs the VMs, so the heal then
+/// reduces to the alert: the inversion only costs control-plane operations
+/// (the stale master reads through this host's disk), while a wrong takeover
+/// double-runs VMs.
+fn demoted_survivor_reassert_safe(peer_dead: Option<bool>, local_guests: Option<usize>) -> bool {
+    peer_dead == Some(true) || local_guests == Some(0)
+}
+
+/// Window over which a resync must advance to count as progressing. `done`
+/// is printed with two decimals, so a large disk resyncing at a normal rate
+/// can show the same value for many one-second ticks.
+const DEMOTED_SURVIVOR_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
+/// How long a demotion seen by this daemon stays evidence for the heal.
+const DEMOTED_SURVIVOR_EVIDENCE_WINDOW: Duration = Duration::from_secs(1800);
+
+/// Resync progress judged over `window`: `mark` is the `done` value at its
+/// last advance and when. Returns whether the resync is progressing and the
+/// new mark. No resync running: not progressing, mark cleared.
+fn resync_progress_window(
+    cur: Option<f64>,
+    mark: Option<(f64, std::time::Instant)>,
+    now: std::time::Instant,
+    window: Duration,
+) -> (bool, Option<(f64, std::time::Instant)>) {
+    match (cur, mark) {
+        (None, _) => (false, None),
+        (Some(c), None) => (true, Some((c, now))),
+        (Some(c), Some((m, _))) if c > m => (true, Some((c, now))),
+        (Some(_), Some((m, at))) => (now.duration_since(at) < window, Some((m, at))),
+    }
+}
+
+/// Track the demotion the heal is about: this daemon read its own pool.conf
+/// as `master`, then as `slave:<peer>`. Returns the updated (was_master,
+/// demoted_at). Becoming master again clears the evidence; a demotion is
+/// recorded once and kept until then (the caller bounds its age).
+fn demotion_evidence(
+    local_master: bool,
+    slave_of_peer: bool,
+    was_master: bool,
+    demoted_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> (bool, Option<std::time::Instant>) {
+    if local_master {
+        return (true, None);
+    }
+    if slave_of_peer && was_master && demoted_at.is_none() {
+        return (false, Some(now));
+    }
+    (was_master, demoted_at)
 }
 
 /// Decide whether the fresh survivor should re-assert pool mastership after
@@ -6310,6 +6392,9 @@ pub struct StateMachine {
     /// When a whole-switch release was last deferred because local DRBD I/O
     /// was suspended (throttles its log line).
     whole_switch_release_deferred_at: Option<std::time::Instant>,
+    /// When the current deferral started, and when it was last alerted.
+    whole_switch_release_deferred_since: Option<std::time::Instant>,
+    whole_switch_release_alerted_at: Option<std::time::Instant>,
     /// Confirm clock for a single-host slave isolation (my gateway
     /// down, master's gateway up over the direct link); the slave stand-down fires
     /// once it has held past `ISOLATED_SLAVE_STANDDOWN_AFTER`.
@@ -6432,9 +6517,18 @@ pub struct StateMachine {
     demoted_survivor_since: Option<std::time::Instant>,
     demoted_survivor_action_at: Option<std::time::Instant>,
     demoted_survivor_attempts: u32,
-    // Last-seen outgoing resync %, to tell a progressing resync (transient
-    // inversion, hold) from a stalled one (stuck inversion, re-assert).
-    demoted_survivor_last_done: Option<f64>,
+    // Outgoing resync % at its last advance and when, to tell a progressing
+    // resync (transient inversion, hold) from a stalled one (stuck inversion,
+    // re-assert) over a window rather than per tick.
+    demoted_survivor_last_done: Option<(f64, std::time::Instant)>,
+    // Whether this daemon last read its own pool.conf as `master`, and when it
+    // then saw itself demoted to `slave:<peer>`: the positive evidence that
+    // the heal's scenario happened (a peer that was master all along never
+    // qualifies).
+    demoted_survivor_was_master: bool,
+    demoted_survivor_demoted_at: Option<std::time::Instant>,
+    // Last alert for a re-assert held by the double-run guard.
+    demoted_survivor_blocked_alert_at: Option<std::time::Instant>,
     // Replication-path watchdog (arbitrated only). Replication belongs on
     // the direct link in steady state; running on the switch fallback is safe
     // (topologically fate-shared) but silently degrades write latency and
@@ -6749,6 +6843,9 @@ impl StateMachine {
             demoted_survivor_action_at: None,
             demoted_survivor_attempts: 0,
             demoted_survivor_last_done: None,
+            demoted_survivor_was_master: false,
+            demoted_survivor_demoted_at: None,
+            demoted_survivor_blocked_alert_at: None,
             fallback_since: None,
             fallback_alert_at: None,
             fallback_alert_attempt_at: None,
@@ -6889,6 +6986,8 @@ impl StateMachine {
             whole_switch_since: None,
             whole_switch_probe_misses: 0,
             whole_switch_release_deferred_at: None,
+            whole_switch_release_deferred_since: None,
+            whole_switch_release_alerted_at: None,
             isolated_slave_since: None,
             ha_deadlock_since: None,
             ha_deadlock_action_at: None,
@@ -9917,9 +10016,12 @@ impl StateMachine {
     /// returning stale node and demote this UpToDate survivor to its slave,
     /// leaving an Inconsistent master that cannot serve the LUN (the pool
     /// deadlocks). Re-assert mastership via the full emergency-transition chain
-    /// (not a bare toolstack restart, which flaps against XHA). `local_uptodate`
-    /// and `peer_stale_connected` are precomputed by the caller from the DRBD
-    /// status.
+    /// (not a bare toolstack restart, which flaps against XHA). It acts only on
+    /// a demotion this daemon saw (its pool.conf went from `master` to
+    /// `slave:<peer>`), and the chain runs only when no guest runs here or the
+    /// peer is dead in the liveset (`demoted_survivor_reassert_safe`);
+    /// otherwise it alerts. `local_uptodate` and `peer_stale_connected` are
+    /// precomputed by the caller from the DRBD status.
     async fn check_demoted_survivor(
         &mut self,
         local_uptodate: bool,
@@ -9936,18 +10038,37 @@ impl StateMachine {
         // arbitrated pools' brief split-resolution states from reaching the fire
         // threshold, without a fate-shared-only gate that would also disable the
         // fix where arbitrated pools can need it.
-        let resync_progressing = match (resync_done, self.demoted_survivor_last_done) {
-            (Some(cur), Some(prev)) => cur > prev + 0.01,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        self.demoted_survivor_last_done = resync_done;
+        let (resync_progressing, mark) = resync_progress_window(
+            resync_done,
+            self.demoted_survivor_last_done,
+            now,
+            DEMOTED_SURVIVOR_PROGRESS_WINDOW,
+        );
+        self.demoted_survivor_last_done = mark;
         let actively_resolving =
             resync_progressing || std::path::Path::new(ISOLATED_STANDDOWN_MARKER).exists();
         // Cheap gate: am I a slave of my peer (pool.conf `slave:<peer>`)? Only then
         // do the disk signals matter, and only then pay the reachability ping.
         let peer_addr = self.config.network.peer_address.to_string();
         let slave_of_peer = xapi::local_slave_master_addr().as_deref() == Some(peer_addr.as_str());
+        // The scenario needs this host to have been demoted from master while
+        // this daemon watched. A peer that was master all along (a master whose
+        // disk is being rebuilt shows Inconsistent too) is not an inversion.
+        let local_master = std::fs::read_to_string("/etc/xensource/pool.conf")
+            .map(|c| c.trim() == "master")
+            .unwrap_or(false);
+        let (was_master, demoted_at) = demotion_evidence(
+            local_master,
+            slave_of_peer,
+            self.demoted_survivor_was_master,
+            self.demoted_survivor_demoted_at,
+            now,
+        );
+        self.demoted_survivor_was_master = was_master;
+        self.demoted_survivor_demoted_at = demoted_at;
+        let slave_of_peer = slave_of_peer
+            && demoted_at
+                .is_some_and(|t| now.duration_since(t) <= DEMOTED_SURVIVOR_EVIDENCE_WINDOW);
         let peer_reachable =
             if slave_of_peer && local_uptodate && peer_stale_connected && !actively_resolving {
                 self.peer_reachable().await
@@ -9979,28 +10100,40 @@ impl StateMachine {
                 warn!(
                     peer = %self.config.node.peer,
                     "inverted control plane: I hold the UpToDate copy but was demoted to slave \
-                     of a peer whose storage is stale (Inconsistent); will re-assert mastership \
-                     if it persists"
+                     of a peer whose storage is stale (Inconsistent or Outdated); will re-assert \
+                     mastership if it persists and no guest runs here"
                 );
                 self.demoted_survivor_since = Some(now);
             }
             StrandedAction::Restart => {
-                let peer_live = self.peer_in_liveset().await;
-                let local_guests = match xapi::twinstor_sr_uuid().await {
-                    Some(sr) => xapi::local_guests_on_sr(&sr).await.map(|g| g.len()),
-                    None => None,
+                // Local reads only (xhad socket, `xl list`): a stale or wedged
+                // master's database must not be able to report "no guests here".
+                let (peer_dead, local_guests) = if cfg!(test) {
+                    (Some(true), Some(0))
+                } else {
+                    (
+                        self.peer_dead_via_liveset().await,
+                        self.running_vm_count().await,
+                    )
                 };
-                if !cfg!(test) && !demoted_survivor_reassert_safe(peer_live, local_guests) {
+                if !demoted_survivor_reassert_safe(peer_dead, local_guests) {
                     // Retry later on the normal cadence, without spending an attempt.
                     self.demoted_survivor_action_at = Some(now);
+                    if self
+                        .demoted_survivor_blocked_alert_at
+                        .is_some_and(|t| now.duration_since(t) < DEGRADED_REALERT_AFTER)
+                    {
+                        return;
+                    }
+                    self.demoted_survivor_blocked_alert_at = Some(now);
                     warn!(
                         heal_event = "demoted_survivor_reassert_blocked",
-                        ?peer_live,
+                        ?peer_dead,
                         ?local_guests,
-                        "not re-asserting pool mastership: the peer is live in the HA liveset \
-                         (or unreadable) and this host runs guests on the SR (or the list is \
-                         unreadable); the takeover's HA disable would let the peer's XHA restart \
-                         them while they still run here"
+                        "not re-asserting pool mastership: this host runs guests (or the count \
+                         is unreadable) and the peer is not confirmed gone from the HA liveset; \
+                         the takeover's HA disable would let the peer's XHA restart them while \
+                         they still run here"
                     );
                     let _ = xapi::send_ha_wedge_alert(
                         "TwinStor: this host holds the only UpToDate copy and is a slave of a peer \
@@ -10020,12 +10153,12 @@ impl StateMachine {
                     attempt = self.demoted_survivor_attempts,
                     heal_event = "demoted_survivor_reassert",
                     "re-asserting pool mastership: this host holds the only UpToDate copy but was \
-                     demoted below a stale (Inconsistent) master; running the emergency-transition \
+                     demoted below a stale (Inconsistent or Outdated) master; running the emergency-transition \
                      chain so the good copy serves and the stale peer resyncs as slave"
                 );
                 let _ = xapi::send_ha_wedge_alert(
                     "TwinStor wrongly-demoted survivor: this host holds the only UpToDate storage \
-                     copy but XHA demoted it to slave of a peer whose disk is stale (Inconsistent) \
+                     copy but XHA demoted it to slave of a peer whose disk is stale (Inconsistent or Outdated) \
                      after that peer rebooted as master. Re-asserting pool mastership so the good \
                      copy serves and the stale peer resyncs as a slave. If it does not stick, on \
                      this host run 'xe pool-emergency-transition-to-master' then 'xe \
@@ -14442,6 +14575,16 @@ impl StateMachine {
                 // this node is the yielder, and otherwise does nothing.
                 self.try_ha_deadlock_exit().await;
             }
+            ReadmissionAction::Revive
+                if self.whole_switch_held
+                    || self
+                        .whole_switch_guard_ever_disarmed
+                        .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                // xhad is down on purpose during a whole-switch hold, and the
+                // hold's release owns the single re-arm; a second start joins
+                // a second xhad and XHA self-fences.
+            }
             ReadmissionAction::Revive => {
                 self.episode_open("readmission");
                 warn!(
@@ -15329,13 +15472,15 @@ impl StateMachine {
                 );
             }
             WholeSwitchAction::Release => {
-                let io_suspended = self
-                    .drbd
-                    .status()
-                    .await
-                    .ok()
-                    .map(|s| s.suspended_user || s.suspended_fencing);
-                if !whole_switch_release_ready(io_suspended) {
+                let io_suspended = self.drbd.status().await.ok().map(|s| s.suspended_any);
+                let statefile_ok = if io_suspended == Some(false) {
+                    statefile_readable().await
+                } else {
+                    None
+                };
+                if !whole_switch_release_ready(io_suspended, statefile_ok) {
+                    let since = *self.whole_switch_release_deferred_since.get_or_insert(now);
+                    let long = now.duration_since(since) >= WHOLE_SWITCH_DEFERRED_ALERT_AFTER;
                     if self
                         .whole_switch_release_deferred_at
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
@@ -15343,16 +15488,45 @@ impl StateMachine {
                         info!(
                             heal_event = "whole_switch_release_deferred",
                             ?io_suspended,
-                            "whole-switch hold over, but local storage I/O is suspended (or \
-                             unreadable): keeping the hold and deferring the HA re-arm, since \
-                             an xhad started now could not reach its statefile and would fence \
-                             this host"
+                            ?statefile_ok,
+                            "whole-switch hold over, but local storage I/O is suspended or the HA \
+                             statefile does not answer (or DRBD is unreadable): keeping the hold \
+                             and deferring the HA re-arm, since an xhad started now could not do \
+                             its statefile I/O and would fence this host"
                         );
                         self.whole_switch_release_deferred_at = Some(now);
+                    }
+                    if long
+                        && self
+                            .whole_switch_release_alerted_at
+                            .is_none_or(|t| now.duration_since(t) >= DEGRADED_REALERT_AFTER)
+                    {
+                        warn!(
+                            heal_event = "whole_switch_release_deferred_long",
+                            "the whole-switch hold has been over for minutes but HA cannot be \
+                             re-armed safely yet (local storage I/O frozen or the statefile \
+                             unreachable); this host stays HA-disarmed"
+                        );
+                        self.heal_state_update(
+                            "whole_switch_release_deferred",
+                            "whole-switch outage over; HA re-arm waiting for local storage I/O",
+                            Some("check this host's storage (twinstor status); HA re-arms once its I/O runs"),
+                        );
+                        let _ = xapi::send_xapi_alert(
+                            "TwinStor: the network outage is over, but this host's storage I/O is \
+                             still frozen (or its HA statefile does not answer), so its HA stays \
+                             disarmed; it re-arms automatically once storage I/O runs. Check \
+                             'twinstor status' on this host.",
+                        )
+                        .await;
+                        self.whole_switch_release_alerted_at = Some(now);
                     }
                     return;
                 }
                 self.whole_switch_release_deferred_at = None;
+                self.whole_switch_release_deferred_since = None;
+                self.whole_switch_release_alerted_at = None;
+                self.clear_heal_state_if_stage("whole_switch_release_deferred");
                 info!(
                     heal_event = "whole_switch_release",
                     "client network restored after a whole-switch hold; re-arming local HA"
@@ -24355,6 +24529,7 @@ poll_interval_ms = 10
             peer_disk: None,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24371,6 +24546,7 @@ poll_interval_ms = 10
             peer_disk: None,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24385,6 +24561,7 @@ poll_interval_ms = 10
             peer_disk: Some(DiskState::UpToDate),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24399,6 +24576,7 @@ poll_interval_ms = 10
             peer_disk: None,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24417,6 +24595,7 @@ poll_interval_ms = 10
             peer_disk: Some(DiskState::UpToDate),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24433,6 +24612,7 @@ poll_interval_ms = 10
             peer_disk: Some(DiskState::UpToDate),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: Some(Replication::SyncTarget),
             resync_done: Some(42.0),
         }
@@ -24447,6 +24627,7 @@ poll_interval_ms = 10
             peer_disk: Some(DiskState::UpToDate),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24461,6 +24642,7 @@ poll_interval_ms = 10
             peer_disk: None,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -24486,6 +24668,7 @@ poll_interval_ms = 10
             peer_disk: Some(DiskState::Inconsistent),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: Some(Replication::SyncSource),
             resync_done: Some(0.0),
         }
@@ -24502,6 +24685,7 @@ poll_interval_ms = 10
             peer_disk: Some(DiskState::Consistent),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: Some(Replication::WFBitMap),
             resync_done: None,
         }
@@ -26415,18 +26599,84 @@ poll_interval_ms = 10
     }
 
     #[test]
-    fn demoted_survivor_reassert_safe_needs_no_guests_or_peer_gone() {
+    fn demoted_survivor_reassert_safe_needs_no_guests_or_peer_dead() {
         // No guest here: the takeover's HA disable has nothing to double-run.
-        assert!(demoted_survivor_reassert_safe(Some(true), Some(0)));
+        assert!(demoted_survivor_reassert_safe(Some(false), Some(0)));
         assert!(demoted_survivor_reassert_safe(None, Some(0)));
-        // The peer is out of the liveset: its XHA cannot restart our VMs.
-        assert!(demoted_survivor_reassert_safe(Some(false), Some(3)));
-        assert!(demoted_survivor_reassert_safe(Some(false), None));
-        // Guests here and the peer live (or either unreadable): hold.
-        assert!(!demoted_survivor_reassert_safe(Some(true), Some(1)));
-        assert!(!demoted_survivor_reassert_safe(Some(true), None));
+        // The peer is dead in the liveset (not live, off the statefile).
+        assert!(demoted_survivor_reassert_safe(Some(true), Some(3)));
+        assert!(demoted_survivor_reassert_safe(Some(true), None));
+        // Guests here and the peer not confirmed dead (or either unreadable): hold.
+        assert!(!demoted_survivor_reassert_safe(Some(false), Some(1)));
+        assert!(!demoted_survivor_reassert_safe(Some(false), None));
         assert!(!demoted_survivor_reassert_safe(None, Some(2)));
         assert!(!demoted_survivor_reassert_safe(None, None));
+    }
+
+    #[test]
+    fn resync_progress_is_judged_over_a_window() {
+        let t0 = std::time::Instant::now();
+        let w = Duration::from_secs(60);
+        // No resync: not progressing, mark cleared.
+        assert_eq!(
+            resync_progress_window(None, Some((5.0, t0)), t0, w),
+            (false, None)
+        );
+        // First reading starts the mark.
+        assert_eq!(
+            resync_progress_window(Some(5.0), None, t0, w),
+            (true, Some((5.0, t0)))
+        );
+        // A slow resync that sits on one printed value stays progressing
+        // within the window (the old per-tick test read it as stalled).
+        let t30 = t0 + Duration::from_secs(30);
+        assert_eq!(
+            resync_progress_window(Some(5.0), Some((5.0, t0)), t30, w),
+            (true, Some((5.0, t0)))
+        );
+        // Any advance moves the mark.
+        assert_eq!(
+            resync_progress_window(Some(5.01), Some((5.0, t0)), t30, w),
+            (true, Some((5.01, t30)))
+        );
+        // No advance for the whole window: stalled.
+        let t61 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            resync_progress_window(Some(5.0), Some((5.0, t0)), t61, w),
+            (false, Some((5.0, t0)))
+        );
+    }
+
+    #[test]
+    fn demotion_evidence_needs_a_seen_master_to_slave_change() {
+        let t0 = std::time::Instant::now();
+        // A slave that never saw itself master has no evidence (the Diskless or
+        // rebuilding master case: the peer was master all along).
+        assert_eq!(
+            demotion_evidence(false, true, false, None, t0),
+            (false, None)
+        );
+        // Master, then slave of the peer: demotion recorded once.
+        let (wm, d) = demotion_evidence(true, false, false, None, t0);
+        assert_eq!((wm, d), (true, None));
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(demotion_evidence(false, true, wm, d, t1), (false, Some(t1)));
+        // Kept while it stays a slave (the caller bounds its age).
+        let t2 = t0 + Duration::from_secs(50);
+        assert_eq!(
+            demotion_evidence(false, true, false, Some(t1), t2),
+            (false, Some(t1))
+        );
+        // An unreadable pool.conf keeps what was seen.
+        assert_eq!(
+            demotion_evidence(false, false, true, None, t2),
+            (true, None)
+        );
+        // Master again: evidence cleared.
+        assert_eq!(
+            demotion_evidence(true, false, false, Some(t1), t2),
+            (true, None)
+        );
     }
 
     #[test]
@@ -27590,11 +27840,16 @@ poll_interval_ms = 10
 
     #[test]
     fn whole_switch_release_waits_for_running_io() {
-        assert!(whole_switch_release_ready(Some(false)));
-        // Suspended I/O: an xhad re-armed now would fence this host.
-        assert!(!whole_switch_release_ready(Some(true)));
+        assert!(whole_switch_release_ready(Some(false), Some(true)));
+        // Statefile path not configured: I/O running is the whole test.
+        assert!(whole_switch_release_ready(Some(false), None));
+        // Suspended I/O (any reason): an xhad re-armed now would fence this host.
+        assert!(!whole_switch_release_ready(Some(true), None));
+        assert!(!whole_switch_release_ready(Some(true), Some(true)));
+        // I/O runs but the statefile does not answer (path gone after a step-down).
+        assert!(!whole_switch_release_ready(Some(false), Some(false)));
         // DRBD status unreadable: wait for the next tick.
-        assert!(!whole_switch_release_ready(None));
+        assert!(!whole_switch_release_ready(None, None));
     }
 
     #[test]
@@ -29079,6 +29334,7 @@ poll_interval_ms = 10
         // A fence-peer decision's freeze is held too: `resume-io` would release it.
         assert!(!should_resume_io(&DrbdStatus {
             suspended_fencing: true,
+            suspended_any: true,
             ..suspended_but_healthy()
         }));
         // Not suspended: nothing to do.
@@ -29321,6 +29577,7 @@ poll_interval_ms = 10
         sm.connected_since = held();
         let fencing = DrbdStatus {
             suspended_fencing: true,
+            suspended_any: true,
             ..suspended_but_healthy()
         };
         drbd.set_status(fencing.clone());
@@ -29670,6 +29927,7 @@ poll_interval_ms = 10
             peer_disk: None,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         };
@@ -33609,6 +33867,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             peer_disk: None,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
@@ -35872,6 +36131,7 @@ poll_interval_ms = 10
         drbd.set_status(DrbdStatus {
             suspended_user: false,
             suspended_fencing: true,
+            suspended_any: true,
             ..base.clone()
         });
         fresh_read(&mut sm);

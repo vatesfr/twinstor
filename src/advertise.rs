@@ -166,6 +166,7 @@ mod tests {
             peer_disk: peer,
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: done.map(|_| Replication::SyncTarget),
             resync_done: done,
         }

@@ -626,6 +626,7 @@ mod tests {
             peer_disk: Some(DiskState::UpToDate),
             suspended_user: false,
             suspended_fencing: false,
+            suspended_any: false,
             replication: None,
             resync_done: None,
         }
