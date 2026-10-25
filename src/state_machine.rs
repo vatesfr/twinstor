@@ -1613,6 +1613,17 @@ fn whole_switch_decision(
     }
 }
 
+/// Whether a whole-switch `Release` may run now. Its single HA re-arm
+/// restarts xhad, whose statefile watchdog starts at once, and the statefile
+/// lives on this SR. While local DRBD I/O is suspended (a fence-peer or freeze
+/// suspend: typically the peer was cut while the hold stood) statefile writes
+/// block, the watchdog runs out about 105 s later and XHA resets this host
+/// with its VMs, as seen in the lab. So the release waits, hold kept, until
+/// I/O runs; an unreadable DRBD status waits too.
+fn whole_switch_release_ready(io_suspended: Option<bool>) -> bool {
+    io_suspended == Some(false)
+}
+
 /// The whole-switch fence guard runs on its own task every ~2 s, separate
 /// from the serial daemon tick. The tick can stall for tens of seconds on
 /// master-forwarded xapi calls when the pool master is unreachable (a slave
@@ -3603,6 +3614,33 @@ fn slave_rejoin_decision(
         Some(t) if now.duration_since(t) < retry_after => StrandedAction::Idle,
         _ => StrandedAction::Restart,
     }
+}
+
+/// Whether the peer's disk marks it as the stale copy that the demoted-survivor
+/// heal is about: a fence loser or returning ex-master still behind
+/// (Inconsistent mid-resync, or Outdated). A Diskless peer is not stale: it
+/// holds no copy at all and, when it is the pool master after a local disk
+/// failure, keeps serving through this host's disk. Counting it as stale made
+/// the slave take mastership from a healthy Diskless master, and the takeover's
+/// HA disable let the master's XHA restart this host's running VMs on the
+/// master (two instances on one disk). Consistent and Unknown are not proof of
+/// staleness either.
+fn peer_disk_is_stale(peer_disk: Option<DiskState>) -> bool {
+    matches!(
+        peer_disk,
+        Some(DiskState::Inconsistent | DiskState::Outdated)
+    )
+}
+
+/// Whether the demoted-survivor re-assert may run its emergency-transition
+/// chain. The chain starts by emergency-disabling this host's HA. While the
+/// peer is still live in the HA liveset, its XHA then reads this host as failed
+/// and restarts this host's protected VMs on the peer while they still run
+/// here. So it runs only when this host has no guest on the SR, or the local
+/// liveset shows the peer gone; an unreadable answer holds (fails closed) and
+/// the operator is alerted instead.
+fn demoted_survivor_reassert_safe(peer_live: Option<bool>, local_guests: Option<usize>) -> bool {
+    peer_live == Some(false) || local_guests == Some(0)
 }
 
 /// Decide whether the fresh survivor should re-assert pool mastership after
@@ -6269,6 +6307,9 @@ pub struct StateMachine {
     /// Consecutive transient beacon misses absorbed while a whole-switch is in
     /// effect/forming (miss-tolerance); reset on any definitive Down/Up read.
     whole_switch_probe_misses: u32,
+    /// When a whole-switch release was last deferred because local DRBD I/O
+    /// was suspended (throttles its log line).
+    whole_switch_release_deferred_at: Option<std::time::Instant>,
     /// Confirm clock for a single-host slave isolation (my gateway
     /// down, master's gateway up over the direct link); the slave stand-down fires
     /// once it has held past `ISOLATED_SLAVE_STANDDOWN_AFTER`.
@@ -6847,6 +6888,7 @@ impl StateMachine {
             whole_switch_held: false,
             whole_switch_since: None,
             whole_switch_probe_misses: 0,
+            whole_switch_release_deferred_at: None,
             isolated_slave_since: None,
             ha_deadlock_since: None,
             ha_deadlock_action_at: None,
@@ -8021,9 +8063,7 @@ impl StateMachine {
         // an Inconsistent master that cannot serve the LUN. If I hold the UpToDate
         // copy but was demoted below a Connected-but-stale peer, re-assert.
         let local_uptodate = status.disk == DiskState::UpToDate;
-        let peer_stale_connected = peer_connected
-            && status.peer_disk.is_some()
-            && status.peer_disk != Some(DiskState::UpToDate);
+        let peer_stale_connected = peer_connected && peer_disk_is_stale(status.peer_disk);
         // A frozen kept copy reconnecting to its giving-way peer looks like this
         // (the peer resyncs from it), and the management probe would wait out a
         // 5 s XAPI timeout before the I/O could resume.
@@ -9945,6 +9985,35 @@ impl StateMachine {
                 self.demoted_survivor_since = Some(now);
             }
             StrandedAction::Restart => {
+                let peer_live = self.peer_in_liveset().await;
+                let local_guests = match xapi::twinstor_sr_uuid().await {
+                    Some(sr) => xapi::local_guests_on_sr(&sr).await.map(|g| g.len()),
+                    None => None,
+                };
+                if !cfg!(test) && !demoted_survivor_reassert_safe(peer_live, local_guests) {
+                    // Retry later on the normal cadence, without spending an attempt.
+                    self.demoted_survivor_action_at = Some(now);
+                    warn!(
+                        heal_event = "demoted_survivor_reassert_blocked",
+                        ?peer_live,
+                        ?local_guests,
+                        "not re-asserting pool mastership: the peer is live in the HA liveset \
+                         (or unreadable) and this host runs guests on the SR (or the list is \
+                         unreadable); the takeover's HA disable would let the peer's XHA restart \
+                         them while they still run here"
+                    );
+                    let _ = xapi::send_ha_wedge_alert(
+                        "TwinStor: this host holds the only UpToDate copy and is a slave of a peer \
+                         whose disk is stale, but it runs VMs while the peer is live in HA, so it \
+                         does not take pool mastership automatically (the peer's HA would restart \
+                         those VMs while they still run here). Check the peer; to re-assert by \
+                         hand, first stop or migrate this host's VMs, then on this host run 'xe \
+                         pool-emergency-transition-to-master' and 'xe pool-recover-slaves', and \
+                         re-arm HA.",
+                    )
+                    .await;
+                    return;
+                }
                 self.demoted_survivor_attempts = self.demoted_survivor_attempts.saturating_add(1);
                 self.demoted_survivor_action_at = Some(now);
                 warn!(
@@ -15260,6 +15329,30 @@ impl StateMachine {
                 );
             }
             WholeSwitchAction::Release => {
+                let io_suspended = self
+                    .drbd
+                    .status()
+                    .await
+                    .ok()
+                    .map(|s| s.suspended_user || s.suspended_fencing);
+                if !whole_switch_release_ready(io_suspended) {
+                    if self
+                        .whole_switch_release_deferred_at
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+                    {
+                        info!(
+                            heal_event = "whole_switch_release_deferred",
+                            ?io_suspended,
+                            "whole-switch hold over, but local storage I/O is suspended (or \
+                             unreadable): keeping the hold and deferring the HA re-arm, since \
+                             an xhad started now could not reach its statefile and would fence \
+                             this host"
+                        );
+                        self.whole_switch_release_deferred_at = Some(now);
+                    }
+                    return;
+                }
+                self.whole_switch_release_deferred_at = None;
                 info!(
                     heal_event = "whole_switch_release",
                     "client network restored after a whole-switch hold; re-arming local HA"
@@ -26308,6 +26401,35 @@ poll_interval_ms = 10
     const DC: u32 = DEMOTED_SURVIVOR_CAP;
 
     #[test]
+    fn peer_disk_stale_only_when_inconsistent_or_outdated() {
+        // The heal's target: a peer that holds a copy which is behind.
+        assert!(peer_disk_is_stale(Some(DiskState::Inconsistent)));
+        assert!(peer_disk_is_stale(Some(DiskState::Outdated)));
+        // A Diskless master after a local disk failure serves through our disk:
+        // not stale. Taking mastership from it double-ran a VM in the lab.
+        assert!(!peer_disk_is_stale(Some(DiskState::Diskless)));
+        assert!(!peer_disk_is_stale(Some(DiskState::UpToDate)));
+        assert!(!peer_disk_is_stale(Some(DiskState::Consistent)));
+        assert!(!peer_disk_is_stale(Some(DiskState::Unknown)));
+        assert!(!peer_disk_is_stale(None));
+    }
+
+    #[test]
+    fn demoted_survivor_reassert_safe_needs_no_guests_or_peer_gone() {
+        // No guest here: the takeover's HA disable has nothing to double-run.
+        assert!(demoted_survivor_reassert_safe(Some(true), Some(0)));
+        assert!(demoted_survivor_reassert_safe(None, Some(0)));
+        // The peer is out of the liveset: its XHA cannot restart our VMs.
+        assert!(demoted_survivor_reassert_safe(Some(false), Some(3)));
+        assert!(demoted_survivor_reassert_safe(Some(false), None));
+        // Guests here and the peer live (or either unreadable): hold.
+        assert!(!demoted_survivor_reassert_safe(Some(true), Some(1)));
+        assert!(!demoted_survivor_reassert_safe(Some(true), None));
+        assert!(!demoted_survivor_reassert_safe(None, Some(2)));
+        assert!(!demoted_survivor_reassert_safe(None, None));
+    }
+
+    #[test]
     fn demoted_survivor_inverted_starts_timer_then_reasserts() {
         let now = std::time::Instant::now();
         // Slave of the peer, I am UpToDate, the peer is Connected but stale and
@@ -27464,6 +27586,15 @@ poll_interval_ms = 10
             ),
             Hold
         );
+    }
+
+    #[test]
+    fn whole_switch_release_waits_for_running_io() {
+        assert!(whole_switch_release_ready(Some(false)));
+        // Suspended I/O: an xhad re-armed now would fence this host.
+        assert!(!whole_switch_release_ready(Some(true)));
+        // DRBD status unreadable: wait for the next tick.
+        assert!(!whole_switch_release_ready(None));
     }
 
     #[test]
