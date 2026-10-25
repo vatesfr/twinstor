@@ -1905,11 +1905,12 @@ fn whole_switch_decision(
 /// lives on this SR. While local DRBD I/O is suspended for any reason (a
 /// fence-peer or freeze suspend when the peer was cut while the hold stood,
 /// or no-data on a Diskless host) statefile writes block, the watchdog runs
-/// out about 105 s later and XHA resets this host with its VMs, as seen in
-/// the lab. I/O running is not enough either: after a step-down the device
-/// path can be gone. So the release also needs a direct read of the
-/// statefile to answer (`statefile_ok`, `None` when its path is unknown).
-/// Otherwise it waits, hold kept; an unreadable DRBD status waits too.
+/// out about 105 s later and XHA resets this host. I/O running is not enough
+/// either: after a step-down the device path can be gone. So the release also
+/// needs a direct read of the statefile to answer (`statefile_ok`, `None`
+/// when its path is unknown). Otherwise it waits, hold kept; an unreadable
+/// DRBD status waits too. The caller does not wait while guests are frozen
+/// here (see the Release arm).
 fn whole_switch_release_ready(io_suspended: Option<bool>, statefile_ok: Option<bool>) -> bool {
     io_suspended == Some(false) && statefile_ok != Some(false)
 }
@@ -1922,31 +1923,14 @@ const WHOLE_SWITCH_STATEFILE_PROBE_EVERY: Duration = Duration::from_secs(20);
 /// HA stays disarmed on this host meanwhile.
 const WHOLE_SWITCH_DEFERRED_ALERT_AFTER: Duration = Duration::from_secs(300);
 
-/// Direct read of the HA statefile device (the path in xhad.conf), bounded:
-/// whether an xhad started now could do its statefile I/O. `None` when the
-/// path is not configured.
-async fn statefile_readable() -> Option<bool> {
-    let text = std::fs::read_to_string("/etc/xensource/xhad.conf").ok()?;
+/// The HA statefile device path xhad uses (`<StateFile>` in xhad.conf), or
+/// `None` when it is not configured.
+async fn statefile_path() -> Option<String> {
+    let text = tokio::fs::read_to_string(XHAD_CONF).await.ok()?;
     let start = text.find("<StateFile>")? + "<StateFile>".len();
     let end = text[start..].find('<')? + start;
     let path = text[start..end].trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    let ok = crate::cmd::cmd_output_for(
-        "dd",
-        &[
-            &format!("if={path}"),
-            "of=/dev/null",
-            "bs=4096",
-            "count=1",
-            "iflag=direct",
-        ],
-        5,
-    )
-    .await
-    .is_ok();
-    Some(ok)
+    (!path.is_empty()).then_some(path)
 }
 
 /// The whole-switch fence guard runs on its own task every ~2 s, separate
@@ -4005,6 +3989,43 @@ fn resync_progress_window(
         (Some(c), Some((m, _))) if c != m => (true, Some((c, now))),
         (Some(_), Some((m, at))) => (now.duration_since(at) < window, Some((m, at))),
     }
+}
+
+/// How long an inversion without demotion evidence must last before it is
+/// alerted (never acted on).
+const DEMOTED_SURVIVOR_UNPROVEN_ALERT_AFTER: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnprovenStep {
+    Idle,
+    Clear,
+    Watch(std::time::Instant),
+    Alert(std::time::Instant),
+}
+
+/// The alert-only watch on an inversion this daemon has no demotion evidence
+/// for: it must last `DEMOTED_SURVIVOR_UNPROVEN_ALERT_AFTER`, then alerts at
+/// the degraded cadence; it clears as soon as the inversion is gone.
+fn demoted_survivor_unproven_step(
+    inverted: bool,
+    since: Option<std::time::Instant>,
+    alerted_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> UnprovenStep {
+    if !inverted {
+        return if since.is_some() {
+            UnprovenStep::Clear
+        } else {
+            UnprovenStep::Idle
+        };
+    }
+    let since = since.unwrap_or(now);
+    if now.duration_since(since) < DEMOTED_SURVIVOR_UNPROVEN_ALERT_AFTER
+        || alerted_at.is_some_and(|t| now.duration_since(t) < DEGRADED_REALERT_AFTER)
+    {
+        return UnprovenStep::Watch(since);
+    }
+    UnprovenStep::Alert(since)
 }
 
 /// Track the demotion the heal is about: this daemon read its own pool.conf
@@ -6700,6 +6721,10 @@ pub struct StateMachine {
     /// Last statefile probe of a deferred release and its result, and the
     /// last static-vdis repair it ran.
     whole_switch_statefile_probe: Option<(std::time::Instant, Option<bool>)>,
+    /// The statefile read in flight, if any. Never more than one: a read
+    /// queued on a pathless multipath device sits in D state and cannot be
+    /// killed, so a new one is started only once the last has exited.
+    whole_switch_statefile_child: Option<std::process::Child>,
     whole_switch_static_vdis_repair_at: Option<std::time::Instant>,
     /// Confirm clock for a single-host slave isolation (my gateway down and
     /// the master silent over the switch; the decision also wants the master's
@@ -6854,6 +6879,9 @@ pub struct StateMachine {
     demoted_survivor_demoted_at: Option<std::time::Instant>,
     // Last alert for a re-assert held by the double-run guard.
     demoted_survivor_blocked_alert_at: Option<std::time::Instant>,
+    // Alert-only watch on an inversion without demotion evidence.
+    demoted_survivor_unproven_since: Option<std::time::Instant>,
+    demoted_survivor_unproven_alert_at: Option<std::time::Instant>,
     // Replication-path watchdog (arbitrated only). Replication belongs on
     // the direct link in steady state; running on the switch fallback is safe
     // (topologically fate-shared) but silently degrades write latency and
@@ -7171,6 +7199,8 @@ impl StateMachine {
             demoted_survivor_was_master: false,
             demoted_survivor_demoted_at: None,
             demoted_survivor_blocked_alert_at: None,
+            demoted_survivor_unproven_since: None,
+            demoted_survivor_unproven_alert_at: None,
             fallback_since: None,
             fallback_alert_at: None,
             fallback_alert_attempt_at: None,
@@ -7314,6 +7344,7 @@ impl StateMachine {
             whole_switch_release_deferred_since: None,
             whole_switch_release_alerted_at: None,
             whole_switch_statefile_probe: None,
+            whole_switch_statefile_child: None,
             whole_switch_static_vdis_repair_at: None,
             isolated_slave_since: None,
             switch_probe_cache: None,
@@ -10399,9 +10430,56 @@ impl StateMachine {
         );
         self.demoted_survivor_was_master = was_master;
         self.demoted_survivor_demoted_at = demoted_at;
-        let slave_of_peer = slave_of_peer
-            && demoted_at
-                .is_some_and(|t| now.duration_since(t) <= DEMOTED_SURVIVOR_EVIDENCE_WINDOW);
+        let proven =
+            demoted_at.is_some_and(|t| now.duration_since(t) <= DEMOTED_SURVIVOR_EVIDENCE_WINDOW);
+        // Without that evidence (a daemon restart after the demotion, or an old
+        // one) a stuck inversion is still worth an operator's look: alert,
+        // never act.
+        let unproven_inversion = slave_of_peer
+            && !proven
+            && local_uptodate
+            && peer_stale_connected
+            && !actively_resolving;
+        match demoted_survivor_unproven_step(
+            unproven_inversion,
+            self.demoted_survivor_unproven_since,
+            self.demoted_survivor_unproven_alert_at,
+            now,
+        ) {
+            UnprovenStep::Clear => {
+                self.demoted_survivor_unproven_since = None;
+                self.demoted_survivor_unproven_alert_at = None;
+                self.clear_heal_state_if_stage("demoted_survivor_unproven");
+            }
+            UnprovenStep::Watch(since) => self.demoted_survivor_unproven_since = Some(since),
+            UnprovenStep::Alert(since) => {
+                self.demoted_survivor_unproven_since = Some(since);
+                self.demoted_survivor_unproven_alert_at = Some(now);
+                warn!(
+                    heal_event = "demoted_survivor_unproven",
+                    "this host holds the UpToDate copy and is a slave of a peer whose disk \
+                     stays stale, but this daemon did not see the demotion happen, so it does \
+                     not take mastership automatically"
+                );
+                self.heal_state_update(
+                    "demoted_survivor_unproven",
+                    "slave of a peer whose disk stays stale; not taking mastership automatically",
+                    Some("check the peer's disk and resync; see the alert"),
+                );
+                let _ = xapi::send_ha_wedge_alert(
+                    "TwinStor: this host holds the only UpToDate copy and is a slave of a peer \
+                     whose disk has stayed stale (Inconsistent or Outdated) without resyncing. \
+                     It does not take pool mastership on its own. Check the peer's disk and \
+                     resync ('twinstor status' on both hosts). If the peer is a stale ex-master \
+                     that XHA re-elected, stop or migrate this host's VMs, then on this host run \
+                     'xe pool-emergency-transition-to-master' and 'xe pool-recover-slaves', and \
+                     re-arm HA.",
+                )
+                .await;
+            }
+            UnprovenStep::Idle => {}
+        }
+        let slave_of_peer = slave_of_peer && proven;
         let peer_reachable =
             if slave_of_peer && local_uptodate && peer_stale_connected && !actively_resolving {
                 self.peer_reachable().await
@@ -10439,7 +10517,8 @@ impl StateMachine {
                     peer = %self.config.node.peer,
                     "inverted control plane: I hold the UpToDate copy but was demoted to slave \
                      of a peer whose storage is stale (Inconsistent or Outdated); will re-assert \
-                     mastership if it persists and no guest runs here"
+                     mastership if it persists, unless guests run here while the peer is live \
+                     in HA"
                 );
                 self.demoted_survivor_since = Some(now);
             }
@@ -10466,7 +10545,7 @@ impl StateMachine {
                     self.demoted_survivor_blocked_alert_at = Some(now);
                     self.heal_state_update(
                         "demoted_survivor_blocked",
-                        "slave of a peer whose disk is stale, with guests here: not taking mastership automatically",
+                        "slave of a peer whose disk is stale, with guests here (or their count unreadable): not taking mastership automatically",
                         Some("check the peer; see the alert for the manual re-assert"),
                     );
                     warn!(
@@ -15845,6 +15924,42 @@ impl StateMachine {
         }
     }
 
+    /// One step of the deferred release's statefile read: collect the read in
+    /// flight if it has exited (`Some(answered)`), else start one. A read
+    /// still running or just started counts as not answering yet. `None`
+    /// when xhad.conf names no statefile.
+    async fn statefile_probe_step(&mut self) -> Option<bool> {
+        if let Some(child) = self.whole_switch_statefile_child.as_mut() {
+            return match child.try_wait() {
+                Ok(None) => Some(false),
+                Ok(Some(status)) => {
+                    self.whole_switch_statefile_child = None;
+                    Some(status.success())
+                }
+                Err(_) => {
+                    self.whole_switch_statefile_child = None;
+                    Some(false)
+                }
+            };
+        }
+        let path = statefile_path().await?;
+        if let Ok(child) = std::process::Command::new("dd")
+            .args([
+                &format!("if={path}"),
+                "of=/dev/null",
+                "bs=4096",
+                "count=1",
+                "iflag=direct",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            self.whole_switch_statefile_child = Some(child);
+        }
+        Some(false)
+    }
+
     /// Whole-switch-down hold. Runs every tick, in both roles. When this host
     /// has lost its client gateway, it asks the peer for its gateway state over
     /// the direct link and, if the peer is isolated too (whole switch down),
@@ -15951,6 +16066,8 @@ impl StateMachine {
                 );
                 self.ha_disable_local().await;
                 self.whole_switch_held = true;
+                // A statefile read from an earlier release says nothing now.
+                self.whole_switch_statefile_probe = None;
                 // Clear the isolated-master and isolated-slave maturity clocks
                 // while holding. They were set during the confirm window before
                 // the latch; left as they are (frozen, since the isolated checks
@@ -15970,10 +16087,15 @@ impl StateMachine {
             }
             WholeSwitchAction::Release => {
                 let io_suspended = self.drbd.status().await.ok().map(|s| s.suspended_any);
+                // Guests frozen here (I/O suspended or unreadable, a guest
+                // running) are not waited for: if the peer's XHA restarts them
+                // meanwhile, multipath moves their queued I/O to the peer's
+                // portal the moment the link returns and both copies run. The
+                // re-arm then goes ahead as it always did, and the statefile
+                // watchdog stops them with this host if it cannot write.
+                let frozen_guests =
+                    io_suspended != Some(false) && self.running_vm_count().await != Some(0);
                 let statefile_ok = if io_suspended == Some(false) {
-                    // One probe per window: a read queued on a pathless
-                    // multipath device can sit in D state past its timeout,
-                    // and a probe per tick would pile them up.
                     match self.whole_switch_statefile_probe {
                         Some((at, ok))
                             if now.duration_since(at) < WHOLE_SWITCH_STATEFILE_PROBE_EVERY =>
@@ -15981,8 +16103,14 @@ impl StateMachine {
                             ok
                         }
                         _ => {
-                            let ok = statefile_readable().await;
-                            self.whole_switch_statefile_probe = Some((now, ok));
+                            let ok = self.statefile_probe_step().await;
+                            if !self
+                                .whole_switch_statefile_child
+                                .as_mut()
+                                .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+                            {
+                                self.whole_switch_statefile_probe = Some((now, ok));
+                            }
                             ok
                         }
                     }
@@ -16010,7 +16138,16 @@ impl StateMachine {
                         crate::cmd::run_cmd("systemctl", &["restart", "attach-static-vdis"]).await;
                     self.whole_switch_statefile_probe = None;
                 }
-                if !whole_switch_release_ready(io_suspended, statefile_ok) {
+                if frozen_guests && !whole_switch_release_ready(io_suspended, statefile_ok) {
+                    warn!(
+                        heal_event = "whole_switch_release_frozen_guests",
+                        ?io_suspended,
+                        "whole-switch hold over with guests frozen on this host: re-arming HA \
+                         now rather than waiting, so the peer cannot restart them while they \
+                         are still here; if the statefile cannot be written, XHA resets this \
+                         host and its frozen guests with it"
+                    );
+                } else if !whole_switch_release_ready(io_suspended, statefile_ok) {
                     let since = *self.whole_switch_release_deferred_since.get_or_insert(now);
                     let long = now.duration_since(since) >= WHOLE_SWITCH_DEFERRED_ALERT_AFTER;
                     if self
@@ -16028,6 +16165,19 @@ impl StateMachine {
                         );
                         self.whole_switch_release_deferred_at = Some(now);
                     }
+                    // Refreshed while it lasts: a stage left untouched is reaped
+                    // after 5 minutes on a host whose storage reads healthy.
+                    if long
+                        && self
+                            .whole_switch_release_deferred_at
+                            .is_some_and(|t| t == now)
+                    {
+                        self.heal_state_update(
+                            "whole_switch_release_deferred",
+                            "whole-switch outage over; HA re-arm waiting for local storage I/O or the HA statefile",
+                            Some("check this host's storage and statefile (twinstor status); HA re-arms once both answer"),
+                        );
+                    }
                     if long
                         && self
                             .whole_switch_release_alerted_at
@@ -16039,17 +16189,12 @@ impl StateMachine {
                              re-armed safely yet (local storage I/O frozen or the statefile \
                              unreachable); this host stays HA-disarmed"
                         );
-                        self.heal_state_update(
-                            "whole_switch_release_deferred",
-                            "whole-switch outage over; HA re-arm waiting for local storage I/O",
-                            Some("check this host's storage (twinstor status); HA re-arms once its I/O runs"),
-                        );
                         let body = if io_suspended == Some(false) {
                             "TwinStor: the network outage is over, but this host's HA statefile \
-                             does not answer, so its HA stays disarmed. Check that \
-                             /etc/xensource/static-vdis/0/disk exists ('systemctl restart \
-                             attach-static-vdis' recreates it) and 'twinstor status' on this host; \
-                             HA re-arms automatically once the statefile answers."
+                             does not answer, so its HA stays disarmed. Check that the 'disk' \
+                             links under /etc/xensource/static-vdis/ exist ('systemctl restart \
+                             attach-static-vdis' recreates them) and 'twinstor status' on this \
+                             host; HA re-arms automatically once the statefile answers."
                         } else {
                             "TwinStor: the network outage is over, but this host's storage I/O is \
                              still frozen (or its state is unreadable), so its HA stays disarmed; \
@@ -16064,6 +16209,7 @@ impl StateMachine {
                 self.whole_switch_release_deferred_at = None;
                 self.whole_switch_release_deferred_since = None;
                 self.whole_switch_release_alerted_at = None;
+                self.whole_switch_statefile_probe = None;
                 self.clear_heal_state_if_stage("whole_switch_release_deferred");
                 info!(
                     heal_event = "whole_switch_release",
@@ -16652,7 +16798,8 @@ impl StateMachine {
                     "TwinStor is holding this node frozen: it yielded during a real \
                      isolation, the network has since recovered, but the peer never \
                      returned. It cannot tell a dead peer from a partitioned one, so it \
-                     will not serve on its own. If the peer is confirmed dead or off: \
+                     will not serve on its own. If the peer is confirmed dead or off (and \
+                     this host's VMs were not restarted elsewhere meanwhile): \
                      rm /run/twinstor/fence-yielded /var/lib/twinstor/yield-loser-latched; \
                      drbdadm resume-io <res>; systemctl restart twinstor. The node then \
                      serves alone. If the peer may still be running somewhere, fix its \
@@ -25229,6 +25376,7 @@ poll_interval_ms = 10
     fn suspended_but_healthy() -> DrbdStatus {
         DrbdStatus {
             suspended_user: true,
+            suspended_any: true,
             ..online_with_peer()
         }
     }
@@ -27166,7 +27314,7 @@ poll_interval_ms = 10
         assert!(peer_disk_is_stale(Some(DiskState::Inconsistent)));
         assert!(peer_disk_is_stale(Some(DiskState::Outdated)));
         // A Diskless master after a local disk failure serves through our disk:
-        // not stale. Taking mastership from it double-ran a VM in the lab.
+        // not stale. Taking mastership from it double-ran a VM in testing.
         assert!(!peer_disk_is_stale(Some(DiskState::Diskless)));
         assert!(!peer_disk_is_stale(Some(DiskState::UpToDate)));
         assert!(!peer_disk_is_stale(Some(DiskState::Consistent)));
@@ -27225,6 +27373,40 @@ poll_interval_ms = 10
         assert_eq!(
             resync_progress_window(Some(1.0), Some((5.0, t0)), t61, w),
             (true, Some((1.0, t61)))
+        );
+    }
+
+    #[test]
+    fn demoted_survivor_unproven_alerts_only_after_it_lasts() {
+        let t0 = std::time::Instant::now();
+        let after = DEMOTED_SURVIVOR_UNPROVEN_ALERT_AFTER;
+        assert_eq!(
+            demoted_survivor_unproven_step(false, None, None, t0),
+            UnprovenStep::Idle
+        );
+        assert_eq!(
+            demoted_survivor_unproven_step(true, None, None, t0),
+            UnprovenStep::Watch(t0)
+        );
+        let t1 = t0 + after;
+        assert_eq!(
+            demoted_survivor_unproven_step(true, Some(t0), None, t1),
+            UnprovenStep::Alert(t0)
+        );
+        // Re-alerted only at the degraded cadence.
+        let t2 = t1 + Duration::from_secs(60);
+        assert_eq!(
+            demoted_survivor_unproven_step(true, Some(t0), Some(t1), t2),
+            UnprovenStep::Watch(t0)
+        );
+        assert_eq!(
+            demoted_survivor_unproven_step(true, Some(t0), Some(t1), t1 + DEGRADED_REALERT_AFTER),
+            UnprovenStep::Alert(t0)
+        );
+        // Gone: clear.
+        assert_eq!(
+            demoted_survivor_unproven_step(false, Some(t0), Some(t1), t2),
+            UnprovenStep::Clear
         );
     }
 
