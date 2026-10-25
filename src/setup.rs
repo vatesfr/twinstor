@@ -52,7 +52,9 @@ their VMs running (unreachable by clients until the switch returns), then
 re-arm HA. A host that loses only its own switch link is stood down after a
 confirmation window, so its VMs restart on the other host. Losing only the
 gateway (router) while the hosts still reach each other over the switch does
-neither. The direct link protects the storage path, not the guest network.
+neither; that check pings the peer address on the gateway (management)
+network, so it applies only when the peer address is on that network. The
+direct link protects the storage path, not the guest network.
 How to choose the mode:
 https://docs.vates.tech/tech-preview/twinstor/installation/";
 
