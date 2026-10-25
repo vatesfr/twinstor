@@ -55,8 +55,7 @@ stood down after a confirmation window, so its VMs restart on the other host;
 a host that loses only its gateway while the peer still answers over the
 gateway (management) network is not stood down. That check applies only when
 the peer address is on that network. The direct link protects the storage
-path, not the guest network.
-How to choose the mode:
+path, not the guest network. How to choose the mode:
 https://docs.vates.tech/tech-preview/twinstor/installation/";
 
 pub struct SetupParams {

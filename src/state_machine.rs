@@ -1843,8 +1843,7 @@ fn isolated_master_decision(
 /// the other stayed armed and restarted its VMs, which still run: a double
 /// run. The hold uses only inputs both hosts read alike (each one's own
 /// gateway, exchanged over the direct-link beacon), so both hold together.
-/// The probe may join it only once both hosts can agree on it through the
-/// beacon.
+/// The switch probe must not join it unless both hosts read it alike.
 /// Inert in fate-shared mode (no separate direct link to learn the peer's
 /// gateway from).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1909,10 +1908,40 @@ fn whole_switch_decision(
 /// either: after a step-down the device path can be gone. So the release also
 /// needs a direct read of the statefile to answer (`statefile_ok`, `None`
 /// when its path is unknown). Otherwise it waits, hold kept; an unreadable
-/// DRBD status waits too. The caller does not wait while guests are frozen
-/// here (see the Release arm).
+/// DRBD status waits too. The caller never waits while guests run here (see
+/// `ReleaseStep`).
 fn whole_switch_release_ready(io_suspended: Option<bool>, statefile_ok: Option<bool>) -> bool {
     io_suspended == Some(false) && statefile_ok != Some(false)
+}
+
+/// What a whole-switch `Release` does this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseStep {
+    /// Ready: re-arm HA now.
+    Release,
+    /// Not ready, but guests run here (or their count is unreadable): re-arm
+    /// now anyway, as before. A guest on a host whose I/O is frozen, at the
+    /// DRBD level or on a pathless multipath map, would otherwise wait while
+    /// the peer's XHA restarts it elsewhere, and its queued writes would
+    /// reach the disk once a path returns: two copies running. Re-armed, an
+    /// xhad that cannot write its statefile resets this host and its guests.
+    RearmWithGuests,
+    /// Not ready and no guest here: keep the hold and wait.
+    Defer,
+}
+
+fn whole_switch_release_step(
+    io_suspended: Option<bool>,
+    statefile_ok: Option<bool>,
+    local_guests: Option<usize>,
+) -> ReleaseStep {
+    if whole_switch_release_ready(io_suspended, statefile_ok) {
+        ReleaseStep::Release
+    } else if local_guests != Some(0) {
+        ReleaseStep::RearmWithGuests
+    } else {
+        ReleaseStep::Defer
+    }
 }
 
 /// How often a deferred whole-switch release re-probes the statefile (and at
@@ -6712,19 +6741,19 @@ pub struct StateMachine {
     /// Consecutive transient beacon misses absorbed while a whole-switch is in
     /// effect/forming (miss-tolerance); reset on any definitive Down/Up read.
     whole_switch_probe_misses: u32,
-    /// When a whole-switch release was last deferred because local DRBD I/O
-    /// was suspended (throttles its log line).
+    /// When a whole-switch release was last deferred (local DRBD I/O
+    /// suspended or the HA statefile not answering); throttles its log line.
     whole_switch_release_deferred_at: Option<std::time::Instant>,
     /// When the current deferral started, and when it was last alerted.
     whole_switch_release_deferred_since: Option<std::time::Instant>,
     whole_switch_release_alerted_at: Option<std::time::Instant>,
-    /// Last statefile probe of a deferred release and its result, and the
-    /// last static-vdis repair it ran.
+    /// Last finished statefile read of a deferred release and its result.
     whole_switch_statefile_probe: Option<(std::time::Instant, Option<bool>)>,
     /// The statefile read in flight, if any. Never more than one: a read
     /// queued on a pathless multipath device sits in D state and cannot be
     /// killed, so a new one is started only once the last has exited.
     whole_switch_statefile_child: Option<std::process::Child>,
+    /// The last static-vdis link repair a deferred release ran.
     whole_switch_static_vdis_repair_at: Option<std::time::Instant>,
     /// Confirm clock for a single-host slave isolation (my gateway down and
     /// the master silent over the switch; the decision also wants the master's
@@ -13255,8 +13284,7 @@ impl StateMachine {
     /// episode (a transient failure is retried after `SWITCH_PROBE_REUSE`);
     /// when it is unavailable (`switch_probe_target`) the answer is `false`,
     /// the gateway-only reading. The outcome is logged once per change. A
-    /// result is
-    /// reused for `SWITCH_PROBE_REUSE`, so a tick costs at most one probe
+    /// result is reused for `SWITCH_PROBE_REUSE`, so a tick costs at most one probe
     /// (about 1.4 s when unanswered, 6 s bound) plus, once per episode, a
     /// resolve (10 s bound). The router-outage heal stage follows the answers
     /// (`gateway_outage_stage_step`).
@@ -15925,24 +15953,28 @@ impl StateMachine {
     }
 
     /// One step of the deferred release's statefile read: collect the read in
-    /// flight if it has exited (`Some(answered)`), else start one. A read
-    /// still running or just started counts as not answering yet. `None`
-    /// when xhad.conf names no statefile.
-    async fn statefile_probe_step(&mut self) -> Option<bool> {
+    /// flight if it has exited, else start one. Returns the reading and
+    /// whether it is final (a finished read, or no statefile configured: the
+    /// caller caches only those). A read still running or just started counts
+    /// as not answering yet. The reading is `None` when xhad.conf names no
+    /// statefile.
+    async fn statefile_probe_step(&mut self) -> (Option<bool>, bool) {
         if let Some(child) = self.whole_switch_statefile_child.as_mut() {
             return match child.try_wait() {
-                Ok(None) => Some(false),
+                Ok(None) => (Some(false), false),
                 Ok(Some(status)) => {
                     self.whole_switch_statefile_child = None;
-                    Some(status.success())
+                    (Some(status.success()), true)
                 }
                 Err(_) => {
                     self.whole_switch_statefile_child = None;
-                    Some(false)
+                    (Some(false), true)
                 }
             };
         }
-        let path = statefile_path().await?;
+        let Some(path) = statefile_path().await else {
+            return (None, true);
+        };
         if let Ok(child) = std::process::Command::new("dd")
             .args([
                 &format!("if={path}"),
@@ -15957,7 +15989,7 @@ impl StateMachine {
         {
             self.whole_switch_statefile_child = Some(child);
         }
-        Some(false)
+        (Some(false), false)
     }
 
     /// Whole-switch-down hold. Runs every tick, in both roles. When this host
@@ -16087,14 +16119,6 @@ impl StateMachine {
             }
             WholeSwitchAction::Release => {
                 let io_suspended = self.drbd.status().await.ok().map(|s| s.suspended_any);
-                // Guests frozen here (I/O suspended or unreadable, a guest
-                // running) are not waited for: if the peer's XHA restarts them
-                // meanwhile, multipath moves their queued I/O to the peer's
-                // portal the moment the link returns and both copies run. The
-                // re-arm then goes ahead as it always did, and the statefile
-                // watchdog stops them with this host if it cannot write.
-                let frozen_guests =
-                    io_suspended != Some(false) && self.running_vm_count().await != Some(0);
                 let statefile_ok = if io_suspended == Some(false) {
                     match self.whole_switch_statefile_probe {
                         Some((at, ok))
@@ -16103,12 +16127,8 @@ impl StateMachine {
                             ok
                         }
                         _ => {
-                            let ok = self.statefile_probe_step().await;
-                            if !self
-                                .whole_switch_statefile_child
-                                .as_mut()
-                                .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
-                            {
+                            let (ok, finished) = self.statefile_probe_step().await;
+                            if finished {
                                 self.whole_switch_statefile_probe = Some((now, ok));
                             }
                             ok
@@ -16138,16 +16158,25 @@ impl StateMachine {
                         crate::cmd::run_cmd("systemctl", &["restart", "attach-static-vdis"]).await;
                     self.whole_switch_statefile_probe = None;
                 }
-                if frozen_guests && !whole_switch_release_ready(io_suspended, statefile_ok) {
+                // A host running guests never waits (see ReleaseStep).
+                let local_guests = if whole_switch_release_ready(io_suspended, statefile_ok) {
+                    None
+                } else {
+                    self.running_vm_count().await
+                };
+                let step = whole_switch_release_step(io_suspended, statefile_ok, local_guests);
+                if step == ReleaseStep::RearmWithGuests {
                     warn!(
-                        heal_event = "whole_switch_release_frozen_guests",
+                        heal_event = "whole_switch_release_with_guests",
                         ?io_suspended,
-                        "whole-switch hold over with guests frozen on this host: re-arming HA \
-                         now rather than waiting, so the peer cannot restart them while they \
-                         are still here; if the statefile cannot be written, XHA resets this \
-                         host and its frozen guests with it"
+                        ?statefile_ok,
+                        "whole-switch hold over with guests on this host while storage I/O or \
+                         the HA statefile is not answering: re-arming HA now rather than \
+                         waiting, so the peer cannot restart them while they are still here; \
+                         if the statefile cannot be written, XHA resets this host and its \
+                         guests with it"
                     );
-                } else if !whole_switch_release_ready(io_suspended, statefile_ok) {
+                } else if step == ReleaseStep::Defer {
                     let since = *self.whole_switch_release_deferred_since.get_or_insert(now);
                     let long = now.duration_since(since) >= WHOLE_SWITCH_DEFERRED_ALERT_AFTER;
                     if self
@@ -28622,6 +28651,33 @@ poll_interval_ms = 10
                 now
             ),
             Hold
+        );
+    }
+
+    #[test]
+    fn whole_switch_release_never_waits_with_guests_here() {
+        use ReleaseStep::*;
+        // Ready: release whatever runs here.
+        assert_eq!(
+            whole_switch_release_step(Some(false), Some(true), None),
+            Release
+        );
+        // Not ready with guests here (or their count unreadable), whatever
+        // the reason: re-arm now, as before, never wait.
+        assert_eq!(
+            whole_switch_release_step(Some(true), None, Some(2)),
+            RearmWithGuests
+        );
+        assert_eq!(whole_switch_release_step(None, None, None), RearmWithGuests);
+        assert_eq!(
+            whole_switch_release_step(Some(false), Some(false), Some(1)),
+            RearmWithGuests
+        );
+        // Not ready and no guest here: wait.
+        assert_eq!(whole_switch_release_step(Some(true), None, Some(0)), Defer);
+        assert_eq!(
+            whole_switch_release_step(Some(false), Some(false), Some(0)),
+            Defer
         );
     }
 
