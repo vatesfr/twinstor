@@ -7,7 +7,10 @@ TwinStor is in the 0.x tech-preview series: treat every release as
 potentially behaviour-changing and read the notes before upgrading a live
 pool.
 
-## [Unreleased]
+## [0.7.2] - 2026-10-25
+
+Follow-up release to 0.7.1: the pool default HA timeout, quieter and safer
+uninstall, and plain log messages.
 
 ### Changed
 - **`twinstor setup` sets the pool's default HA timeout** (pool
@@ -29,7 +32,6 @@ pool.
   off, no iSCSI session, setup key already gone) on one line instead of as
   warnings, and says whether the SR forget that follows a failed destroy
   worked.
-
 - The bundle ships the README instead of `INSTALL.md`. The user
   documentation is at https://docs.vates.tech/tech-preview/twinstor/.
 
