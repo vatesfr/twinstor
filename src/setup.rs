@@ -50,8 +50,10 @@ split DRBD. If the whole switch dies, each host reads over the cable that its
 peer lost the gateway too; after 15 s both disarm local XHA fencing and keep
 their VMs running (unreachable by clients until the switch returns), then
 re-arm HA. A host that loses only its own switch link is stood down after a
-confirmation window, so its VMs restart on the other host. The direct link
-protects the storage path, not the guest network. How to choose the mode:
+confirmation window, so its VMs restart on the other host. Losing only the
+gateway (router) while the hosts still reach each other over the switch does
+neither. The direct link protects the storage path, not the guest network.
+How to choose the mode:
 https://docs.vates.tech/tech-preview/twinstor/installation/";
 
 pub struct SetupParams {
