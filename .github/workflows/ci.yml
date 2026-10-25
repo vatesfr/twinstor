@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -31,7 +34,3 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y musl-tools
       - run: cargo build --release --target x86_64-unknown-linux-musl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: twinstor-x86_64-musl
-          path: target/x86_64-unknown-linux-musl/release/twinstor
