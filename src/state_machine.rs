@@ -15943,12 +15943,13 @@ impl StateMachine {
         }
     }
 
-    /// One step of the deferred release's statefile read: collect the read in
-    /// flight if it has exited, else start one. Returns the reading and
-    /// whether it is final (a finished read, or no statefile configured: the
-    /// caller caches only those). A read still running or just started counts
-    /// as not answering yet. The reading is `None` when xhad.conf names no
-    /// statefile.
+    /// One step of the statefile read a release runs on a host with no guest:
+    /// collect the read in flight if it has exited, else start one. Returns
+    /// the reading and whether it is final (a finished read, or no statefile
+    /// configured: the caller caches only those). A read still running or
+    /// just started counts as not answering yet; a read started before
+    /// `episode` (the first tick of this release) is dropped. The reading is
+    /// `None` when xhad.conf names no statefile.
     async fn statefile_probe_step(&mut self, episode: std::time::Instant) -> (Option<bool>, bool) {
         if let Some((started, child)) = self.whole_switch_statefile_child.as_mut() {
             let started = *started;
@@ -16078,9 +16079,13 @@ impl StateMachine {
             },
         );
         if action != WholeSwitchAction::Release {
-            // A deferral is measured from the release it delays, not from an
-            // earlier one the hold came back after.
-            self.whole_switch_release_deferred_since = None;
+            // A deferral is measured, logged and alerted from the release it
+            // delays, not from an earlier one the hold came back after.
+            if self.whole_switch_release_deferred_since.take().is_some() {
+                self.clear_heal_state_if_stage("whole_switch_release_deferred");
+            }
+            self.whole_switch_release_deferred_at = None;
+            self.whole_switch_release_alerted_at = None;
             self.whole_switch_release_episode_at = None;
         }
         match action {
@@ -16169,6 +16174,7 @@ impl StateMachine {
                     warn!(
                         heal_event = "whole_switch_release_with_guests",
                         ?io_suspended,
+                        ?local_guests,
                         "whole-switch hold over with guests on this host while its storage I/O \
                          is suspended (or unreadable): re-arming HA now rather than waiting, so \
                          the peer cannot restart them while they are still here; if the \
