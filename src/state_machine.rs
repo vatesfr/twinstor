@@ -660,6 +660,11 @@ const WHOLE_SWITCH_MISS_TOLERANCE: u32 = 3;
 /// task, not the serial tick, so it keeps this pace even when the tick stalls
 /// on master-forwarded xapi calls during the outage.
 const WHOLE_SWITCH_GUARD_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the serial tick reuses a "peer answers over the switch" probe.
+/// The whole-switch, isolated-master and isolated-slave checks can all ask
+/// within one tick while the gateway is down, each after its own gateway ping
+/// (up to 6 s); one probe answers them all.
+const SWITCH_PROBE_REUSE: Duration = Duration::from_secs(5);
 /// How recently the guard must have had a reachable `peer_gw == Down` read to
 /// treat the peer as still isolated. Long enough to bridge a run of
 /// `Unreachable` probes under heavy DRBD resync (one gets through within this
@@ -854,6 +859,338 @@ async fn ping_default_gateway() -> bool {
         ).await,
         Ok(Ok(st)) if st.success()
     )
+}
+
+/// Where to ping for "the peer answers over the switched network": the
+/// peer's configured address and the local device that reaches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchProbe {
+    ip: String,
+    dev: String,
+}
+
+/// The `dev` of the first line of an `ip route get <addr>` reply, when that
+/// route is directly connected: an answer through a gateway (`via`) or a
+/// local or non-unicast route says nothing about the switch.
+fn route_get_direct_dev(text: &str) -> Result<String, String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+    let Some(line) = line else {
+        return Err("no route to the peer address".to_string());
+    };
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words
+        .first()
+        .and_then(|w| w.parse::<std::net::IpAddr>().ok())
+        .is_none()
+    {
+        return Err(format!("not a unicast route to the peer address ({line})"));
+    }
+    if words.contains(&"via") {
+        return Err(format!(
+            "the peer address is routed through a gateway ({line})"
+        ));
+    }
+    match words.iter().skip_while(|w| **w != "dev").nth(1) {
+        Some(dev) => Ok((*dev).to_string()),
+        None => Err(format!(
+            "no device in the route to the peer address ({line})"
+        )),
+    }
+}
+
+/// The `dev` of the default route in `ip route show default` text.
+fn default_route_dev(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("default"))?
+        .split_whitespace()
+        .skip_while(|w| *w != "dev")
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// The XHA heartbeat device from `xhad.conf`
+/// (`<HeartbeatInterface>xenbr1</HeartbeatInterface>` under `<localhost>`).
+fn xhad_heartbeat_interface(xhad_conf: &str) -> Option<String> {
+    const TAG: &str = "<HeartbeatInterface>";
+    let start = xhad_conf.find(TAG)? + TAG.len();
+    let end = xhad_conf[start..].find('<')? + start;
+    let dev = xhad_conf[start..end].trim();
+    (!dev.is_empty()).then(|| dev.to_string())
+}
+
+/// Why the peer address alone rules the switch probe out, before any route
+/// lookup: empty, the direct-link address (an answer proves only the
+/// cable), or IPv6 (dom0's `ping` may not take a v6 address without `-6`,
+/// which older iputils lack, so a v6 probe could silently always miss).
+fn switch_probe_address_unusable(peer_address: &str, direct_peers: &[String]) -> Option<String> {
+    let peer_address = peer_address.trim();
+    if peer_address.is_empty() {
+        return Some("no peer address".to_string());
+    }
+    if direct_peers.iter().any(|d| d.trim() == peer_address) {
+        return Some("the peer address is the direct-link address".to_string());
+    }
+    if peer_address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_ipv6())
+    {
+        return Some("the peer address is IPv6; the switch probe pings IPv4 only".to_string());
+    }
+    None
+}
+
+/// Whether "the peer answers on `network.peer_address`" can stand for "the
+/// switched client network still works", and how to probe it. The peer
+/// address is the replication and iSCSI address, which may sit on its own
+/// storage network; an answer there says nothing about the client and
+/// management switch. So the probe is available only when the peer address
+/// is not a direct-link address, its route is directly connected (no `via`),
+/// and that device is the default route's device (the gateway network) and,
+/// when `xhad.conf` names one, the XHA heartbeat device. Anything else is
+/// unavailable, with the reason, and callers keep the gateway-only reading.
+fn switch_probe_target(
+    peer_address: &str,
+    direct_peers: &[String],
+    route_get: &str,
+    default_route: &str,
+    heartbeat_iface: Option<&str>,
+) -> Result<SwitchProbe, String> {
+    if let Some(why) = switch_probe_address_unusable(peer_address, direct_peers) {
+        return Err(why);
+    }
+    let peer_address = peer_address.trim();
+    let dev = route_get_direct_dev(route_get)?;
+    let Some(default_dev) = default_route_dev(default_route) else {
+        return Err("no default route".to_string());
+    };
+    if dev != default_dev {
+        return Err(format!(
+            "the peer address is on {dev}, not on the gateway network ({default_dev})"
+        ));
+    }
+    if let Some(hb) = heartbeat_iface
+        && hb != dev
+    {
+        return Err(format!(
+            "the peer address is on {dev}, not on the XHA heartbeat network ({hb})"
+        ));
+    }
+    Ok(SwitchProbe {
+        ip: peer_address.to_string(),
+        dev,
+    })
+}
+
+/// Why the switch probe is unavailable. `transient` marks an `ip` command
+/// that could not run or timed out: the guard resolves again on its next
+/// round and counts the round as a missed probe, the tick retries after
+/// `SWITCH_PROBE_REUSE`, so one bad read neither disarms at once nor brings
+/// back the gateway-only behavior for a whole router outage. A structural
+/// reason (no route, routed via a gateway, another device, a heartbeat
+/// mismatch, the direct link, IPv6) stands for the episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchProbeUnavailable {
+    reason: String,
+    transient: bool,
+}
+
+/// A resolved switch probe and when it was resolved.
+type SwitchProbeResolved = (
+    std::time::Instant,
+    Result<SwitchProbe, SwitchProbeUnavailable>,
+);
+
+/// Whether to (re)resolve the switch probe: never resolved this episode, or
+/// a transient failure at least `retry` old. A resolved target and a
+/// structural "unavailable" both stand until the gateway-down episode ends.
+fn switch_probe_needs_resolve(
+    resolved: Option<&SwitchProbeResolved>,
+    now: std::time::Instant,
+    retry: Duration,
+) -> bool {
+    match resolved {
+        None => true,
+        Some((_, Ok(_))) => false,
+        Some((at, Err(u))) => u.transient && now.duration_since(*at) >= retry,
+    }
+}
+
+/// Resolve the switch probe from local state (the direct-peer file, the
+/// routing table, `xhad.conf`). Bounded: each `ip` call has a 5 s limit, so
+/// a resolve costs at most 10 s, and callers resolve once per gateway-down
+/// episode (plus retries after a transient failure), so a config or routing
+/// change between episodes is picked up. Only a command that cannot run or
+/// times out is transient; a clean non-zero exit (for example "Network is
+/// unreachable": no route at all) is a structural answer.
+async fn resolve_switch_probe(peer_address: &str) -> Result<SwitchProbe, SwitchProbeUnavailable> {
+    let structural = |reason: String| SwitchProbeUnavailable {
+        reason,
+        transient: false,
+    };
+    let transient = |reason: String| SwitchProbeUnavailable {
+        reason,
+        transient: true,
+    };
+    let direct = read_direct_peer_ips().await;
+    if let Some(why) = switch_probe_address_unusable(peer_address, &direct) {
+        return Err(structural(why));
+    }
+    let route_get = match crate::cmd::cmd_status_for("ip", &["route", "get", peer_address], 5).await
+    {
+        Ok((true, out, _)) => out,
+        Ok((false, _, err)) => {
+            return Err(structural(format!(
+                "no route to the peer address ({})",
+                err.trim()
+            )));
+        }
+        Err(e) => return Err(transient(format!("`ip route get` did not run: {e}"))),
+    };
+    let default_route =
+        match crate::cmd::cmd_status_for("ip", &["route", "show", "default"], 5).await {
+            Ok((true, out, _)) => out,
+            Ok((false, _, err)) => {
+                return Err(structural(format!(
+                    "`ip route show default` failed ({})",
+                    err.trim()
+                )));
+            }
+            Err(e) => {
+                return Err(transient(format!(
+                    "`ip route show default` did not run: {e}"
+                )));
+            }
+        };
+    let heartbeat = tokio::fs::read_to_string(XHAD_CONF)
+        .await
+        .ok()
+        .and_then(|t| xhad_heartbeat_interface(&t));
+    switch_probe_target(
+        peer_address,
+        &direct,
+        &route_get,
+        &default_route,
+        heartbeat.as_deref(),
+    )
+    .map_err(structural)
+}
+
+/// The guard's read of one round from the resolve and, when a target
+/// exists, the ping (`Ok(answered)`). A transient resolve failure counts as
+/// a missed probe: it feeds the two-misses rule, so it can neither disarm
+/// at once (the clocks mature long before a retry window would end) nor
+/// keep the switch counted alive. A structural "unavailable" keeps the
+/// gateway-only behavior.
+fn guard_probe_read(outcome: Result<bool, &SwitchProbeUnavailable>) -> SwitchProbeRead {
+    match outcome {
+        Ok(true) => SwitchProbeRead::Answered,
+        Ok(false) => SwitchProbeRead::Missed,
+        Err(u) if u.transient => SwitchProbeRead::Missed,
+        Err(_) => SwitchProbeRead::Unavailable,
+    }
+}
+
+/// A short key for the per-episode resolve outcome, so the tick logs once
+/// per change of outcome (target, structural reason, or transient failure).
+fn switch_probe_outcome_key(resolved: &Result<SwitchProbe, SwitchProbeUnavailable>) -> String {
+    match resolved {
+        Ok(p) => format!("ok {} {}", p.ip, p.dev),
+        Err(u) if u.transient => "transient".to_string(),
+        Err(u) => format!("unavailable {}", u.reason),
+    }
+}
+
+/// Whether the peer answers ICMP on its address, sent out of the gateway
+/// network's device (`-I`), so the reply can only come over that switch.
+/// A lost default gateway with this still answering is a gateway or router
+/// outage: the switch carries traffic and this host is not cut off from the
+/// client network. Loss-tolerant like `ping_default_gateway` (3 packets,
+/// success on any reply): about 0.4 s when answered, 1.4 s when not, 6 s
+/// hard bound.
+async fn ping_peer_over_switch(probe: &SwitchProbe) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            tokio::process::Command::new("ping")
+                .args(["-c", "3", "-i", "0.2", "-W", "1", "-I", &probe.dev, &probe.ip])
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await,
+        Ok(Ok(st)) if st.success()
+    )
+}
+
+/// The `twinstor status` stage for a gateway outage with the peer still
+/// answering over the switch.
+const GATEWAY_OUTAGE_STAGE: &str = "gateway_outage_peer_reachable";
+
+/// What a fresh tick probe does to the router-outage stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayOutageStage {
+    /// First answer (or first after a miss): log and show the stage.
+    Set,
+    /// Still answering: rewrite the stage so it stays fresh.
+    Refresh,
+    /// First miss after an answer: actions are no longer suppressed, so log
+    /// and clear the stage.
+    Clear,
+    Nothing,
+}
+
+fn gateway_outage_stage_step(was_answering: bool, answered: bool) -> GatewayOutageStage {
+    match (was_answering, answered) {
+        (false, true) => GatewayOutageStage::Set,
+        (true, true) => GatewayOutageStage::Refresh,
+        (true, false) => GatewayOutageStage::Clear,
+        (false, false) => GatewayOutageStage::Nothing,
+    }
+}
+
+/// One fence-guard switch probe, as `guard_switch_alive` folds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchProbeRead {
+    /// Not probed: the guard is not forming a disarm (gateway up, already
+    /// disarmed, or no peer `Down` seen).
+    NotRun,
+    /// The probe cannot speak for the switch (see `switch_probe_target`).
+    Unavailable,
+    Answered,
+    Missed,
+}
+
+/// Consecutive missed switch probes before the guard treats the switch as
+/// dead. One lost burst during a long router outage must not disarm XHA.
+const GUARD_SWITCH_MISSES_TO_DISARM: u32 = 2;
+
+/// Whether the guard probes the switch this round: while a disarm is forming
+/// (local gateway down, not yet disarmed, a peer `Down` seen). Probing through
+/// the confirm window, not only once matured, means a real switch death has
+/// already missed twice by the time the clocks mature, so the miss rule adds
+/// no delay to that disarm.
+fn guard_should_probe_switch(
+    gateway_ok: bool,
+    already_disarmed: bool,
+    peer_down_since: Option<std::time::Instant>,
+) -> bool {
+    !gateway_ok && !already_disarmed && peer_down_since.is_some()
+}
+
+/// Fold one probe into the guard's consecutive-miss count. Returns (switch
+/// still alive, new miss count). Alive blocks the disarm: an answer, or a
+/// miss short of `GUARD_SWITCH_MISSES_TO_DISARM`. An unavailable probe, or a
+/// round that did not probe, never counts as alive (the gateway-only
+/// behavior) and resets the count.
+fn guard_switch_alive(read: SwitchProbeRead, misses: u32) -> (bool, u32) {
+    match read {
+        SwitchProbeRead::NotRun | SwitchProbeRead::Unavailable => (false, 0),
+        SwitchProbeRead::Answered => (true, 0),
+        SwitchProbeRead::Missed => {
+            let misses = misses.saturating_add(1);
+            (misses < GUARD_SWITCH_MISSES_TO_DISARM, misses)
+        }
+    }
 }
 
 /// Whether `addr` is one of this host's own addresses. Binding a UDP socket
@@ -1550,14 +1887,20 @@ fn isolated_master_decision(
 /// this is:
 ///   * peer gateway up: single-host isolation, handled by the stand-down and
 ///     reclaim paths, so `None`;
-///   * peer gateway down: whole switch. Both hosts are equally unreachable,
-///     so moving VMs is pointless. Once sustained, `Hold` (disable HA to
-///     suppress the statefile fence, keep VMs running); before that,
-///     `Confirming`;
+///   * peer gateway down and the peer answers on its client address over the
+///     switch: the switch still carries traffic, so only the gateway (router)
+///     is gone. Not a whole-switch outage and no host is isolated from the
+///     other, so `None`;
+///   * peer gateway down and the peer silent over the switch: whole switch.
+///     Both hosts are equally unreachable, so moving VMs is pointless. Once
+///     sustained, `Hold` (disable HA to suppress the statefile fence, keep VMs
+///     running); before that, `Confirming`;
 ///   * peer unreachable on the direct link: host death, handled by the
 ///     failover path, so `None`.
 ///
 /// When the local gateway is back and a hold stands, `Release` (re-arm HA).
+/// The switch-reachability signal only keeps a hold from forming; a standing
+/// hold ends on the existing triggers, so a flapping switch cannot cycle HA.
 /// Inert in fate-shared mode (no separate direct link to learn the peer's
 /// gateway from).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1573,6 +1916,7 @@ fn whole_switch_decision(
     arbitrated: bool,
     gateway_ok: bool,
     peer_gw: crate::peer_signal::PeerGateway,
+    peer_reachable_over_switch: bool,
     since: Option<std::time::Instant>,
     held: bool,
     now: std::time::Instant,
@@ -1589,8 +1933,9 @@ fn whole_switch_decision(
             WholeSwitchAction::None
         };
     }
-    // Isolated. Whole-switch if and only if the peer is reachable on the
-    // direct link and its gateway is also down (PeerGateway::Down means both).
+    // Gateway lost. Whole-switch if and only if the peer is reachable on the
+    // direct link, its gateway is also down (PeerGateway::Down means both),
+    // and it does not answer over the switch (checked below).
     if !matches!(peer_gw, crate::peer_signal::PeerGateway::Down) {
         // Not, or no longer, a whole-switch: peer Up means single-host
         // isolation; peer Unreachable means host death or the direct link
@@ -1606,6 +1951,11 @@ fn whole_switch_decision(
     }
     if held {
         return WholeSwitchAction::None; // already holding
+    }
+    if peer_reachable_over_switch {
+        // Both gateways down, yet the peer answers over the switch: a router
+        // outage. Holding would disarm XHA on both hosts for nothing.
+        return WholeSwitchAction::None;
     }
     match since {
         Some(t) if now.duration_since(t) >= confirm => WholeSwitchAction::Hold,
@@ -1685,7 +2035,10 @@ async fn statefile_readable() -> Option<bool> {
 /// keep-VMs disarm cannot fire there (no VM runs on both hosts), and a
 /// healthy peer's brief gateway blip or a rebooting peer cannot mature the
 /// clock. A peer `Up` read (or the local gateway returning) releases the
-/// latch back to the main tick's stand-down.
+/// latch back to the main tick's stand-down. A switch that still carries
+/// traffic to the peer (`peer_reachable_over_switch`, from
+/// `guard_switch_alive`: an answer, or a single miss) means a gateway or
+/// router outage, not a dead switch, so it never disarms.
 #[derive(Debug, PartialEq, Eq)]
 enum GuardAction {
     /// Confirmed whole-switch: emergency-disarm local XHA fencing and keep VMs.
@@ -1701,6 +2054,7 @@ enum GuardAction {
 fn whole_switch_guard_decision(
     arbitrated: bool,
     gateway_ok: bool,
+    peer_reachable_over_switch: bool,
     peer_up_now: bool,
     gw_down_since: Option<std::time::Instant>,
     peer_down_since: Option<std::time::Instant>,
@@ -1748,7 +2102,7 @@ fn whole_switch_guard_decision(
     // `!peer_down_stale` gate rules out a peer that has gone away.
     let my_matured = gw_down_since.is_some_and(|t| now.duration_since(t) >= confirm);
     let peer_matured = peer_down_since.is_some_and(|t| now.duration_since(t) >= confirm);
-    if my_matured && peer_matured && !peer_down_stale {
+    if my_matured && peer_matured && !peer_down_stale && !peer_reachable_over_switch {
         GuardAction::Disarm
     } else {
         GuardAction::None
@@ -1765,12 +2119,17 @@ fn whole_switch_guard_decision(
 /// direct link (`peer_gateway_up`: single-host, not whole-switch), the peer
 /// is UpToDate (safe hand-off), this node runs VMs, and all that has held for
 /// `after`. A whole-switch outage (peer gateway down) never satisfies
-/// `peer_gateway_up`; the whole-switch hold handles it.
+/// `peer_gateway_up`; the whole-switch hold handles it. A master that still
+/// answers on its client address over the switch
+/// (`peer_reachable_over_switch`) means only this host's gateway path is
+/// gone, not its client network: this host is not isolated and never stands
+/// down.
 #[allow(clippy::too_many_arguments)]
 fn isolated_slave_standdown_decision(
     standdown_enabled: bool,
     self_slave: bool,
     gateway_ok: bool,
+    peer_reachable_over_switch: bool,
     peer_gateway_up: bool,
     peer_uptodate: bool,
     has_vms: bool,
@@ -1781,6 +2140,7 @@ fn isolated_slave_standdown_decision(
     if !(standdown_enabled
         && self_slave
         && !gateway_ok
+        && !peer_reachable_over_switch
         && peer_gateway_up
         && peer_uptodate
         && has_vms)
@@ -1829,13 +2189,17 @@ fn current_boot_id() -> String {
         .unwrap_or_default()
 }
 
-/// Island side: this node is the master, its gateway is gone, and the peer is
-/// alive on the replication link. The state is worth an alert whether or not
-/// VMs run here (HA may move VMs here at any moment).
+/// Island side: this node is the master, its gateway is gone, the peer does
+/// not answer on its client address over the switch, and the peer is alive on
+/// the replication link. The state is worth an alert whether or not VMs run
+/// here (HA may move VMs here at any moment). A peer that still answers over
+/// the switch means only the gateway (router) is gone, not this host's client
+/// network: not isolated, so `None`, which also resets the maturity clock.
 #[allow(clippy::too_many_arguments)]
 fn master_isolated_decision(
     i_am_master: bool,
     gateway_ok: bool,
+    peer_reachable_over_switch: bool,
     peer_replication_alive: bool,
     peer_uptodate: bool,
     // The peer can receive the failed-over VMs. Standing down hands the VMs to
@@ -1860,7 +2224,7 @@ fn master_isolated_decision(
     alerted_at: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> IsolationAction {
-    if !i_am_master || gateway_ok || !peer_replication_alive {
+    if !i_am_master || gateway_ok || peer_reachable_over_switch || !peer_replication_alive {
         return IsolationAction::None;
     }
     let Some(since) = since else {
@@ -6389,7 +6753,8 @@ pub struct StateMachine {
     /// an unsettled state and can make XHA self-fence.
     whole_switch_guard_ever_disarmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Confirm clock for the whole-switch condition (both gateways down over the
-    /// direct link); the hold only fires once it has held past `WHOLE_SWITCH_CONFIRM`.
+    /// direct link, and the peer silent over the switch); the hold only fires
+    /// once it has held past `WHOLE_SWITCH_CONFIRM`.
     whole_switch_since: Option<std::time::Instant>,
     /// Consecutive transient beacon misses absorbed while a whole-switch is in
     /// effect/forming (miss-tolerance); reset on any definitive Down/Up read.
@@ -6404,10 +6769,29 @@ pub struct StateMachine {
     /// last static-vdis repair it ran.
     whole_switch_statefile_probe: Option<(std::time::Instant, Option<bool>)>,
     whole_switch_static_vdis_repair_at: Option<std::time::Instant>,
-    /// Confirm clock for a single-host slave isolation (my gateway
-    /// down, master's gateway up over the direct link); the slave stand-down fires
-    /// once it has held past `ISOLATED_SLAVE_STANDDOWN_AFTER`.
+    /// Confirm clock for a single-host slave isolation (my gateway down and
+    /// the master silent over the switch; the decision also wants the master's
+    /// gateway up over the direct link); the slave stand-down fires once it
+    /// has held past `ISOLATED_SLAVE_STANDDOWN_AFTER`.
     isolated_slave_since: Option<std::time::Instant>,
+    /// Last "peer answers over the switch" probe (when, result), reused for
+    /// `SWITCH_PROBE_REUSE` so the checks of one tick share one ping.
+    switch_probe_cache: Option<(std::time::Instant, bool)>,
+    /// The last switch probe of this gateway-down episode answered (the
+    /// router-outage heal stage is set); drives `gateway_outage_stage_step`.
+    switch_probe_answering: bool,
+    /// The switch probe resolved for this gateway-down episode, or why it is
+    /// unavailable (see `switch_probe_needs_resolve`).
+    switch_probe_resolved: Option<SwitchProbeResolved>,
+    /// The resolve outcome last logged this gateway-down episode
+    /// (`switch_probe_outcome_key`): a change logs again.
+    switch_probe_logged_outcome: Option<String>,
+    /// A gateway-down episode may have left switch-probe state or the
+    /// router-outage stage behind. Starts false: `run` clears the heal-state
+    /// file at startup, so a restart cannot leave the stage behind.
+    switch_probe_episode_open: bool,
+    /// When the router-outage stage was first written this episode.
+    gateway_outage_stage_started: Option<u64>,
     /// HA-deadlock auto-exit debounce and rate-limit timers.
     ha_deadlock_since: Option<std::time::Instant>,
     ha_deadlock_action_at: Option<std::time::Instant>,
@@ -7000,6 +7384,12 @@ impl StateMachine {
             whole_switch_statefile_probe: None,
             whole_switch_static_vdis_repair_at: None,
             isolated_slave_since: None,
+            switch_probe_cache: None,
+            switch_probe_answering: false,
+            switch_probe_resolved: None,
+            switch_probe_logged_outcome: None,
+            switch_probe_episode_open: false,
+            gateway_outage_stage_started: None,
             ha_deadlock_since: None,
             ha_deadlock_action_at: None,
             vdi_lock_prev: None,
@@ -7368,11 +7758,17 @@ impl StateMachine {
                 // XHA's ~105 s survival budget.
                 let guard_flag = self.whole_switch_guard.clone();
                 let guard_ever = self.whole_switch_guard_ever_disarmed.clone();
+                let guard_peer_addr = self.config.network.peer_address.to_string();
                 tokio::spawn(async move {
                     use std::sync::atomic::Ordering;
                     let mut gw_down_since: Option<std::time::Instant> = None;
                     let mut peer_down_since: Option<std::time::Instant> = None;
                     let mut last_reachable_down: Option<std::time::Instant> = None;
+                    // The switch probe, resolved once per gateway-down episode
+                    // (routing or a regenerated config may change between
+                    // episodes), and its consecutive-miss count.
+                    let mut switch_probe: Option<SwitchProbeResolved> = None;
+                    let mut switch_misses: u32 = 0;
                     loop {
                         let now = std::time::Instant::now();
                         let gateway_ok = ping_default_gateway().await;
@@ -7410,9 +7806,62 @@ impl StateMachine {
                             // Unreachable: preserve both clocks (ambiguous).
                         }
                         let already_disarmed = guard_flag.load(Ordering::Relaxed);
+                        // While a disarm is forming, ask whether the switch still
+                        // carries traffic to the peer: an answer means only the
+                        // gateway (router) is gone, so keep XHA armed. Two misses
+                        // in a row count as a dead switch, so one lost burst
+                        // over a long router outage cannot disarm. After a
+                        // Rearm the count starts from zero, so a re-disarm takes
+                        // one more round than the first one did.
+                        //
+                        // Cost: a round is the 2 s sleep, the gateway ping (6 s
+                        // bound), the beacon (3 s connect + 3 s read bound), and
+                        // this probe (6 s bound), plus the resolve (two 5 s `ip`
+                        // calls) on the episode's first probing round and after a
+                        // transient failure (that round counts as a miss and
+                        // sends no ping). With every timeout maxed that is about
+                        // 30 s for a resolving round and 20 s otherwise; on a
+                        // working direct
+                        // link with the switch dead it is about 5 s (each ping
+                        // gives up after about 1.4 s). The two misses of a switch
+                        // death at the outage start land inside the 15 s confirm
+                        // window; a switch death mid-outage disarms within about
+                        // two rounds after the last answer (about 10 s typical,
+                        // about 60 s with every timeout maxed), under the 90 s
+                        // arbitrated XHA timeout.
+                        if gateway_ok {
+                            switch_probe = None;
+                        }
+                        let read = if guard_should_probe_switch(
+                            gateway_ok,
+                            already_disarmed,
+                            peer_down_since,
+                        ) {
+                            // A transient failure is resolved again every round.
+                            if switch_probe_needs_resolve(
+                                switch_probe.as_ref(),
+                                std::time::Instant::now(),
+                                Duration::ZERO,
+                            ) {
+                                let resolved = resolve_switch_probe(&guard_peer_addr).await;
+                                switch_probe = Some((std::time::Instant::now(), resolved));
+                            }
+                            match switch_probe.as_ref().map(|(_, r)| r) {
+                                Some(Ok(probe)) => {
+                                    guard_probe_read(Ok(ping_peer_over_switch(probe).await))
+                                }
+                                Some(Err(u)) => guard_probe_read(Err(u)),
+                                None => SwitchProbeRead::Unavailable,
+                            }
+                        } else {
+                            SwitchProbeRead::NotRun
+                        };
+                        let (switch_alive, misses) = guard_switch_alive(read, switch_misses);
+                        switch_misses = misses;
                         match whole_switch_guard_decision(
                             true,
                             gateway_ok,
+                            switch_alive,
                             peer_up_now,
                             gw_down_since,
                             peer_down_since,
@@ -7437,8 +7886,9 @@ impl StateMachine {
                                 warn!(
                                     heal_event = "whole_switch_guard_disarm",
                                     "fast fence-guard confirmed a whole-switch outage \
-                                           (my client gateway down + the peer's gateway also \
-                                           down over the direct link) and emergency-disarmed \
+                                           (my client gateway down, the peer's gateway also \
+                                           down over the direct link, and the peer silent over \
+                                           the switch) and emergency-disarmed \
                                            local XHA fencing ahead of the serial tick, to keep \
                                            VMs running rather than let XHA self-fence. The tick \
                                            adopts the hold and re-arms HA when the switch returns."
@@ -12847,6 +13297,147 @@ impl StateMachine {
         false
     }
 
+    /// Whether the peer answers over the switched gateway network
+    /// (`ping_peer_over_switch`). Only the arbitrated isolation checks call
+    /// it, and only once the default gateway is already down, so a healthy
+    /// host never pays for it. The target is resolved once per gateway-down
+    /// episode (a transient failure is retried after `SWITCH_PROBE_REUSE`);
+    /// when it is unavailable (`switch_probe_target`) the answer is `false`,
+    /// the gateway-only reading. The outcome is logged once per change. A
+    /// result is
+    /// reused for `SWITCH_PROBE_REUSE`, so a tick costs at most one probe
+    /// (about 1.4 s when unanswered, 6 s bound) plus, once per episode, a
+    /// resolve (10 s bound). The router-outage heal stage follows the answers
+    /// (`gateway_outage_stage_step`).
+    async fn peer_reachable_over_switch(&mut self) -> bool {
+        self.switch_probe_episode_open = true;
+        let now = std::time::Instant::now();
+        if let Some((at, ok)) = self.switch_probe_cache
+            && now.duration_since(at) < SWITCH_PROBE_REUSE
+        {
+            return ok;
+        }
+        if switch_probe_needs_resolve(self.switch_probe_resolved.as_ref(), now, SWITCH_PROBE_REUSE)
+        {
+            let resolved =
+                resolve_switch_probe(&self.config.network.peer_address.to_string()).await;
+            let key = switch_probe_outcome_key(&resolved);
+            if self.switch_probe_logged_outcome.as_deref() != Some(key.as_str()) {
+                match &resolved {
+                    Ok(p) => info!(
+                        heal_event = "switch_probe_available",
+                        peer = p.ip.as_str(),
+                        dev = p.dev.as_str(),
+                        "the default gateway does not answer; checking whether the peer \
+                           answers over the switch on the gateway network"
+                    ),
+                    Err(u) => info!(
+                        heal_event = "switch_probe_unavailable",
+                        reason = u.reason.as_str(),
+                        retried = u.transient,
+                        "the default gateway does not answer and the peer-over-the-switch \
+                           check is unavailable, so the isolation checks use the gateway alone"
+                    ),
+                }
+                self.switch_probe_logged_outcome = Some(key);
+            }
+            self.switch_probe_resolved = Some((std::time::Instant::now(), resolved));
+        }
+        let probe = match &self.switch_probe_resolved {
+            Some((_, Ok(p))) => Some(p.clone()),
+            _ => None,
+        };
+        let ok = match &probe {
+            Some(p) => ping_peer_over_switch(p).await,
+            None => false,
+        };
+        self.switch_probe_cache = Some((std::time::Instant::now(), ok));
+        match gateway_outage_stage_step(self.switch_probe_answering, ok) {
+            GatewayOutageStage::Set => {
+                let (peer, dev) = probe.map(|p| (p.ip, p.dev)).unwrap_or_default();
+                warn!(
+                    heal_event = "gateway_outage_peer_reachable",
+                    peer = peer.as_str(),
+                    dev = dev.as_str(),
+                    "the default gateway does not answer, but the peer answers over the \
+                       switch on the gateway network: a gateway or router outage, not a switch \
+                       outage or a host isolation. No whole-switch hold and no isolated \
+                       stand-down while the peer answers"
+                );
+                self.gateway_outage_stage_write();
+            }
+            GatewayOutageStage::Refresh => self.gateway_outage_stage_write(),
+            GatewayOutageStage::Clear => {
+                info!(
+                    heal_event = "gateway_outage_peer_unreachable",
+                    "the peer stopped answering over the switch during the gateway outage: \
+                       the isolation checks act on the gateway again"
+                );
+                self.gateway_outage_stage_clear();
+            }
+            GatewayOutageStage::Nothing => {}
+        }
+        self.switch_probe_answering = ok;
+        ok
+    }
+
+    /// The default gateway answers again: end the switch-probe episode and
+    /// clear the router-outage stage, whether or not the stage steps set it.
+    /// A stage left by a previous run needs nothing here: `run` clears the
+    /// heal-state file at startup. The next gateway loss resolves the target
+    /// afresh. Cheap on a healthy host: one flag check.
+    fn switch_probe_episode_end(&mut self) {
+        if !self.switch_probe_episode_open {
+            return;
+        }
+        self.switch_probe_episode_open = false;
+        self.switch_probe_cache = None;
+        self.switch_probe_resolved = None;
+        self.switch_probe_answering = false;
+        self.switch_probe_logged_outcome = None;
+        self.gateway_outage_stage_clear();
+    }
+
+    /// Write the router-outage stage for `twinstor status`. Status only: it
+    /// goes straight to the heal-state file, with none of
+    /// `heal_state_update`'s bookkeeping (no episode start for the flap-storm
+    /// detector, no episode open, no heal_stage log), since a router outage
+    /// is not a heal episode. Rewritten on every fresh answer so the orphan
+    /// reaper never sees it stale. Never overwrites another stage.
+    fn gateway_outage_stage_write(&mut self) {
+        let started = *self
+            .gateway_outage_stage_started
+            .get_or_insert_with(crate::heal_state::unix_now);
+        if cfg!(test) {
+            return;
+        }
+        if crate::heal_state::read().is_some_and(|h| h.stage != GATEWAY_OUTAGE_STAGE) {
+            return;
+        }
+        crate::heal_state::write(
+            GATEWAY_OUTAGE_STAGE,
+            "gateway unreachable but the peer answers over the switch: router outage, \
+             isolation actions suppressed",
+            Some("restore the default gateway (router); nothing to do on the hosts"),
+            0,
+            0,
+            0,
+            started,
+        );
+    }
+
+    /// Clear the router-outage stage if it is the one shown. Status only, like
+    /// `gateway_outage_stage_write`: no episode close.
+    fn gateway_outage_stage_clear(&mut self) {
+        self.gateway_outage_stage_started = None;
+        if cfg!(test) {
+            return;
+        }
+        if crate::heal_state::read().is_some_and(|h| h.stage == GATEWAY_OUTAGE_STAGE) {
+            crate::heal_state::clear();
+        }
+    }
+
     /// The peer's addresses this node knows locally: the configured peer
     /// address (also its iSCSI portal), plus the direct-link IP in arbitrated
     /// mode. Read from local files only, no xapi.
@@ -15387,7 +15978,9 @@ impl StateMachine {
     /// the direct link and, if the peer is isolated too (whole switch down),
     /// holds: it ha-disables to suppress the XHA statefile fence and keeps VMs
     /// running until the switch returns, since moving them to an equally
-    /// unreachable peer gains nothing. Single-host isolation and real host
+    /// unreachable peer gains nothing. Both gateways down while the peer still
+    /// answers on its client address over the switch is a router outage, not
+    /// a dead switch, and never holds. Single-host isolation and real host
     /// death fall through to the stand-down, reclaim and failover paths.
     /// Inert in fate-shared mode.
     async fn check_whole_switch_hold(&mut self) {
@@ -15399,6 +15992,9 @@ impl StateMachine {
         };
         let now = std::time::Instant::now();
         let gateway_ok = ping_default_gateway().await;
+        if gateway_ok {
+            self.switch_probe_episode_end();
+        }
         // Only probe the peer while we are isolated, to avoid a per-tick connect.
         let raw_peer_gw = if gateway_ok {
             crate::peer_signal::PeerGateway::Up
@@ -15443,7 +16039,22 @@ impl StateMachine {
         } else {
             peer_gw
         };
-        let condition = !gateway_ok && matches!(peer_gw, crate::peer_signal::PeerGateway::Down);
+        let held = self.whole_switch_held || guard_ever_disarmed;
+        // Both gateways look down. Before confirming a whole-switch outage, ask
+        // whether the switch still carries traffic to the peer: if the peer
+        // answers over the switch, only the gateway (router) is gone. Probed
+        // only while a hold could form, never on a healthy host or under a
+        // standing hold (which ends on the existing triggers). The guard
+        // disarms only after two of its own probes missed in a row, so it
+        // never latches on a router outage either. A missed probe here only
+        // starts the 15 s confirm, and any answer resets it.
+        let peer_down = !gateway_ok && matches!(peer_gw, crate::peer_signal::PeerGateway::Down);
+        let peer_reachable_over_switch = if peer_down && !held {
+            self.peer_reachable_over_switch().await
+        } else {
+            false
+        };
+        let condition = peer_down && !peer_reachable_over_switch;
         if condition {
             self.whole_switch_since.get_or_insert(now);
         } else {
@@ -15453,8 +16064,9 @@ impl StateMachine {
             self.arbitrated,
             gateway_ok,
             peer_gw,
+            peer_reachable_over_switch,
             self.whole_switch_since,
-            self.whole_switch_held || guard_ever_disarmed,
+            held,
             now,
             // When the guard has already confirmed and disarmed, skip the 15 s
             // confirm here (the guard already waited it out) and adopt at once.
@@ -15627,7 +16239,10 @@ impl StateMachine {
     /// statefile heartbeat) so the master marks this host offline and restarts
     /// its VMs. Gated on the beacon (master gateway up means single-host
     /// isolation); a whole-switch outage (master gateway down) is the
-    /// whole-switch hold's job. Arbitrated mode with stand-down enabled only.
+    /// whole-switch hold's job. A master that still answers on its client
+    /// address over the switch means only this host's gateway is unreachable,
+    /// not its client network: no stand-down, and the maturity clock resets.
+    /// Arbitrated mode with stand-down enabled only.
     async fn check_isolated_slave_standdown(&mut self) {
         if cfg!(test)
             || !self.arbitrated
@@ -15645,32 +16260,48 @@ impl StateMachine {
             .map(|c| c.trim() != "master")
             .unwrap_or(false);
         let gateway_ok = ping_default_gateway().await;
+        // A slave that lost its gateway but still reaches the master over the
+        // switch is not cut off from the client network (the gateway or router
+        // is). Probed only once the local signals line up.
+        if gateway_ok {
+            self.switch_probe_episode_end();
+        }
+        let peer_reachable_over_switch = if self_slave && !gateway_ok {
+            self.peer_reachable_over_switch().await
+        } else {
+            false
+        };
         // Probe the peer gateway, peer UpToDate and local VM count only when
         // the cheap local signals already line up (we are an isolated slave).
-        let (peer_gateway_up, peer_uptodate, has_vms) = if self_slave && !gateway_ok {
-            let pg = matches!(
-                crate::peer_signal::peer_gateway(&peer_dl).await,
-                crate::peer_signal::PeerGateway::Up
-            );
-            let put = self
-                .drbd
-                .status()
-                .await
-                .map(|s| s.peer_disk == Some(DiskState::UpToDate))
-                .unwrap_or(false);
-            let vms = xapi::local_running_vm_count().await > 0;
-            (pg, put, vms)
-        } else {
-            (false, false, false)
-        };
+        let (peer_gateway_up, peer_uptodate, has_vms) =
+            if self_slave && !gateway_ok && !peer_reachable_over_switch {
+                let pg = matches!(
+                    crate::peer_signal::peer_gateway(&peer_dl).await,
+                    crate::peer_signal::PeerGateway::Up
+                );
+                let put = self
+                    .drbd
+                    .status()
+                    .await
+                    .map(|s| s.peer_disk == Some(DiskState::UpToDate))
+                    .unwrap_or(false);
+                let vms = xapi::local_running_vm_count().await > 0;
+                (pg, put, vms)
+            } else {
+                (false, false, false)
+            };
         // The maturity clock measures how long we have been an isolated slave,
         // a stable, local-only signal. The decision below re-checks the peer
         // probes (beacon, DRBD peer disk, VM count) when it fires. Folding them
         // into the clock would let one transient beacon miss (a direct-link
         // round trip timing out under contention) reset the window, so the
         // stand-down might never fire. Keep the clock on the local signal and
-        // gate the action on the full condition.
-        let isolated_slave = self_slave && !gateway_ok;
+        // gate the action on the full condition. Reaching the master over the
+        // switch is the exception: it is positive evidence that this host is
+        // not isolated, so it resets the clock like a returning gateway does.
+        // A dropped probe packet reads as unreachable, so a miss never resets
+        // it.
+        let isolated_slave = self_slave && !gateway_ok && !peer_reachable_over_switch;
         if isolated_slave {
             self.isolated_slave_since.get_or_insert(now);
         } else {
@@ -15680,6 +16311,7 @@ impl StateMachine {
             self.config.ha.self_standdown_isolated_master,
             self_slave,
             gateway_ok,
+            peer_reachable_over_switch,
             peer_gateway_up,
             peer_uptodate,
             has_vms,
@@ -15798,7 +16430,23 @@ impl StateMachine {
             // None.
             self.isolated_master_since = None;
             self.isolated_master_recovered_since = None;
-            if !gateway_ok && peer_alive && self.master_isolated_since.is_none() {
+            // A master that lost its gateway but still reaches the peer over
+            // the switch is not isolated from the client network: the gateway
+            // or router is out. Probed only once the gateway is down; a hit
+            // makes the decision return None, which resets the clock below.
+            // Arbitrated only: in fate-shared mode the peer is reached over
+            // that same switch, so this alert-only path keeps its gateway-only
+            // reading there.
+            if gateway_ok {
+                self.switch_probe_episode_end();
+            }
+            let peer_reachable_over_switch = if arbitrated && !gateway_ok {
+                self.peer_reachable_over_switch().await
+            } else {
+                false
+            };
+            let isolated = !gateway_ok && !peer_reachable_over_switch && peer_alive;
+            if isolated && self.master_isolated_since.is_none() {
                 self.master_isolated_since = Some(now);
             }
             // The local running-VM count tells a wrongful isolated master (0
@@ -15806,7 +16454,7 @@ impl StateMachine {
             // gates both the fast stand-down and the nothing-to-strand path
             // below. Read only while the isolation condition can hold, to avoid
             // an xl list every tick.
-            let vms = if !gateway_ok && peer_alive {
+            let vms = if isolated {
                 Some(xapi::local_running_vm_count().await as usize)
             } else {
                 None
@@ -15821,7 +16469,7 @@ impl StateMachine {
             // heartbeat whether or not this node can read its socket. Only the
             // slow path with VMs consults this; the 0-VM wrongful path stands
             // down regardless, as there is nothing to hand off.
-            let peer_liveset_ready = if !gateway_ok && peer_alive {
+            let peer_liveset_ready = if isolated {
                 self.peer_in_liveset().await != Some(false)
             } else {
                 false
@@ -15829,6 +16477,7 @@ impl StateMachine {
             match master_isolated_decision(
                 true,
                 gateway_ok,
+                peer_reachable_over_switch,
                 peer_alive,
                 peer_uptodate,
                 peer_liveset_ready,
@@ -15839,7 +16488,8 @@ impl StateMachine {
                 now,
             ) {
                 IsolationAction::None => {
-                    // Isolation is over (gateway back, or peer gone). Clear the
+                    // Isolation is over (gateway back, peer gone, or the peer
+                    // answers over the switch: a router outage). Clear the
                     // master-isolated heal state and alert we raised, or status
                     // stays on a stale "master isolated / auto-heal N min" after
                     // a reconnection that came before the stand-down.
@@ -27491,6 +28141,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27506,20 +28157,6 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 true,
-                true,
-                true,
-                true,
-                false,
-                Some(1),
-                Some(old),
-                Option::None,
-                now
-            ),
-            None
-        );
-        assert_eq!(
-            master_isolated_decision(
-                false,
                 false,
                 true,
                 true,
@@ -27534,7 +28171,24 @@ poll_interval_ms = 10
         );
         assert_eq!(
             master_isolated_decision(
+                false,
+                false,
+                false,
                 true,
+                true,
+                true,
+                false,
+                Some(1),
+                Some(old),
+                Option::None,
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            master_isolated_decision(
+                true,
+                false,
                 false,
                 false,
                 true,
@@ -27551,6 +28205,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27570,6 +28225,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27586,6 +28242,7 @@ poll_interval_ms = 10
         assert_ne!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27607,6 +28264,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27621,6 +28279,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27659,6 +28318,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27677,6 +28337,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27693,6 +28354,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 false,
                 true,
@@ -27708,6 +28370,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27726,6 +28389,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 true,
+                false,
                 true,
                 true,
                 true,
@@ -27741,6 +28405,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 false,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27755,6 +28420,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 false,
                 true,
@@ -27781,6 +28447,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27799,6 +28466,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27816,6 +28484,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27831,6 +28500,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27848,6 +28518,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 false,
@@ -27867,6 +28538,7 @@ poll_interval_ms = 10
             master_isolated_decision(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -27881,6 +28553,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27897,6 +28570,7 @@ poll_interval_ms = 10
         assert_eq!(
             master_isolated_decision(
                 true,
+                false,
                 false,
                 true,
                 true,
@@ -27935,47 +28609,56 @@ poll_interval_ms = 10
         let recent = now - Duration::from_secs(5); // not yet confirmed
         // Fate-shared: never acts (no direct link to learn the peer's gateway).
         assert_eq!(
-            whole_switch_decision(false, false, Down, Some(old), false, now, confirm),
+            whole_switch_decision(false, false, Down, false, Some(old), false, now, confirm),
             None
         );
         // Gateway up, not held: nothing.
         assert_eq!(
-            whole_switch_decision(true, true, Up, Option::None, false, now, confirm),
+            whole_switch_decision(true, true, Up, false, Option::None, false, now, confirm),
             None
         );
         // Gateway up while holding: release and re-arm.
         assert_eq!(
-            whole_switch_decision(true, true, Up, Some(old), true, now, confirm),
+            whole_switch_decision(true, true, Up, false, Some(old), true, now, confirm),
             Release
         );
         // Isolated, peer gateway up: single-host isolation, not our case.
         assert_eq!(
-            whole_switch_decision(true, false, Up, Some(old), false, now, confirm),
+            whole_switch_decision(true, false, Up, false, Some(old), false, now, confirm),
             None
         );
         // Isolated, peer unreachable on the direct link: real death, not our case.
         assert_eq!(
-            whole_switch_decision(true, false, Unreachable, Some(old), false, now, confirm),
+            whole_switch_decision(
+                true,
+                false,
+                Unreachable,
+                false,
+                Some(old),
+                false,
+                now,
+                confirm
+            ),
             None
         );
         // Isolated, peer gateway down but not yet sustained: confirming.
         assert_eq!(
-            whole_switch_decision(true, false, Down, Some(recent), false, now, confirm),
+            whole_switch_decision(true, false, Down, false, Some(recent), false, now, confirm),
             Confirming
         );
         // Isolated, peer gateway down, confirmed: hold (ha-disable, keep VMs).
         assert_eq!(
-            whole_switch_decision(true, false, Down, Some(old), false, now, confirm),
+            whole_switch_decision(true, false, Down, false, Some(old), false, now, confirm),
             Hold
         );
         // Already holding while still isolated: keep holding (no repeat action).
         assert_eq!(
-            whole_switch_decision(true, false, Down, Some(old), true, now, confirm),
+            whole_switch_decision(true, false, Down, false, Some(old), true, now, confirm),
             None
         );
         // A single-tick blip (since just opened) never fires the hold.
         assert_eq!(
-            whole_switch_decision(true, false, Down, Some(now), false, now, confirm),
+            whole_switch_decision(true, false, Down, false, Some(now), false, now, confirm),
             Confirming
         );
         // Asymmetric recovery: holding, still isolated, but the peer's gateway
@@ -27983,13 +28666,22 @@ poll_interval_ms = 10
         // failover can run; otherwise our VMs stay stranded until our gateway
         // returns.
         assert_eq!(
-            whole_switch_decision(true, false, Up, Some(old), true, now, confirm),
+            whole_switch_decision(true, false, Up, false, Some(old), true, now, confirm),
             Release
         );
         // Holding, still isolated, but the peer went unreachable (real death, or
         // the direct link dropped too): release so the failover path takes over.
         assert_eq!(
-            whole_switch_decision(true, false, Unreachable, Some(old), true, now, confirm),
+            whole_switch_decision(
+                true,
+                false,
+                Unreachable,
+                false,
+                Some(old),
+                true,
+                now,
+                confirm
+            ),
             Release
         );
     }
@@ -28048,10 +28740,13 @@ poll_interval_ms = 10
         let recent = now - Duration::from_secs(5); // clock not yet at confirm
         let dn_fresh = Some(now - Duration::from_secs(4)); // reachable Down seen recently
         let dn_stale = Some(now - Duration::from_secs(45)); // last reachable Down aged out
-        // args: arbitrated, gateway_ok, peer_up_now, gw_down_since, peer_down_since,
-        //       last_reachable_down, already_disarmed, now, confirm, freshness
+        // args: arbitrated, gateway_ok, peer_reachable_over_switch (false here),
+        //       peer_up_now, gw_down_since, peer_down_since, last_reachable_down,
+        //       already_disarmed, now, confirm, freshness
         let d = |arb, gw, up, gwds, pds, lrd, dis| {
-            whole_switch_guard_decision(arb, gw, up, gwds, pds, lrd, dis, now, confirm, fresh)
+            whole_switch_guard_decision(
+                arb, gw, false, up, gwds, pds, lrd, dis, now, confirm, fresh,
+            )
         };
 
         // Fate-shared: never acts.
@@ -28211,8 +28906,9 @@ poll_interval_ms = 10
 
     #[test]
     fn isolated_slave_standdown_decision_matrix() {
-        // args: (standdown_enabled, self_slave, gateway_ok, peer_gateway_up,
-        //        peer_uptodate, has_vms, since, now, after)
+        // args: (standdown_enabled, self_slave, gateway_ok,
+        //        peer_reachable_over_switch, peer_gateway_up, peer_uptodate,
+        //        has_vms, since, now, after)
         let now = std::time::Instant::now();
         let after = Duration::from_secs(120);
         let old = now - Duration::from_secs(150); // held past `after`
@@ -28221,6 +28917,7 @@ poll_interval_ms = 10
         assert!(isolated_slave_standdown_decision(
             true,
             true,
+            false,
             false,
             true,
             true,
@@ -28234,6 +28931,7 @@ poll_interval_ms = 10
             true,
             true,
             false,
+            false,
             true,
             true,
             true,
@@ -28245,6 +28943,7 @@ poll_interval_ms = 10
         assert!(!isolated_slave_standdown_decision(
             true,
             true,
+            false,
             false,
             true,
             true,
@@ -28258,6 +28957,7 @@ poll_interval_ms = 10
             false,
             true,
             false,
+            false,
             true,
             true,
             true,
@@ -28267,6 +28967,7 @@ poll_interval_ms = 10
         )); // stand-down disabled
         assert!(!isolated_slave_standdown_decision(
             true,
+            false,
             false,
             false,
             true,
@@ -28280,6 +28981,7 @@ poll_interval_ms = 10
             true,
             true,
             true,
+            false,
             true,
             true,
             true,
@@ -28294,6 +28996,7 @@ poll_interval_ms = 10
             true,
             false,
             false,
+            false,
             true,
             true,
             Some(old),
@@ -28303,6 +29006,7 @@ poll_interval_ms = 10
         assert!(!isolated_slave_standdown_decision(
             true,
             true,
+            false,
             false,
             true,
             false,
@@ -28315,6 +29019,7 @@ poll_interval_ms = 10
             true,
             true,
             false,
+            false,
             true,
             true,
             false,
@@ -28322,6 +29027,518 @@ poll_interval_ms = 10
             now,
             after
         )); // no VMs to hand off
+    }
+
+    #[test]
+    fn switch_probe_target_only_on_the_gateway_network() {
+        let direct = vec!["10.99.99.2".to_string()];
+        let default = "default via 192.168.1.1 dev xenbr1 \n";
+        let on_gw = "192.168.1.133 dev xenbr1 src 192.168.1.138 uid 0 \n    cache \n";
+        let probe = SwitchProbe {
+            ip: "192.168.1.133".to_string(),
+            dev: "xenbr1".to_string(),
+        };
+        // Directly connected on the default route's device, matching the XHA
+        // heartbeat device (or no heartbeat tag): available, pinged out of it.
+        assert_eq!(
+            switch_probe_target("192.168.1.133", &direct, on_gw, default, Some("xenbr1")),
+            Ok(probe.clone())
+        );
+        assert_eq!(
+            switch_probe_target("192.168.1.133", &direct, on_gw, default, Option::None),
+            Ok(probe)
+        );
+        // Routed through a gateway: an answer would not prove the switch.
+        let via = "192.168.5.133 via 192.168.1.1 dev xenbr1 src 192.168.1.138 uid 0\n";
+        assert!(switch_probe_target("192.168.5.133", &direct, via, default, Option::None).is_err());
+        // On a dedicated storage network (another device): unavailable, a
+        // management switch death must keep its protections.
+        let storage = "10.20.0.2 dev xenbr2 src 10.20.0.1 uid 0\n    cache\n";
+        let err = switch_probe_target("10.20.0.2", &direct, storage, default, Option::None);
+        assert!(err.as_ref().is_err_and(|e| e.contains("xenbr2")), "{err:?}");
+        // On the default device but not the XHA heartbeat device: unavailable.
+        assert!(
+            switch_probe_target("192.168.1.133", &direct, on_gw, default, Some("xenbr0")).is_err()
+        );
+        // The direct-link address proves only the cable.
+        let dl = "10.99.99.2 dev eth3 src 10.99.99.1 uid 0\n";
+        assert!(switch_probe_target("10.99.99.2", &direct, dl, default, Option::None).is_err());
+        // No default route, no route at all, a local route, an empty address.
+        assert!(switch_probe_target("192.168.1.133", &direct, on_gw, "", Option::None).is_err());
+        assert!(switch_probe_target("192.168.1.133", &direct, "", default, Option::None).is_err());
+        let local = "local 192.168.1.133 dev lo table local src 192.168.1.133 uid 0\n";
+        assert!(
+            switch_probe_target("192.168.1.133", &direct, local, default, Option::None).is_err()
+        );
+        assert!(switch_probe_target("", &direct, on_gw, default, Option::None).is_err());
+    }
+
+    #[test]
+    fn route_and_xhad_parsers() {
+        assert_eq!(
+            default_route_dev("default via 192.168.1.1 dev xenbr1 proto static\n").as_deref(),
+            Some("xenbr1")
+        );
+        assert_eq!(
+            default_route_dev("192.168.1.0/24 dev xenbr1\n"),
+            Option::None
+        );
+        assert_eq!(
+            route_get_direct_dev("192.168.1.133 dev xenbr1 src 192.168.1.138 uid 0\n"),
+            Ok("xenbr1".to_string())
+        );
+        let conf = "<xhad-config><local-config><localhost>\n\
+                    <HostID>x</HostID>\n\
+                    <HeartbeatInterface>xenbr1</HeartbeatInterface>\n\
+                    <HeartbeatPhysicalInterface>eth1</HeartbeatPhysicalInterface>\n\
+                    </localhost></local-config></xhad-config>";
+        assert_eq!(xhad_heartbeat_interface(conf).as_deref(), Some("xenbr1"));
+        assert_eq!(xhad_heartbeat_interface("<xhad-config/>"), Option::None);
+        assert_eq!(
+            xhad_heartbeat_interface("<HeartbeatInterface> </HeartbeatInterface>"),
+            Option::None
+        );
+    }
+
+    #[test]
+    fn whole_switch_router_outage_never_holds() {
+        use crate::peer_signal::PeerGateway::{Down, Up};
+        use WholeSwitchAction::*;
+        let now = std::time::Instant::now();
+        let confirm = Duration::from_secs(15);
+        let old = now - Duration::from_secs(20);
+        let recent = now - Duration::from_secs(5);
+        // Router outage: my gateway down, the peer's gateway down over the
+        // direct link, but the peer answers over the switch. Not a whole-switch
+        // outage: never confirming, never holding.
+        assert_eq!(
+            whole_switch_decision(true, false, Down, true, Some(old), false, now, confirm),
+            None
+        );
+        assert_eq!(
+            whole_switch_decision(true, false, Down, true, Some(recent), false, now, confirm),
+            None
+        );
+        // Real whole-switch (the peer is silent over the switch): unchanged.
+        assert_eq!(
+            whole_switch_decision(true, false, Down, false, Some(old), false, now, confirm),
+            Hold
+        );
+        assert_eq!(
+            whole_switch_decision(true, false, Down, false, Some(recent), false, now, confirm),
+            Confirming
+        );
+        // A standing hold is not released by the switch signal (a flapping
+        // switch must not cycle HA); it ends on the existing triggers.
+        assert_eq!(
+            whole_switch_decision(true, false, Down, true, Some(old), true, now, confirm),
+            None
+        );
+        assert_eq!(
+            whole_switch_decision(true, true, Up, true, Option::None, true, now, confirm),
+            Release
+        );
+        // Fate-shared stays inert whatever the probe says.
+        assert_eq!(
+            whole_switch_decision(false, false, Down, true, Some(old), false, now, confirm),
+            None
+        );
+    }
+
+    #[test]
+    fn whole_switch_guard_router_outage_never_disarms() {
+        use GuardAction::*;
+        let now = std::time::Instant::now();
+        let confirm = Duration::from_secs(15);
+        let fresh = Duration::from_secs(30);
+        let matured = Some(now - Duration::from_secs(20));
+        let dn_fresh = Some(now - Duration::from_secs(4));
+        let d = |switch: bool, disarmed: bool| {
+            whole_switch_guard_decision(
+                true, false, switch, false, matured, matured, dn_fresh, disarmed, now, confirm,
+                fresh,
+            )
+        };
+        // Both gateways down and matured, but the switch still carries traffic
+        // to the peer: a router outage, keep XHA armed.
+        assert_eq!(d(true, false), None);
+        // Real whole-switch (the switch counts as dead): unchanged.
+        assert_eq!(d(false, false), Disarm);
+        // An existing disarm keeps its latch: the caller never probes then, and
+        // the release stays on the existing triggers.
+        assert_eq!(d(true, true), None);
+        assert_eq!(d(false, true), None);
+    }
+
+    #[test]
+    fn guard_switch_probe_needs_two_misses_in_a_row() {
+        use SwitchProbeRead::*;
+        let now = std::time::Instant::now();
+        let some = Some(now);
+        // Probed only while a disarm is forming.
+        assert!(guard_should_probe_switch(false, false, some));
+        assert!(!guard_should_probe_switch(true, false, some));
+        assert!(!guard_should_probe_switch(false, true, some));
+        assert!(!guard_should_probe_switch(false, false, Option::None));
+        // Answered: alive, count reset.
+        assert_eq!(guard_switch_alive(Answered, 1), (true, 0));
+        // One miss: still alive (one lost burst never disarms).
+        assert_eq!(guard_switch_alive(Missed, 0), (true, 1));
+        // Second miss in a row: the switch counts as dead.
+        assert_eq!(guard_switch_alive(Missed, 1), (false, 2));
+        assert_eq!(guard_switch_alive(Missed, 2), (false, 3));
+        // Unavailable or not probed: the gateway-only behavior, count reset.
+        assert_eq!(guard_switch_alive(Unavailable, 1), (false, 0));
+        assert_eq!(guard_switch_alive(NotRun, 1), (false, 0));
+    }
+
+    /// Runs the guard's probe fold and decision over a sequence of probe reads
+    /// with both clocks matured and a fresh peer `Down`, as during a long
+    /// router outage, and returns the action of each round.
+    fn guard_rounds(reads: &[SwitchProbeRead]) -> Vec<GuardAction> {
+        let now = std::time::Instant::now();
+        let matured = Some(now - Duration::from_secs(20));
+        let dn_fresh = Some(now - Duration::from_secs(4));
+        let mut misses = 0;
+        reads
+            .iter()
+            .map(|read| {
+                let (alive, m) = guard_switch_alive(*read, misses);
+                misses = m;
+                whole_switch_guard_decision(
+                    true,
+                    false,
+                    alive,
+                    false,
+                    matured,
+                    matured,
+                    dn_fresh,
+                    false,
+                    now,
+                    Duration::from_secs(15),
+                    Duration::from_secs(30),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn guard_router_outage_with_lost_bursts_and_a_switch_death() {
+        use GuardAction::*;
+        use SwitchProbeRead::*;
+        // Hours of router outage with an occasional lost burst: never disarms.
+        assert_eq!(
+            guard_rounds(&[Answered, Missed, Answered, Missed, Answered, Answered]),
+            vec![None, None, None, None, None, None]
+        );
+        // The switch dies in the middle of the router outage: the probe stops
+        // answering, and the second miss in a row disarms.
+        assert_eq!(
+            guard_rounds(&[Answered, Answered, Missed, Missed]),
+            vec![None, None, None, Disarm]
+        );
+        // A real whole-switch from the start: the probes during the confirm
+        // window have already missed twice, so the matured round disarms at once.
+        assert_eq!(guard_rounds(&[Missed, Missed]), vec![None, Disarm]);
+        // Probe unavailable (peer address on another network): the gateway-only
+        // behavior, disarm at once as before.
+        assert_eq!(guard_rounds(&[Unavailable]), vec![Disarm]);
+    }
+
+    #[test]
+    fn route_parsers_table_proto_ipv6_and_several_defaults() {
+        // `table` and `proto` words around the device.
+        assert_eq!(
+            route_get_direct_dev("192.168.1.133 dev xenbr1 table main src 192.168.1.138 uid 0\n"),
+            Ok("xenbr1".to_string())
+        );
+        assert_eq!(
+            default_route_dev(
+                "default via 192.168.1.1 dev xenbr1 proto dhcp src 192.168.1.138 metric 100\n"
+            )
+            .as_deref(),
+            Some("xenbr1")
+        );
+        assert_eq!(
+            default_route_dev("default via 192.168.1.1 dev xenbr1 table main\n").as_deref(),
+            Some("xenbr1")
+        );
+        // IPv6 `ip route get` prints `from ::`; directly connected is fine,
+        // through a router is not.
+        assert_eq!(
+            route_get_direct_dev(
+                "2001:db8::2 from :: dev xenbr1 proto kernel src 2001:db8::1 metric 256 pref medium\n"
+            ),
+            Ok("xenbr1".to_string())
+        );
+        assert!(
+            route_get_direct_dev(
+                "2001:db9::2 from :: via fe80::1 dev xenbr1 proto ra src 2001:db8::1 metric 1024\n"
+            )
+            .is_err()
+        );
+        // Several default routes: the first one wins (the one in use).
+        assert_eq!(
+            default_route_dev(
+                "default via 192.168.1.1 dev xenbr1 metric 100\ndefault via 10.0.0.1 dev xenbr2 metric 200\n"
+            )
+            .as_deref(),
+            Some("xenbr1")
+        );
+        // ECMP default: no device on the first line, so no single gateway
+        // network; the probe is unavailable.
+        let ecmp = "default proto static metric 1024\n\
+                    \tnexthop via 192.168.1.1 dev xenbr1 weight 1\n\
+                    \tnexthop via 192.168.2.1 dev xenbr2 weight 1\n";
+        assert_eq!(default_route_dev(ecmp), Option::None);
+        let on_gw = "192.168.1.133 dev xenbr1 src 192.168.1.138 uid 0\n";
+        assert!(switch_probe_target("192.168.1.133", &[], on_gw, ecmp, Option::None).is_err());
+    }
+
+    #[test]
+    fn switch_probe_resolve_retries_only_transient_failures() {
+        let now = std::time::Instant::now();
+        let retry = Duration::from_secs(30);
+        let old = now - Duration::from_secs(31);
+        let recent = now - Duration::from_secs(5);
+        let probe = SwitchProbe {
+            ip: "192.168.1.133".to_string(),
+            dev: "xenbr1".to_string(),
+        };
+        let failed = |transient| {
+            Err(SwitchProbeUnavailable {
+                reason: "x".to_string(),
+                transient,
+            })
+        };
+        // Not resolved yet this episode.
+        assert!(switch_probe_needs_resolve(Option::None, now, retry));
+        // Resolved: stands for the episode.
+        assert!(!switch_probe_needs_resolve(
+            Some(&(old, Ok(probe))),
+            now,
+            retry
+        ));
+        // A failed or timed-out `ip` command is retried after the window.
+        assert!(!switch_probe_needs_resolve(
+            Some(&(recent, failed(true))),
+            now,
+            retry
+        ));
+        assert!(switch_probe_needs_resolve(
+            Some(&(old, failed(true))),
+            now,
+            retry
+        ));
+        // A structural "unavailable" stands for the episode.
+        assert!(!switch_probe_needs_resolve(
+            Some(&(old, failed(false))),
+            now,
+            retry
+        ));
+    }
+
+    #[test]
+    fn gateway_outage_stage_follows_the_answers() {
+        use GatewayOutageStage::*;
+        assert_eq!(gateway_outage_stage_step(false, true), Set);
+        assert_eq!(gateway_outage_stage_step(true, true), Refresh);
+        // First miss after an answer: actions are live again, clear the stage.
+        assert_eq!(gateway_outage_stage_step(true, false), Clear);
+        assert_eq!(gateway_outage_stage_step(false, false), Nothing);
+    }
+
+    #[tokio::test]
+    async fn gateway_outage_stage_has_no_episode_bookkeeping() {
+        // The router-outage stage is status only: setting and clearing it,
+        // repeatedly (gateway blips with the peer answering), must not count
+        // flap-storm episodes or open or close a heal episode.
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(MockDrbd::new(connecting_secondary())),
+            Box::new(MockIscsi::new()),
+        );
+        for _ in 0..4 {
+            sm.gateway_outage_stage_write();
+            sm.gateway_outage_stage_write();
+            assert!(sm.gateway_outage_stage_started.is_some());
+            sm.gateway_outage_stage_clear();
+            assert!(sm.gateway_outage_stage_started.is_none());
+        }
+        assert!(sm.sb_episode_starts.is_empty());
+        assert!(sm.heal_episode_started.is_none());
+        assert!(sm.heal_stage_logged.is_none());
+        assert!(sm.episode.is_none());
+    }
+
+    #[test]
+    fn guard_redisarm_after_a_rearm_starts_from_zero_misses() {
+        use GuardAction::*;
+        use SwitchProbeRead::*;
+        let now = std::time::Instant::now();
+        let matured = Some(now - Duration::from_secs(20));
+        let dn_fresh = Some(now - Duration::from_secs(4));
+        let mut misses = 0;
+        let mut round = |probe: SwitchProbeRead, disarmed: bool| {
+            let read = if guard_should_probe_switch(false, disarmed, matured) {
+                probe
+            } else {
+                NotRun
+            };
+            let (alive, m) = guard_switch_alive(read, misses);
+            misses = m;
+            whole_switch_guard_decision(
+                true,
+                false,
+                alive,
+                false,
+                matured,
+                matured,
+                dn_fresh,
+                disarmed,
+                now,
+                Duration::from_secs(15),
+                Duration::from_secs(30),
+            )
+        };
+        // Switch dead: disarm on the second miss.
+        assert_eq!(round(Missed, false), None);
+        assert_eq!(round(Missed, false), Disarm);
+        // Disarmed: no probing, the count resets.
+        assert_eq!(round(Missed, true), None);
+        // After a Rearm (latch cleared), a re-disarm needs two fresh misses:
+        // one round more than an immediate re-disarm.
+        assert_eq!(round(Missed, false), None);
+        assert_eq!(round(Missed, false), Disarm);
+    }
+
+    #[test]
+    fn guard_transient_resolve_failure_counts_as_a_miss() {
+        use GuardAction::*;
+        use SwitchProbeRead::*;
+        let transient = SwitchProbeUnavailable {
+            reason: "`ip route get` did not run".to_string(),
+            transient: true,
+        };
+        let structural = SwitchProbeUnavailable {
+            reason: "the peer address is on xenbr2".to_string(),
+            transient: false,
+        };
+        assert_eq!(guard_probe_read(Ok(true)), Answered);
+        assert_eq!(guard_probe_read(Ok(false)), Missed);
+        assert_eq!(guard_probe_read(Err(&transient)), Missed);
+        assert_eq!(guard_probe_read(Err(&structural)), Unavailable);
+        // Matured clocks during a router outage: a transient failure followed
+        // by an answer never disarms (no instant disarm on a bad read).
+        let t = guard_probe_read(Err(&transient));
+        let a = guard_probe_read(Ok(true));
+        assert_eq!(guard_rounds(&[t, a, t, a]), vec![None, None, None, None]);
+        // Two transient failures in a row count as two misses: disarm.
+        assert_eq!(guard_rounds(&[t, t]), vec![None, Disarm]);
+        // A transient failure then a real miss: also two misses.
+        let m = guard_probe_read(Ok(false));
+        assert_eq!(guard_rounds(&[a, t, m]), vec![None, None, Disarm]);
+    }
+
+    #[test]
+    fn switch_probe_ipv6_peer_is_unavailable_and_outcomes_have_keys() {
+        let v6_route = "2001:db8::2 from :: dev xenbr1 proto kernel src 2001:db8::1\n";
+        let v6_default = "default via fe80::1 dev xenbr1 proto ra metric 1024\n";
+        let err = switch_probe_target("2001:db8::2", &[], v6_route, v6_default, Option::None);
+        assert!(err.as_ref().is_err_and(|e| e.contains("IPv6")), "{err:?}");
+        assert!(switch_probe_address_unusable("192.168.1.133", &[]).is_none());
+        // Outcome keys: one per target, per structural reason, and one for any
+        // transient failure, so the tick logs once per change.
+        let ok = Ok(SwitchProbe {
+            ip: "192.168.1.133".to_string(),
+            dev: "xenbr1".to_string(),
+        });
+        let t = |reason: &str, transient| {
+            Err(SwitchProbeUnavailable {
+                reason: reason.to_string(),
+                transient,
+            })
+        };
+        assert_eq!(switch_probe_outcome_key(&ok), "ok 192.168.1.133 xenbr1");
+        assert_eq!(
+            switch_probe_outcome_key(&t("a", true)),
+            switch_probe_outcome_key(&t("b", true))
+        );
+        assert_ne!(
+            switch_probe_outcome_key(&t("a", true)),
+            switch_probe_outcome_key(&t("a", false))
+        );
+        assert_ne!(
+            switch_probe_outcome_key(&t("a", false)),
+            switch_probe_outcome_key(&t("b", false))
+        );
+    }
+
+    #[test]
+    fn isolated_slave_no_standdown_when_master_reachable_over_switch() {
+        let now = std::time::Instant::now();
+        let after = Duration::from_secs(120);
+        let old = now - Duration::from_secs(150);
+        // Slave-only gateway loss: my gateway down, the master's gateway up
+        // over the direct link, every other signal lined up and matured, but
+        // the master answers over the switch. Not isolated: never stand down.
+        assert!(!isolated_slave_standdown_decision(
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            Some(old),
+            now,
+            after
+        ));
+        // Real slave isolation (the master is silent over the switch):
+        // unchanged, stand down.
+        assert!(isolated_slave_standdown_decision(
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true,
+            Some(old),
+            now,
+            after
+        ));
+    }
+
+    #[test]
+    fn isolated_master_no_standdown_when_peer_reachable_over_switch() {
+        use IsolationAction::*;
+        let now = std::time::Instant::now();
+        let old = now - ISOLATED_MASTER_STANDDOWN_AFTER - Duration::from_secs(1);
+        let fast = now - WRONGFUL_ISOLATED_MASTER_STANDDOWN_AFTER - Duration::from_secs(1);
+        let d = |switch: bool, vms: Option<usize>, since| {
+            master_isolated_decision(
+                true,
+                false,
+                switch,
+                true,
+                true,
+                true,
+                true,
+                vms,
+                Some(since),
+                Option::None,
+                now,
+            )
+        };
+        // Master-only gateway loss, the peer answers over the switch: not
+        // isolated, so no stand-down, no wrongful fast path, no alert, and
+        // `None` resets the maturity clock.
+        assert_eq!(d(true, Some(1), old), None);
+        assert_eq!(d(true, Some(0), fast), None);
+        // Real master isolation (the peer is silent over the switch): unchanged.
+        assert_eq!(d(false, Some(1), old), StandDown);
+        assert_eq!(d(false, Some(0), fast), StandDown);
     }
 
     #[test]

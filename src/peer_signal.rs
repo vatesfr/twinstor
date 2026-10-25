@@ -21,8 +21,17 @@
 //!     gateway is up. The peer can still serve clients, so this node stands
 //!     down and the peer reclaims its VMs.
 //!   * **whole-switch outage**: peer reachable on the direct link but its
-//!     gateway is also down. Moving VMs is pointless, so both hold and keep
-//!     running (suppressing the XHA state-file fence) until the switch returns.
+//!     gateway is also down, and the peer does not answer over the switch.
+//!     Moving VMs is pointless, so both hold and keep running (suppressing the
+//!     XHA state-file fence) until the switch returns.
+//!   * **gateway or router outage**: the gateway is down, but the peer still
+//!     answers over the switch. The switch works and no host is cut off from
+//!     the client network: no hold, no stand-down. This check pings the peer
+//!     address out of the default route's device, so it applies only when the
+//!     peer address sits directly on the gateway (management) network, and
+//!     on the XHA heartbeat network when xhad.conf names one; with the peer
+//!     address on a separate storage network the classification uses the
+//!     gateway alone.
 //!   * **true host death**: peer not reachable on the direct link at all. The
 //!     real failover path.
 //!
