@@ -1909,39 +1909,24 @@ fn whole_switch_decision(
 /// needs a direct read of the statefile to answer (`statefile_ok`, `None`
 /// when its path is unknown). Otherwise it waits, hold kept; an unreadable
 /// DRBD status waits too. The caller never waits while guests run here (see
-/// `ReleaseStep`).
+/// `whole_switch_release_waits`).
 fn whole_switch_release_ready(io_suspended: Option<bool>, statefile_ok: Option<bool>) -> bool {
     io_suspended == Some(false) && statefile_ok != Some(false)
 }
 
-/// What a whole-switch `Release` does this tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleaseStep {
-    /// Ready: re-arm HA now.
-    Release,
-    /// Not ready, but guests run here (or their count is unreadable): re-arm
-    /// now anyway, as before. A guest on a host whose I/O is frozen, at the
-    /// DRBD level or on a pathless multipath map, would otherwise wait while
-    /// the peer's XHA restarts it elsewhere, and its queued writes would
-    /// reach the disk once a path returns: two copies running. Re-armed, an
-    /// xhad that cannot write its statefile resets this host and its guests.
-    RearmWithGuests,
-    /// Not ready and no guest here: keep the hold and wait.
-    Defer,
-}
-
-fn whole_switch_release_step(
+/// Whether a whole-switch `Release` keeps the hold this tick. Only a host
+/// with no guest waits. A host running guests, or whose guest count is
+/// unreadable, re-arms at once, as before: a guest on a host whose I/O is
+/// frozen (at the DRBD level, or on a pathless multipath map) would otherwise
+/// wait while the peer's XHA restarts it elsewhere, and its queued writes
+/// would reach the disk once a path returns: two copies running. Re-armed, an
+/// xhad that cannot write its statefile resets this host and its guests.
+fn whole_switch_release_waits(
     io_suspended: Option<bool>,
     statefile_ok: Option<bool>,
     local_guests: Option<usize>,
-) -> ReleaseStep {
-    if whole_switch_release_ready(io_suspended, statefile_ok) {
-        ReleaseStep::Release
-    } else if local_guests != Some(0) {
-        ReleaseStep::RearmWithGuests
-    } else {
-        ReleaseStep::Defer
-    }
+) -> bool {
+    local_guests == Some(0) && !whole_switch_release_ready(io_suspended, statefile_ok)
 }
 
 /// How often a deferred whole-switch release re-probes the statefile (and at
@@ -6742,17 +6727,22 @@ pub struct StateMachine {
     /// effect/forming (miss-tolerance); reset on any definitive Down/Up read.
     whole_switch_probe_misses: u32,
     /// When a whole-switch release was last deferred (local DRBD I/O
-    /// suspended or the HA statefile not answering); throttles its log line.
+    /// suspended or the HA statefile not answering); throttles its log line
+    /// and the refresh of its heal stage.
     whole_switch_release_deferred_at: Option<std::time::Instant>,
     /// When the current deferral started, and when it was last alerted.
     whole_switch_release_deferred_since: Option<std::time::Instant>,
     whole_switch_release_alerted_at: Option<std::time::Instant>,
     /// Last finished statefile read of a deferred release and its result.
     whole_switch_statefile_probe: Option<(std::time::Instant, Option<bool>)>,
-    /// The statefile read in flight, if any. Never more than one: a read
-    /// queued on a pathless multipath device sits in D state and cannot be
-    /// killed, so a new one is started only once the last has exited.
-    whole_switch_statefile_child: Option<std::process::Child>,
+    /// The statefile read in flight and when it started, if any. Never more
+    /// than one: a read queued on a pathless multipath device sits in D state
+    /// and cannot be killed, so a new one is started only once the last has
+    /// exited. A read started before the current release is not used.
+    whole_switch_statefile_child: Option<(std::time::Instant, std::process::Child)>,
+    /// When the current run of Release ticks began (the first tick after a
+    /// hold ended); reads started earlier are stale.
+    whole_switch_release_episode_at: Option<std::time::Instant>,
     /// The last static-vdis link repair a deferred release ran.
     whole_switch_static_vdis_repair_at: Option<std::time::Instant>,
     /// Confirm clock for a single-host slave isolation (my gateway down and
@@ -7374,6 +7364,7 @@ impl StateMachine {
             whole_switch_release_alerted_at: None,
             whole_switch_statefile_probe: None,
             whole_switch_statefile_child: None,
+            whole_switch_release_episode_at: None,
             whole_switch_static_vdis_repair_at: None,
             isolated_slave_since: None,
             switch_probe_cache: None,
@@ -15958,19 +15949,24 @@ impl StateMachine {
     /// caller caches only those). A read still running or just started counts
     /// as not answering yet. The reading is `None` when xhad.conf names no
     /// statefile.
-    async fn statefile_probe_step(&mut self) -> (Option<bool>, bool) {
-        if let Some(child) = self.whole_switch_statefile_child.as_mut() {
-            return match child.try_wait() {
-                Ok(None) => (Some(false), false),
+    async fn statefile_probe_step(&mut self, episode: std::time::Instant) -> (Option<bool>, bool) {
+        if let Some((started, child)) = self.whole_switch_statefile_child.as_mut() {
+            let started = *started;
+            match child.try_wait() {
+                Ok(None) => return (Some(false), false),
                 Ok(Some(status)) => {
                     self.whole_switch_statefile_child = None;
-                    (Some(status.success()), true)
+                    // A read left from an earlier release says nothing now:
+                    // drop it and start a fresh one below.
+                    if started >= episode {
+                        return (Some(status.success()), true);
+                    }
                 }
                 Err(_) => {
                     self.whole_switch_statefile_child = None;
-                    (Some(false), true)
+                    return (Some(false), true);
                 }
-            };
+            }
         }
         let Some(path) = statefile_path().await else {
             return (None, true);
@@ -15987,7 +15983,7 @@ impl StateMachine {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            self.whole_switch_statefile_child = Some(child);
+            self.whole_switch_statefile_child = Some((std::time::Instant::now(), child));
         }
         (Some(false), false)
     }
@@ -16085,6 +16081,7 @@ impl StateMachine {
             // A deferral is measured from the release it delays, not from an
             // earlier one the hold came back after.
             self.whole_switch_release_deferred_since = None;
+            self.whole_switch_release_episode_at = None;
         }
         match action {
             WholeSwitchAction::Hold => {
@@ -16119,7 +16116,13 @@ impl StateMachine {
             }
             WholeSwitchAction::Release => {
                 let io_suspended = self.drbd.status().await.ok().map(|s| s.suspended_any);
-                let statefile_ok = if io_suspended == Some(false) {
+                // Only a host with no guest waits (see `whole_switch_release_waits`):
+                // a host running guests, or whose count is unreadable, re-arms
+                // now, as before, without reading the statefile first.
+                let local_guests = self.running_vm_count().await;
+                let episode = *self.whole_switch_release_episode_at.get_or_insert(now);
+                let check_statefile = local_guests == Some(0) && io_suspended == Some(false);
+                let statefile_ok = if check_statefile {
                     match self.whole_switch_statefile_probe {
                         Some((at, ok))
                             if now.duration_since(at) < WHOLE_SWITCH_STATEFILE_PROBE_EVERY =>
@@ -16127,7 +16130,7 @@ impl StateMachine {
                             ok
                         }
                         _ => {
-                            let (ok, finished) = self.statefile_probe_step().await;
+                            let (ok, finished) = self.statefile_probe_step(episode).await;
                             if finished {
                                 self.whole_switch_statefile_probe = Some((now, ok));
                             }
@@ -16141,7 +16144,7 @@ impl StateMachine {
                 // link may be missing (the boot-time race the readmission
                 // revive repairs, which stands aside during a hold). Repair it
                 // here, once per probe window.
-                if io_suspended == Some(false)
+                if check_statefile
                     && statefile_ok == Some(false)
                     && !static_vdi_links_ok(STATIC_VDIS_DIR)
                     && self
@@ -16154,29 +16157,25 @@ impl StateMachine {
                         "whole-switch release: storage I/O runs but the HA statefile link is \
                          missing; restarting attach-static-vdis before re-arming HA"
                     );
-                    let _ =
-                        crate::cmd::run_cmd("systemctl", &["restart", "attach-static-vdis"]).await;
+                    let _ = crate::cmd::run_cmd_for(
+                        "systemctl",
+                        &["restart", "attach-static-vdis"],
+                        30,
+                    )
+                    .await;
                     self.whole_switch_statefile_probe = None;
                 }
-                // A host running guests never waits (see ReleaseStep).
-                let local_guests = if whole_switch_release_ready(io_suspended, statefile_ok) {
-                    None
-                } else {
-                    self.running_vm_count().await
-                };
-                let step = whole_switch_release_step(io_suspended, statefile_ok, local_guests);
-                if step == ReleaseStep::RearmWithGuests {
+                if local_guests != Some(0) && io_suspended != Some(false) {
                     warn!(
                         heal_event = "whole_switch_release_with_guests",
                         ?io_suspended,
-                        ?statefile_ok,
-                        "whole-switch hold over with guests on this host while storage I/O or \
-                         the HA statefile is not answering: re-arming HA now rather than \
-                         waiting, so the peer cannot restart them while they are still here; \
-                         if the statefile cannot be written, XHA resets this host and its \
-                         guests with it"
+                        "whole-switch hold over with guests on this host while its storage I/O \
+                         is suspended (or unreadable): re-arming HA now rather than waiting, so \
+                         the peer cannot restart them while they are still here; if the \
+                         statefile cannot be written, XHA resets this host and its guests with it"
                     );
-                } else if step == ReleaseStep::Defer {
+                }
+                if whole_switch_release_waits(io_suspended, statefile_ok, local_guests) {
                     let since = *self.whole_switch_release_deferred_since.get_or_insert(now);
                     let long = now.duration_since(since) >= WHOLE_SWITCH_DEFERRED_ALERT_AFTER;
                     if self
@@ -16239,6 +16238,7 @@ impl StateMachine {
                 self.whole_switch_release_deferred_since = None;
                 self.whole_switch_release_alerted_at = None;
                 self.whole_switch_statefile_probe = None;
+                self.whole_switch_release_episode_at = None;
                 self.clear_heal_state_if_stage("whole_switch_release_deferred");
                 info!(
                     heal_event = "whole_switch_release",
@@ -28656,29 +28656,30 @@ poll_interval_ms = 10
 
     #[test]
     fn whole_switch_release_never_waits_with_guests_here() {
-        use ReleaseStep::*;
-        // Ready: release whatever runs here.
-        assert_eq!(
-            whole_switch_release_step(Some(false), Some(true), None),
-            Release
-        );
-        // Not ready with guests here (or their count unreadable), whatever
-        // the reason: re-arm now, as before, never wait.
-        assert_eq!(
-            whole_switch_release_step(Some(true), None, Some(2)),
-            RearmWithGuests
-        );
-        assert_eq!(whole_switch_release_step(None, None, None), RearmWithGuests);
-        assert_eq!(
-            whole_switch_release_step(Some(false), Some(false), Some(1)),
-            RearmWithGuests
-        );
-        // Not ready and no guest here: wait.
-        assert_eq!(whole_switch_release_step(Some(true), None, Some(0)), Defer);
-        assert_eq!(
-            whole_switch_release_step(Some(false), Some(false), Some(0)),
-            Defer
-        );
+        // Guests here, or their count unreadable: never wait, whatever the
+        // storage reads.
+        assert!(!whole_switch_release_waits(Some(true), None, Some(2)));
+        assert!(!whole_switch_release_waits(None, None, None));
+        assert!(!whole_switch_release_waits(
+            Some(false),
+            Some(false),
+            Some(1)
+        ));
+        // No guest here: wait while not ready.
+        assert!(whole_switch_release_waits(Some(true), None, Some(0)));
+        assert!(whole_switch_release_waits(
+            Some(false),
+            Some(false),
+            Some(0)
+        ));
+        assert!(whole_switch_release_waits(None, None, Some(0)));
+        // No guest, I/O running, statefile answering or not configured: go.
+        assert!(!whole_switch_release_waits(
+            Some(false),
+            Some(true),
+            Some(0)
+        ));
+        assert!(!whole_switch_release_waits(Some(false), None, Some(0)));
     }
 
     #[test]
@@ -28691,7 +28692,7 @@ poll_interval_ms = 10
         assert!(!whole_switch_release_ready(Some(true), Some(true)));
         // I/O runs but the statefile does not answer (path gone after a step-down).
         assert!(!whole_switch_release_ready(Some(false), Some(false)));
-        // DRBD status unreadable: wait for the next tick.
+        // DRBD status unreadable: not ready (a host with no guest waits).
         assert!(!whole_switch_release_ready(None, None));
     }
 
