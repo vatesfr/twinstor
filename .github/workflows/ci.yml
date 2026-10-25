@@ -11,12 +11,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# The toolchain is pinned to the one releases are built with, so a new
+# clippy lint cannot fail CI on unchanged code. Bump it on purpose.
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -27,8 +30,8 @@ jobs:
   musl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.1
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
