@@ -964,18 +964,72 @@ fn switch_probe_target(
     })
 }
 
+/// Why the switch probe is unavailable. `transient` marks a failed or
+/// timed-out `ip` command, retried after `SWITCH_PROBE_RETRY`, so one bad
+/// read does not bring back the gateway-only behavior for a whole router
+/// outage. A structural reason (routed via a gateway, another device, a
+/// heartbeat mismatch, the direct link) stands for the episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchProbeUnavailable {
+    reason: String,
+    transient: bool,
+}
+
+/// A resolved switch probe and when it was resolved.
+type SwitchProbeResolved = (
+    std::time::Instant,
+    Result<SwitchProbe, SwitchProbeUnavailable>,
+);
+
+/// How long a transient resolve failure stands before the next attempt.
+const SWITCH_PROBE_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether to (re)resolve the switch probe: never resolved this episode, or
+/// a transient failure at least `retry` old. A resolved target and a
+/// structural "unavailable" both stand until the gateway-down episode ends.
+fn switch_probe_needs_resolve(
+    resolved: Option<&SwitchProbeResolved>,
+    now: std::time::Instant,
+    retry: Duration,
+) -> bool {
+    match resolved {
+        None => true,
+        Some((_, Ok(_))) => false,
+        Some((at, Err(u))) => u.transient && now.duration_since(*at) >= retry,
+    }
+}
+
 /// Resolve the switch probe from local state (the direct-peer file, the
-/// routing table, `xhad.conf`). Bounded: each `ip` call has a 5 s limit.
-/// Callers resolve once per gateway-down episode, so a config or routing
-/// change between episodes is picked up.
-async fn resolve_switch_probe(peer_address: &str) -> Result<SwitchProbe, String> {
+/// routing table, `xhad.conf`). Bounded: each `ip` call has a 5 s limit, so
+/// a resolve costs at most 10 s, and callers resolve once per gateway-down
+/// episode (plus a retry after a transient failure), so a config or routing
+/// change between episodes is picked up. An IPv6 peer address is checked
+/// against the IPv6 default route.
+async fn resolve_switch_probe(peer_address: &str) -> Result<SwitchProbe, SwitchProbeUnavailable> {
+    let transient = |reason: String| SwitchProbeUnavailable {
+        reason,
+        transient: true,
+    };
     let direct = read_direct_peer_ips().await;
-    let route_get = crate::cmd::cmd_output_for("ip", &["route", "get", peer_address], 5)
-        .await
-        .unwrap_or_default();
-    let default_route = crate::cmd::cmd_output_for("ip", &["route", "show", "default"], 5)
-        .await
-        .unwrap_or_default();
+    let route_get = match crate::cmd::cmd_output_for("ip", &["route", "get", peer_address], 5).await
+    {
+        Ok(t) if !t.trim().is_empty() => t,
+        Ok(_) => return Err(transient("`ip route get` printed nothing".to_string())),
+        Err(e) => return Err(transient(format!("`ip route get` failed: {e}"))),
+    };
+    let v6 = peer_address
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_ipv6());
+    let default_args: &[&str] = if v6 {
+        &["-6", "route", "show", "default"]
+    } else {
+        &["route", "show", "default"]
+    };
+    let default_route = match crate::cmd::cmd_output_for("ip", default_args, 5).await {
+        Ok(t) => t,
+        Err(e) => return Err(transient(format!("`ip route show default` failed: {e}"))),
+    };
     let heartbeat = tokio::fs::read_to_string(XHAD_CONF)
         .await
         .ok()
@@ -987,6 +1041,10 @@ async fn resolve_switch_probe(peer_address: &str) -> Result<SwitchProbe, String>
         &default_route,
         heartbeat.as_deref(),
     )
+    .map_err(|reason| SwitchProbeUnavailable {
+        reason,
+        transient: false,
+    })
 }
 
 /// Whether the peer answers ICMP on its address, sent out of the gateway
@@ -1008,6 +1066,32 @@ async fn ping_peer_over_switch(probe: &SwitchProbe) -> bool {
         .await,
         Ok(Ok(st)) if st.success()
     )
+}
+
+/// The `twinstor status` stage for a gateway outage with the peer still
+/// answering over the switch.
+const GATEWAY_OUTAGE_STAGE: &str = "gateway_outage_peer_reachable";
+
+/// What a fresh tick probe does to the router-outage stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayOutageStage {
+    /// First answer (or first after a miss): log and show the stage.
+    Set,
+    /// Still answering: rewrite the stage so it stays fresh.
+    Refresh,
+    /// First miss after an answer: actions are no longer suppressed, so log
+    /// and clear the stage.
+    Clear,
+    Nothing,
+}
+
+fn gateway_outage_stage_step(was_answering: bool, answered: bool) -> GatewayOutageStage {
+    match (was_answering, answered) {
+        (false, true) => GatewayOutageStage::Set,
+        (true, true) => GatewayOutageStage::Refresh,
+        (true, false) => GatewayOutageStage::Clear,
+        (false, false) => GatewayOutageStage::Nothing,
+    }
 }
 
 /// One fence-guard switch probe, as `guard_switch_alive` folds it.
@@ -6504,12 +6588,20 @@ pub struct StateMachine {
     /// Last "peer answers over the switch" probe (when, result), reused for
     /// `SWITCH_PROBE_REUSE` so the checks of one tick share one ping.
     switch_probe_cache: Option<(std::time::Instant, bool)>,
-    /// The router-outage classification was logged (and its heal state set)
-    /// for this gateway-down episode; cleared once the gateway answers again.
-    switch_probe_logged: bool,
-    /// The switch probe resolved for this gateway-down episode (or why it is
-    /// unavailable, logged once); cleared once the gateway answers again.
-    switch_probe_resolved: Option<Result<SwitchProbe, String>>,
+    /// The last switch probe of this gateway-down episode answered (the
+    /// router-outage heal stage is set); drives `gateway_outage_stage_step`.
+    switch_probe_answering: bool,
+    /// The switch probe resolved for this gateway-down episode, or why it is
+    /// unavailable (see `switch_probe_needs_resolve`).
+    switch_probe_resolved: Option<SwitchProbeResolved>,
+    /// "Unavailable" was logged for this gateway-down episode.
+    switch_probe_unavailable_logged: bool,
+    /// A gateway-down episode may have left switch-probe state or the
+    /// router-outage stage behind. Starts true, so the first gateway-up after
+    /// a daemon restart clears a stage the previous run left.
+    switch_probe_episode_open: bool,
+    /// When the router-outage stage was first written this episode.
+    gateway_outage_stage_started: Option<u64>,
     /// HA-deadlock auto-exit debounce and rate-limit timers.
     ha_deadlock_since: Option<std::time::Instant>,
     ha_deadlock_action_at: Option<std::time::Instant>,
@@ -7086,8 +7178,11 @@ impl StateMachine {
             whole_switch_probe_misses: 0,
             isolated_slave_since: None,
             switch_probe_cache: None,
-            switch_probe_logged: false,
+            switch_probe_answering: false,
             switch_probe_resolved: None,
+            switch_probe_unavailable_logged: false,
+            switch_probe_episode_open: true,
+            gateway_outage_stage_started: None,
             ha_deadlock_since: None,
             ha_deadlock_action_at: None,
             vdi_lock_prev: None,
@@ -7465,7 +7560,7 @@ impl StateMachine {
                     // The switch probe, resolved once per gateway-down episode
                     // (routing or a regenerated config may change between
                     // episodes), and its consecutive-miss count.
-                    let mut switch_probe: Option<Result<SwitchProbe, String>> = None;
+                    let mut switch_probe: Option<SwitchProbeResolved> = None;
                     let mut switch_misses: u32 = 0;
                     loop {
                         let now = std::time::Instant::now();
@@ -7508,7 +7603,23 @@ impl StateMachine {
                         // carries traffic to the peer: an answer means only the
                         // gateway (router) is gone, so keep XHA armed. Two misses
                         // in a row count as a dead switch, so one lost burst
-                        // over a long router outage cannot disarm.
+                        // over a long router outage cannot disarm. After a
+                        // Rearm the count starts from zero, so a re-disarm takes
+                        // one more round than the first one did.
+                        //
+                        // Cost: a round is the 2 s sleep, the gateway ping (6 s
+                        // bound), the beacon (3 s connect + 3 s read bound), and
+                        // this probe (6 s bound), plus the resolve (two 5 s `ip`
+                        // calls) on the episode's first probing round and on a
+                        // retry. With every timeout maxed that is about 30 s for a
+                        // resolving round and 20 s otherwise; on a working direct
+                        // link with the switch dead it is about 5 s (each ping
+                        // gives up after about 1.4 s). The two misses of a switch
+                        // death at the outage start land inside the 15 s confirm
+                        // window; a switch death mid-outage disarms within about
+                        // two rounds after the last answer (about 10 s typical,
+                        // about 60 s with every timeout maxed), under the 90 s
+                        // arbitrated XHA timeout.
                         if gateway_ok {
                             switch_probe = None;
                         }
@@ -7517,10 +7628,15 @@ impl StateMachine {
                             already_disarmed,
                             peer_down_since,
                         ) {
-                            if switch_probe.is_none() {
-                                switch_probe = Some(resolve_switch_probe(&guard_peer_addr).await);
+                            if switch_probe_needs_resolve(
+                                switch_probe.as_ref(),
+                                std::time::Instant::now(),
+                                SWITCH_PROBE_RETRY,
+                            ) {
+                                let resolved = resolve_switch_probe(&guard_peer_addr).await;
+                                switch_probe = Some((std::time::Instant::now(), resolved));
                             }
-                            match &switch_probe {
+                            match switch_probe.as_ref().map(|(_, r)| r) {
                                 Some(Ok(probe)) => {
                                     if ping_peer_over_switch(probe).await {
                                         SwitchProbeRead::Answered
@@ -12907,74 +13023,130 @@ impl StateMachine {
     /// (`ping_peer_over_switch`). Only the arbitrated isolation checks call
     /// it, and only once the default gateway is already down, so a healthy
     /// host never pays for it. The target is resolved once per gateway-down
-    /// episode; when it is unavailable (`switch_probe_target`) the answer is
-    /// `false`, the gateway-only reading, and the reason is logged once. A
-    /// result is reused for `SWITCH_PROBE_REUSE`, so a tick costs at most one
-    /// probe. The first answer of an episode is logged and set as the heal
-    /// state; `switch_probe_episode_end` clears both.
+    /// episode (a transient failure is retried after `SWITCH_PROBE_RETRY`);
+    /// when it is unavailable (`switch_probe_target`) the answer is `false`,
+    /// the gateway-only reading, and the reason is logged once. A result is
+    /// reused for `SWITCH_PROBE_REUSE`, so a tick costs at most one probe
+    /// (about 1.4 s when unanswered, 6 s bound) plus, once per episode, a
+    /// resolve (10 s bound). The router-outage heal stage follows the answers
+    /// (`gateway_outage_stage_step`).
     async fn peer_reachable_over_switch(&mut self) -> bool {
+        self.switch_probe_episode_open = true;
         let now = std::time::Instant::now();
         if let Some((at, ok)) = self.switch_probe_cache
             && now.duration_since(at) < SWITCH_PROBE_REUSE
         {
             return ok;
         }
-        if self.switch_probe_resolved.is_none() {
+        if switch_probe_needs_resolve(self.switch_probe_resolved.as_ref(), now, SWITCH_PROBE_RETRY)
+        {
             let resolved =
                 resolve_switch_probe(&self.config.network.peer_address.to_string()).await;
-            if let Err(why) = &resolved {
+            if let Err(u) = &resolved
+                && !self.switch_probe_unavailable_logged
+            {
+                self.switch_probe_unavailable_logged = true;
                 info!(
                     heal_event = "switch_probe_unavailable",
-                    reason = why.as_str(),
+                    reason = u.reason.as_str(),
+                    retried = u.transient,
                     "the default gateway does not answer and the peer-over-the-switch check \
                        is unavailable, so the isolation checks use the gateway alone"
                 );
             }
-            self.switch_probe_resolved = Some(resolved);
+            self.switch_probe_resolved = Some((std::time::Instant::now(), resolved));
         }
-        let ok = match &self.switch_probe_resolved {
-            Some(Ok(probe)) => ping_peer_over_switch(probe).await,
-            _ => false,
+        let probe = match &self.switch_probe_resolved {
+            Some((_, Ok(p))) => Some(p.clone()),
+            _ => None,
+        };
+        let ok = match &probe {
+            Some(p) => ping_peer_over_switch(p).await,
+            None => false,
         };
         self.switch_probe_cache = Some((std::time::Instant::now(), ok));
-        if ok && !self.switch_probe_logged {
-            self.switch_probe_logged = true;
-            let (peer, dev) = match &self.switch_probe_resolved {
-                Some(Ok(p)) => (p.ip.clone(), p.dev.clone()),
-                _ => (String::new(), String::new()),
-            };
-            warn!(
-                heal_event = "gateway_outage_peer_reachable",
-                peer = peer.as_str(),
-                dev = dev.as_str(),
-                "the default gateway does not answer, but the peer answers over the \
-                   switch on the gateway network: a gateway or router outage, not a switch \
-                   outage or a host isolation. No whole-switch hold and no isolated \
-                   stand-down while the peer answers"
-            );
-            // Do not overwrite another heal episode's stage.
-            let other_stage = crate::heal_state::read()
-                .is_some_and(|h| h.stage != "gateway_outage_peer_reachable");
-            if !other_stage {
-                self.heal_state_update(
-                    "gateway_outage_peer_reachable",
-                    "gateway unreachable but the peer answers over the switch: router \
-                     outage, isolation actions suppressed",
-                    Some("restore the default gateway (router); nothing to do on the hosts"),
+        match gateway_outage_stage_step(self.switch_probe_answering, ok) {
+            GatewayOutageStage::Set => {
+                let (peer, dev) = probe.map(|p| (p.ip, p.dev)).unwrap_or_default();
+                warn!(
+                    heal_event = "gateway_outage_peer_reachable",
+                    peer = peer.as_str(),
+                    dev = dev.as_str(),
+                    "the default gateway does not answer, but the peer answers over the \
+                       switch on the gateway network: a gateway or router outage, not a switch \
+                       outage or a host isolation. No whole-switch hold and no isolated \
+                       stand-down while the peer answers"
                 );
+                self.gateway_outage_stage_write();
             }
+            GatewayOutageStage::Refresh => self.gateway_outage_stage_write(),
+            GatewayOutageStage::Clear => {
+                info!(
+                    heal_event = "gateway_outage_peer_unreachable",
+                    "the peer stopped answering over the switch during the gateway outage: \
+                       the isolation checks act on the gateway again"
+                );
+                self.gateway_outage_stage_clear();
+            }
+            GatewayOutageStage::Nothing => {}
         }
+        self.switch_probe_answering = ok;
         ok
     }
 
-    /// The default gateway answers again: end the switch-probe episode. The
-    /// next gateway loss resolves the target afresh and logs again.
+    /// The default gateway answers again: end the switch-probe episode and
+    /// clear the router-outage stage, whether or not this run set it (a
+    /// restart mid-episode leaves it behind). The next gateway loss resolves
+    /// the target afresh. Cheap on a healthy host: one flag check.
     fn switch_probe_episode_end(&mut self) {
+        if !self.switch_probe_episode_open {
+            return;
+        }
+        self.switch_probe_episode_open = false;
         self.switch_probe_cache = None;
         self.switch_probe_resolved = None;
-        if self.switch_probe_logged {
-            self.switch_probe_logged = false;
-            self.clear_heal_state_if_stage("gateway_outage_peer_reachable");
+        self.switch_probe_answering = false;
+        self.switch_probe_unavailable_logged = false;
+        self.gateway_outage_stage_clear();
+    }
+
+    /// Write the router-outage stage for `twinstor status`. Status only: it
+    /// goes straight to the heal-state file, with none of
+    /// `heal_state_update`'s bookkeeping (no episode start for the flap-storm
+    /// detector, no episode open, no heal_stage log), since a router outage
+    /// is not a heal episode. Rewritten on every fresh answer so the orphan
+    /// reaper never sees it stale. Never overwrites another stage.
+    fn gateway_outage_stage_write(&mut self) {
+        let started = *self
+            .gateway_outage_stage_started
+            .get_or_insert_with(crate::heal_state::unix_now);
+        if cfg!(test) {
+            return;
+        }
+        if crate::heal_state::read().is_some_and(|h| h.stage != GATEWAY_OUTAGE_STAGE) {
+            return;
+        }
+        crate::heal_state::write(
+            GATEWAY_OUTAGE_STAGE,
+            "gateway unreachable but the peer answers over the switch: router outage, \
+             isolation actions suppressed",
+            Some("restore the default gateway (router); nothing to do on the hosts"),
+            0,
+            0,
+            0,
+            started,
+        );
+    }
+
+    /// Clear the router-outage stage if it is the one shown. Status only, like
+    /// `gateway_outage_stage_write`: no episode close.
+    fn gateway_outage_stage_clear(&mut self) {
+        self.gateway_outage_stage_started = None;
+        if cfg!(test) {
+            return;
+        }
+        if crate::heal_state::read().is_some_and(|h| h.stage == GATEWAY_OUTAGE_STAGE) {
+            crate::heal_state::clear();
         }
     }
 
@@ -28547,6 +28719,173 @@ poll_interval_ms = 10
         // Probe unavailable (peer address on another network): the gateway-only
         // behavior, disarm at once as before.
         assert_eq!(guard_rounds(&[Unavailable]), vec![Disarm]);
+    }
+
+    #[test]
+    fn route_parsers_table_proto_ipv6_and_several_defaults() {
+        // `table` and `proto` words around the device.
+        assert_eq!(
+            route_get_direct_dev("192.168.1.133 dev xenbr1 table main src 192.168.1.138 uid 0\n"),
+            Ok("xenbr1".to_string())
+        );
+        assert_eq!(
+            default_route_dev(
+                "default via 192.168.1.1 dev xenbr1 proto dhcp src 192.168.1.138 metric 100\n"
+            )
+            .as_deref(),
+            Some("xenbr1")
+        );
+        assert_eq!(
+            default_route_dev("default via 192.168.1.1 dev xenbr1 table main\n").as_deref(),
+            Some("xenbr1")
+        );
+        // IPv6 `ip route get` prints `from ::`; directly connected is fine,
+        // through a router is not.
+        assert_eq!(
+            route_get_direct_dev(
+                "2001:db8::2 from :: dev xenbr1 proto kernel src 2001:db8::1 metric 256 pref medium\n"
+            ),
+            Ok("xenbr1".to_string())
+        );
+        assert!(
+            route_get_direct_dev(
+                "2001:db9::2 from :: via fe80::1 dev xenbr1 proto ra src 2001:db8::1 metric 1024\n"
+            )
+            .is_err()
+        );
+        // Several default routes: the first one wins (the one in use).
+        assert_eq!(
+            default_route_dev(
+                "default via 192.168.1.1 dev xenbr1 metric 100\ndefault via 10.0.0.1 dev xenbr2 metric 200\n"
+            )
+            .as_deref(),
+            Some("xenbr1")
+        );
+        // ECMP default: no device on the first line, so no single gateway
+        // network; the probe is unavailable.
+        let ecmp = "default proto static metric 1024\n\
+                    \tnexthop via 192.168.1.1 dev xenbr1 weight 1\n\
+                    \tnexthop via 192.168.2.1 dev xenbr2 weight 1\n";
+        assert_eq!(default_route_dev(ecmp), Option::None);
+        let on_gw = "192.168.1.133 dev xenbr1 src 192.168.1.138 uid 0\n";
+        assert!(switch_probe_target("192.168.1.133", &[], on_gw, ecmp, Option::None).is_err());
+    }
+
+    #[test]
+    fn switch_probe_resolve_retries_only_transient_failures() {
+        let now = std::time::Instant::now();
+        let retry = Duration::from_secs(30);
+        let old = now - Duration::from_secs(31);
+        let recent = now - Duration::from_secs(5);
+        let probe = SwitchProbe {
+            ip: "192.168.1.133".to_string(),
+            dev: "xenbr1".to_string(),
+        };
+        let failed = |transient| {
+            Err(SwitchProbeUnavailable {
+                reason: "x".to_string(),
+                transient,
+            })
+        };
+        // Not resolved yet this episode.
+        assert!(switch_probe_needs_resolve(Option::None, now, retry));
+        // Resolved: stands for the episode.
+        assert!(!switch_probe_needs_resolve(
+            Some(&(old, Ok(probe))),
+            now,
+            retry
+        ));
+        // A failed or timed-out `ip` command is retried after the window.
+        assert!(!switch_probe_needs_resolve(
+            Some(&(recent, failed(true))),
+            now,
+            retry
+        ));
+        assert!(switch_probe_needs_resolve(
+            Some(&(old, failed(true))),
+            now,
+            retry
+        ));
+        // A structural "unavailable" stands for the episode.
+        assert!(!switch_probe_needs_resolve(
+            Some(&(old, failed(false))),
+            now,
+            retry
+        ));
+    }
+
+    #[test]
+    fn gateway_outage_stage_follows_the_answers() {
+        use GatewayOutageStage::*;
+        assert_eq!(gateway_outage_stage_step(false, true), Set);
+        assert_eq!(gateway_outage_stage_step(true, true), Refresh);
+        // First miss after an answer: actions are live again, clear the stage.
+        assert_eq!(gateway_outage_stage_step(true, false), Clear);
+        assert_eq!(gateway_outage_stage_step(false, false), Nothing);
+    }
+
+    #[tokio::test]
+    async fn gateway_outage_stage_has_no_episode_bookkeeping() {
+        // The router-outage stage is status only: setting and clearing it,
+        // repeatedly (gateway blips with the peer answering), must not count
+        // flap-storm episodes or open or close a heal episode.
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(MockDrbd::new(connecting_secondary())),
+            Box::new(MockIscsi::new()),
+        );
+        for _ in 0..4 {
+            sm.gateway_outage_stage_write();
+            sm.gateway_outage_stage_write();
+            assert!(sm.gateway_outage_stage_started.is_some());
+            sm.gateway_outage_stage_clear();
+            assert!(sm.gateway_outage_stage_started.is_none());
+        }
+        assert!(sm.sb_episode_starts.is_empty());
+        assert!(sm.heal_episode_started.is_none());
+        assert!(sm.heal_stage_logged.is_none());
+        assert!(sm.episode.is_none());
+    }
+
+    #[test]
+    fn guard_redisarm_after_a_rearm_starts_from_zero_misses() {
+        use GuardAction::*;
+        use SwitchProbeRead::*;
+        let now = std::time::Instant::now();
+        let matured = Some(now - Duration::from_secs(20));
+        let dn_fresh = Some(now - Duration::from_secs(4));
+        let mut misses = 0;
+        let mut round = |probe: SwitchProbeRead, disarmed: bool| {
+            let read = if guard_should_probe_switch(false, disarmed, matured) {
+                probe
+            } else {
+                NotRun
+            };
+            let (alive, m) = guard_switch_alive(read, misses);
+            misses = m;
+            whole_switch_guard_decision(
+                true,
+                false,
+                alive,
+                false,
+                matured,
+                matured,
+                dn_fresh,
+                disarmed,
+                now,
+                Duration::from_secs(15),
+                Duration::from_secs(30),
+            )
+        };
+        // Switch dead: disarm on the second miss.
+        assert_eq!(round(Missed, false), None);
+        assert_eq!(round(Missed, false), Disarm);
+        // Disarmed: no probing, the count resets.
+        assert_eq!(round(Missed, true), None);
+        // After a Rearm (latch cleared), a re-disarm needs two fresh misses:
+        // one round more than an immediate re-disarm.
+        assert_eq!(round(Missed, false), None);
+        assert_eq!(round(Missed, false), Disarm);
     }
 
     #[test]
