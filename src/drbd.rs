@@ -1025,7 +1025,13 @@ pub fn parse_drbdadm_text(text: &str) -> Result<DrbdStatus> {
         }
         // I/O suspend reason on the resource line (DRBD 9). Only an explicit
         // user/script suspend is actionable; fencing/quorum suspends self-resume.
-        if let Some(s) = extract(trimmed, "suspended:") {
+        // Whole token only: the DRBD 9 peer-device field `resync-suspended:`
+        // (a paused resync) is not an I/O suspend.
+        if let Some(s) = trimmed
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("suspended:"))
+            .map(str::to_string)
+        {
             // The value can be a comma-joined set ("user,fencing").
             suspended_user = s.split(',').any(|v| v == "user");
             suspended_fencing = s.split(',').any(|v| v == "fencing");
@@ -1570,6 +1576,12 @@ mod tests {
         let s = t("quorum");
         assert!(s.suspended_any);
         assert!(!t("no").suspended_any);
+        // A paused resync on the peer-device line is not an I/O suspend.
+        let s = parse_drbdadm_text(
+            "twinstor-data role:Primary suspended:no\n  disk:UpToDate\n  peer role:Primary\n    replication:PausedSyncS peer-disk:Inconsistent resync-suspended:user\n",
+        )
+        .unwrap();
+        assert!(!s.suspended_any && !s.suspended_user);
         let s = t("user,fencing");
         assert!(s.suspended_fencing && s.suspended_user);
         let s = t("user");

@@ -1627,6 +1627,10 @@ fn whole_switch_release_ready(io_suspended: Option<bool>, statefile_ok: Option<b
     io_suspended == Some(false) && statefile_ok != Some(false)
 }
 
+/// How often a deferred whole-switch release re-probes the statefile (and at
+/// most repairs its static-vdis link).
+const WHOLE_SWITCH_STATEFILE_PROBE_EVERY: Duration = Duration::from_secs(20);
+
 /// A deferred whole-switch release is alerted once it has lasted this long:
 /// HA stays disarmed on this host meanwhile.
 const WHOLE_SWITCH_DEFERRED_ALERT_AFTER: Duration = Duration::from_secs(300);
@@ -3674,17 +3678,17 @@ fn peer_disk_is_stale(peer_disk: Option<DiskState>) -> bool {
 /// liveset shows the peer dead (not live and off the statefile); an unreadable
 /// answer holds (fails closed) and the operator is alerted instead. In the
 /// heal's own scenario the survivor usually runs the VMs, so the heal then
-/// reduces to the alert: the inversion only costs control-plane operations
-/// (the stale master reads through this host's disk), while a wrong takeover
-/// double-runs VMs.
+/// reduces to the alert: the deadlock it leaves is on the control plane (pool
+/// operations go through the stale master, which still reads through this
+/// host's disk), while a wrong takeover double-runs VMs.
 fn demoted_survivor_reassert_safe(peer_dead: Option<bool>, local_guests: Option<usize>) -> bool {
     peer_dead == Some(true) || local_guests == Some(0)
 }
 
-/// Window over which a resync must advance to count as progressing. `done`
-/// is printed with two decimals, so a large disk resyncing at a normal rate
-/// can show the same value for many one-second ticks.
-const DEMOTED_SURVIVOR_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
+/// Window over which a resync must move to count as progressing. `done` is
+/// printed with two decimals, so a large disk resyncing slowly can show the
+/// same value for over a minute (0.01 % of 20 TB at 30 MB/s is about 66 s).
+const DEMOTED_SURVIVOR_PROGRESS_WINDOW: Duration = Duration::from_secs(300);
 /// How long a demotion seen by this daemon stays evidence for the heal.
 const DEMOTED_SURVIVOR_EVIDENCE_WINDOW: Duration = Duration::from_secs(1800);
 
@@ -3700,7 +3704,8 @@ fn resync_progress_window(
     match (cur, mark) {
         (None, _) => (false, None),
         (Some(c), None) => (true, Some((c, now))),
-        (Some(c), Some((m, _))) if c > m => (true, Some((c, now))),
+        // Any change is movement: a resync that restarted reads lower.
+        (Some(c), Some((m, _))) if c != m => (true, Some((c, now))),
         (Some(_), Some((m, at))) => (now.duration_since(at) < window, Some((m, at))),
     }
 }
@@ -6395,6 +6400,10 @@ pub struct StateMachine {
     /// When the current deferral started, and when it was last alerted.
     whole_switch_release_deferred_since: Option<std::time::Instant>,
     whole_switch_release_alerted_at: Option<std::time::Instant>,
+    /// Last statefile probe of a deferred release and its result, and the
+    /// last static-vdis repair it ran.
+    whole_switch_statefile_probe: Option<(std::time::Instant, Option<bool>)>,
+    whole_switch_static_vdis_repair_at: Option<std::time::Instant>,
     /// Confirm clock for a single-host slave isolation (my gateway
     /// down, master's gateway up over the direct link); the slave stand-down fires
     /// once it has held past `ISOLATED_SLAVE_STANDDOWN_AFTER`.
@@ -6988,6 +6997,8 @@ impl StateMachine {
             whole_switch_release_deferred_at: None,
             whole_switch_release_deferred_since: None,
             whole_switch_release_alerted_at: None,
+            whole_switch_statefile_probe: None,
+            whole_switch_static_vdis_repair_at: None,
             isolated_slave_since: None,
             ha_deadlock_since: None,
             ha_deadlock_action_at: None,
@@ -10090,10 +10101,15 @@ impl StateMachine {
             DEMOTED_SURVIVOR_CAP,
         ) {
             StrandedAction::Clear => {
-                info!("demoted-survivor strand cleared: pool mastership is no longer inverted");
+                info!(
+                    "demoted-survivor watch cleared: the inversion ended, or the demotion this \
+                     daemon saw is too old to act on"
+                );
                 self.demoted_survivor_since = None;
                 self.demoted_survivor_action_at = None;
                 self.demoted_survivor_attempts = 0;
+                self.demoted_survivor_blocked_alert_at = None;
+                self.clear_heal_state_if_stage("demoted_survivor_blocked");
             }
             StrandedAction::Idle | StrandedAction::Reclaim | StrandedAction::ForceReset => {}
             StrandedAction::StartTimer => {
@@ -10126,6 +10142,11 @@ impl StateMachine {
                         return;
                     }
                     self.demoted_survivor_blocked_alert_at = Some(now);
+                    self.heal_state_update(
+                        "demoted_survivor_blocked",
+                        "slave of a peer whose disk is stale, with guests here: not taking mastership automatically",
+                        Some("check the peer; see the alert for the manual re-assert"),
+                    );
                     warn!(
                         heal_event = "demoted_survivor_reassert_blocked",
                         ?peer_dead,
@@ -15428,7 +15449,7 @@ impl StateMachine {
         } else {
             self.whole_switch_since = None;
         }
-        match whole_switch_decision(
+        let action = whole_switch_decision(
             self.arbitrated,
             gateway_ok,
             peer_gw,
@@ -15442,7 +15463,13 @@ impl StateMachine {
             } else {
                 WHOLE_SWITCH_CONFIRM
             },
-        ) {
+        );
+        if action != WholeSwitchAction::Release {
+            // A deferral is measured from the release it delays, not from an
+            // earlier one the hold came back after.
+            self.whole_switch_release_deferred_since = None;
+        }
+        match action {
             WholeSwitchAction::Hold => {
                 warn!(
                     heal_event = "whole_switch_hold",
@@ -15474,10 +15501,45 @@ impl StateMachine {
             WholeSwitchAction::Release => {
                 let io_suspended = self.drbd.status().await.ok().map(|s| s.suspended_any);
                 let statefile_ok = if io_suspended == Some(false) {
-                    statefile_readable().await
+                    // One probe per window: a read queued on a pathless
+                    // multipath device can sit in D state past its timeout,
+                    // and a probe per tick would pile them up.
+                    match self.whole_switch_statefile_probe {
+                        Some((at, ok))
+                            if now.duration_since(at) < WHOLE_SWITCH_STATEFILE_PROBE_EVERY =>
+                        {
+                            ok
+                        }
+                        _ => {
+                            let ok = statefile_readable().await;
+                            self.whole_switch_statefile_probe = Some((now, ok));
+                            ok
+                        }
+                    }
                 } else {
                     None
                 };
+                // I/O runs but the statefile does not answer: the static-vdis
+                // link may be missing (the boot-time race the readmission
+                // revive repairs, which stands aside during a hold). Repair it
+                // here, once per probe window.
+                if io_suspended == Some(false)
+                    && statefile_ok == Some(false)
+                    && !static_vdi_links_ok(STATIC_VDIS_DIR)
+                    && self
+                        .whole_switch_static_vdis_repair_at
+                        .is_none_or(|t| now.duration_since(t) >= WHOLE_SWITCH_STATEFILE_PROBE_EVERY)
+                {
+                    self.whole_switch_static_vdis_repair_at = Some(now);
+                    warn!(
+                        heal_event = "whole_switch_static_vdis_repair",
+                        "whole-switch release: storage I/O runs but the HA statefile link is \
+                         missing; restarting attach-static-vdis before re-arming HA"
+                    );
+                    let _ =
+                        crate::cmd::run_cmd("systemctl", &["restart", "attach-static-vdis"]).await;
+                    self.whole_switch_statefile_probe = None;
+                }
                 if !whole_switch_release_ready(io_suspended, statefile_ok) {
                     let since = *self.whole_switch_release_deferred_since.get_or_insert(now);
                     let long = now.duration_since(since) >= WHOLE_SWITCH_DEFERRED_ALERT_AFTER;
@@ -15512,13 +15574,19 @@ impl StateMachine {
                             "whole-switch outage over; HA re-arm waiting for local storage I/O",
                             Some("check this host's storage (twinstor status); HA re-arms once its I/O runs"),
                         );
-                        let _ = xapi::send_xapi_alert(
+                        let body = if io_suspended == Some(false) {
+                            "TwinStor: the network outage is over, but this host's HA statefile \
+                             does not answer, so its HA stays disarmed. Check that \
+                             /etc/xensource/static-vdis/0/disk exists ('systemctl restart \
+                             attach-static-vdis' recreates it) and 'twinstor status' on this host; \
+                             HA re-arms automatically once the statefile answers."
+                        } else {
                             "TwinStor: the network outage is over, but this host's storage I/O is \
-                             still frozen (or its HA statefile does not answer), so its HA stays \
-                             disarmed; it re-arms automatically once storage I/O runs. Check \
-                             'twinstor status' on this host.",
-                        )
-                        .await;
+                             still frozen (or its state is unreadable), so its HA stays disarmed; \
+                             it re-arms automatically once storage I/O runs. Check 'twinstor \
+                             status' on this host."
+                        };
+                        let _ = xapi::send_xapi_alert(body).await;
                         self.whole_switch_release_alerted_at = Some(now);
                     }
                     return;
@@ -26639,11 +26707,16 @@ poll_interval_ms = 10
             resync_progress_window(Some(5.01), Some((5.0, t0)), t30, w),
             (true, Some((5.01, t30)))
         );
-        // No advance for the whole window: stalled.
+        // No movement for the whole window: stalled.
         let t61 = t0 + Duration::from_secs(61);
         assert_eq!(
             resync_progress_window(Some(5.0), Some((5.0, t0)), t61, w),
             (false, Some((5.0, t0)))
+        );
+        // A resync that restarted reads lower: movement, not a stall.
+        assert_eq!(
+            resync_progress_window(Some(1.0), Some((5.0, t0)), t61, w),
+            (true, Some((1.0, t61)))
         );
     }
 
