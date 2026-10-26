@@ -308,6 +308,17 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
             }
         }
     }
+    // With the data wiped, no state of this install may reach the next one:
+    // freshness stamps, HA disarm and re-arm records, fence and freeze
+    // markers all describe the copy just erased, and a reinstall read them
+    // as its own. /run too, since uninstall does not reboot.
+    if !keep_data {
+        for dir in ["/var/lib/twinstor", "/run/twinstor"] {
+            for path in remove_dir_contents(std::path::Path::new(dir)) {
+                println!("  removed {path}");
+            }
+        }
+    }
     // Remove config dir if empty
     let _ = std::fs::remove_dir("/etc/twinstor");
 
@@ -333,6 +344,29 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
 
 fn print_step(n: u32, msg: &str) {
     println!("step {n}: {msg}");
+}
+
+/// Remove everything inside `dir` (files and subdirectories), keeping `dir`
+/// itself. Returns the paths removed; a missing `dir` removes nothing.
+fn remove_dir_contents(dir: &std::path::Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return removed;
+    };
+    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        let r = if p.is_dir() && !p.is_symlink() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        match r {
+            Ok(()) => removed.push(p.display().to_string()),
+            Err(e) => println!("  failed to remove {}: {e}", p.display()),
+        }
+    }
+    removed
 }
 
 /// What to run by hand when the pool's ha-reboot-vm-on-internal-shutdown
@@ -619,7 +653,23 @@ fn failure_reason(e: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{failure_reason, tail_zero_seek_mib, unpatch_lvm_global_filter};
+    use super::{
+        failure_reason, remove_dir_contents, tail_zero_seek_mib, unpatch_lvm_global_filter,
+    };
+
+    #[test]
+    fn dir_contents_removed_dir_kept() {
+        let dir = std::env::temp_dir().join(format!("twinstor-uninstall-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("last-healthy"), "1").unwrap();
+        std::fs::write(dir.join("sub/x"), "1").unwrap();
+        let removed = remove_dir_contents(&dir);
+        assert_eq!(removed.len(), 2);
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(remove_dir_contents(&dir).is_empty(), "missing dir: nothing");
+    }
 
     #[test]
     fn failure_reason_keeps_only_the_tools_message() {
