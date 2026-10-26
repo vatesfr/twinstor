@@ -152,9 +152,15 @@ DRBD_PORT=$(sed -n 's/^drbd_port *= *\([0-9]*\).*/\1/p' "$ETC/twinstor.toml" 2>/
 # then recovers and multipath reinstates the same path, with no new login
 # and no map reload. Arbitrated mode freezes I/O at the disconnect, so a
 # failover there carries no such gap.
+# Not on a Diskless node (its local disk failed): it holds no copy, its
+# guests' writes can only land on the peer's, and the peer's portal is the one
+# path they have left once this node's target stops.
 PORTAL_PORT=$(sed -n 's/^portal_port *= *\([0-9]*\).*/\1/p' "$ETC/twinstor.toml" 2>/dev/null | head -1)
 [ -n "$PORTAL_PORT" ] || PORTAL_PORT=3260
-if [ -z "$DIRECT_PEER" ] && [ "$LOCAL_ROLE" = "Primary" ] && [ -n "$PEER_ADDR" ]; then
+LOCAL_DISK=$(timeout 10 drbdadm dstate "$RESOURCE" 2>/dev/null | head -1 | cut -d/ -f1)
+if [ -z "$DIRECT_PEER" ] && [ "$LOCAL_ROLE" = "Primary" ] && [ "$LOCAL_DISK" = "Diskless" ]; then
+    log "fate-shared: this node is Diskless (its local disk failed): no copy here to diverge, the peer's iSCSI portal stays its guests' path (no fence)"
+elif [ -z "$DIRECT_PEER" ] && [ "$LOCAL_ROLE" = "Primary" ] && [ -n "$PEER_ADDR" ]; then
     FENCE_RULE="-d $PEER_ADDR/32 -p tcp -m tcp --dport $PORTAL_PORT -m comment --comment twinstor-peer-portal-fence -j REJECT --reject-with tcp-reset"
     if timeout 5 iptables -w 3 -C OUTPUT $FENCE_RULE 2>/dev/null; then
         RULE_STATE="present"

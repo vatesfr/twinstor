@@ -2440,6 +2440,7 @@ mod tests {
                      status) [ -f $S/status_fails ] && exit 1; echo \"$2 role:$(cat $S/role) suspended:$(cat $S/susp)\" ;;\n\
                      cstate) echo StandAlone ;;\n\
                      get-gi) cat $S/gi 2>/dev/null ;;\n\
+                     dstate) cat $S/dstate 2>/dev/null || echo UpToDate/UpToDate ;;\n\
                      suspend-io) [ -f $S/suspend_rc ] && exit $(cat $S/suspend_rc); echo user,fencing > $S/susp; [ -f $S/suspend_hangs ] && sleep 30 ;;\n\
                      esac\nexit 0\n",
                         st = st.display()
@@ -2663,6 +2664,25 @@ mod tests {
         std::fs::remove_file(&win).unwrap();
         assert_eq!(run(&rig), 1, "{}", rig.log());
         assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
+    }
+
+    #[test]
+    fn fence_peer_diskless_node_keeps_the_peer_portal() {
+        if !fence_rig_usable() {
+            return;
+        }
+        // Fate-shared (no direct link), Primary: an UpToDate node fences the
+        // path through the peer's portal; a Diskless one holds no copy, so
+        // that path is its guests' only one and stays.
+        let rig = FenceRig::new("diskless");
+        let fenced = rig.root.join("run/peer-portal-fenced");
+        rig.set("dstate", "Diskless/UpToDate");
+        let _ = rig.run(5);
+        assert!(!fenced.exists(), "{}", rig.log());
+        assert!(rig.log().contains("Diskless"), "{}", rig.log());
+        rig.set("dstate", "UpToDate/UpToDate");
+        let _ = rig.run(5);
+        assert!(fenced.exists(), "{}", rig.log());
     }
 
     #[test]

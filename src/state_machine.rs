@@ -11576,6 +11576,10 @@ impl StateMachine {
             // Connected with a known peer disk: DRBD can report Connected for a
             // moment before the handshake finds the split-brain.
             Ok(s) if s.connection == ConnectionState::Connected && s.peer_disk.is_some() => true,
+            // Diskless (the local disk failed): no copy here, the guests' writes
+            // can only land on the peer's, and its portal may be their only
+            // path left.
+            Ok(s) if s.disk == DiskState::Diskless => true,
             // The loser whose boundary stopped its guests: cleared by a flip
             // to winner and once the pair is Connected.
             Ok(_) if self.peer_portal_release => true,
