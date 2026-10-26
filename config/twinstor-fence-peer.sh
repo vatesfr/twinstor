@@ -359,16 +359,19 @@ freeze_peer_reconnecting() {
 # survived on a gateway that still answered a retried echo, and the copies
 # forked (20 to 40% loss on both hosts, both topologies, test pools). The
 # keeper (the lower name, the tiebreak below) still decides on one probe, as
-# before. The other node, when its I/O is frozen while it decides (arbitrated,
-# or freeze mode), reads the peer as gone only after the peer stayed silent
-# for a short window; an answer sends it into the tiebreak, where it yields
-# only to a peer that demonstrably still serves. Silent means the peer's DRBD
-# port, and on arbitrated its iSCSI portal too: after a lossy disconnect the
-# keeper's DRBD can take half a minute to tear the old connection down and
-# listen again while it already serves (an arbitrated test pool forked on
-# that). A peer whose target is down serves nobody and still reads as gone.
-# A dead keeper costs the survivor this window. Under resource-only fencing
-# this node's copy takes writes while it decides, so nothing waits there.
+# before. On arbitrated, where the I/O is frozen while this decides, the
+# other node reads the peer as gone only after the peer stayed silent for a
+# short window; an answer sends it into the tiebreak, where it yields only to
+# a peer that demonstrably still serves. Silent means the peer's DRBD port
+# and its iSCSI portal: after a lossy disconnect the keeper's DRBD can take
+# half a minute to tear the old connection down and listen again while it
+# already serves (a test pool forked on that). A peer whose target is down
+# serves nobody and still reads as gone. A dead keeper costs the survivor
+# this window. Not in fate-shared freeze mode, which has no keeper at the
+# tiebreak: there the window made both nodes yield frozen under sustained
+# loss, both reached the freeze budget, both stepped down, and nobody served
+# (test pool). Under resource-only fencing this node's copy takes writes
+# while it decides, so nothing waits there either.
 # Read where the decision needs it (a promote-time or isolated run never does).
 read_keeper() {
     MY_NAME=$(hostname)
@@ -382,7 +385,7 @@ read_keeper() {
     { [ -z "$PEER_NAME" ] || [ "$MY_NAME" \< "$PEER_NAME" ]; } && IS_KEEPER=1
 }
 FROZEN_IO=0
-{ [ -n "$DIRECT_PEER" ] || [ "$FREEZE" = 1 ]; } && FROZEN_IO=1
+[ -n "$DIRECT_PEER" ] && FROZEN_IO=1
 PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-10}"
 peer_portal_answers() {
     [ -n "$DIRECT_PEER" ] || return 1
@@ -396,7 +399,7 @@ peer_portal_answers() {
 peer_listening_within_window() {
     local end
     end=$(( $(date +%s) + PEER_SILENT_SECS ))
-    log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it$([ -n "$DIRECT_PEER" ] && echo " and its iSCSI portal") for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
+    log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it and its iSCSI portal for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
     while [ "$(date +%s)" -lt "$end" ]; do
         if peer_drbd_listening; then
             log "the peer's DRBD port answered within the window: the peer is alive -> tiebreak"

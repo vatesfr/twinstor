@@ -2906,44 +2906,35 @@ mod tests {
     fn fence_peer_non_keeper_rides_out_a_lossy_probe() {
         // Heavy loss on both hosts: the first probe of the live peer's DRBD
         // port is lost. Both runs reading the peer as gone and surviving made
-        // two writers. In freeze mode the non-keeper probes for a window and
-        // yields to the peer it then sees; the keeper still decides on one
+        // two writers. On arbitrated the non-keeper probes for a window and
+        // yields to the keeper it then sees; the keeper still decides on one
         // probe; a peer silent for the whole window is gone.
         if !fence_rig_usable() {
             return;
         }
         let drbd_port = bind_or_wait("127.0.0.5", 0).local_addr().unwrap().port();
         let rig = lossy_rig("lossy", "127.0.0.5", drbd_port);
-        let daemon = rig.fake_process("daemon");
-        rig.flag(daemon.pid());
+        std::fs::write(rig.root.join("etc/direct-peer"), "127.0.0.253\n").unwrap();
         // Keeper, nothing answers: survives at once, no window.
         rig.set("hostname", "twinstor-1");
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
-        assert!(!rig.log().contains("probing it for up to"), "{}", rig.log());
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "{}",
-            rig.log()
-        );
+        assert!(!rig.log().contains("probing it"), "{}", rig.log());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{}", rig.log());
         // Non-keeper, nothing answers for the window: the peer is gone.
         rig.set("hostname", "twinstor-3");
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
         assert!(rig.log().contains("silent for 2s"), "{}", rig.log());
-        assert!(
-            t0.elapsed() >= std::time::Duration::from_secs(1),
-            "{}",
-            rig.log()
-        );
+        assert!(t0.elapsed() >= std::time::Duration::from_secs(1), "{}", rig.log());
         assert!(!rig.marker().exists());
-        // Non-keeper, the peer's port and daemon answer 2 s in (the first
-        // probes lost): yield frozen to it.
+        // Non-keeper, the keeper's DRBD port and portal answer 2 s in (the
+        // first probes lost): yield frozen to it.
         let opener = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(2));
             (
                 bind_or_wait("127.0.0.5", drbd_port),
-                bind_or_wait("127.0.0.5", 7900),
+                bind_or_wait("127.0.0.5", 3260),
             )
         });
         assert_eq!(run_window(&rig, 8), 1, "{}", rig.log());
@@ -2951,21 +2942,23 @@ mod tests {
         let log = rig.log();
         assert!(log.contains("answered within the window"), "{log}");
         assert!(
-            log.lines()
-                .last()
-                .unwrap()
-                .contains("verdict=tiebreak_yield exit=1"),
+            log.lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
             "{log}"
         );
         drop(opener.join().unwrap());
-        // Resource-only (no freeze, no direct link): this copy takes writes
-        // while deciding, so no window.
-        drop(daemon);
+        // Freeze mode (fate-shared, no keeper at the tiebreak) and
+        // resource-only: no window, the decision is the 0.7.3 one.
+        std::fs::remove_file(rig.root.join("etc/direct-peer")).unwrap();
         let _ = std::fs::remove_file(rig.marker());
         rig.set("susp", "fencing");
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
         assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
-        let tail: String = rig.log().lines().rev().take(3).collect();
-        assert!(!tail.contains("probing it for up to"), "{tail}");
+        assert_eq!(rig.last_freeze(), "1", "{}", rig.log());
+        drop(daemon);
+        assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
+        let tail: String = rig.log().lines().rev().take(8).collect();
+        assert!(!tail.contains("probing it"), "{tail}");
     }
 
     #[test]
