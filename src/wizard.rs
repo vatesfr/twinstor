@@ -369,7 +369,10 @@ async fn offer_to_free_empty_local_srs(blockers: &[SrBlocker]) -> Result<bool> {
         let label = name.map(|n| format!("\"{n}\" ")).unwrap_or_default();
         println!(
             "\nThe local SR {label}({uuid}) holds no virtual disk and occupies {}.",
-            devs.join(", ")
+            devs.iter()
+                .map(|d| kernel_dev(d))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         println!("Destroying it frees these disks for TwinStor. Nothing on it is in use.");
         let confirm = ask(
@@ -402,6 +405,9 @@ async fn offer_to_free_empty_local_srs(blockers: &[SrBlocker]) -> Result<bool> {
             Ok(()) => {
                 println!("  destroyed.");
                 freed = true;
+                for dev in &devs {
+                    label_freed_os_partition(dev).await;
+                }
             }
             Err(e) => {
                 // Plug it back so the host is left as it was.
@@ -420,9 +426,70 @@ async fn offer_to_free_empty_local_srs(blockers: &[SrBlocker]) -> Result<bool> {
     Ok(freed)
 }
 
+/// `/dev/sda4` for a `/dev/disk/by-id/...` alias: the name operators know.
+fn kernel_dev(dev: &str) -> String {
+    std::fs::canonicalize(dev)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| dev.to_string())
+}
+
+/// The parent disk and partition number of a partition, from sysfs
+/// (`sda4` -> `("sda", 4)`). None for a whole disk.
+fn partition_of(kname: &str) -> Option<(String, u32)> {
+    let sys = std::fs::canonicalize(format!("/sys/class/block/{kname}")).ok()?;
+    let num = std::fs::read_to_string(sys.join("partition"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let parent = sys.parent()?.file_name()?.to_string_lossy().to_string();
+    Some((parent, num))
+}
+
+/// A partition of the system disk (or of another disk holding an XCP-ng
+/// install) is offered only when labelled for TwinStor. When the wizard has
+/// just destroyed the local SR on such a partition, that partition is known to
+/// be the SR's and nothing else's, so label it: otherwise the destroy frees
+/// nothing the wizard can use (the installer's default layout on a
+/// single-disk host).
+async fn label_freed_os_partition(dev: &str) {
+    let Ok(canon) = std::fs::canonicalize(dev) else {
+        return;
+    };
+    let kname = canon
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let Some((disk, num)) = partition_of(&kname) else {
+        return;
+    };
+    if system_disk().as_deref() != Some(disk.as_str()) && !xcp_os_disks().contains(&disk) {
+        return;
+    }
+    let disk_dev = format!("/dev/{disk}");
+    match run_cmd(
+        "sgdisk",
+        &["-c", &format!("{num}:twinstor-data"), &disk_dev],
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = run_cmd("partprobe", &[&disk_dev]).await;
+            let _ = run_cmd("udevadm", &["settle"]).await;
+            println!("  labelled /dev/{kname} (on the system disk) for TwinStor.");
+        }
+        Err(e) => println!(
+            "  /dev/{kname} is on the system disk, so it is offered only once labelled \
+             for TwinStor, and labelling failed ({e}). Run\n    \
+             sgdisk -c {num}:twinstor-data {disk_dev}\n  then run setup again."
+        ),
+    }
+}
+
 /// Operator guidance explaining why an SR-backed disk is not offered and how to
 /// free it, or None when nothing is blocked. Destroy frees the space (on the
-/// system disk it then becomes carveable); forget alone leaves LVM/filesystem
+/// system disk it must then be labelled); forget alone leaves LVM/filesystem
 /// signatures that still block it.
 fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
     if blockers.is_empty() {
@@ -437,7 +504,9 @@ fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
             .unwrap_or_default();
         s.push_str(&format!(
             "  - {} is used by local SR{} (uuid {})\n",
-            b.dev, label, b.uuid
+            kernel_dev(&b.dev),
+            label,
+            b.uuid
         ));
     }
     s.push_str(
@@ -447,7 +516,8 @@ fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
         \x20 - or keep the data: xe sr-forget uuid=<uuid>, then wipe the leftover\n\
         \x20   LVM/filesystem signatures (wipefs -a / pvremove) before re-running.\n\
         Destroying frees the space; forgetting alone leaves signatures that still\n\
-        block it.",
+        block it. A freed partition of the system disk is offered only once\n\
+        labelled: sgdisk -c <partition number>:twinstor-data /dev/<disk>",
     );
     Some(s)
 }
