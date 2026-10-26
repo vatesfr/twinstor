@@ -2094,6 +2094,13 @@ fn isolated_slave_standdown_decision(
 /// boot_id means the node has rebooted since. Master-path markers carry no
 /// `boot_id=` line, so they never match here.
 fn slave_fence_needs_ha_disable(marker_content: &str, current_boot_id: &str) -> bool {
+    stamped_in_earlier_boot(marker_content, current_boot_id)
+}
+
+/// Whether a record's `boot_id=` line names a boot other than the current
+/// one (the node rebooted since it was written). No stamp, or an unreadable
+/// current boot_id, proves nothing: false.
+fn stamped_in_earlier_boot(marker_content: &str, current_boot_id: &str) -> bool {
     match marker_content
         .lines()
         .find_map(|l| l.trim().strip_prefix("boot_id="))
@@ -2233,6 +2240,70 @@ fn standdown_allowed_ha(ha_enabled: Option<bool>) -> bool {
 fn ha_rearm_obligation_path() -> String {
     std::env::var("TWINSTOR_HA_REARM_OBLIGATION")
         .unwrap_or_else(|_| "/var/lib/twinstor/ha-rearm-obligation".to_string())
+}
+
+/// Boot-stamped record that this daemon emergency-disarmed the local HA
+/// (the whole-switch hold and the stand-downs). `host-emergency-ha-disable`
+/// leaves xapi's local `ha.armed` false, and restarting xhad afterwards does
+/// not set it back: only a pool HA cycle does. While pool HA stays enabled,
+/// the next reboot of this host makes xapi disable pool HA without a word
+/// when it is the master, and nothing re-enabled it, so the guests a forced
+/// reboot stopped stayed halted (test pool). The HA watchdog reads this record
+/// (see `disarm_trap_decision`).
+fn ha_local_disarm_path() -> String {
+    std::env::var("TWINSTOR_HA_LOCAL_DISARM")
+        .unwrap_or_else(|_| "/var/lib/twinstor/ha-local-disarm".to_string())
+}
+
+/// Record a local emergency HA disarm under this boot's id. Free function:
+/// the whole-switch fast guard runs in a detached task.
+fn note_local_ha_disarm() {
+    if cfg!(test) {
+        return;
+    }
+    let boot = current_boot_id();
+    let p = ha_local_disarm_path();
+    if let Some(dir) = std::path::Path::new(&p).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, format!("boot_id={boot}\n"));
+}
+
+/// What the HA watchdog does with a local-disarm record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisarmTrapAction {
+    /// Nothing to decide yet (same boot with pool HA on, HA unreadable, or a
+    /// hold still standing).
+    Keep,
+    /// The record is spent: local HA is armed again (a pool cycle realigned
+    /// it), or pool HA went off during the disarm's own boot (an operator, or
+    /// a recovery that writes its own re-arm obligation), or this host is not
+    /// the master that would re-enable it.
+    Clear,
+    /// This host rebooted since the disarm and pool HA is off: xapi's
+    /// armed-mismatch trap disabled it. Write the re-arm obligation.
+    Rearm,
+}
+
+fn disarm_trap_decision(
+    record: &str,
+    current_boot: &str,
+    local_armed: Option<bool>,
+    ha: Option<bool>,
+    is_master: bool,
+    hold_standing: bool,
+) -> DisarmTrapAction {
+    if local_armed == Some(true) {
+        return DisarmTrapAction::Clear;
+    }
+    let rebooted = stamped_in_earlier_boot(record, current_boot);
+    match ha {
+        Some(false) if !rebooted => DisarmTrapAction::Clear,
+        Some(false) if hold_standing => DisarmTrapAction::Keep,
+        Some(false) if is_master => DisarmTrapAction::Rearm,
+        Some(false) => DisarmTrapAction::Clear,
+        _ => DisarmTrapAction::Keep,
+    }
 }
 
 /// For `twinstor status`: whether the daemon currently owes an automatic HA
@@ -7834,6 +7905,7 @@ impl StateMachine {
                                 // Emergency-disarm local fencing to beat the XHA
                                 // state-file survival watchdog. Idempotent with
                                 // the main tick's ha_disable_local.
+                                note_local_ha_disarm();
                                 let _ = crate::cmd::cmd_output_for(
                                     "xe",
                                     &["host-emergency-ha-disable", "--force"],
@@ -15762,6 +15834,7 @@ impl StateMachine {
         if cfg!(test) {
             return;
         }
+        note_local_ha_disarm();
         let _ =
             crate::cmd::cmd_output_for("xe", &["host-emergency-ha-disable", "--force"], 30).await;
     }
@@ -19200,7 +19273,12 @@ impl StateMachine {
         // obligation polls far more often than the steady-state check: a
         // daemon-initiated disable must be reconciled within a couple of
         // minutes once the peer is back, not up to 10 minutes later.
-        let interval = if std::path::Path::new(&ha_rearm_obligation_path()).exists() {
+        // A local-disarm record polls fast too: it narrows the window in which
+        // an operator's own pool-ha-disable, followed by a reboot, could read
+        // as the trap.
+        let interval = if std::path::Path::new(&ha_rearm_obligation_path()).exists()
+            || std::path::Path::new(&ha_local_disarm_path()).exists()
+        {
             HA_REARM_RETRY_INTERVAL
         } else {
             HA_CHECK_INTERVAL
@@ -19217,6 +19295,7 @@ impl StateMachine {
         // the re-arm, so pool-ha-enable can init instead of failing forever with
         // DAEMON_IS_PRESENT. Reuses this fetched `ha`.
         self.reconcile_stuck_xhad(ha).await;
+        self.check_disarm_trap(ha).await;
         self.fulfil_ha_rearm_obligation(ha).await;
         // After a peer self-fence and rejoin there is no re-arm obligation (only
         // daemon-initiated disables write one), so HA would stay off. Detect the
@@ -19267,6 +19346,49 @@ impl StateMachine {
                 }
             }
             HaCheckAction::None => {}
+        }
+    }
+
+    /// Pool HA lost to xapi's armed-mismatch trap (see `ha_local_disarm_path`):
+    /// once this host has rebooted since its own emergency disarm and pool HA
+    /// reads off on the master, write the re-arm obligation. Its own gates
+    /// still decide when (healthy dual copy, peer back in the pool, no
+    /// maintenance, no pending HA task).
+    async fn check_disarm_trap(&mut self, ha: Option<bool>) {
+        let Ok(record) = std::fs::read_to_string(ha_local_disarm_path()) else {
+            return;
+        };
+        let is_master = ha == Some(false) && xapi::is_pool_master_resilient().await == Some(true);
+        match disarm_trap_decision(
+            &record,
+            &current_boot_id(),
+            xapi::local_ha_armed(),
+            ha,
+            is_master,
+            self.whole_switch_held,
+        ) {
+            DisarmTrapAction::Keep => {}
+            DisarmTrapAction::Clear => {
+                let _ = std::fs::remove_file(ha_local_disarm_path());
+            }
+            DisarmTrapAction::Rearm => {
+                if ha_obligation_read().is_none() {
+                    let Some(sr) = xapi::twinstor_sr_uuid().await else {
+                        return;
+                    };
+                    let timeout = xapi::pool_ha_timeout()
+                        .await
+                        .unwrap_or_else(|| crate::setup::ha_timeout_secs(self.arbitrated));
+                    warn!(
+                        heal_event = "ha_rearm_after_armed_trap",
+                        "pool HA is off after this host rebooted while locally HA-disarmed \
+                         (xapi disables pool HA at such a boot); owing a re-arm once the pair \
+                         is healthy"
+                    );
+                    ha_obligation_write(&sr, timeout.into());
+                }
+                let _ = std::fs::remove_file(ha_local_disarm_path());
+            }
         }
     }
 
@@ -31664,6 +31786,52 @@ poll_interval_ms = 10
         );
         sm.fence_stuck_primary().await;
         assert!(!sm.stuck_held_logged);
+    }
+
+    #[test]
+    fn disarm_trap_decision_table() {
+        use super::{DisarmTrapAction as A, disarm_trap_decision as d};
+        let rec = "boot_id=aaaa\n";
+        // Same boot: pool HA on keeps; pool HA off is someone's decision.
+        assert_eq!(
+            d(rec, "aaaa", Some(false), Some(true), true, false),
+            A::Keep
+        );
+        assert_eq!(
+            d(rec, "aaaa", Some(false), Some(false), true, false),
+            A::Clear
+        );
+        // Rebooted since the disarm, pool HA off: the trap. The master owes a
+        // re-arm, not while a hold stands, and a slave drops the record.
+        assert_eq!(
+            d(rec, "bbbb", Some(false), Some(false), true, false),
+            A::Rearm
+        );
+        assert_eq!(
+            d(rec, "bbbb", Some(false), Some(false), true, true),
+            A::Keep
+        );
+        assert_eq!(
+            d(rec, "bbbb", Some(false), Some(false), false, false),
+            A::Clear
+        );
+        // Rebooted, HA still reads on (xapi not settled yet) or unreadable.
+        assert_eq!(
+            d(rec, "bbbb", Some(false), Some(true), true, false),
+            A::Keep
+        );
+        assert_eq!(d(rec, "bbbb", None, None, true, false), A::Keep);
+        // Realigned by a pool cycle: spent, whatever else.
+        assert_eq!(
+            d(rec, "bbbb", Some(true), Some(false), true, false),
+            A::Clear
+        );
+        // No stamp, or an unreadable boot_id, proves no reboot.
+        assert_eq!(
+            d("", "bbbb", Some(false), Some(false), true, false),
+            A::Clear
+        );
+        assert_eq!(d(rec, "", Some(false), Some(false), true, false), A::Clear);
     }
 
     #[test]

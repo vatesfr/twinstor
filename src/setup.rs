@@ -2921,13 +2921,21 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
         assert!(!rig.log().contains("probing it for up to"), "{}", rig.log());
-        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{}", rig.log());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "{}",
+            rig.log()
+        );
         // Non-keeper, nothing answers for the window: the peer is gone.
         rig.set("hostname", "twinstor-3");
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
         assert!(rig.log().contains("stayed silent for 2s"), "{}", rig.log());
-        assert!(t0.elapsed() >= std::time::Duration::from_secs(1), "{}", rig.log());
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_secs(1),
+            "{}",
+            rig.log()
+        );
         assert!(!rig.marker().exists());
         // Non-keeper, the peer's port and daemon answer 2 s in (the first
         // probes lost): yield frozen to it.
@@ -2943,7 +2951,10 @@ mod tests {
         let log = rig.log();
         assert!(log.contains("answered within the window"), "{log}");
         assert!(
-            log.lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            log.lines()
+                .last()
+                .unwrap()
+                .contains("verdict=tiebreak_yield exit=1"),
             "{log}"
         );
         drop(opener.join().unwrap());
@@ -2975,7 +2986,11 @@ mod tests {
         });
         assert_eq!(run_window(&rig, 8), 1, "{}", rig.log());
         assert!(
-            rig.log().lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            rig.log()
+                .lines()
+                .last()
+                .unwrap()
+                .contains("verdict=tiebreak_yield exit=1"),
             "{}",
             rig.log()
         );
