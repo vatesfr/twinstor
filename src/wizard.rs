@@ -334,6 +334,92 @@ fn local_sr_blockers() -> Vec<SrBlocker> {
         .collect()
 }
 
+/// The local SRs holding disks, grouped: (uuid, name, devices), in first-seen
+/// order.
+fn group_blockers(blockers: &[SrBlocker]) -> Vec<(String, Option<String>, Vec<String>)> {
+    let mut out: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+    for b in blockers {
+        match out.iter_mut().find(|(u, _, _)| *u == b.uuid) {
+            Some((_, _, devs)) => devs.push(b.dev.clone()),
+            None => out.push((b.uuid.clone(), b.name.clone(), vec![b.dev.clone()])),
+        }
+    }
+    out
+}
+
+/// Offer to destroy each local SR that holds disks but no virtual disk (the
+/// installer's default local SR on the data disks, never used), after a typed
+/// confirmation. An SR with virtual disks is never touched: the note that
+/// follows says how to free it by hand. `true` when one was destroyed (the
+/// caller scans the disks again).
+async fn offer_to_free_empty_local_srs(blockers: &[SrBlocker]) -> Result<bool> {
+    let Some((this_host, _)) = two_host_pool().await else {
+        return Ok(false);
+    };
+    let mut freed = false;
+    for (uuid, name, devs) in group_blockers(blockers) {
+        let Ok(vdis) =
+            cmd_output("xe", &["vdi-list", &format!("sr-uuid={uuid}"), "--minimal"]).await
+        else {
+            continue;
+        };
+        if !vdis.trim().is_empty() {
+            continue;
+        }
+        let label = name.map(|n| format!("\"{n}\" ")).unwrap_or_default();
+        println!(
+            "\nThe local SR {label}({uuid}) holds no virtual disk and occupies {}.",
+            devs.join(", ")
+        );
+        println!("Destroying it frees these disks for TwinStor. Nothing on it is in use.");
+        let confirm = ask(
+            "Type 'destroy' to destroy this SR now (anything else keeps it)",
+            None,
+        )?;
+        if !confirm.eq_ignore_ascii_case("destroy") {
+            println!("Kept.");
+            continue;
+        }
+        let pbd = cmd_output(
+            "xe",
+            &[
+                "pbd-list",
+                &format!("sr-uuid={uuid}"),
+                &format!("host-uuid={this_host}"),
+                "--minimal",
+            ],
+        )
+        .await
+        .unwrap_or_default();
+        let pbd = pbd.trim();
+        if !pbd.is_empty()
+            && let Err(e) = run_cmd("xe", &["pbd-unplug", &format!("uuid={pbd}")]).await
+        {
+            println!("  could not unplug it ({e}); kept. Free it by hand as described below.");
+            continue;
+        }
+        match run_cmd("xe", &["sr-destroy", &format!("uuid={uuid}")]).await {
+            Ok(()) => {
+                println!("  destroyed.");
+                freed = true;
+            }
+            Err(e) => {
+                // Plug it back so the host is left as it was.
+                if !pbd.is_empty() {
+                    let _ = run_cmd("xe", &["pbd-plug", &format!("uuid={pbd}")]).await;
+                }
+                println!(
+                    "  could not destroy it ({e}); left as it was. Free it by hand as described below."
+                );
+            }
+        }
+    }
+    if freed {
+        let _ = run_cmd("udevadm", &["settle"]).await;
+    }
+    Ok(freed)
+}
+
 /// Operator guidance explaining why an SR-backed disk is not offered and how to
 /// free it, or None when nothing is blocked. Destroy frees the space (on the
 /// system disk it then becomes carveable); forget alone leaves LVM/filesystem
@@ -768,6 +854,50 @@ fn is_point_to_point(netmask: &str) -> bool {
     matches!(netmask, "255.255.255.252" | "255.255.255.254")
 }
 
+/// One line per non-management NIC of this host: device, link, IP. Shown
+/// when no direct link is found, so a back-to-back cable without a link (a
+/// DAC whose port is down, a cable in the wrong port) is visible at once.
+async fn nic_link_lines() -> Vec<String> {
+    let Some((this_uuid, _peer)) = two_host_pool().await else {
+        return vec![];
+    };
+    let pifs = cmd_output(
+        "xe",
+        &["pif-list", &format!("host-uuid={this_uuid}"), "--minimal"],
+    )
+    .await
+    .unwrap_or_default();
+    let mut out = Vec::new();
+    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let p = pif_params(pif).await;
+        if let Some(l) = nic_link_line(&p) {
+            out.push(l);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn nic_link_line(p: &std::collections::HashMap<String, String>) -> Option<String> {
+    let device = p.get("device").filter(|d| !d.is_empty())?;
+    if p.get("management").is_some_and(|m| m == "true")
+        || p.get("physical").is_some_and(|m| m == "false")
+    {
+        return None;
+    }
+    let link = if p.get("carrier").is_some_and(|c| c == "true") {
+        "link up"
+    } else {
+        "no link"
+    };
+    let ip = p
+        .get("IP")
+        .filter(|i| !i.is_empty())
+        .map(|i| format!(", IP {i}"))
+        .unwrap_or_else(|| ", no IP".into());
+    Some(format!("{device}: {link}{ip}"))
+}
+
 /// This host's NICs that have a cable/carrier but no IP and aren't the
 /// management interface: candidates for an as-yet-unconfigured direct link.
 async fn carrier_nics_without_ip() -> Vec<String> {
@@ -1039,11 +1169,26 @@ async fn resolve_direct_link(
             }
         }
         DirectLinkOutcome::None => {
-            println!(
-                "\nNo second network or spare cabled NIC found for a direct link.\n\
-                 Arbitrated mode needs a dedicated back-to-back link. Using fate-shared mode."
-            );
-            Ok(None)
+            println!("\nNo second network or spare cabled NIC found for a direct link.");
+            let nics = nic_link_lines().await;
+            if !nics.is_empty() {
+                println!("This host's other NICs:");
+                for l in &nics {
+                    println!("  {l}");
+                }
+                println!(
+                    "A direct-link NIC must show a link (cable plugged in, the other host powered\n\
+                     on, the port up on both ends) and have no IP yet."
+                );
+            }
+            if ask_yes_no(
+                "Arbitrated mode needs a dedicated back-to-back link. Continue in fate-shared mode instead?",
+                true,
+            )? {
+                Ok(None)
+            } else {
+                bail!("connect the direct link, then re-run setup and choose arbitrated mode")
+            }
         }
     }
 }
@@ -1123,6 +1268,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
 
     print_banner();
     println!("TwinStor interactive setup. Press Enter to accept defaults.\n");
+    crate::preflight::run().await?;
 
     // 1. The other node and the network that carries replication + iSCSI.
     // TwinStor mirrors storage between the two hosts, so it needs the address of
@@ -1254,8 +1400,14 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // SR's free space.
     let mut disks = candidate_disks();
     // Disks consumed by a local SR are silently excluded above; surface them so
-    // "why isn't my big disk offered?" has an answer and a remedy.
-    let sr_note = sr_blocker_note(&local_sr_blockers());
+    // "why isn't my big disk offered?" has an answer and a remedy. An empty one
+    // (the installer's default local SR, never used) can be destroyed here.
+    let mut blockers = local_sr_blockers();
+    if offer_to_free_empty_local_srs(&blockers).await? {
+        disks = candidate_disks();
+        blockers = local_sr_blockers();
+    }
+    let sr_note = sr_blocker_note(&blockers);
     if disks.is_empty() {
         // No spare disk and no free partition, but the system disk may carry a
         // large unallocated tail (the usual single-disk install where local
@@ -1518,6 +1670,54 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn blockers_group_by_sr() {
+        let b = |dev: &str, uuid: &str| SrBlocker {
+            dev: dev.into(),
+            uuid: uuid.into(),
+            name: Some("Local storage".into()),
+        };
+        let g = group_blockers(&[
+            b("/dev/sda", "u1"),
+            b("/dev/nvme0n1p3", "u2"),
+            b("/dev/sdb", "u1"),
+        ]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].0, "u1");
+        assert_eq!(g[0].2, vec!["/dev/sda", "/dev/sdb"]);
+        assert_eq!(g[1].2, vec!["/dev/nvme0n1p3"]);
+    }
+
+    #[test]
+    fn nic_link_lines_show_link_and_ip() {
+        let m = |kv: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            nic_link_line(&m(&[
+                ("device", "eth3"),
+                ("carrier", "false"),
+                ("IP", ""),
+                ("physical", "true")
+            ]))
+            .as_deref(),
+            Some("eth3: no link, no IP")
+        );
+        assert_eq!(
+            nic_link_line(&m(&[
+                ("device", "eth1"),
+                ("carrier", "true"),
+                ("IP", "10.0.0.2")
+            ]))
+            .as_deref(),
+            Some("eth1: link up, IP 10.0.0.2")
+        );
+        assert!(nic_link_line(&m(&[("device", "eth0"), ("management", "true")])).is_none());
+        assert!(nic_link_line(&m(&[("device", "bond0"), ("physical", "false")])).is_none());
     }
 
     #[test]
