@@ -456,39 +456,78 @@ fn beacon_claim_ext(
 const ARB_MUTUAL_CONFIRM: Duration = Duration::from_secs(15);
 const ARB_MUTUAL_READ_EVERY: Duration = Duration::from_secs(5);
 
+/// How the peer attests it is frozen for good, from its beacon claim.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PeerFrozen {
+    /// `G`: frozen by its yield with guests, at this generation.
+    Guests(u64),
+    /// `Y`: yielded without guests and latched as the loser (it never
+    /// resumes nor promotes alone), at this generation.
+    Latched(u64),
+}
+
 /// What one pass of `arb_mutual_freeze_tick` reads.
 #[derive(Debug, Clone, Copy)]
 struct MutualFreezeRead {
     /// This node is the keeper (`node.name < node.peer`).
     keeper: bool,
     primary: bool,
-    connected: bool,
+    up_to_date: bool,
+    /// DRBD is trying to connect (not Connected, not StandAlone: a handshake
+    /// that reached a verdict belongs to the StandAlone handling).
+    connecting: bool,
     /// Frozen by the daemon's own suspend (`suspended_user`).
     suspended_user: bool,
     /// This node's fence-peer yielded (`fence_yield_marker`).
     yielded: bool,
     /// The yield was taken with guests on the SR here (`yield_guests_marker`).
     with_guests: bool,
-    /// The generation in the peer's `G` claim (frozen with guests), if any.
-    peer_frozen_gen: Option<u64>,
+    peer: Option<PeerFrozen>,
     /// This node's live current generation.
     local_current: Option<u64>,
 }
 
-/// Arbitrated mutual freeze (both nodes yielded with guests, both frozen, the
-/// link not back): the keeper resumes on its copy. Safe only while the peer
-/// attests it is frozen at this node's own generation, so neither copy wrote
-/// since the split and the peer acknowledges nothing from then on: the copies
-/// cannot fork, the peer's copy is merely behind once this one writes. Returns
-/// the peer generation to bind the win to.
+/// Arbitrated mutual freeze: this node, frozen with guests, resumes on its
+/// copy. Safe only while the peer attests it is frozen at this node's own
+/// generation, so neither copy wrote since the split and the peer
+/// acknowledges nothing from then on: the copies cannot fork, the peer's copy
+/// is merely behind once this one writes. Against a peer frozen with guests
+/// only the keeper acts; against a peer latched as the loser (no guests) the
+/// node with guests acts, keeper or not. Returns the peer generation to bind
+/// the win to.
 fn mutual_freeze_keep(r: &MutualFreezeRead) -> Option<u64> {
-    if !(r.keeper && r.primary && !r.connected && r.suspended_user && r.yielded && r.with_guests) {
+    if !(r.primary
+        && r.up_to_date
+        && r.connecting
+        && r.suspended_user
+        && r.yielded
+        && r.with_guests)
+    {
         return None;
     }
-    match (r.peer_frozen_gen, r.local_current) {
-        (Some(u), Some(cur)) if same_gen(u, cur) => Some(u),
-        _ => None,
-    }
+    let u = match r.peer {
+        Some(PeerFrozen::Guests(u)) if r.keeper => u,
+        Some(PeerFrozen::Latched(u)) => u,
+        _ => return None,
+    };
+    r.local_current.filter(|&c| same_gen(u, c)).map(|_| u)
+}
+
+/// Kernel-log stamp of the newest loss of a Connected link (`CONNECTED_LOST`)
+/// for `resource`; None when there is none or the log carries no numeric
+/// stamps. A newer one than at the first read of a mutual freeze shows the
+/// link came back and fell again (both nodes frozen with a write to the same
+/// block, as the XHA statefile, abort every reconnect with "Concurrent writes
+/// detected"); a link that comes back cleanly stays Connected instead.
+fn newest_connected_lost_stamp(log: &str, resource: &str) -> Option<f64> {
+    let named = format!("drbd {resource} ");
+    log.lines()
+        .rev()
+        .find(|l| l.contains(CONNECTED_LOST) && l.contains(&named))
+        .and_then(|l| {
+            let rest = l.trim_start().strip_prefix('[')?;
+            rest.split(']').next()?.trim().parse().ok()
+        })
 }
 
 /// Whether a yield latch bound to `before` must follow the generation to
@@ -553,6 +592,28 @@ async fn yield_had_guests(guests: &dyn crate::loser_boundary::GuestControl, mark
         write_fork_record(marker, None);
     }
     !free
+}
+
+/// Where to read the peer's beacon claim (see `read_peer_claim`).
+#[cfg_attr(test, allow(dead_code))]
+struct ClaimReadArgs {
+    direct: Option<String>,
+    replication: String,
+    peer: String,
+    resource: String,
+}
+
+/// The peer's split-brain claim as served on its beacon (direct link first in
+/// arbitrated mode, then the replication address).
+#[cfg_attr(test, allow(dead_code))]
+async fn read_peer_claim(a: ClaimReadArgs) -> crate::peer_signal::PeerClaim {
+    if let Some(dl) = &a.direct {
+        let r = crate::peer_signal::peer_claim(dl, &a.peer, &a.resource).await;
+        if r != crate::peer_signal::PeerClaim::Unreachable {
+            return r;
+        }
+    }
+    crate::peer_signal::peer_claim(&a.replication, &a.peer, &a.resource).await
 }
 
 /// The files behind the beacon claim (see `compute_beacon_claim`).
@@ -6248,6 +6309,9 @@ pub struct StateMachine {
     arb_frozen_cache: Option<(std::time::Instant, bool)>,
     #[cfg(test)]
     test_refusals: Option<u64>,
+    /// Test hook: `newest_connected_lost_stamp` over the kernel log.
+    #[cfg(test)]
+    test_drop_stamp: f64,
     #[cfg(test)]
     test_refusal_stamp: f64,
     #[cfg(test)]
@@ -7122,10 +7186,12 @@ pub struct StateMachine {
     arb_yield_hold_since: Option<std::time::Instant>,
     arb_yield_hold_alerted: bool,
     /// Arbitrated mutual freeze (`arb_mutual_freeze_tick`): the first read
-    /// that found both nodes frozen, with the peer generation it named, and
-    /// when the peer's claim was last read.
-    arb_mutual_since: Option<(std::time::Instant, u64)>,
+    /// that found both nodes frozen, with the peer generation it named and the
+    /// kernel-log stamp of the newest link drop then; when the peer's claim
+    /// was last read, and the read in flight (off the tick).
+    arb_mutual_since: Option<(std::time::Instant, u64, f64)>,
     arb_mutual_read_at: Option<std::time::Instant>,
+    arb_mutual_query: Option<tokio::task::JoinHandle<crate::peer_signal::PeerClaim>>,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
     arb_yield_xapi_wait_since: Option<std::time::Instant>,
@@ -7165,6 +7231,8 @@ impl StateMachine {
             arb_frozen_cache: None,
             #[cfg(test)]
             test_refusals: None,
+            #[cfg(test)]
+            test_drop_stamp: 0.0,
             #[cfg(test)]
             test_refusal_stamp: 0.0,
             #[cfg(test)]
@@ -7426,6 +7494,7 @@ impl StateMachine {
             arb_yield_hold_since: None,
             arb_mutual_since: None,
             arb_mutual_read_at: None,
+            arb_mutual_query: None,
             arb_yield_hold_alerted: false,
             arb_yield_xapi_wait_since: None,
             frozen_domains: None,
@@ -20077,16 +20146,18 @@ impl StateMachine {
         }
         #[cfg(not(test))]
         {
-            let peer = &self.config.node.peer;
-            let res = &self.config.storage.drbd_resource;
-            if let Some(dl) = &self.peer_dl_ip {
-                let r = crate::peer_signal::peer_claim(dl, peer, res).await;
-                if r != crate::peer_signal::PeerClaim::Unreachable {
-                    return r;
-                }
-            }
-            crate::peer_signal::peer_claim(&self.config.network.peer_address.to_string(), peer, res)
-                .await
+            read_peer_claim(self.claim_read_args()).await
+        }
+    }
+
+    /// What `read_peer_claim` needs, owned, so a read can run off the tick.
+    #[cfg_attr(test, allow(dead_code))]
+    fn claim_read_args(&self) -> ClaimReadArgs {
+        ClaimReadArgs {
+            direct: self.peer_dl_ip.clone(),
+            replication: self.config.network.peer_address.to_string(),
+            peer: self.config.node.peer.clone(),
+            resource: self.config.storage.drbd_resource.clone(),
         }
     }
 
@@ -21017,89 +21088,122 @@ impl StateMachine {
         true
     }
 
-    /// Arbitrated mutual freeze, every pass while not Connected: both nodes
-    /// yielded with guests (neither had a tiebreaker, such as a router outage
-    /// plus a host cut) and both stay frozen with the link not back to settle
-    /// it. Nothing else ends that: the guests on both hosts stay frozen past
-    /// the multipath queue and their filesystems go read-only. The keeper
-    /// resumes on its copy once the peer attests, on two reads at least
-    /// `ARB_MUTUAL_CONFIRM` apart, that it is frozen with guests at this
-    /// node's own generation (`mutual_freeze_keep`). The win record bound to
-    /// the peer's generation is written first, so the peer reads `W` for its
-    /// copy; once the link is back that copy reads as behind and
-    /// `arbitrated_yield_step` steps the peer down through the crash boundary,
-    /// as for any yield.
+    /// Arbitrated mutual freeze, every pass: both nodes yielded (neither had a
+    /// tiebreaker, such as a router outage plus a host cut) and both stay
+    /// frozen while the link, back, cannot settle: each reconnect aborts
+    /// ("Concurrent writes detected": both frozen copies hold a write to the
+    /// same block, such as the XHA statefile), the handlers yield again, and
+    /// the guests on both hosts stay frozen past the multipath queue until
+    /// their filesystems go read-only. Nothing else ends it.
+    ///
+    /// - A node frozen with guests resumes on its copy (`mutual_freeze_keep`)
+    ///   once reads at least `ARB_MUTUAL_CONFIRM` apart agree, a link drop
+    ///   newer than at the first read shows the link back and failing to
+    ///   settle (a link that comes back cleanly stays Connected, and the
+    ///   leftover lift resumes both), and no handshake of this episode refused
+    ///   this copy. The win record bound to the peer's generation goes first,
+    ///   so the peer reads `W` for its copy before this one writes.
+    /// - A node frozen by its yield that reads the peer's win for its own
+    ///   generation latches the loser verdict, so a reboot never lets it
+    ///   promote alone; the next handshake reads its copy as behind and
+    ///   `arbitrated_yield_step` steps it down.
     async fn arb_mutual_freeze_tick(&mut self) {
         use crate::peer_signal::{ForkClaim, PeerClaim};
-        // Cheap checks first: the files, then DRBD, then the peer (paced).
-        let keeper = self.config.node.name < self.config.node.peer;
-        if !self.arbitrated
-            || !keeper
-            || !std::path::Path::new(&self.yield_path).exists()
-            || !std::path::Path::new(&self.yield_guests_path).exists()
-        {
-            self.arb_mutual_since = None;
+        // Cheap checks first: the files, then DRBD, then the peer (read off
+        // the tick, so a cut never stalls it).
+        if !self.arbitrated || !std::path::Path::new(&self.yield_path).exists() {
+            self.arb_mutual_reset();
             return;
         }
         let Ok(status) = self.drbd.status().await else {
             return;
         };
-        if status.role != Role::Primary
-            || status.connection == ConnectionState::Connected
-            || !status.suspended_user
-        {
-            self.arb_mutual_since = None;
+        if status.role != Role::Primary || !status.suspended_user {
+            self.arb_mutual_reset();
             return;
         }
-        if self
-            .arb_mutual_read_at
-            .is_some_and(|t| t.elapsed() < ARB_MUTUAL_READ_EVERY)
-        {
+        let Some(claim) = self.arb_mutual_claim().await else {
             return;
-        }
-        self.arb_mutual_read_at = Some(std::time::Instant::now());
-        let peer_frozen_gen = match self.query_peer_claim().await {
-            PeerClaim::Claim(ForkClaim::FrozenGuests(u)) => Some(u),
-            _ => None,
         };
+        let local_current = self.drbd.local_current_uuid().await;
+        if let PeerClaim::Claim(ForkClaim::Won(u)) = claim
+            && local_current.is_some_and(|c| same_gen(u, c))
+            && !self.yield_latched()
+        {
+            warn!(heal_event = "arb_mutual_freeze_lost",
+                  peer_won_over = %format!("{u:016X}"), incident = ?self.incident_id,
+                  "arbitrated: the peer took the win for this node's generation and serves;                    latching the loser verdict (this copy resyncs from the peer once the link                    is back, and never promotes alone, after a reboot included)");
+            write_fork_record(&self.latch_path, local_current);
+            return;
+        }
         let read = MutualFreezeRead {
-            keeper,
+            keeper: self.config.node.name < self.config.node.peer,
             primary: status.role == Role::Primary,
-            connected: status.connection == ConnectionState::Connected,
+            up_to_date: status.disk == DiskState::UpToDate,
+            connecting: status.connection == ConnectionState::Connecting,
             suspended_user: status.suspended_user,
             yielded: true,
-            with_guests: true,
-            peer_frozen_gen,
-            local_current: self.drbd.local_current_uuid().await,
+            with_guests: std::path::Path::new(&self.yield_guests_path).exists(),
+            peer: match claim {
+                PeerClaim::Claim(ForkClaim::FrozenGuests(u)) => Some(PeerFrozen::Guests(u)),
+                PeerClaim::Claim(ForkClaim::Yielded(u)) => Some(PeerFrozen::Latched(u)),
+                _ => None,
+            },
+            local_current,
         };
         let Some(peer_gen) = mutual_freeze_keep(&read) else {
             self.arb_mutual_since = None;
             return;
         };
-        let since = match self.arb_mutual_since {
-            Some((t, g)) if same_gen(g, peer_gen) => t,
+        let drop_now = self.connected_lost_stamp().await;
+        let (since, baseline) = match self.arb_mutual_since {
+            Some((t, g, b)) if same_gen(g, peer_gen) => (t, b),
             _ => {
                 info!(heal_event = "arb_mutual_freeze_seen",
-                      peer_gen = %format!("{peer_gen:016X}"), incident = ?self.incident_id,
-                      "arbitrated: both nodes yielded with guests and are frozen at the same \
-                       generation; this node (the keeper) resumes if it still reads so in 15 s");
-                self.arb_mutual_since = Some((std::time::Instant::now(), peer_gen));
+                      peer = ?read.peer, incident = ?self.incident_id,
+                      "arbitrated: this node and its peer are both frozen at the same generation \
+                       after yielding; this node resumes if, 15 s on, the link is back but cannot \
+                       settle");
+                self.arb_mutual_since = Some((std::time::Instant::now(), peer_gen, drop_now));
                 return;
             }
         };
         if since.elapsed() < ARB_MUTUAL_CONFIRM {
             return;
         }
+        if drop_now <= baseline {
+            if self
+                .log_pace
+                .due("arb_mutual_link_not_back", Duration::from_secs(60))
+            {
+                info!(heal_event = "arb_mutual_freeze_wait", reason = "no_new_link_drop",
+                      waited_secs = since.elapsed().as_secs(), incident = ?self.incident_id,
+                      "arbitrated: both nodes frozen, but the link has not come back and failed \
+                       again since; a link that comes back cleanly settles this without a winner");
+            }
+            return;
+        }
+        let refusals = self.refusals_this_episode().await;
+        if refusals != Some(0) {
+            if self
+                .log_pace
+                .due("arb_mutual_refused", Duration::from_secs(60))
+            {
+                info!(heal_event = "arb_mutual_freeze_wait", reason = "handshake_verdict",
+                      refusals = ?refusals, incident = ?self.incident_id,
+                      "arbitrated: a handshake of this episode refused this copy (or the log \
+                       could not place one); the StandAlone handling decides");
+            }
+            return;
+        }
         self.incident_begin("arbmutual");
         warn!(heal_event = "arb_mutual_freeze_keep",
-              peer_gen = %format!("{peer_gen:016X}"), confirmed_secs = since.elapsed().as_secs(),
-              incident = ?self.incident_id,
-              "arbitrated: both nodes are frozen at the same generation with the link down; \
-               this node (the keeper) takes the win for this split and resumes its guests. \
-               The peer's copy is behind from now on: once the link is back, its guests are \
-               stopped and restarted and it resyncs from this node");
-        // The win first: the peer must read `W` for its copy before this copy
-        // writes anything it lacks.
+              peer = ?read.peer, keeper = read.keeper,
+              confirmed_secs = since.elapsed().as_secs(), incident = ?self.incident_id,
+              "arbitrated: both nodes are frozen at the same generation and the link cannot \
+               settle; this node takes the win for this split and resumes its guests. The \
+               peer's copy is behind from now on: its guests are stopped and restarted and it \
+               resyncs from this node");
         write_fork_record(&self.win_path, Some(peer_gen));
         if let Err(e) = self.drbd.resume_io().await {
             // Still frozen with the win recorded: the next read retries, and a
@@ -21115,14 +21219,70 @@ impl StateMachine {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
-        self.arb_mutual_since = None;
+        self.arb_mutual_reset();
         let _ = xapi::send_xapi_alert(
             "TwinStor: both nodes froze their storage I/O during a network split and neither \
-             could decide alone. This node, the keeper, resumed serving its guests. The peer's \
-             guests stay frozen until the link between the nodes is back; they are then \
-             restarted and the peer resyncs from this node.",
+             could decide alone. This node resumed serving its guests. The peer's guests were \
+             frozen; they are restarted and the peer resyncs from this node.",
         )
         .await;
+    }
+
+    fn arb_mutual_reset(&mut self) {
+        self.arb_mutual_since = None;
+        if let Some(h) = self.arb_mutual_query.take() {
+            h.abort();
+        }
+    }
+
+    /// The peer's beacon claim for `arb_mutual_freeze_tick`, read at most
+    /// every `ARB_MUTUAL_READ_EVERY` and off the tick (an unreachable beacon
+    /// costs seconds per address): `Some` when a read has finished.
+    async fn arb_mutual_claim(&mut self) -> Option<crate::peer_signal::PeerClaim> {
+        if let Some(h) = &self.arb_mutual_query {
+            if !h.is_finished() {
+                return None;
+            }
+            return self.arb_mutual_query.take()?.await.ok();
+        }
+        if self
+            .arb_mutual_read_at
+            .is_some_and(|t| t.elapsed() < ARB_MUTUAL_READ_EVERY)
+        {
+            return None;
+        }
+        self.arb_mutual_read_at = Some(std::time::Instant::now());
+        #[cfg(test)]
+        {
+            Some(self.test_peer_claim)
+        }
+        #[cfg(not(test))]
+        {
+            self.arb_mutual_query = Some(tokio::spawn(read_peer_claim(self.claim_read_args())));
+            None
+        }
+    }
+
+    /// `newest_connected_lost_stamp` over the live kernel log; 0 when none
+    /// (or on any failure). Bounded.
+    async fn connected_lost_stamp(&self) -> f64 {
+        #[cfg(test)]
+        {
+            self.test_drop_stamp
+        }
+        #[cfg(not(test))]
+        {
+            let resource = format!("twinstor-{}", self.config.storage.drbd_resource);
+            crate::cmd::cmd_output_for(
+                "sh",
+                &["-c", "dmesg | grep -F 'conn( Connected -> ' || true"],
+                10,
+            )
+            .await
+            .ok()
+            .and_then(|out| newest_connected_lost_stamp(&out, &resource))
+            .unwrap_or(0.0)
+        }
     }
 
     /// Start a log-only incident id (`class-<unix seconds>`) if none is open,
@@ -37442,47 +37602,77 @@ poll_interval_ms = 10
         (sm, drbd)
     }
 
-    fn mutual_read(peer: Option<u64>, local: Option<u64>) -> MutualFreezeRead {
+    fn mutual_read(peer: Option<PeerFrozen>, local: Option<u64>) -> MutualFreezeRead {
         MutualFreezeRead {
             keeper: true,
             primary: true,
-            connected: false,
+            up_to_date: true,
+            connecting: true,
             suspended_user: true,
             yielded: true,
             with_guests: true,
-            peer_frozen_gen: peer,
+            peer,
             local_current: local,
         }
     }
 
     #[test]
-    fn mutual_freeze_keeps_only_a_keeper_frozen_with_the_peer_at_its_generation() {
+    fn mutual_freeze_acts_only_on_a_peer_frozen_at_this_generation() {
+        use PeerFrozen::{Guests, Latched};
         let g = 0x7266_27B9_52C8_F8A6;
-        let base = mutual_read(Some(g), Some(g));
+        let base = mutual_read(Some(Guests(g)), Some(g));
         assert_eq!(mutual_freeze_keep(&base), Some(g));
         // The primary-at-the-time bit is not part of the generation.
         assert_eq!(
-            mutual_freeze_keep(&mutual_read(Some(g | 1), Some(g))),
+            mutual_freeze_keep(&mutual_read(Some(Guests(g | 1)), Some(g))),
             Some(g | 1)
         );
         // The peer at another generation: one copy wrote since the split.
-        assert_eq!(mutual_freeze_keep(&mutual_read(Some(g + 2), Some(g))), None);
-        // No frozen claim from the peer, or no local generation.
+        assert_eq!(
+            mutual_freeze_keep(&mutual_read(Some(Guests(g + 2)), Some(g))),
+            None
+        );
         assert_eq!(mutual_freeze_keep(&mutual_read(None, Some(g))), None);
-        assert_eq!(mutual_freeze_keep(&mutual_read(Some(g), None)), None);
-        assert_eq!(mutual_freeze_keep(&mutual_read(Some(0), Some(0))), None);
-        // Every local condition is required; the non-keeper never acts.
+        assert_eq!(
+            mutual_freeze_keep(&mutual_read(Some(Guests(g)), None)),
+            None
+        );
+        assert_eq!(
+            mutual_freeze_keep(&mutual_read(Some(Guests(0)), Some(0))),
+            None
+        );
+        // A peer frozen with guests: only the keeper acts.
+        let non_keeper = MutualFreezeRead {
+            keeper: false,
+            ..base
+        };
+        assert_eq!(mutual_freeze_keep(&non_keeper), None);
+        // A peer latched as the loser (no guests, never resumes alone): the
+        // node with guests acts, keeper or not.
+        let latched = MutualFreezeRead {
+            peer: Some(Latched(g)),
+            ..non_keeper
+        };
+        assert_eq!(mutual_freeze_keep(&latched), Some(g));
+        assert_eq!(
+            mutual_freeze_keep(&MutualFreezeRead {
+                peer: Some(Latched(g + 2)),
+                ..latched
+            }),
+            None
+        );
+        // Every local condition is required.
         for off in [
-            MutualFreezeRead {
-                keeper: false,
-                ..base
-            },
             MutualFreezeRead {
                 primary: false,
                 ..base
             },
             MutualFreezeRead {
-                connected: true,
+                up_to_date: false,
+                ..base
+            },
+            MutualFreezeRead {
+                connecting: false,
                 ..base
             },
             MutualFreezeRead {
@@ -37502,6 +37692,21 @@ poll_interval_ms = 10
         }
     }
 
+    #[test]
+    fn newest_connected_lost_stamp_reads_the_resources_own_drops() {
+        // Lines as the kernel logged the 2026-10-25 mutual freeze.
+        let log = "\
+[ 4100.100000] drbd twinstor-data twinstor-2: conn( Connected -> ProtocolError ) peer( Primary -> Unknown )\n\
+[ 4110.200000] drbd twinstor-other x: conn( Connected -> NetworkFailure )\n\
+[ 4105.300000] drbd twinstor-data twinstor-2: conn( Connected -> ProtocolError ) peer( Primary -> Unknown )\n";
+        assert_eq!(
+            newest_connected_lost_stamp(log, "twinstor-data"),
+            Some(4105.3)
+        );
+        assert_eq!(newest_connected_lost_stamp(log, "twinstor-none"), None);
+        assert_eq!(newest_connected_lost_stamp("", "twinstor-data"), None);
+    }
+
     #[tokio::test]
     async fn arbitrated_frozen_yield_with_guests_is_served_as_g() {
         use crate::peer_signal::ForkClaim;
@@ -37512,7 +37717,7 @@ poll_interval_ms = 10
         *drbd.current_uuid.lock().unwrap() = Some(g);
         let guests = crate::loser_boundary::fake::FakeGuests::with_guests(vec![lb_guest(1, "web")]);
         let path = |t: &str| test_private_path(t, String::new());
-        let p = ClaimPaths {
+        let mut p = ClaimPaths {
             yield_marker: path("g-yield"),
             latch: path("g-latch"),
             win: path("g-win"),
@@ -37534,7 +37739,12 @@ poll_interval_ms = 10
             read_fork_record(&p.latch).is_none(),
             "a yield with guests is never latched as the loser"
         );
+        // A fate-shared pool without freeze mode still serves no G.
+        p.arbitrated = false;
+        p.fs_freeze_allowed = true;
+        assert_eq!(compute_beacon_claim(&drbd, &guests, &p).await, None);
         // Not frozen any more: no G.
+        p.arbitrated = true;
         drbd.status.lock().unwrap().suspended_user = false;
         assert_eq!(compute_beacon_claim(&drbd, &guests, &p).await, None);
         for f in [&p.yield_marker, &p.yield_guests] {
@@ -37542,94 +37752,174 @@ poll_interval_ms = 10
         }
     }
 
-    #[tokio::test]
-    async fn arb_mutual_freeze_keeper_resumes_after_confirmation() {
-        use crate::peer_signal::{ForkClaim, PeerClaim};
+    /// The arb yield machine frozen with guests in Connecting, the link seen
+    /// dropping at kernel stamp 100, no refusal this episode.
+    fn mutual_machine(tag: &str) -> (StateMachine, std::sync::Arc<MockDrbd>) {
         let fake = std::sync::Arc::new(crate::loser_boundary::fake::FakeGuests::with_guests(vec![
             lb_guest(1, "web"),
         ]));
-        let (mut sm, drbd) = arb_yield_machine(
-            "arb-mutual",
-            fake,
-            std::sync::Arc::new(AtomicBool::new(false)),
-        );
+        let (mut sm, drbd) =
+            arb_yield_machine(tag, fake, std::sync::Arc::new(AtomicBool::new(false)));
         drbd.status.lock().unwrap().connection = ConnectionState::Connecting;
-        let g = 0x7266_27B9_52C8_F8A6;
         std::fs::write(&sm.yield_guests_path, "unknown\n").unwrap();
-        sm.test_peer_claim = PeerClaim::Claim(ForkClaim::FrozenGuests(g));
+        sm.test_refusals = Some(0);
+        sm.test_drop_stamp = 100.0;
+        (sm, drbd)
+    }
 
-        // First read: seen, not acted on.
-        sm.arb_mutual_freeze_tick().await;
-        assert!(!drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
-        assert!(sm.arb_mutual_since.is_some());
-        // A read inside the pacing interval does nothing.
-        sm.arb_mutual_freeze_tick().await;
-        assert!(!drbd.calls().contains(&"resume_io"));
+    fn mutual_cleanup(sm: &StateMachine) {
+        for p in [&sm.yield_guests_path, &sm.win_path] {
+            let _ = std::fs::remove_file(p);
+        }
+        arb_yield_cleanup(sm);
+    }
 
-        // Confirmed 15 s later: the win, then the resume, then the yield ends.
+    /// Back-date the first read past the confirmation, as if seen 16 s ago.
+    fn mutual_backdate(sm: &mut StateMachine, g: u64, baseline: f64) {
         sm.arb_mutual_since = Some((
             std::time::Instant::now() - ARB_MUTUAL_CONFIRM - Duration::from_secs(1),
             g,
+            baseline,
         ));
+        sm.arb_mutual_read_at = None;
+    }
+
+    #[tokio::test]
+    async fn arb_mutual_freeze_resumes_once_the_link_is_back_and_failing() {
+        use crate::peer_signal::{ForkClaim, PeerClaim};
+        let (mut sm, drbd) = mutual_machine("arb-mutual");
+        let g = 0x7266_27B9_52C8_F8A6;
+        sm.test_peer_claim = PeerClaim::Claim(ForkClaim::FrozenGuests(g));
+
+        // First read: seen, not acted on; a read inside the pacing does nothing.
+        sm.arb_mutual_freeze_tick().await;
+        assert!(!drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        assert_eq!(
+            sm.arb_mutual_since.map(|(_, u, b)| (u, b)),
+            Some((g, 100.0))
+        );
+        sm.arb_mutual_freeze_tick().await;
+        assert!(!drbd.calls().contains(&"resume_io"));
+
+        // Confirmed, but the link never came back and fell again: hold.
+        mutual_backdate(&mut sm, g, 100.0);
+        sm.arb_mutual_freeze_tick().await;
+        assert!(!drbd.calls().contains(&"resume_io"));
+
+        // A refusal this episode: the StandAlone handling decides.
+        sm.test_drop_stamp = 130.0;
+        sm.test_refusals = Some(1);
+        sm.arb_mutual_read_at = None;
+        sm.arb_mutual_freeze_tick().await;
+        assert!(!drbd.calls().contains(&"resume_io"));
+
+        // A newer drop and no refusal: the win, then the resume.
+        sm.test_refusals = Some(0);
         sm.arb_mutual_read_at = None;
         sm.arb_mutual_freeze_tick().await;
         assert!(drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
         assert_eq!(read_fork_record(&sm.win_path), Some(Some(g)));
         assert!(!std::path::Path::new(&sm.yield_path).exists());
         assert!(!std::path::Path::new(&sm.yield_guests_path).exists());
-        let _ = std::fs::remove_file(&sm.win_path);
-        arb_yield_cleanup(&sm);
+        mutual_cleanup(&sm);
     }
 
     #[tokio::test]
     async fn arb_mutual_freeze_holds_without_a_matching_frozen_peer() {
         use crate::peer_signal::{ForkClaim, PeerClaim};
         let g = 0x7266_27B9_52C8_F8A6;
-        for (claim, connection) in [
+        for (claim, connection, disk) in [
             // The peer wrote since the split.
             (
                 PeerClaim::Claim(ForkClaim::FrozenGuests(g + 2)),
                 ConnectionState::Connecting,
+                DiskState::UpToDate,
             ),
-            // The peer yielded without guests, or attests nothing.
             (
-                PeerClaim::Claim(ForkClaim::Yielded(g)),
+                PeerClaim::Unreachable,
                 ConnectionState::Connecting,
+                DiskState::UpToDate,
             ),
-            (PeerClaim::Unreachable, ConnectionState::Connecting),
-            // The link is back: the handshake decides.
+            // The link is back, or a handshake reached a verdict.
             (
                 PeerClaim::Claim(ForkClaim::FrozenGuests(g)),
                 ConnectionState::Connected,
+                DiskState::UpToDate,
+            ),
+            (
+                PeerClaim::Claim(ForkClaim::FrozenGuests(g)),
+                ConnectionState::StandAlone,
+                DiskState::UpToDate,
+            ),
+            // This copy is not current (a resync target at the split).
+            (
+                PeerClaim::Claim(ForkClaim::FrozenGuests(g)),
+                ConnectionState::Connecting,
+                DiskState::Inconsistent,
             ),
         ] {
-            let fake =
-                std::sync::Arc::new(crate::loser_boundary::fake::FakeGuests::with_guests(vec![
-                    lb_guest(1, "web"),
-                ]));
-            let (mut sm, drbd) = arb_yield_machine(
-                "arb-mutual-hold",
-                fake,
-                std::sync::Arc::new(AtomicBool::new(false)),
-            );
-            drbd.status.lock().unwrap().connection = connection;
-            std::fs::write(&sm.yield_guests_path, "unknown\n").unwrap();
+            let (mut sm, drbd) = mutual_machine("arb-mutual-hold");
+            {
+                let mut st = drbd.status.lock().unwrap();
+                st.connection = connection;
+                st.disk = disk;
+            }
             sm.test_peer_claim = claim;
-            sm.arb_mutual_since = Some((
-                std::time::Instant::now() - ARB_MUTUAL_CONFIRM - Duration::from_secs(1),
-                g,
-            ));
+            sm.test_drop_stamp = 200.0;
+            mutual_backdate(&mut sm, g, 100.0);
             sm.arb_mutual_freeze_tick().await;
             assert!(
                 !drbd.calls().contains(&"resume_io"),
-                "{claim:?} {connection:?}: {:?}",
+                "{claim:?} {connection:?} {disk:?}: {:?}",
                 drbd.calls()
             );
             assert!(read_fork_record(&sm.win_path).is_none());
             assert!(sm.arb_mutual_since.is_none(), "{claim:?} {connection:?}");
-            let _ = std::fs::remove_file(&sm.yield_guests_path);
-            arb_yield_cleanup(&sm);
+            mutual_cleanup(&sm);
         }
+    }
+
+    #[tokio::test]
+    async fn arb_mutual_freeze_with_guests_acts_on_a_latched_peer_when_not_keeper() {
+        use crate::peer_signal::{ForkClaim, PeerClaim};
+        let (mut sm, drbd) = mutual_machine("arb-mutual-y");
+        let g = 0x7266_27B9_52C8_F8A6;
+        // node-a is the keeper in the test config: play node-b.
+        let mut cfg = (*sm.config).clone();
+        std::mem::swap(&mut cfg.node.name, &mut cfg.node.peer);
+        sm.config = std::sync::Arc::new(cfg);
+        sm.test_peer_claim = PeerClaim::Claim(ForkClaim::FrozenGuests(g));
+        sm.test_drop_stamp = 200.0;
+        mutual_backdate(&mut sm, g, 100.0);
+        sm.arb_mutual_freeze_tick().await;
+        assert!(
+            !drbd.calls().contains(&"resume_io"),
+            "not the keeper: a peer frozen with guests is the keeper's call"
+        );
+        sm.test_peer_claim = PeerClaim::Claim(ForkClaim::Yielded(g));
+        mutual_backdate(&mut sm, g, 100.0);
+        sm.arb_mutual_freeze_tick().await;
+        assert!(drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        assert_eq!(read_fork_record(&sm.win_path), Some(Some(g)));
+        mutual_cleanup(&sm);
+    }
+
+    #[tokio::test]
+    async fn arb_mutual_freeze_peer_win_latches_this_copy_as_the_loser() {
+        use crate::peer_signal::{ForkClaim, PeerClaim};
+        let (mut sm, drbd) = mutual_machine("arb-mutual-w");
+        let g = 0x7266_27B9_52C8_F8A6;
+        sm.test_peer_claim = PeerClaim::Claim(ForkClaim::Won(g));
+        sm.arb_mutual_freeze_tick().await;
+        assert_eq!(read_fork_record(&sm.latch_path), Some(Some(g)));
+        assert!(!drbd.calls().contains(&"resume_io"));
+        // A win over another generation is not this copy's verdict.
+        let _ = std::fs::remove_file(&sm.latch_path);
+        sm.test_peer_claim = PeerClaim::Claim(ForkClaim::Won(g + 2));
+        sm.arb_mutual_read_at = None;
+        sm.arb_mutual_freeze_tick().await;
+        assert!(read_fork_record(&sm.latch_path).is_none());
+        mutual_cleanup(&sm);
     }
 
     fn arb_yield_cleanup(sm: &StateMachine) {
