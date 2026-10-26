@@ -372,6 +372,35 @@ fn is_virtual_device(name: &str) -> bool {
     VIRTUAL.iter().any(|p| name.starts_with(p))
 }
 
+/// An NVMe controller path node (`nvme<subsys>c<ctrl>n<ns>`): with native
+/// NVMe multipath the kernel lists one per path in `/sys/block`, hidden,
+/// beside the namespace head (`nvme0n1`) that carries the partitions and the
+/// filesystems. The path node shows no partition of its own and a name that
+/// is not the system disk's, so it read as an empty whole disk: a tester's
+/// wizard offered the XCP-ng boot disk (a Dell BOSS-N1) this way.
+fn is_nvme_path_node(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("nvme") else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let Some((subsys, rest)) = rest.split_once('c') else {
+        return false;
+    };
+    let Some((ctrl, ns)) = rest.split_once('n') else {
+        return false;
+    };
+    digits(subsys) && digits(ctrl) && digits(ns)
+}
+
+/// A `/sys/block` entry the kernel hides (`hidden` = 1: an NVMe multipath
+/// path node, see `is_nvme_path_node`, which also covers kernels without the
+/// attribute). Never a backing target: the device it is a path to is listed
+/// under its own name.
+fn is_hidden_block(name: &str, sys_path: &std::path::Path) -> bool {
+    is_nvme_path_node(name)
+        || std::fs::read_to_string(sys_path.join("hidden")).is_ok_and(|h| h.trim() == "1")
+}
+
 /// Candidate backing targets: whole free disks and free partitions on data
 /// disks. Partitions of an OS disk (the running system disk, or a dormant
 /// XCP-ng install disk, see `parse_xcp_os_disks`) are excluded, because the
@@ -438,7 +467,7 @@ fn candidate_disks() -> Vec<CandidateDisk> {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if is_virtual_device(&name) {
+        if is_virtual_device(&name) || is_hidden_block(&name, &e.path()) {
             continue;
         }
         // The running system disk or a dormant XCP-ng install disk: its
@@ -1483,6 +1512,36 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn nvme_path_nodes_are_never_candidates() {
+        for name in ["nvme0c0n1", "nvme1c2n3", "nvme10c11n12"] {
+            assert!(is_nvme_path_node(name), "{name}");
+        }
+        // Namespace heads and their partitions stay eligible.
+        for name in [
+            "nvme0n1",
+            "nvme0n1p4",
+            "nvme12n3",
+            "sda",
+            "md0",
+            "nvme",
+            "nvmec0n1",
+            "nvme0cn1",
+            "nvme0c0n",
+        ] {
+            assert!(!is_nvme_path_node(name), "{name}");
+        }
+        // The kernel's hidden flag excludes too, whatever the name.
+        let dir = std::env::temp_dir().join(format!("twinstor-hidden-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_hidden_block("sdz", &dir), "no attribute: not hidden");
+        std::fs::write(dir.join("hidden"), "0\n").unwrap();
+        assert!(!is_hidden_block("sdz", &dir));
+        std::fs::write(dir.join("hidden"), "1\n").unwrap();
+        assert!(is_hidden_block("sdz", &dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

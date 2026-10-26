@@ -2920,13 +2920,21 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
         assert!(!rig.log().contains("probing it"), "{}", rig.log());
-        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{}", rig.log());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "{}",
+            rig.log()
+        );
         // Non-keeper, nothing answers for the window: the peer is gone.
         rig.set("hostname", "twinstor-3");
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
         assert!(rig.log().contains("silent for 2s"), "{}", rig.log());
-        assert!(t0.elapsed() >= std::time::Duration::from_secs(1), "{}", rig.log());
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_secs(1),
+            "{}",
+            rig.log()
+        );
         assert!(!rig.marker().exists());
         // Non-keeper, the keeper's DRBD port and portal answer 2 s in (the
         // first probes lost): yield frozen to it.
@@ -2942,7 +2950,10 @@ mod tests {
         let log = rig.log();
         assert!(log.contains("answered within the window"), "{log}");
         assert!(
-            log.lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            log.lines()
+                .last()
+                .unwrap()
+                .contains("verdict=tiebreak_yield exit=1"),
             "{log}"
         );
         drop(opener.join().unwrap());
@@ -3012,9 +3023,15 @@ mod tests {
         let portal = bind_or_wait("127.0.0.3", 3260);
         assert_eq!(run_window(&rig, 6), 1, "{}", rig.log());
         let log = rig.log();
-        assert!(log.contains("iSCSI portal answered within the window"), "{log}");
         assert!(
-            log.lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            log.contains("iSCSI portal answered within the window"),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .last()
+                .unwrap()
+                .contains("verdict=tiebreak_yield exit=1"),
             "{log}"
         );
         // Target down too (a peer that serves nobody): gone, survive.
