@@ -66,11 +66,24 @@ pub(crate) fn version_differences(
 }
 
 /// Records of `xe pbd-list currently-attached=false params=sr-uuid,host-uuid`:
-/// (sr uuid, host uuid) per unplugged PBD.
+/// (sr uuid, host uuid) per unplugged PBD. xe prints the fields in record
+/// order whatever `params=` asks (host-uuid first), so each blank-line
+/// separated record is read whole.
 pub(crate) fn parse_unplugged_pbds(out: &str) -> Vec<(String, String)> {
     let mut v = Vec::new();
-    let mut sr = None;
+    let (mut sr, mut host) = (None, None);
+    let mut flush = |sr: &mut Option<String>, host: &mut Option<String>| {
+        if let (Some(s), Some(h)) = (sr.take(), host.take()) {
+            v.push((s, h));
+        }
+        *sr = None;
+        *host = None;
+    };
     for line in out.lines() {
+        if line.trim().is_empty() {
+            flush(&mut sr, &mut host);
+            continue;
+        }
         // `sr-uuid ( RO)    : <uuid>`: xe pads the column before the colon.
         let Some((left, value)) = line
             .split_once(')')
@@ -79,14 +92,13 @@ pub(crate) fn parse_unplugged_pbds(out: &str) -> Vec<(String, String)> {
             continue;
         };
         let value = value.trim().to_string();
-        if left.trim_start().starts_with("sr-uuid") {
-            sr = Some(value);
-        } else if left.trim_start().starts_with("host-uuid")
-            && let Some(s) = sr.take()
-        {
-            v.push((s, value));
+        match left.trim_start() {
+            k if k.starts_with("sr-uuid") => sr = Some(value),
+            k if k.starts_with("host-uuid") => host = Some(value),
+            _ => {}
         }
     }
+    flush(&mut sr, &mut host);
     v
 }
 
@@ -263,19 +275,31 @@ mod tests {
 
     #[test]
     fn unplugged_pbds_pair_sr_and_host() {
+        // As xe prints it: host-uuid first, whatever `params=` says.
         let out = "\
+host-uuid ( RO)    : 22222222-bbbb\n\
+      sr-uuid ( RO): 11111111-aaaa\n\
+\n\
+\n\
+host-uuid ( RO)    : 44444444-dddd\n\
+      sr-uuid ( RO): 33333333-cccc\n";
+        let want = vec![
+            ("11111111-aaaa".to_string(), "22222222-bbbb".to_string()),
+            ("33333333-cccc".to_string(), "44444444-dddd".to_string()),
+        ];
+        assert_eq!(parse_unplugged_pbds(out), want);
+        // The other order pairs the same way.
+        let swapped = "\
 sr-uuid ( RO)    : 11111111-aaaa\n\
     host-uuid ( RO): 22222222-bbbb\n\
 \n\
-\n\
 sr-uuid ( RO)    : 33333333-cccc\n\
     host-uuid ( RO): 44444444-dddd\n";
+        assert_eq!(parse_unplugged_pbds(swapped), want);
+        // A single record (the case the first parser reported as all plugged).
         assert_eq!(
-            parse_unplugged_pbds(out),
-            vec![
-                ("11111111-aaaa".to_string(), "22222222-bbbb".to_string()),
-                ("33333333-cccc".to_string(), "44444444-dddd".to_string())
-            ]
+            parse_unplugged_pbds("host-uuid ( RO)    : h\n      sr-uuid ( RO): s\n"),
+            vec![("s".to_string(), "h".to_string())]
         );
         assert!(parse_unplugged_pbds("").is_empty());
     }
