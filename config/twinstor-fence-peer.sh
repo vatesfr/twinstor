@@ -249,10 +249,11 @@ peer_drbd_listening() {
 # crashed run leaves no stale lock, and the lock file lives under /run. The
 # wait is bounded: a run that cannot get the lock in time stays frozen
 # without outdating anyone (exit 1, no yield marker), never a second writer.
-# The bound covers a normal run (yield path ~30 s plus 3 s per ping target,
-# each drbdadm call bounded at 10 s); a run delayed past it by wedged DRBD
-# calls makes a waiting run freeze, which is the safe side.
-LOCK_WAIT="${TWINSTOR_FENCE_LOCK_WAIT:-60}"
+# The bound covers a normal run (yield path ~50 s with the lossy-link
+# windows, plus up to 6 s per ping target, each drbdadm call bounded at
+# 10 s); a run delayed past it by wedged DRBD calls makes a waiting run
+# freeze, which is the safe side.
+LOCK_WAIT="${TWINSTOR_FENCE_LOCK_WAIT:-90}"
 mkdir -p "$RUN" 2>/dev/null
 if command -v flock >/dev/null 2>&1 && exec 9>>"$RUN/fence-peer.lock"; then
     if ! flock -n 9; then
@@ -352,6 +353,45 @@ freeze_peer_reconnecting() {
     return 1
 }
 
+# Lossy links. Under heavy packet loss (not a clean cut) DRBD drops and
+# re-forms the connection again and again, and one probe of the peer proves
+# nothing: both nodes' runs lost their single probe, read the peer as gone and
+# survived on a gateway that still answered a retried echo, and the copies
+# forked (20 to 40% loss on both hosts, both topologies, test pools). The
+# keeper (the lower name, the tiebreak below) still decides on one probe, as
+# before. The other node, when its I/O is frozen while it decides (arbitrated,
+# or freeze mode), reads the peer as gone only after the peer's DRBD port
+# stayed silent for a short window; an answer sends it into the tiebreak,
+# where it yields only to a peer that demonstrably still serves. A dead keeper
+# costs the survivor this window. Under resource-only fencing this node's
+# copy takes writes while it decides, so nothing waits there.
+MY_NAME=$(hostname)
+PEER_NAME=$(timeout 10 drbdsetup events2 "$RESOURCE" --now 2>/dev/null \
+    | grep -o 'conn-name:[^ ]*' | head -1 | cut -d: -f2)
+# No name from DRBD (events2 failed): the configured peer name, the one the
+# daemon's own keeper rule reads, rather than none (which makes this node the
+# keeper, and the peer's run may read it the same way).
+[ -n "$PEER_NAME" ] || PEER_NAME=$(sed -n 's/^peer *= *"\(.*\)".*/\1/p' "$ETC/twinstor.toml" 2>/dev/null | head -1)
+IS_KEEPER=0
+{ [ -z "$PEER_NAME" ] || [ "$MY_NAME" \< "$PEER_NAME" ]; } && IS_KEEPER=1
+FROZEN_IO=0
+{ [ -n "$DIRECT_PEER" ] || [ "$FREEZE" = 1 ]; } && FROZEN_IO=1
+PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-10}"
+peer_listening_within_window() {
+    local end
+    end=$(( $(date +%s) + PEER_SILENT_SECS ))
+    log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
+    while [ "$(date +%s)" -lt "$end" ]; do
+        if peer_drbd_listening; then
+            log "the peer's DRBD port answered within the window: the peer is alive -> tiebreak"
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "the peer's DRBD port stayed silent for ${PEER_SILENT_SECS}s: the peer is gone"
+    return 1
+}
+
 if peer_bounce_flagged; then
     log "peer advertises an administrative bounce (beacon B flag) -> standing down: exit 1, no outdate, no yield marker"
     verdict bounce_standdown 1
@@ -371,7 +411,11 @@ for target in $TARGETS; do
     # spent here is a second of frozen I/O under resource-and-stonith); two
     # more only if the first is lost.
     FIRST_OK=1
-    if ping -c 1 -W 1 "$target" >/dev/null 2>&1 || { FIRST_OK=0; ping -c 2 -W 1 "$target" >/dev/null 2>&1; }; then
+    # With the I/O frozen anyway, a few more before reading the gateway as
+    # down: a keeper on a lossy link that yields here leaves both nodes
+    # frozen (its peer yields to it in the tiebreak below).
+    if ping -c 1 -W 1 "$target" >/dev/null 2>&1 || { FIRST_OK=0; ping -c 2 -W 1 "$target" >/dev/null 2>&1; } \
+        || { [ "$FROZEN_IO" = 1 ] && ping -c 4 -i 0.5 -W 1 "$target" >/dev/null 2>&1; }; then
         # An earlier target that did not answer and answers now: the network
         # came back during this run, as when the first echo here was lost.
         if [ "$FREEZE" = 1 ] && [ "$FIRST_OK" = 1 ] && [ -n "$EARLIER_DOWN" ]; then
@@ -418,7 +462,8 @@ for target in $TARGETS; do
         # replication with no solo-write generation bump on either side:
         # nothing diverges, nothing is discarded, no VMs restart. The
         # true-partition path (peer not listening) is unchanged and instant.
-        if [ "$LOCAL_ROLE" != "Secondary" ] && { peer_drbd_listening || freeze_peer_reconnecting; }; then
+        if [ "$LOCAL_ROLE" != "Secondary" ] && { peer_drbd_listening || freeze_peer_reconnecting \
+            || { [ "$FROZEN_IO" = 1 ] && [ "$IS_KEEPER" = 0 ] && peer_listening_within_window; }; }; then
             for _ in 1 2 3 4; do
                 sleep 1
                 CSTATE=$(timeout 5 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)
@@ -440,9 +485,6 @@ for target in $TARGETS; do
             # keeper (listening but unable to serve) must never freeze a
             # healthy survivor, so on a dead portal we keep the old
             # both-survive behavior and let the resolver clean up.
-            MY_NAME=$(hostname)
-            PEER_NAME=$(timeout 10 drbdsetup events2 "$RESOURCE" --now 2>/dev/null \
-                | grep -o 'conn-name:[^ ]*' | head -1 | cut -d: -f2)
             # Fate-shared freeze mode (the daemon keeps $FS_FREEZE_FLAG while
             # it runs the pair in it): no hostname keeper. A cut shorter than
             # this handler ends with the link back here, after the peer's own
@@ -451,7 +493,7 @@ for target in $TARGETS; do
             # guests (15 s of acknowledged writes, test pool). Yielding frozen
             # (on a live peer portal, below) hands the decision to where the
             # guests ran, and nothing acknowledged here can be lost.
-            if [ "$FREEZE" = 0 ] && { [ -z "$PEER_NAME" ] || [ "$MY_NAME" \< "$PEER_NAME" ]; }; then
+            if [ "$FREEZE" = 0 ] && [ "$IS_KEEPER" = 1 ]; then
                 log "peer listening, not reconnected after 4s; tiebreak KEEPER ($MY_NAME < ${PEER_NAME:-unknown}) -> exit 4 (survive, serve clients)"
                 verdict keeper 4
             fi
@@ -468,14 +510,24 @@ for target in $TARGETS; do
             # No address from DRBD (events2 failed): the configured peer address,
             # rather than reading "answers nowhere" and surviving beside it.
             [ -n "$PROBE_ADDRS" ] || PROBE_ADDRS="$PEER_ADDR"
-            for addr in $PROBE_ADDRS; do
-                if timeout 2 bash -c "exec 3<>/dev/tcp/$addr/$PROBE_PORT" 2>/dev/null; then
-                    exec 3<&- 3>&- 2>/dev/null
-                    PORTAL_OK=1; break
-                fi
+            # One pass when this copy takes writes meanwhile (resource-only);
+            # with the I/O frozen, retried over the window, so a lossy link
+            # does not read a live peer as gray and make a second writer.
+            PROBE_SECS=0
+            [ "$FROZEN_IO" = 1 ] && PROBE_SECS=$PEER_SILENT_SECS
+            PROBE_END=$(( $(date +%s) + PROBE_SECS ))
+            while :; do
+                for addr in $PROBE_ADDRS; do
+                    if timeout 2 bash -c "exec 3<>/dev/tcp/$addr/$PROBE_PORT" 2>/dev/null; then
+                        exec 3<&- 3>&- 2>/dev/null
+                        PORTAL_OK=1; break
+                    fi
+                done
+                [ "$PORTAL_OK" = 1 ] || [ "$(date +%s)" -ge "$PROBE_END" ] && break
+                sleep 0.5
             done
             if [ "$PORTAL_OK" = 0 ]; then
-                log "tiebreak yield candidate but the peer answers NOWHERE on port $PROBE_PORT (probed: ${PROBE_ADDRS:-none}; gray peer) -> exit 4 (survive; legacy behavior)"
+                log "tiebreak yield candidate but the peer answers NOWHERE on port $PROBE_PORT (probed for ${PROBE_SECS}s: ${PROBE_ADDRS:-none}; gray peer) -> exit 4 (survive; legacy behavior)"
                 verdict gray_peer_survive 4
             fi
             # Extended defusal while frozen: with the keeper's callout done

@@ -2880,6 +2880,115 @@ mod tests {
         );
     }
 
+    /// A rig whose DRBD (events2) names the peer `twinstor-2` at `ip`,
+    /// StandAlone, with the toml pointing at `ip` and `drbd_port`.
+    fn lossy_rig(tag: &str, ip: &str, drbd_port: u16) -> FenceRig {
+        let rig = FenceRig::new(tag);
+        std::fs::write(
+            rig.root.join("etc/twinstor.toml"),
+            format!("peer_address = \"{ip}\"\ndrbd_port = {drbd_port}\n"),
+        )
+        .unwrap();
+        std::fs::write(rig.root.join("bin/drbdsetup"), format!("#!/bin/sh\necho 'exists connection name:twinstor-data peer-node-id:1 conn-name:twinstor-2 connection:StandAlone'\necho 'exists path name:twinstor-data peer-node-id:1 conn-name:twinstor-2 local:ipv4:127.0.0.1:7789 peer:ipv4:{ip}:7789 established:no'\n")).unwrap();
+        rig
+    }
+
+    fn run_window(rig: &FenceRig, secs: u32) -> i32 {
+        rig.command(90)
+            .env("TWINSTOR_PEER_SILENT_SECS", secs.to_string())
+            .status()
+            .unwrap()
+            .code()
+            .unwrap()
+    }
+
+    #[test]
+    fn fence_peer_non_keeper_rides_out_a_lossy_probe() {
+        // Heavy loss on both hosts: the first probe of the live peer's DRBD
+        // port is lost. Both runs reading the peer as gone and surviving made
+        // two writers. In freeze mode the non-keeper probes for a window and
+        // yields to the peer it then sees; the keeper still decides on one
+        // probe; a peer silent for the whole window is gone.
+        if !fence_rig_usable() {
+            return;
+        }
+        let drbd_port = bind_or_wait("127.0.0.5", 0).local_addr().unwrap().port();
+        let rig = lossy_rig("lossy", "127.0.0.5", drbd_port);
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        // Keeper, nothing answers: survives at once, no window.
+        rig.set("hostname", "twinstor-1");
+        let t0 = std::time::Instant::now();
+        assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
+        assert!(!rig.log().contains("probing it for up to"), "{}", rig.log());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{}", rig.log());
+        // Non-keeper, nothing answers for the window: the peer is gone.
+        rig.set("hostname", "twinstor-3");
+        let t0 = std::time::Instant::now();
+        assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
+        assert!(rig.log().contains("stayed silent for 2s"), "{}", rig.log());
+        assert!(t0.elapsed() >= std::time::Duration::from_secs(1), "{}", rig.log());
+        assert!(!rig.marker().exists());
+        // Non-keeper, the peer's port and daemon answer 2 s in (the first
+        // probes lost): yield frozen to it.
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            (
+                bind_or_wait("127.0.0.5", drbd_port),
+                bind_or_wait("127.0.0.5", 7900),
+            )
+        });
+        assert_eq!(run_window(&rig, 8), 1, "{}", rig.log());
+        assert!(rig.marker().exists(), "{}", rig.log());
+        let log = rig.log();
+        assert!(log.contains("answered within the window"), "{log}");
+        assert!(
+            log.lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            "{log}"
+        );
+        drop(opener.join().unwrap());
+        // Resource-only (no freeze, no direct link): this copy takes writes
+        // while deciding, so no window.
+        drop(daemon);
+        let _ = std::fs::remove_file(rig.marker());
+        rig.set("susp", "fencing");
+        assert_eq!(run_window(&rig, 6), 4, "{}", rig.log());
+        let tail: String = rig.log().lines().rev().take(3).collect();
+        assert!(!tail.contains("probing it for up to"), "{tail}");
+    }
+
+    #[test]
+    fn fence_peer_arbitrated_non_keeper_retries_the_portal_proof() {
+        // Arbitrated, heavy loss: the non-keeper sees the peer's DRBD port,
+        // but its probes of the keeper's portal are lost at first. One pass
+        // read the keeper as gray and survived beside it; the retry yields.
+        if !fence_rig_usable() {
+            return;
+        }
+        let drbd = bind_or_wait("127.0.0.4", 0);
+        let rig = lossy_rig("arbportal", "127.0.0.4", drbd.local_addr().unwrap().port());
+        std::fs::write(rig.root.join("etc/direct-peer"), "127.0.0.253\n").unwrap();
+        rig.set("hostname", "twinstor-3");
+        let opener = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            bind_or_wait("127.0.0.4", 3260)
+        });
+        assert_eq!(run_window(&rig, 8), 1, "{}", rig.log());
+        assert!(
+            rig.log().lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            "{}",
+            rig.log()
+        );
+        let portal = opener.join().unwrap();
+        // A portal that never answers in the window: gray peer, survive.
+        drop(portal);
+        let _ = std::fs::remove_file(rig.marker());
+        rig.set("susp", "fencing");
+        assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
+        assert!(rig.log().contains("probed for 2s"), "{}", rig.log());
+        drop(drbd);
+    }
+
     #[test]
     fn fence_peer_keeps_a_yield_in_force() {
         // An earlier run yielded (suspend-io and marker); the next run finds
