@@ -5312,7 +5312,32 @@ fn diskless_alert_body(peer_serves: bool) -> &'static str {
 /// manual reboot. Demoting in place is safe because the reconnect stays
 /// non-destructive: the kernel still decides the resync direction, and
 /// a true divergence still refuses and writes the marker for the resolver.
-fn should_demote_stuck_primary(s: &DrbdStatus, aborted_reconnects: u32) -> bool {
+///
+/// Aborts alone do not prove that cause: with both nodes frozen by their own
+/// yields on the same data, every connect can abort on a write both sides
+/// still hold pending, while the peer serves nobody either. Tearing the
+/// storage down there wedged on the suspended I/O and forced a reboot under
+/// the running guests (test pool). So the kernel's own refusal must have
+/// appeared during this episode (`sig_now > sig_baseline`, as for the serving
+/// flavour below), and no guest may run here (`local_guests`, None when it
+/// cannot be read, refuses): the teardown can wedge on the frozen I/O, and a
+/// frozen copy behind the peer with guests on it steps down through the loser
+/// crash boundary instead (arbitrated) or holds.
+fn should_demote_stuck_primary(
+    s: &DrbdStatus,
+    aborted_reconnects: u32,
+    sig_baseline: Option<f64>,
+    sig_now: f64,
+    local_guests: Option<usize>,
+) -> bool {
+    stuck_primary_signature(s, aborted_reconnects)
+        && sig_baseline.is_some_and(|b| sig_now > b)
+        && local_guests == Some(0)
+}
+
+/// The cheap half of `should_demote_stuck_primary`: repeated aborts on a
+/// suspended non-serving Primary.
+fn stuck_primary_signature(s: &DrbdStatus, aborted_reconnects: u32) -> bool {
     aborted_reconnects >= SUSPENDED_PRIMARY_DEMOTE_AFTER
         && s.role == Role::Primary
         && s.suspended_user
@@ -6078,6 +6103,8 @@ pub struct StateMachine {
     test_refusals: Option<u64>,
     #[cfg(test)]
     test_refusal_stamp: f64,
+    #[cfg(test)]
+    test_local_guests: Option<usize>,
     // Stuck-Primary recovery bookkeeping. The demote stopped the iSCSI target
     // and the recovery (promote + target restart) still has to run once the
     // reconnect lands; the reboot fallback found a recent fence stamp and gave
@@ -6086,6 +6113,10 @@ pub struct StateMachine {
     demote_target_down: bool,
     stuck_demote_given_up: bool,
     stuck_fence_hold_alerted: bool,
+    /// The stuck-Primary hold (`hold_stuck_primary`): logged and alerted
+    /// once per episode.
+    stuck_held_logged: bool,
+    stuck_held_alerted: bool,
     last_disk: Option<DiskState>,
     last_peer_disk: Option<Option<DiskState>>,
     last_connection: Option<crate::drbd::ConnectionState>,
@@ -6984,9 +7015,13 @@ impl StateMachine {
             test_refusals: None,
             #[cfg(test)]
             test_refusal_stamp: 0.0,
+            #[cfg(test)]
+            test_local_guests: Some(0),
             demote_target_down: false,
             stuck_demote_given_up: false,
             stuck_fence_hold_alerted: false,
+            stuck_held_logged: false,
+            stuck_held_alerted: false,
             last_disk: None,
             last_peer_disk: None,
             last_connection: None,
@@ -8367,6 +8402,8 @@ impl StateMachine {
             self.sa_sig_baseline = None;
             self.stuck_demote_given_up = false;
             self.stuck_fence_hold_alerted = false;
+            self.stuck_held_logged = false;
+            self.stuck_held_alerted = false;
             if self.demote_target_down {
                 self.finish_stuck_primary_recovery(status.role).await;
             }
@@ -8824,8 +8861,24 @@ impl StateMachine {
                 if self.sa_aborted_reconnects == 1 {
                     self.sa_sig_baseline = Some(self.newest_refusal_stamp().await);
                 }
-                if should_demote_stuck_primary(&status, self.sa_aborted_reconnects) {
-                    if self.stuck_demote_given_up {
+                if stuck_primary_signature(&status, self.sa_aborted_reconnects) {
+                    // The kernel log and the guest count only once the cheap
+                    // conditions hold (a shell per 5s retry tick would be
+                    // noise).
+                    let sig_now = self.newest_refusal_stamp().await;
+                    let guests = self.local_guest_count().await;
+                    if !should_demote_stuck_primary(
+                        &status,
+                        self.sa_aborted_reconnects,
+                        self.sa_sig_baseline,
+                        sig_now,
+                        guests,
+                    ) {
+                        // Not the stale-target case, or guests run here:
+                        // hold frozen with the plain reconnects below.
+                        let refused = self.sa_sig_baseline.is_some_and(|b| sig_now > b);
+                        self.hold_stuck_primary(refused, guests).await;
+                    } else if self.stuck_demote_given_up {
                         // Reboot fallback disarmed and the demote wedges:
                         // hold, but keep retrying the alert until delivered
                         // (and keep the plain reconnect attempts below).
@@ -21579,6 +21632,21 @@ impl StateMachine {
     /// degrade to alert-and-hold (plain reconnect retries continue) instead
     /// of looping reboots.
     async fn fence_stuck_primary(&mut self) {
+        // Never under running guests: the reboot kills them, and after a hold
+        // xapi may come back with pool HA disabled and restart nothing (test
+        // pool). Hold frozen instead; the operator alert says why.
+        let guests = self.local_guest_count().await;
+        if guests != Some(0) {
+            error!(
+                guests = ?guests,
+                heal_event = "stuck_primary_fence_refused",
+                "stuck-Primary recovery could not complete, and guests run on this host \
+                 (or the count is unreadable): holding frozen instead of a forced reboot"
+            );
+            self.stuck_demote_given_up = true;
+            self.hold_stuck_primary(true, guests).await;
+            return;
+        }
         let recent = stuck_fence_recent(
             std::fs::read_to_string(STUCK_PRIMARY_FENCE_STAMP)
                 .ok()
@@ -21623,6 +21691,65 @@ impl StateMachine {
             "stuck suspended Primary: the in-place demote wedged on the suspended I/O",
         )
         .await;
+    }
+
+    /// Running guest domains on this host for the stuck-Primary gates; None
+    /// when unreadable (the gates refuse).
+    async fn local_guest_count(&self) -> Option<usize> {
+        #[cfg(test)]
+        {
+            self.test_local_guests
+        }
+        #[cfg(not(test))]
+        {
+            self.running_vm_count().await
+        }
+    }
+
+    /// A frozen Primary the stuck-Primary recovery must not touch: DRBD
+    /// never asked to resync it from the peer (`refused` false: no proof the
+    /// peer is ahead, which is also what both nodes frozen by their own
+    /// yields looks like), or guests run on it. It stays frozen, nothing is
+    /// torn down, the plain reconnects continue, and the operator is told
+    /// once per episode (delivered-only latch, like `alert_stuck_hold`).
+    async fn hold_stuck_primary(&mut self, refused: bool, guests: Option<usize>) {
+        if !self.stuck_held_logged {
+            warn!(
+                aborted_reconnects = self.sa_aborted_reconnects,
+                stale_target_refusal = refused,
+                guests = ?guests,
+                heal_event = "stuck_primary_held",
+                "suspended non-serving Primary stuck StandAlone, but not demoting in place: \
+                 {}",
+                if !refused {
+                    "DRBD never asked to resync this copy from the peer (the peer may be \
+                     frozen too)"
+                } else {
+                    "guests run on this host (or the count is unreadable)"
+                }
+            );
+            self.stuck_held_logged = true;
+        }
+        if self.stuck_held_alerted {
+            return;
+        }
+        let why = if !refused {
+            "DRBD never asked to resync it from the peer, so the peer may not be ahead (it may be frozen as well)"
+        } else {
+            "guests run on it"
+        };
+        if xapi::send_xapi_alert(&format!(
+            "TwinStor is holding this node frozen instead of recovering it: its storage \
+             I/O has been suspended since a fence-peer yield, its reconnects to the peer \
+             keep aborting, and {why}. Demoting it in place would tear its storage down \
+             under the frozen I/O and could force a reboot under the guests. Check \
+             whether the peer is serving; if both nodes are frozen, the pair needs an \
+             operator to choose which node resumes (see Troubleshooting)."
+        ))
+        .await
+        {
+            self.stuck_held_alerted = true;
+        }
     }
 
     /// Delivered-only latch for the alert-and-hold state: a failed send (XAPI
@@ -31469,28 +31596,74 @@ poll_interval_ms = 10
         let mut s = online_no_peer();
         s.role = Role::Primary;
         s.suspended_user = true;
+        let n = SUSPENDED_PRIMARY_DEMOTE_AFTER;
+        // The kernel's stale-target refusal appeared during the episode.
+        let (base, now) = (Some(100.0), 150.0);
 
         assert!(
-            !should_demote_stuck_primary(&s, SUSPENDED_PRIMARY_DEMOTE_AFTER - 1),
+            !should_demote_stuck_primary(&s, n - 1, base, now, Some(0)),
             "must not demote before the abort threshold (could race the peer's own recovery)"
         );
-        assert!(should_demote_stuck_primary(
-            &s,
-            SUSPENDED_PRIMARY_DEMOTE_AFTER
-        ));
+        assert!(should_demote_stuck_primary(&s, n, base, now, Some(0)));
+
+        // Aborts without the refusal: both nodes frozen by their own yields on
+        // the same data abort every connect too, and the peer serves nobody.
+        assert!(
+            !should_demote_stuck_primary(&s, n, base, 100.0, Some(0)),
+            "no refusal newer than the episode's baseline: no proof the peer is ahead"
+        );
+        assert!(!should_demote_stuck_primary(&s, n, None, now, Some(0)));
+
+        // Never under guests, and an unreadable count refuses.
+        assert!(
+            !should_demote_stuck_primary(&s, n, base, now, Some(2)),
+            "the teardown wedges on the frozen I/O and the fallback reboots under the guests"
+        );
+        assert!(!should_demote_stuck_primary(&s, n, base, now, None));
 
         s.suspended_user = false;
         assert!(
-            !should_demote_stuck_primary(&s, SUSPENDED_PRIMARY_DEMOTE_AFTER),
+            !should_demote_stuck_primary(&s, n, base, now, Some(0)),
             "a SERVING Primary must never be torn down by this path"
         );
 
         s.suspended_user = true;
         s.role = Role::Secondary;
         assert!(
-            !should_demote_stuck_primary(&s, SUSPENDED_PRIMARY_DEMOTE_AFTER),
+            !should_demote_stuck_primary(&s, n, base, now, Some(0)),
             "a Secondary needs no demote; the plain reconnect suffices"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_primary_fence_never_reboots_under_guests() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(online_with_peer()));
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        sm.test_local_guests = Some(2);
+        sm.fence_stuck_primary().await;
+        assert!(sm.stuck_held_logged, "guests: held, not rebooted");
+        assert!(sm.stuck_demote_given_up, "no further teardown this episode");
+        // An unreadable count holds too.
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        sm.test_local_guests = None;
+        sm.fence_stuck_primary().await;
+        assert!(sm.stuck_held_logged);
+        // No guest: the reboot path (a no-op in tests), no hold.
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd)),
+            Box::new(MockIscsi::new()),
+        );
+        sm.fence_stuck_primary().await;
+        assert!(!sm.stuck_held_logged);
     }
 
     #[test]
