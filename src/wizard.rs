@@ -334,9 +334,327 @@ fn local_sr_blockers() -> Vec<SrBlocker> {
         .collect()
 }
 
+/// The local SRs holding disks, grouped: (uuid, name, devices), in first-seen
+/// order.
+fn group_blockers(blockers: &[SrBlocker]) -> Vec<(String, Option<String>, Vec<String>)> {
+    let mut out: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+    for b in blockers {
+        match out.iter_mut().find(|(u, _, _)| *u == b.uuid) {
+            Some((_, _, devs)) => devs.push(b.dev.clone()),
+            None => out.push((b.uuid.clone(), b.name.clone(), vec![b.dev.clone()])),
+        }
+    }
+    out
+}
+
+/// What the wizard knows about a local SR before offering to destroy it.
+#[derive(Debug, Default)]
+struct SrFacts {
+    /// XAPI knows this SR (an old volume group from before a reinstall is
+    /// not one).
+    known: bool,
+    shared: bool,
+    sr_type: String,
+    /// Hosts with a PBD for this SR.
+    pbd_hosts: Vec<String>,
+    /// None when the list could not be read.
+    vdis: Option<usize>,
+    /// Files in an EXT SR's mount that are not virtual disks (ISOs,
+    /// backups); None when the mount could not be read.
+    other_files: Option<Vec<String>>,
+    /// A partition of the system disk would have to be labelled to be
+    /// offered, and that disk has no GPT label.
+    os_disk_not_gpt: bool,
+}
+
+/// Why the wizard must not destroy this SR, or None when it may offer to:
+/// a local SR (ext or lvm, not shared, attached to this host only) that
+/// XAPI knows, holding no virtual disk and, for ext, no other file.
+fn destroy_refusal(f: &SrFacts, this_host: &str) -> Option<String> {
+    if !f.known {
+        return Some("XAPI does not know this SR".into());
+    }
+    if f.shared || !matches!(f.sr_type.as_str(), "ext" | "lvm") {
+        return Some(format!(
+            "it is not a local disk SR (type {}, shared {})",
+            f.sr_type, f.shared
+        ));
+    }
+    if f.pbd_hosts.iter().any(|h| h != this_host) {
+        return Some("another host has it attached".into());
+    }
+    match f.vdis {
+        None => return Some("its virtual disks could not be listed".into()),
+        Some(n) if n > 0 => return Some(format!("it holds {n} virtual disk(s)")),
+        Some(_) => {}
+    }
+    if f.sr_type == "ext" {
+        match &f.other_files {
+            None => return Some("its content could not be read (is it plugged here?)".into()),
+            Some(files) if !files.is_empty() => {
+                return Some(format!("it holds other files: {}", files.join(", ")));
+            }
+            Some(_) => {}
+        }
+    }
+    if f.os_disk_not_gpt {
+        return Some(
+            "it sits on the system disk, which has no GPT label, so the freed partition \
+             could not be labelled for TwinStor"
+                .into(),
+        );
+    }
+    None
+}
+
+async fn xe_param(class: &str, uuid: &str, param: &str) -> Option<String> {
+    cmd_output(
+        "xe",
+        &[
+            &format!("{class}-param-get"),
+            &format!("uuid={uuid}"),
+            &format!("param-name={param}"),
+        ],
+    )
+    .await
+    .ok()
+    .map(|s| s.trim().to_string())
+}
+
+async fn sr_vdi_count(uuid: &str) -> Option<usize> {
+    let v = cmd_output("xe", &["vdi-list", &format!("sr-uuid={uuid}"), "--minimal"])
+        .await
+        .ok()?;
+    Some(v.split(',').filter(|s| !s.trim().is_empty()).count())
+}
+
+/// The facts behind `destroy_refusal` for one SR occupying `devs`.
+async fn sr_facts(uuid: &str, devs: &[String]) -> SrFacts {
+    let Some(sr_type) = xe_param("sr", uuid, "type").await else {
+        return SrFacts::default();
+    };
+    let pbd_hosts = cmd_output(
+        "xe",
+        &[
+            "pbd-list",
+            &format!("sr-uuid={uuid}"),
+            "params=host-uuid",
+            "--minimal",
+        ],
+    )
+    .await
+    .unwrap_or_default()
+    .split(',')
+    .map(|h| h.trim().to_string())
+    .filter(|h| !h.is_empty())
+    .collect();
+    let other_files = std::fs::read_dir(format!("/run/sr-mount/{uuid}"))
+        .ok()
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| !n.ends_with(".vhd") && n != "lost+found")
+                .collect()
+        });
+    let os = system_disk();
+    let xcp = xcp_os_disks();
+    let mut os_disk_not_gpt = false;
+    for dev in devs {
+        let Ok(canon) = std::fs::canonicalize(dev) else {
+            continue;
+        };
+        let kname = canon
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if let Some((disk, _)) = partition_of(&kname)
+            && (os.as_deref() == Some(disk.as_str()) || xcp.contains(&disk))
+        {
+            let pt = cmd_output("lsblk", &["-dno", "PTTYPE", &format!("/dev/{disk}")])
+                .await
+                .unwrap_or_default();
+            os_disk_not_gpt |= pt.trim() != "gpt";
+        }
+    }
+    SrFacts {
+        known: true,
+        shared: xe_param("sr", uuid, "shared").await.as_deref() == Some("true"),
+        sr_type,
+        pbd_hosts,
+        vdis: sr_vdi_count(uuid).await,
+        other_files,
+        os_disk_not_gpt,
+    }
+}
+
+/// Offer to destroy each local SR that holds disks but no virtual disk (the
+/// installer's default local SR on the data disks, never used), after a typed
+/// confirmation. An SR with virtual disks is never touched: the note that
+/// follows says how to free it by hand. `true` when one was destroyed (the
+/// caller scans the disks again).
+async fn offer_to_free_empty_local_srs(blockers: &[SrBlocker]) -> Result<bool> {
+    let Some((this_host, _)) = two_host_pool().await else {
+        return Ok(false);
+    };
+    let mut freed = false;
+    for (uuid, name, devs) in group_blockers(blockers) {
+        let label = name.map(|n| format!("\"{n}\" ")).unwrap_or_default();
+        if let Some(why) = destroy_refusal(&sr_facts(&uuid, &devs).await, &this_host) {
+            // An SR holding virtual disks is the note's business; say why
+            // any other one is not offered.
+            if !why.starts_with("it holds") || why.contains("other files") {
+                println!("\nThe SR {label}({uuid}) is not offered for destruction: {why}.");
+            }
+            continue;
+        }
+        println!(
+            "\nThe local SR {label}({uuid}) holds no virtual disk and occupies {}.",
+            devs.iter()
+                .map(|d| kernel_dev(d))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "It holds nothing else and only this host uses it: destroying it frees these \
+             disks for TwinStor."
+        );
+        let confirm = ask(
+            "Type 'destroy' to destroy this SR now (anything else keeps it)",
+            None,
+        )?;
+        if !confirm.eq_ignore_ascii_case("destroy") {
+            println!("Kept.");
+            continue;
+        }
+        // The prompt may have waited a long time: a VM may have been created
+        // on it since (the local SR is often the pool's default SR).
+        if sr_vdi_count(&uuid).await != Some(0) {
+            println!("  it holds a virtual disk now; kept.");
+            continue;
+        }
+        let pbd = cmd_output(
+            "xe",
+            &[
+                "pbd-list",
+                &format!("sr-uuid={uuid}"),
+                &format!("host-uuid={this_host}"),
+                "--minimal",
+            ],
+        )
+        .await
+        .unwrap_or_default();
+        let pbd = pbd.trim();
+        if !pbd.is_empty()
+            && let Err(e) = run_cmd("xe", &["pbd-unplug", &format!("uuid={pbd}")]).await
+        {
+            println!("  could not unplug it ({e}); kept. Free it by hand as described below.");
+            continue;
+        }
+        match run_cmd("xe", &["sr-destroy", &format!("uuid={uuid}")]).await {
+            Ok(()) => {
+                println!("  destroyed.");
+                freed = true;
+                for dev in &devs {
+                    label_freed_os_partition(dev).await;
+                }
+            }
+            Err(e) => {
+                // Plug it back so the host is left as it was.
+                let replugged = pbd.is_empty()
+                    || run_cmd("xe", &["pbd-plug", &format!("uuid={pbd}")])
+                        .await
+                        .is_ok();
+                if replugged {
+                    println!(
+                        "  could not destroy it ({e}); left as it was. Free it by hand as described below."
+                    );
+                } else {
+                    println!(
+                        "  could not destroy it ({e}), and plugging it back failed too: run \
+                         xe pbd-plug uuid={pbd}, then free it by hand as described below."
+                    );
+                }
+            }
+        }
+    }
+    if freed {
+        let _ = run_cmd("udevadm", &["settle"]).await;
+    }
+    Ok(freed)
+}
+
+/// `/dev/sda4` for a `/dev/disk/by-id/...` alias: the name operators know.
+fn kernel_dev(dev: &str) -> String {
+    std::fs::canonicalize(dev)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| dev.to_string())
+}
+
+/// The parent disk and partition number of a partition, from sysfs
+/// (`sda4` -> `("sda", 4)`). None for a whole disk.
+fn partition_of(kname: &str) -> Option<(String, u32)> {
+    let sys = std::fs::canonicalize(format!("/sys/class/block/{kname}")).ok()?;
+    let num = std::fs::read_to_string(sys.join("partition"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let parent = sys.parent()?.file_name()?.to_string_lossy().to_string();
+    Some((parent, num))
+}
+
+/// A partition of the system disk (or of another disk holding an XCP-ng
+/// install) is offered only when labelled for TwinStor. When the wizard has
+/// just destroyed the local SR on such a partition, that partition is known to
+/// be the SR's and nothing else's, so label it: otherwise the destroy frees
+/// nothing the wizard can use (the installer's default layout on a
+/// single-disk host).
+async fn label_freed_os_partition(dev: &str) {
+    let Ok(canon) = std::fs::canonicalize(dev) else {
+        return;
+    };
+    let kname = canon
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let Some((disk, num)) = partition_of(&kname) else {
+        return;
+    };
+    if system_disk().as_deref() != Some(disk.as_str()) && !xcp_os_disks().contains(&disk) {
+        return;
+    }
+    let disk_dev = format!("/dev/{disk}");
+    match run_cmd(
+        "sgdisk",
+        &["-c", &format!("{num}:twinstor-data"), &disk_dev],
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = run_cmd("partprobe", &[&disk_dev]).await;
+            // partprobe may refuse a disk with mounted partitions: ask udev to
+            // re-read this partition so its by-partlabel link appears.
+            let _ = run_cmd(
+                "udevadm",
+                &["trigger", "--action=change", &format!("/dev/{kname}")],
+            )
+            .await;
+            let _ = run_cmd("udevadm", &["settle"]).await;
+            println!("  labelled /dev/{kname} (on the system disk) for TwinStor.");
+        }
+        Err(e) => println!(
+            "  /dev/{kname} is on the system disk, so it is offered only once labelled \
+             for TwinStor, and labelling failed ({e}). Run\n    \
+             sgdisk -c {num}:twinstor-data {disk_dev}\n  then run setup again."
+        ),
+    }
+}
+
 /// Operator guidance explaining why an SR-backed disk is not offered and how to
 /// free it, or None when nothing is blocked. Destroy frees the space (on the
-/// system disk it then becomes carveable); forget alone leaves LVM/filesystem
+/// system disk it must then be labelled); forget alone leaves LVM/filesystem
 /// signatures that still block it.
 fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
     if blockers.is_empty() {
@@ -351,7 +669,9 @@ fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
             .unwrap_or_default();
         s.push_str(&format!(
             "  - {} is used by local SR{} (uuid {})\n",
-            b.dev, label, b.uuid
+            kernel_dev(&b.dev),
+            label,
+            b.uuid
         ));
     }
     s.push_str(
@@ -361,7 +681,8 @@ fn sr_blocker_note(blockers: &[SrBlocker]) -> Option<String> {
         \x20 - or keep the data: xe sr-forget uuid=<uuid>, then wipe the leftover\n\
         \x20   LVM/filesystem signatures (wipefs -a / pvremove) before re-running.\n\
         Destroying frees the space; forgetting alone leaves signatures that still\n\
-        block it.",
+        block it. A freed partition of the system disk is offered only once\n\
+        labelled: sgdisk -c <partition number>:twinstor-data /dev/<disk>",
     );
     Some(s)
 }
@@ -768,6 +1089,50 @@ fn is_point_to_point(netmask: &str) -> bool {
     matches!(netmask, "255.255.255.252" | "255.255.255.254")
 }
 
+/// One line per non-management NIC of this host: device, link, IP. Shown
+/// when no direct link is found, so a back-to-back cable without a link (a
+/// DAC whose port is down, a cable in the wrong port) is visible at once.
+async fn nic_link_lines() -> Vec<String> {
+    let Some((this_uuid, _peer)) = two_host_pool().await else {
+        return vec![];
+    };
+    let pifs = cmd_output(
+        "xe",
+        &["pif-list", &format!("host-uuid={this_uuid}"), "--minimal"],
+    )
+    .await
+    .unwrap_or_default();
+    let mut out = Vec::new();
+    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let p = pif_params(pif).await;
+        if let Some(l) = nic_link_line(&p) {
+            out.push(l);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn nic_link_line(p: &std::collections::HashMap<String, String>) -> Option<String> {
+    let device = p.get("device").filter(|d| !d.is_empty())?;
+    if p.get("management").is_some_and(|m| m == "true")
+        || p.get("physical").is_some_and(|m| m == "false")
+    {
+        return None;
+    }
+    let link = if p.get("carrier").is_some_and(|c| c == "true") {
+        "link up"
+    } else {
+        "no link"
+    };
+    let ip = p
+        .get("IP")
+        .filter(|i| !i.is_empty())
+        .map(|i| format!(", IP {i}"))
+        .unwrap_or_else(|| ", no IP".into());
+    Some(format!("{device}: {link}{ip}"))
+}
+
 /// This host's NICs that have a cable/carrier but no IP and aren't the
 /// management interface: candidates for an as-yet-unconfigured direct link.
 async fn carrier_nics_without_ip() -> Vec<String> {
@@ -786,8 +1151,7 @@ async fn carrier_nics_without_ip() -> Vec<String> {
         let device = p.get("device").cloned().unwrap_or_default();
         let has_ip = p.get("IP").map(|s| !s.is_empty()).unwrap_or(false);
         let carrier = p.get("carrier").map(|s| s == "true").unwrap_or(false);
-        let mgmt = p.get("management").map(|s| s == "true").unwrap_or(false);
-        if device.is_empty() || has_ip || !carrier || mgmt {
+        if device.is_empty() || has_ip || !carrier || pif_unusable(&p).is_some() {
             continue;
         }
         out.push(device);
@@ -906,35 +1270,303 @@ async fn pif_uuid_for_device(device: &str) -> Option<String> {
     (!u.is_empty()).then(|| u.to_string())
 }
 
-/// Configure this host's end of the direct link with `local_dl`/30 via the
-/// persistent XAPI method, then confirm the address comes up. Only this node's
-/// end: the peer configures its own (dom0-to-dom0 SSH over the link doesn't
-/// work, and setup runs per-host anyway).
-async fn configure_direct_link(device: &str, local_dl: Ipv4Addr) -> Result<()> {
-    let uuid = pif_uuid_for_device(device)
+/// `other-config` key the wizard sets on each PIF it configures as an end of
+/// the direct link: a link it finds half configured is resumed only when the
+/// address is its own, never an operator's routed /30.
+const DIRECT_LINK_TAG: &str = "twinstor-direct-link";
+
+/// Why a PIF cannot be an end of the direct link, from its `xe pif-param-list`
+/// fields: only an untagged physical NIC outside any bond, and never the
+/// management one.
+fn pif_unusable(p: &std::collections::HashMap<String, String>) -> Option<&'static str> {
+    let is = |k: &str, v: &str| p.get(k).is_some_and(|s| s == v);
+    if is("management", "true") {
+        Some("it is the management interface")
+    } else if !is("physical", "true") {
+        Some("it is not a physical NIC (a bond or a VLAN)")
+    } else if p.get("VLAN").is_some_and(|v| v != "-1") {
+        Some("it is a VLAN")
+    } else if p
+        .get("bond-slave-of")
+        .is_some_and(|b| !b.is_empty() && b != "<not in database>")
+    {
+        Some("it is part of a bond")
+    } else {
+        None
+    }
+}
+
+/// Whether the wizard configured this PIF as a direct-link end.
+fn pif_tagged(p: &std::collections::HashMap<String, String>) -> bool {
+    p.get("other-config")
+        .is_some_and(|o| o.contains(&format!("{DIRECT_LINK_TAG}: true")))
+}
+
+/// What to do with the peer's PIF on the direct-link network, given its
+/// current state.
+#[derive(Debug, PartialEq)]
+enum PeerEnd {
+    /// It already holds the expected address.
+    Done,
+    /// No address and a link: configure it.
+    Configure,
+    /// Something else is there; the operator decides.
+    Refuse(String),
+}
+
+fn peer_end_action(ip: &str, carrier: bool, unusable: Option<&str>, expected: Ipv4Addr) -> PeerEnd {
+    if let Some(why) = unusable {
+        PeerEnd::Refuse(why.to_string())
+    } else if ip == expected.to_string() {
+        PeerEnd::Done
+    } else if !ip.is_empty() {
+        PeerEnd::Refuse(format!("it already has the address {ip}"))
+    } else if !carrier {
+        PeerEnd::Refuse("it shows no link (is the cable on another port of the peer?)".into())
+    } else {
+        PeerEnd::Configure
+    }
+}
+
+/// The peer's PIF on the same network as this host's `device`, if exactly one.
+async fn peer_pif_on_same_network(device: &str) -> Option<String> {
+    let (_, peer_host) = two_host_pool().await?;
+    let local = pif_uuid_for_device(device).await?;
+    let network = pif_params(&local).await.get("network-uuid").cloned()?;
+    let pif = cmd_output(
+        "xe",
+        &[
+            "pif-list",
+            &format!("host-uuid={peer_host}"),
+            &format!("network-uuid={network}"),
+            "--minimal",
+        ],
+    )
+    .await
+    .ok()?;
+    let pif = pif.trim();
+    (!pif.is_empty() && !pif.contains(',')).then(|| pif.to_string())
+}
+
+/// The manual way to configure the peer's end, for the messages below.
+fn peer_end_manual(peer_dl: Ipv4Addr) -> String {
+    format!(
+        "configure the peer's end of the direct link by hand, on the peer:\n\
+         \x20 PIF=$(xe pif-list device=<its direct-link NIC> host-uuid=$(xe host-list hostname=$(hostname) --minimal) --minimal)\n\
+         \x20 xe pif-reconfigure-ip uuid=$PIF mode=static IP={peer_dl} netmask={DIRECT_LINK_NETMASK}\n\
+         then run setup here again"
+    )
+}
+
+/// XAPI refuses to change a PIF's address while pool HA is enabled.
+async fn refuse_if_pool_ha() -> Result<()> {
+    let pool = cmd_output("xe", &["pool-list", "--minimal"])
         .await
-        .ok_or_else(|| anyhow::anyhow!("could not resolve a PIF uuid for {device} on this host"))?;
+        .unwrap_or_default();
+    let ha = cmd_output(
+        "xe",
+        &[
+            "pool-param-get",
+            &format!("uuid={}", pool.trim()),
+            "param-name=ha-enabled",
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    if ha.trim() == "true" {
+        bail!(
+            "pool HA is enabled, and XAPI refuses to change network addresses while it is: \
+             disable it (xe pool-ha-disable), then run setup again (setup enables it at the end)"
+        );
+    }
+    Ok(())
+}
+
+/// Give `pif` the address `ip`/30 and tag it as a direct-link end.
+async fn set_link_end(pif: &str, ip: Ipv4Addr) -> Result<()> {
     run_cmd(
         "xe",
         &[
             "pif-reconfigure-ip",
-            &format!("uuid={uuid}"),
+            &format!("uuid={pif}"),
             "mode=static",
-            &format!("IP={local_dl}"),
+            &format!("IP={ip}"),
             &format!("netmask={DIRECT_LINK_NETMASK}"),
         ],
     )
+    .await?;
+    let _ = run_cmd(
+        "xe",
+        &[
+            "pif-param-set",
+            &format!("uuid={pif}"),
+            &format!("other-config:{DIRECT_LINK_TAG}=true"),
+        ],
+    )
+    .await;
+    Ok(())
+}
+
+/// Undo `set_link_end`: no address, no tag.
+async fn clear_link_end(pif: &str) -> Result<()> {
+    let _ = run_cmd(
+        "xe",
+        &[
+            "pif-param-remove",
+            &format!("uuid={pif}"),
+            "param-name=other-config",
+            &format!("param-key={DIRECT_LINK_TAG}"),
+        ],
+    )
+    .await;
+    run_cmd(
+        "xe",
+        &["pif-reconfigure-ip", &format!("uuid={pif}"), "mode=None"],
+    )
     .await
-    .with_context(|| format!("reconfiguring {device} with {local_dl}/30"))?;
-    // XAPI applies this synchronously, but poll briefly to be sure the address
-    // is up before run_setup's route check relies on it.
-    for _ in 0..10 {
-        if host_ipv4_addrs().await.contains(&local_dl) {
+}
+
+async fn ping_once(ip: &str) -> bool {
+    tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "1", ip])
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Bring up the direct link on `device`: this host's end `local_dl` (set
+/// unless `local_is_set`) and the peer's end on its PIF in the same pool
+/// network. Both hosts are in one pool, so XAPI reaches the peer's PIF from
+/// here. The peer's PIF is checked before anything changes; when the peer
+/// does not answer afterwards, every address this run set is removed again.
+async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bool) -> Result<()> {
+    let peer_dl = p2p_peer(local_dl).expect("a validated /30 address");
+    let manual = peer_end_manual(peer_dl);
+    refuse_if_pool_ha().await?;
+    let Some(peer_pif) = peer_pif_on_same_network(device).await else {
+        bail!("the peer has no single NIC on the same pool network as {device}; {manual}");
+    };
+    let p = pif_params(&peer_pif).await;
+    let peer_dev = p.get("device").cloned().unwrap_or_default();
+    let action = peer_end_action(
+        p.get("IP").map(String::as_str).unwrap_or(""),
+        p.get("carrier").is_some_and(|s| s == "true"),
+        pif_unusable(&p),
+        peer_dl,
+    );
+    if let PeerEnd::Refuse(why) = &action {
+        bail!("the peer's {peer_dev} cannot take {peer_dl}: {why}; {manual}");
+    }
+    if action == PeerEnd::Configure
+        && !ask_yes_no(
+            &format!("Configure the peer's {peer_dev} with {peer_dl}/30 too?"),
+            true,
+        )?
+    {
+        bail!("{manual}");
+    }
+    let local_pif = pif_uuid_for_device(device)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("could not resolve a PIF uuid for {device} on this host"))?;
+    if !local_is_set {
+        set_link_end(&local_pif, local_dl)
+            .await
+            .with_context(|| format!("reconfiguring {device} with {local_dl}/30"))?;
+        println!("  configured {device} = {local_dl}/30.");
+    }
+    if action == PeerEnd::Configure {
+        if let Err(e) = set_link_end(&peer_pif, peer_dl).await {
+            if !local_is_set {
+                let _ = clear_link_end(&local_pif).await;
+            }
+            return Err(e)
+                .with_context(|| format!("reconfiguring the peer's {peer_dev} with {peer_dl}/30"));
+        }
+        println!("  configured the peer's {peer_dev} = {peer_dl}/30.");
+    } else {
+        println!("  the peer's {peer_dev} already has {peer_dl}.");
+    }
+    // Both ends apply their address asynchronously.
+    for _ in 0..20 {
+        if host_ipv4_addrs().await.contains(&local_dl) && ping_once(&peer_dl.to_string()).await {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    bail!("{device} did not come up with {local_dl}/30 after reconfigure");
+    // A wrong pairing (pool networks pair NICs by device name, so the cable
+    // may sit on another NIC of the peer): undo what this run set, so a later
+    // run does not take it for a working link.
+    let mut undone = Vec::new();
+    if action == PeerEnd::Configure && clear_link_end(&peer_pif).await.is_ok() {
+        undone.push(format!("the peer's {peer_dev}"));
+    }
+    if !local_is_set && clear_link_end(&local_pif).await.is_ok() {
+        undone.push(device.to_string());
+    }
+    let undone = if undone.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The addresses set on {} were removed again.",
+            undone.join(" and ")
+        )
+    };
+    bail!(
+        "{peer_dl} does not answer over {device}: the cable may sit on another NIC of the \
+         peer than {peer_dev}.{undone} Check the cabling, or {manual}"
+    )
+}
+
+/// A direct link this wizard configured on this host (tagged
+/// `DIRECT_LINK_TAG`) whose peer end on the same pool network has no address:
+/// an earlier run stopped before configuring the peer. Returns the device and
+/// this host's address on it.
+async fn half_configured_link() -> Option<(String, Ipv4Addr)> {
+    let (this_host, _) = two_host_pool().await?;
+    let pifs = cmd_output(
+        "xe",
+        &["pif-list", &format!("host-uuid={this_host}"), "--minimal"],
+    )
+    .await
+    .ok()?;
+    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let p = pif_params(pif).await;
+        let (Some(dev), Some(ip)) = (
+            p.get("device"),
+            p.get("IP").and_then(|s| s.parse::<Ipv4Addr>().ok()),
+        ) else {
+            continue;
+        };
+        if !pif_tagged(&p)
+            || pif_unusable(&p).is_some()
+            || p.get("netmask").map(String::as_str) != Some(DIRECT_LINK_NETMASK)
+            || p2p_peer(ip).is_none()
+        {
+            continue;
+        }
+        let Some(peer_pif) = peer_pif_on_same_network(dev).await else {
+            continue;
+        };
+        if pif_params(&peer_pif)
+            .await
+            .get("IP")
+            .is_none_or(|s| s.is_empty())
+        {
+            return Some((dev.clone(), ip));
+        }
+    }
+    None
+}
+
+/// The address this host should take on the direct link: the other half of
+/// the /30 the peer's end already holds, if it holds one, else the default.
+fn default_local_dl(peer_ip: Option<Ipv4Addr>, peer_mask: Option<&str>) -> Ipv4Addr {
+    match (peer_ip, peer_mask) {
+        (Some(ip), Some(DIRECT_LINK_NETMASK)) => {
+            p2p_peer(ip).unwrap_or(Ipv4Addr::new(10, 99, 99, 1))
+        }
+        _ => Ipv4Addr::new(10, 99, 99, 1),
+    }
 }
 
 /// Resolve the direct link for arbitrated mode interactively. Returns the
@@ -953,6 +1585,17 @@ async fn resolve_direct_link(
         .collect();
     ready.sort_by_key(|n| std::cmp::Reverse(n.point_to_point));
     let ready_ips: Vec<IpAddr> = ready.iter().map(|n| n.peer_ip).collect();
+    if ready.is_empty()
+        && let Some((device, local_dl)) = half_configured_link().await
+    {
+        let peer_dl = p2p_peer(local_dl).expect("checked by half_configured_link");
+        println!(
+            "\n{device} has {local_dl}/30 here (set by an earlier setup), but the peer's end\n\
+             of that link has no address yet."
+        );
+        bring_up_direct_link(&device, local_dl, true).await?;
+        return Ok(Some(IpAddr::V4(peer_dl)));
+    }
     // Only probe NICs if there's no ready network to offer.
     let carrier = if ready.is_empty() {
         carrier_nics_without_ip().await
@@ -999,13 +1642,23 @@ async fn resolve_direct_link(
             println!("\nFound a cabled NIC with no IP: {device} (a likely direct link).");
             if ask_yes_no(&format!("Configure {device} as the direct link now?"), true)? {
                 println!(
-                    "This host takes one end of a point-to-point /30; the peer takes the\n\
-                     other. Use 10.99.99.1 on the first node and 10.99.99.2 on the second\n\
-                     (match what the first node printed)."
+                    "This host takes one end of a point-to-point /30 and the peer the other;\n\
+                     setup configures both. Pick another /30 if 10.99.99.0/30 is in use."
                 );
+                // The peer's end may already hold its half of a /30 (the
+                // manual command, an earlier run): offer the other half.
+                let peer_now = match peer_pif_on_same_network(&device).await {
+                    Some(pp) => pif_params(&pp).await,
+                    None => Default::default(),
+                };
+                let default_dl = default_local_dl(
+                    peer_now.get("IP").and_then(|s| s.parse().ok()),
+                    peer_now.get("netmask").map(String::as_str),
+                )
+                .to_string();
                 let local_dl = loop {
                     let Ok(ip) =
-                        ask("This host's direct-link IP", Some("10.99.99.1"))?.parse::<Ipv4Addr>()
+                        ask("This host's direct-link IP", Some(&default_dl))?.parse::<Ipv4Addr>()
                     else {
                         println!("  not a valid IPv4 address");
                         continue;
@@ -1023,9 +1676,7 @@ async fn resolve_direct_link(
                     break ip;
                 };
                 let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
-                configure_direct_link(&device, local_dl).await?;
-                println!("  configured {device} = {local_dl}/30; the peer's end is {peer_dl}.");
-                println!("  when you run setup on the peer, give its end {peer_dl}.");
+                bring_up_direct_link(&device, local_dl, false).await?;
                 Ok(Some(IpAddr::V4(peer_dl)))
             } else {
                 println!("\n{}", direct_link_instructions(&device));
@@ -1039,11 +1690,26 @@ async fn resolve_direct_link(
             }
         }
         DirectLinkOutcome::None => {
-            println!(
-                "\nNo second network or spare cabled NIC found for a direct link.\n\
-                 Arbitrated mode needs a dedicated back-to-back link. Using fate-shared mode."
-            );
-            Ok(None)
+            println!("\nNo second network or spare cabled NIC found for a direct link.");
+            let nics = nic_link_lines().await;
+            if !nics.is_empty() {
+                println!("This host's other NICs:");
+                for l in &nics {
+                    println!("  {l}");
+                }
+                println!(
+                    "A direct-link NIC must show a link (cable plugged in, the other host powered\n\
+                     on, the port up on both ends) and have no IP yet."
+                );
+            }
+            if ask_yes_no(
+                "Arbitrated mode needs a dedicated back-to-back link. Continue in fate-shared mode instead?",
+                true,
+            )? {
+                Ok(None)
+            } else {
+                bail!("connect the direct link, then re-run setup and choose arbitrated mode")
+            }
         }
     }
 }
@@ -1123,6 +1789,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
 
     print_banner();
     println!("TwinStor interactive setup. Press Enter to accept defaults.\n");
+    crate::preflight::run().await?;
 
     // 1. The other node and the network that carries replication + iSCSI.
     // TwinStor mirrors storage between the two hosts, so it needs the address of
@@ -1254,8 +1921,14 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // SR's free space.
     let mut disks = candidate_disks();
     // Disks consumed by a local SR are silently excluded above; surface them so
-    // "why isn't my big disk offered?" has an answer and a remedy.
-    let sr_note = sr_blocker_note(&local_sr_blockers());
+    // "why isn't my big disk offered?" has an answer and a remedy. An empty one
+    // (the installer's default local SR, never used) can be destroyed here.
+    let mut blockers = local_sr_blockers();
+    if offer_to_free_empty_local_srs(&blockers).await? {
+        disks = candidate_disks();
+        blockers = local_sr_blockers();
+    }
+    let sr_note = sr_blocker_note(&blockers);
     if disks.is_empty() {
         // No spare disk and no free partition, but the system disk may carry a
         // large unallocated tail (the usual single-disk install where local
@@ -1521,6 +2194,54 @@ mod tests {
     }
 
     #[test]
+    fn blockers_group_by_sr() {
+        let b = |dev: &str, uuid: &str| SrBlocker {
+            dev: dev.into(),
+            uuid: uuid.into(),
+            name: Some("Local storage".into()),
+        };
+        let g = group_blockers(&[
+            b("/dev/sda", "u1"),
+            b("/dev/nvme0n1p3", "u2"),
+            b("/dev/sdb", "u1"),
+        ]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].0, "u1");
+        assert_eq!(g[0].2, vec!["/dev/sda", "/dev/sdb"]);
+        assert_eq!(g[1].2, vec!["/dev/nvme0n1p3"]);
+    }
+
+    #[test]
+    fn nic_link_lines_show_link_and_ip() {
+        let m = |kv: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            nic_link_line(&m(&[
+                ("device", "eth3"),
+                ("carrier", "false"),
+                ("IP", ""),
+                ("physical", "true")
+            ]))
+            .as_deref(),
+            Some("eth3: no link, no IP")
+        );
+        assert_eq!(
+            nic_link_line(&m(&[
+                ("device", "eth1"),
+                ("carrier", "true"),
+                ("IP", "10.0.0.2")
+            ]))
+            .as_deref(),
+            Some("eth1: link up, IP 10.0.0.2")
+        );
+        assert!(nic_link_line(&m(&[("device", "eth0"), ("management", "true")])).is_none());
+        assert!(nic_link_line(&m(&[("device", "bond0"), ("physical", "false")])).is_none());
+    }
+
+    #[test]
     fn nvme_path_nodes_are_never_candidates() {
         for name in ["nvme0c0n1", "nvme1c2n3", "nvme10c11n12"] {
             assert!(is_nvme_path_node(name), "{name}");
@@ -1612,6 +2333,174 @@ mod tests {
     #[test]
     fn nothing_found_yields_none() {
         assert_eq!(decide_direct_link(&[], &[]), DirectLinkOutcome::None);
+    }
+
+    #[test]
+    fn peer_end_configured_only_when_blank_and_cabled() {
+        let want: Ipv4Addr = "10.99.99.2".parse().unwrap();
+        assert_eq!(peer_end_action("", true, None, want), PeerEnd::Configure);
+        assert_eq!(
+            peer_end_action("10.99.99.2", true, None, want),
+            PeerEnd::Done
+        );
+        assert!(matches!(
+            peer_end_action("192.0.2.7", true, None, want),
+            PeerEnd::Refuse(_)
+        ));
+        assert!(matches!(
+            peer_end_action("", false, None, want),
+            PeerEnd::Refuse(_)
+        ));
+        // An unusable PIF (management, bond member, VLAN) is never touched,
+        // even blank and cabled.
+        assert_eq!(
+            peer_end_action("", true, Some("it is part of a bond"), want),
+            PeerEnd::Refuse("it is part of a bond".into())
+        );
+    }
+
+    fn pif_map(kv: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn only_an_empty_local_sr_of_this_host_may_be_destroyed() {
+        let ok = SrFacts {
+            known: true,
+            shared: false,
+            sr_type: "ext".into(),
+            pbd_hosts: vec!["me".into()],
+            vdis: Some(0),
+            other_files: Some(vec![]),
+            os_disk_not_gpt: false,
+        };
+        assert_eq!(destroy_refusal(&ok, "me"), None);
+        let lvm = SrFacts {
+            sr_type: "lvm".into(),
+            other_files: None,
+            ..ok
+        };
+        assert_eq!(
+            destroy_refusal(&lvm, "me"),
+            None,
+            "lvm has no mount to read"
+        );
+        let ok = SrFacts {
+            sr_type: "ext".into(),
+            other_files: Some(vec![]),
+            ..lvm
+        };
+        let refused = |f: SrFacts| destroy_refusal(&f, "me").is_some();
+        assert!(refused(SrFacts {
+            known: false,
+            ..Default::default()
+        }));
+        assert!(refused(SrFacts {
+            shared: true,
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            sr_type: "lvmoiscsi".into(),
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            pbd_hosts: vec!["me".into(), "peer".into()],
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            vdis: Some(1),
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            vdis: None,
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            other_files: Some(vec!["debian.iso".into()]),
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            other_files: None,
+            ..ok_clone(&ok)
+        }));
+        assert!(refused(SrFacts {
+            os_disk_not_gpt: true,
+            ..ok_clone(&ok)
+        }));
+    }
+
+    fn ok_clone(f: &SrFacts) -> SrFacts {
+        SrFacts {
+            known: f.known,
+            shared: f.shared,
+            sr_type: f.sr_type.clone(),
+            pbd_hosts: f.pbd_hosts.clone(),
+            vdis: f.vdis,
+            other_files: f.other_files.clone(),
+            os_disk_not_gpt: f.os_disk_not_gpt,
+        }
+    }
+
+    #[test]
+    fn only_a_plain_physical_nic_can_be_a_link_end() {
+        let plain = [
+            ("physical", "true"),
+            ("VLAN", "-1"),
+            ("bond-slave-of", "<not in database>"),
+            ("management", "false"),
+        ];
+        assert_eq!(pif_unusable(&pif_map(&plain)), None);
+        let with = |k: &str, v: &str| {
+            let mut m = pif_map(&plain);
+            m.insert(k.into(), v.into());
+            pif_unusable(&m)
+        };
+        assert!(with("management", "true").is_some());
+        assert!(
+            with("physical", "false").is_some(),
+            "a bond master or VLAN PIF"
+        );
+        assert!(with("VLAN", "20").is_some());
+        assert!(with("bond-slave-of", "OpaqueRef:1234").is_some());
+        assert!(
+            pif_unusable(&pif_map(&[])).is_some(),
+            "unreadable: unusable"
+        );
+    }
+
+    #[test]
+    fn half_configured_link_needs_the_wizards_own_tag() {
+        assert!(pif_tagged(&pif_map(&[(
+            "other-config",
+            "twinstor-direct-link: true"
+        )])));
+        assert!(pif_tagged(&pif_map(&[(
+            "other-config",
+            "foo: bar; twinstor-direct-link: true"
+        )])));
+        assert!(!pif_tagged(&pif_map(&[("other-config", "")])));
+        assert!(!pif_tagged(&pif_map(&[])));
+    }
+
+    #[test]
+    fn local_default_completes_the_peers_30() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(default_local_dl(None, None), ip("10.99.99.1"));
+        assert_eq!(
+            default_local_dl(Some(ip("10.99.99.1")), Some("255.255.255.252")),
+            ip("10.99.99.2")
+        );
+        assert_eq!(
+            default_local_dl(Some(ip("10.20.0.6")), Some("255.255.255.252")),
+            ip("10.20.0.5")
+        );
+        // Not a /30: the default, and the operator decides.
+        assert_eq!(
+            default_local_dl(Some(ip("10.20.0.6")), Some("255.255.255.0")),
+            ip("10.99.99.1")
+        );
     }
 
     #[test]
