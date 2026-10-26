@@ -243,11 +243,12 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
     }
 
     // Step 5: wipe the backing device
+    let mut wiped = false;
     if !keep_data {
         let backing = backing_dev.as_ref().map(|d| d.display().to_string());
         if let Some(backing) = backing {
             print_step(5, &format!("wiping backing device {backing}"));
-            clear_backing_device(&backing).await;
+            wiped = clear_backing_device(&backing).await;
         } else {
             print_step(5, "wiping backing device");
             println!("  no config found, skipping wipe");
@@ -311,13 +312,20 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
     // With the data wiped, no state of this install may reach the next one:
     // freshness stamps, HA disarm and re-arm records, fence and freeze
     // markers all describe the copy just erased, and a reinstall read them
-    // as its own. /run too, since uninstall does not reboot.
-    if !keep_data {
+    // as its own. /run too, since uninstall does not reboot. A wipe that did
+    // not happen keeps them: they still describe the data left in place.
+    if wiped {
         for dir in ["/var/lib/twinstor", "/run/twinstor"] {
             for path in remove_dir_contents(std::path::Path::new(dir)) {
                 println!("  removed {path}");
             }
         }
+        let gw = "/run/twinstor-gateway-confirmed-up";
+        if std::fs::remove_file(gw).is_ok() {
+            println!("  removed {gw}");
+        }
+    } else if !keep_data {
+        println!("  kept /var/lib/twinstor and /run/twinstor: the backing device was not wiped");
     }
     // Remove config dir if empty
     let _ = std::fs::remove_dir("/etc/twinstor");
@@ -408,19 +416,26 @@ async fn is_lvm_lv(dev: &str) -> bool {
 /// with `wipefs -a` and zero the head and tail, the tail being where DRBD's
 /// internal metadata lives. Each sub-step reports its own failure but never
 /// aborts the uninstall.
-async fn clear_backing_device(backing: &str) {
+/// Wipe the backing device; `true` only when it was wiped (the LV removed,
+/// or both the head and the DRBD metadata at the tail zeroed).
+async fn clear_backing_device(backing: &str) -> bool {
     if is_lvm_lv(backing).await {
-        match run_cmd("lvremove", &["-f", backing]).await {
-            Ok(()) => println!("  LV removed"),
-            Err(e) => println!("  LV removal failed ({e})"),
-        }
-        return;
+        return match run_cmd("lvremove", &["-f", backing]).await {
+            Ok(()) => {
+                println!("  LV removed");
+                true
+            }
+            Err(e) => {
+                println!("  LV removal failed ({e})");
+                false
+            }
+        };
     }
     if let Err(e) = run_cmd("wipefs", &["-a", backing]).await {
         println!("  wipefs failed ({e})");
     }
     // Head: LVM PV label, filesystem superblocks.
-    let _ = run_cmd(
+    let head = run_cmd(
         "dd",
         &[
             "if=/dev/zero",
@@ -431,13 +446,15 @@ async fn clear_backing_device(backing: &str) {
             "status=none",
         ],
     )
-    .await;
+    .await
+    .is_ok();
     // Tail: DRBD internal metadata.
+    let mut tail = false;
     if let Ok(out) = cmd_output("blockdev", &["--getsz", backing]).await
         && let Ok(sectors) = out.trim().parse::<u64>()
         && let Some(seek) = tail_zero_seek_mib(sectors)
     {
-        let _ = run_cmd(
+        tail = run_cmd(
             "dd",
             &[
                 "if=/dev/zero",
@@ -449,9 +466,15 @@ async fn clear_backing_device(backing: &str) {
                 "status=none",
             ],
         )
-        .await;
+        .await
+        .is_ok();
     }
-    println!("  backing device wiped");
+    if head && tail {
+        println!("  backing device wiped");
+    } else {
+        println!("  backing device NOT fully wiped (head zeroed: {head}, metadata zeroed: {tail})");
+    }
+    head && tail
 }
 
 /// Resolve the twinstor SR uuid for uninstall: the recorded uuid when that SR
