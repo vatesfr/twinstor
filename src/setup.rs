@@ -2930,7 +2930,7 @@ mod tests {
         rig.set("hostname", "twinstor-3");
         let t0 = std::time::Instant::now();
         assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
-        assert!(rig.log().contains("stayed silent for 2s"), "{}", rig.log());
+        assert!(rig.log().contains("silent for 2s"), "{}", rig.log());
         assert!(
             t0.elapsed() >= std::time::Duration::from_secs(1),
             "{}",
@@ -3002,6 +3002,34 @@ mod tests {
         assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
         assert!(rig.log().contains("probed for 2s"), "{}", rig.log());
         drop(drbd);
+    }
+
+    #[test]
+    fn fence_peer_arbitrated_non_keeper_reads_a_serving_portal_as_alive() {
+        // After a lossy disconnect the keeper's DRBD can stay in teardown for
+        // half a minute, its port closed, while it already serves. The
+        // non-keeper must not read that as a dead peer and survive beside it:
+        // the keeper's portal answers, so it goes to the tiebreak and yields.
+        if !fence_rig_usable() {
+            return;
+        }
+        let rig = lossy_rig("arbportalgate", "127.0.0.3", 1);
+        std::fs::write(rig.root.join("etc/direct-peer"), "127.0.0.253\n").unwrap();
+        rig.set("hostname", "twinstor-3");
+        let portal = bind_or_wait("127.0.0.3", 3260);
+        assert_eq!(run_window(&rig, 6), 1, "{}", rig.log());
+        let log = rig.log();
+        assert!(log.contains("iSCSI portal answered within the window"), "{log}");
+        assert!(
+            log.lines().last().unwrap().contains("verdict=tiebreak_yield exit=1"),
+            "{log}"
+        );
+        // Target down too (a peer that serves nobody): gone, survive.
+        drop(portal);
+        let _ = std::fs::remove_file(rig.marker());
+        rig.set("susp", "fencing");
+        assert_eq!(run_window(&rig, 2), 4, "{}", rig.log());
+        assert!(rig.log().contains("silent for 2s"), "{}", rig.log());
     }
 
     #[test]

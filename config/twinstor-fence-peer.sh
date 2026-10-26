@@ -360,11 +360,15 @@ freeze_peer_reconnecting() {
 # forked (20 to 40% loss on both hosts, both topologies, test pools). The
 # keeper (the lower name, the tiebreak below) still decides on one probe, as
 # before. The other node, when its I/O is frozen while it decides (arbitrated,
-# or freeze mode), reads the peer as gone only after the peer's DRBD port
-# stayed silent for a short window; an answer sends it into the tiebreak,
-# where it yields only to a peer that demonstrably still serves. A dead keeper
-# costs the survivor this window. Under resource-only fencing this node's
-# copy takes writes while it decides, so nothing waits there.
+# or freeze mode), reads the peer as gone only after the peer stayed silent
+# for a short window; an answer sends it into the tiebreak, where it yields
+# only to a peer that demonstrably still serves. Silent means the peer's DRBD
+# port, and on arbitrated its iSCSI portal too: after a lossy disconnect the
+# keeper's DRBD can take half a minute to tear the old connection down and
+# listen again while it already serves (an arbitrated test pool forked on
+# that). A peer whose target is down serves nobody and still reads as gone.
+# A dead keeper costs the survivor this window. Under resource-only fencing
+# this node's copy takes writes while it decides, so nothing waits there.
 # Read where the decision needs it (a promote-time or isolated run never does).
 read_keeper() {
     MY_NAME=$(hostname)
@@ -380,18 +384,31 @@ read_keeper() {
 FROZEN_IO=0
 { [ -n "$DIRECT_PEER" ] || [ "$FREEZE" = 1 ]; } && FROZEN_IO=1
 PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-10}"
+peer_portal_answers() {
+    [ -n "$DIRECT_PEER" ] || return 1
+    for p in $PEER_ADDR $DIRECT_PEER; do
+        if timeout 2 bash -c "exec 3<>/dev/tcp/$p/$PORTAL_PORT" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
 peer_listening_within_window() {
     local end
     end=$(( $(date +%s) + PEER_SILENT_SECS ))
-    log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
+    log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it$([ -n "$DIRECT_PEER" ] && echo " and its iSCSI portal") for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
     while [ "$(date +%s)" -lt "$end" ]; do
         if peer_drbd_listening; then
             log "the peer's DRBD port answered within the window: the peer is alive -> tiebreak"
             return 0
         fi
+        if peer_portal_answers; then
+            log "the peer's iSCSI portal answered within the window: the peer serves -> tiebreak"
+            return 0
+        fi
         sleep 0.5
     done
-    log "the peer's DRBD port stayed silent for ${PEER_SILENT_SECS}s: the peer is gone"
+    log "the peer stayed silent for ${PEER_SILENT_SECS}s: the peer is gone"
     return 1
 }
 
