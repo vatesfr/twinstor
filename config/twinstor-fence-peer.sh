@@ -365,15 +365,18 @@ freeze_peer_reconnecting() {
 # where it yields only to a peer that demonstrably still serves. A dead keeper
 # costs the survivor this window. Under resource-only fencing this node's
 # copy takes writes while it decides, so nothing waits there.
-MY_NAME=$(hostname)
-PEER_NAME=$(timeout 10 drbdsetup events2 "$RESOURCE" --now 2>/dev/null \
-    | grep -o 'conn-name:[^ ]*' | head -1 | cut -d: -f2)
-# No name from DRBD (events2 failed): the configured peer name, the one the
-# daemon's own keeper rule reads, rather than none (which makes this node the
-# keeper, and the peer's run may read it the same way).
-[ -n "$PEER_NAME" ] || PEER_NAME=$(sed -n 's/^peer *= *"\(.*\)".*/\1/p' "$ETC/twinstor.toml" 2>/dev/null | head -1)
-IS_KEEPER=0
-{ [ -z "$PEER_NAME" ] || [ "$MY_NAME" \< "$PEER_NAME" ]; } && IS_KEEPER=1
+# Read where the decision needs it (a promote-time or isolated run never does).
+read_keeper() {
+    MY_NAME=$(hostname)
+    PEER_NAME=$(timeout 10 drbdsetup events2 "$RESOURCE" --now 2>/dev/null \
+        | grep -o 'conn-name:[^ ]*' | head -1 | cut -d: -f2)
+    # No name from DRBD (events2 failed): the configured peer name, the one
+    # the daemon's own keeper rule reads, rather than none (which makes this
+    # node the keeper, and the peer's run may read it the same way).
+    [ -n "$PEER_NAME" ] || PEER_NAME=$(sed -n 's/^peer *= *"\(.*\)".*/\1/p' "$ETC/twinstor.toml" 2>/dev/null | head -1)
+    IS_KEEPER=0
+    { [ -z "$PEER_NAME" ] || [ "$MY_NAME" \< "$PEER_NAME" ]; } && IS_KEEPER=1
+}
 FROZEN_IO=0
 { [ -n "$DIRECT_PEER" ] || [ "$FREEZE" = 1 ]; } && FROZEN_IO=1
 PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-10}"
@@ -462,6 +465,7 @@ for target in $TARGETS; do
         # replication with no solo-write generation bump on either side:
         # nothing diverges, nothing is discarded, no VMs restart. The
         # true-partition path (peer not listening) is unchanged and instant.
+        [ "$LOCAL_ROLE" != "Secondary" ] && read_keeper
         if [ "$LOCAL_ROLE" != "Secondary" ] && { peer_drbd_listening || freeze_peer_reconnecting \
             || { [ "$FROZEN_IO" = 1 ] && [ "$IS_KEEPER" = 0 ] && peer_listening_within_window; }; }; then
             for _ in 1 2 3 4; do

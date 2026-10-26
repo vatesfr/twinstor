@@ -2255,18 +2255,47 @@ fn ha_local_disarm_path() -> String {
         .unwrap_or_else(|_| "/var/lib/twinstor/ha-local-disarm".to_string())
 }
 
-/// Record a local emergency HA disarm under this boot's id. Free function:
-/// the whole-switch fast guard runs in a detached task.
+/// Record a local emergency HA disarm under this boot's id and the running
+/// xapi's PID, before the disarm. Only a host whose local HA is armed: that
+/// disarm is what sets the trap, and a pool whose HA was already off on
+/// purpose must never be re-armed by this. Free function: the whole-switch
+/// fast guard runs in a detached task.
 fn note_local_ha_disarm() {
-    if cfg!(test) {
+    if cfg!(test) || crate::xapi::local_ha_armed() != Some(true) {
         return;
     }
-    let boot = current_boot_id();
     let p = ha_local_disarm_path();
     if let Some(dir) = std::path::Path::new(&p).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&p, format!("boot_id={boot}\n"));
+    let _ = std::fs::write(
+        &p,
+        format!("boot_id={}\nxapi_pid={}\n", current_boot_id(), xapi_pid()),
+    );
+}
+
+/// The running xapi's PID, empty when none runs or it cannot be read.
+fn xapi_pid() -> String {
+    std::process::Command::new("pgrep")
+        .args(["-o", "-x", "xapi"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether xapi has started again since the record was written: the host
+/// rebooted, or the toolstack restarted (xapi checks the local armed flag at
+/// every start). A missing stamp or an unreadable current value proves
+/// nothing.
+fn xapi_restarted_since(record: &str, current_boot: &str, current_xapi_pid: &str) -> bool {
+    let pid = record
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("xapi_pid="))
+        .map(str::trim)
+        .unwrap_or("");
+    stamped_in_earlier_boot(record, current_boot)
+        || (!pid.is_empty() && !current_xapi_pid.is_empty() && pid != current_xapi_pid)
 }
 
 /// What the HA watchdog does with a local-disarm record.
@@ -2280,14 +2309,14 @@ enum DisarmTrapAction {
     /// a recovery that writes its own re-arm obligation), or this host is not
     /// the master that would re-enable it.
     Clear,
-    /// This host rebooted since the disarm and pool HA is off: xapi's
-    /// armed-mismatch trap disabled it. Write the re-arm obligation.
+    /// xapi started again since the disarm (a reboot or a toolstack restart)
+    /// and pool HA is off: its armed-mismatch trap disabled it. Write the
+    /// re-arm obligation.
     Rearm,
 }
 
 fn disarm_trap_decision(
-    record: &str,
-    current_boot: &str,
+    restarted: bool,
     local_armed: Option<bool>,
     ha: Option<bool>,
     is_master: bool,
@@ -2296,9 +2325,8 @@ fn disarm_trap_decision(
     if local_armed == Some(true) {
         return DisarmTrapAction::Clear;
     }
-    let rebooted = stamped_in_earlier_boot(record, current_boot);
     match ha {
-        Some(false) if !rebooted => DisarmTrapAction::Clear,
+        Some(false) if !restarted => DisarmTrapAction::Clear,
         Some(false) if hold_standing => DisarmTrapAction::Keep,
         Some(false) if is_master => DisarmTrapAction::Rearm,
         Some(false) => DisarmTrapAction::Clear,
@@ -8949,7 +8977,15 @@ impl StateMachine {
                         // Not the stale-target case, or guests run here:
                         // hold frozen with the plain reconnects below.
                         let refused = self.sa_sig_baseline.is_some_and(|b| sig_now > b);
-                        self.hold_stuck_primary(refused, guests).await;
+                        let why = if refused {
+                            "it is a suspended Primary whose reconnects to the peer keep \
+                             aborting, and guests run on it"
+                        } else {
+                            "it is a suspended Primary whose reconnects to the peer keep \
+                             aborting, and DRBD never asked to resync it from the peer, so the \
+                             peer may not be ahead (it may be frozen as well)"
+                        };
+                        self.hold_stuck_primary(why, guests).await;
                     } else if self.stuck_demote_given_up {
                         // Reboot fallback disarmed and the demote wedges:
                         // hold, but keep retrying the alert until delivered
@@ -10220,6 +10256,7 @@ impl StateMachine {
                     // always works; it unblocks xapi so the reset can then rewrite pool.conf
                     // to slave-of-peer. Detached: reset-master restarts the toolstack
                     // (~30-60 s); do not stall the tick. Rate-limited by the retry cadence.
+                    note_local_ha_disarm();
                     let cmd = format!(
                         "(xe host-emergency-ha-disable --force >/dev/null 2>&1; \
                           xe pool-emergency-reset-master master-address={peer_ip}) \
@@ -18777,6 +18814,7 @@ impl StateMachine {
                        clearing local HA state with 'host-emergency-ha-disable \
                        --force'; the re-arm path rejoins me afterwards"
                 );
+                note_local_ha_disarm();
                 let _ = crate::cmd::run_cmd_for(
                     "xe",
                     &["host-emergency-ha-disable", "--force"],
@@ -19360,8 +19398,7 @@ impl StateMachine {
         };
         let is_master = ha == Some(false) && xapi::is_pool_master_resilient().await == Some(true);
         match disarm_trap_decision(
-            &record,
-            &current_boot_id(),
+            xapi_restarted_since(&record, &current_boot_id(), &xapi_pid()),
             xapi::local_ha_armed(),
             ha,
             is_master,
@@ -19381,8 +19418,8 @@ impl StateMachine {
                         .unwrap_or_else(|| crate::setup::ha_timeout_secs(self.arbitrated));
                     warn!(
                         heal_event = "ha_rearm_after_armed_trap",
-                        "pool HA is off after this host rebooted while locally HA-disarmed \
-                         (xapi disables pool HA at such a boot); owing a re-arm once the pair \
+                        "pool HA is off after xapi restarted on this host while it was locally \
+                         HA-disarmed (xapi then disables pool HA); owing a re-arm once the pair \
                          is healthy"
                     );
                     ha_obligation_write(&sr, timeout.into());
@@ -21766,7 +21803,12 @@ impl StateMachine {
                  (or the count is unreadable): holding frozen instead of a forced reboot"
             );
             self.stuck_demote_given_up = true;
-            self.hold_stuck_primary(true, guests).await;
+            self.hold_stuck_primary(
+                "its stuck-Primary recovery could not complete (the storage teardown or \
+                 restart wedged), and guests run on it",
+                guests,
+            )
+            .await;
             return;
         }
         let recent = stuck_fence_recent(
@@ -21828,45 +21870,33 @@ impl StateMachine {
         }
     }
 
-    /// A frozen Primary the stuck-Primary recovery must not touch: DRBD
-    /// never asked to resync it from the peer (`refused` false: no proof the
-    /// peer is ahead, which is also what both nodes frozen by their own
-    /// yields looks like), or guests run on it. It stays frozen, nothing is
-    /// torn down, the plain reconnects continue, and the operator is told
-    /// once per episode (delivered-only latch, like `alert_stuck_hold`).
-    async fn hold_stuck_primary(&mut self, refused: bool, guests: Option<usize>) {
+    /// A node the stuck-Primary recovery must not touch further: DRBD never
+    /// asked to resync it from the peer (no proof the peer is ahead, which is
+    /// also what both nodes frozen by their own yields looks like), or guests
+    /// run on it (or their count cannot be read). Nothing is torn down, the
+    /// plain reconnects continue, and the operator is told once per episode
+    /// (delivered-only latch, like `alert_stuck_hold`). `why` completes "this
+    /// node is held because ...".
+    async fn hold_stuck_primary(&mut self, why: &str, guests: Option<usize>) {
         if !self.stuck_held_logged {
             warn!(
                 aborted_reconnects = self.sa_aborted_reconnects,
-                stale_target_refusal = refused,
                 guests = ?guests,
                 heal_event = "stuck_primary_held",
-                "suspended non-serving Primary stuck StandAlone, but not demoting in place: \
-                 {}",
-                if !refused {
-                    "DRBD never asked to resync this copy from the peer (the peer may be \
-                     frozen too)"
-                } else {
-                    "guests run on this host (or the count is unreadable)"
-                }
+                "not recovering this node in place: {why}"
             );
             self.stuck_held_logged = true;
         }
         if self.stuck_held_alerted {
             return;
         }
-        let why = if !refused {
-            "DRBD never asked to resync it from the peer, so the peer may not be ahead (it may be frozen as well)"
-        } else {
-            "guests run on it"
-        };
         if xapi::send_xapi_alert(&format!(
-            "TwinStor is holding this node frozen instead of recovering it: its storage \
-             I/O has been suspended since a fence-peer yield, its reconnects to the peer \
-             keep aborting, and {why}. Demoting it in place would tear its storage down \
-             under the frozen I/O and could force a reboot under the guests. Check \
-             whether the peer is serving; if both nodes are frozen, the pair needs an \
-             operator to choose which node resumes (see Troubleshooting)."
+            "TwinStor is holding this node as it is instead of recovering it in place: \
+             {why} (or their count cannot be read). Tearing its storage down or \
+             rebooting it now could stop running guests or leave the pair with no \
+             copy serving. Check whether the peer is serving; if both nodes are frozen, \
+             the pair needs an operator to choose which node resumes (see \
+             Troubleshooting)."
         ))
         .await
         {
@@ -31790,48 +31820,33 @@ poll_interval_ms = 10
 
     #[test]
     fn disarm_trap_decision_table() {
-        use super::{DisarmTrapAction as A, disarm_trap_decision as d};
-        let rec = "boot_id=aaaa\n";
-        // Same boot: pool HA on keeps; pool HA off is someone's decision.
-        assert_eq!(
-            d(rec, "aaaa", Some(false), Some(true), true, false),
-            A::Keep
-        );
-        assert_eq!(
-            d(rec, "aaaa", Some(false), Some(false), true, false),
-            A::Clear
-        );
-        // Rebooted since the disarm, pool HA off: the trap. The master owes a
-        // re-arm, not while a hold stands, and a slave drops the record.
-        assert_eq!(
-            d(rec, "bbbb", Some(false), Some(false), true, false),
-            A::Rearm
-        );
-        assert_eq!(
-            d(rec, "bbbb", Some(false), Some(false), true, true),
-            A::Keep
-        );
-        assert_eq!(
-            d(rec, "bbbb", Some(false), Some(false), false, false),
-            A::Clear
-        );
-        // Rebooted, HA still reads on (xapi not settled yet) or unreadable.
-        assert_eq!(
-            d(rec, "bbbb", Some(false), Some(true), true, false),
-            A::Keep
-        );
-        assert_eq!(d(rec, "bbbb", None, None, true, false), A::Keep);
+        use super::{DisarmTrapAction as A, disarm_trap_decision as d, xapi_restarted_since};
+        // xapi not restarted since the disarm: pool HA on keeps; pool HA off
+        // is someone's decision.
+        assert_eq!(d(false, Some(false), Some(true), true, false), A::Keep);
+        assert_eq!(d(false, Some(false), Some(false), true, false), A::Clear);
+        // Restarted since, pool HA off: the trap. The master owes a re-arm,
+        // not while a hold stands, and a slave drops the record.
+        assert_eq!(d(true, Some(false), Some(false), true, false), A::Rearm);
+        assert_eq!(d(true, Some(false), Some(false), true, true), A::Keep);
+        assert_eq!(d(true, Some(false), Some(false), false, false), A::Clear);
+        // Restarted, HA still reads on (xapi not settled yet) or unreadable.
+        assert_eq!(d(true, Some(false), Some(true), true, false), A::Keep);
+        assert_eq!(d(true, None, None, true, false), A::Keep);
         // Realigned by a pool cycle: spent, whatever else.
-        assert_eq!(
-            d(rec, "bbbb", Some(true), Some(false), true, false),
-            A::Clear
+        assert_eq!(d(true, Some(true), Some(false), true, false), A::Clear);
+
+        let rec = "boot_id=aaaa\nxapi_pid=100\n";
+        assert!(!xapi_restarted_since(rec, "aaaa", "100"));
+        assert!(xapi_restarted_since(rec, "bbbb", "100"), "rebooted");
+        assert!(
+            xapi_restarted_since(rec, "aaaa", "200"),
+            "toolstack restart"
         );
-        // No stamp, or an unreadable boot_id, proves no reboot.
-        assert_eq!(
-            d("", "bbbb", Some(false), Some(false), true, false),
-            A::Clear
-        );
-        assert_eq!(d(rec, "", Some(false), Some(false), true, false), A::Clear);
+        // Unreadable values prove nothing.
+        assert!(!xapi_restarted_since(rec, "", ""));
+        assert!(!xapi_restarted_since("", "bbbb", "200"));
+        assert!(!xapi_restarted_since("boot_id=aaaa\n", "aaaa", "200"));
     }
 
     #[test]
