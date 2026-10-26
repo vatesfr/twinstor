@@ -292,7 +292,13 @@ fn parse_sr_blockers(mounts: &str, pvs: &str) -> Vec<(String, String)> {
         let (Some(pv), Some(vg)) = (f.next(), f.next()) else {
             continue;
         };
-        if let Some(uuid) = vg.strip_prefix("VG_XenStorage-")
+        // LVM SRs live in VG_XenStorage-<uuid>; the EXT local SR (the XCP-ng
+        // installer's default) in XSLocalEXT-<uuid>, whose filesystem is
+        // mounted from a device-mapper node and so never shows above. Missing
+        // it hid a tester's three data disks with no word on why.
+        if let Some(uuid) = vg
+            .strip_prefix("VG_XenStorage-")
+            .or_else(|| vg.strip_prefix("XSLocalEXT-"))
             && !is_dm(pv)
             && seen.insert(pv.to_string())
         {
@@ -1723,6 +1729,22 @@ tmpfs /dev/shm tmpfs rw 0 0\n";
   /dev/sda4     twinstor-vg\n";
         let got = parse_sr_blockers(mounts, pvs);
         assert_eq!(got.len(), 2);
+        // The installer's EXT local SR over several disks: its mount is a
+        // device-mapper node (skipped), its PVs carry the SR uuid.
+        let ext_mounts = "/dev/mapper/XSLocalEXT--b7a2eef2--fdef--c3d5--10ba--dcf0e4c440e4-b7a2eef2--fdef--c3d5--10ba--dcf0e4c440e4 /run/sr-mount/b7a2eef2-fdef-c3d5-10ba-dcf0e4c440e4 ext3 rw 0 0\n";
+        let ext_pvs = "\
+  /dev/sda  XSLocalEXT-b7a2eef2-fdef-c3d5-10ba-dcf0e4c440e4\n\
+  /dev/sdb  XSLocalEXT-b7a2eef2-fdef-c3d5-10ba-dcf0e4c440e4\n\
+  /dev/sdc  XSLocalEXT-b7a2eef2-fdef-c3d5-10ba-dcf0e4c440e4\n";
+        let ext = parse_sr_blockers(ext_mounts, ext_pvs);
+        assert_eq!(
+            ext.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(),
+            ["/dev/sda", "/dev/sdb", "/dev/sdc"]
+        );
+        assert!(
+            ext.iter()
+                .all(|(_, u)| u == "b7a2eef2-fdef-c3d5-10ba-dcf0e4c440e4")
+        );
         assert_eq!(
             got[0],
             (
