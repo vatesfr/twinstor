@@ -40,7 +40,7 @@ The [installation guide](https://docs.vates.tech/tech-preview/twinstor/installat
 
 - **Exactly two hosts and two copies.** While a host or a disk is down, the pool runs on one copy until the resync finishes.
 - **Long network cuts with HA on can reboot a host.** After a cut of more than about a minute, XCP-ng HA may reboot one host once the link is back. No confirmed write is lost, and HA restarts that host's VMs.
-- **A double network failure can cost a few seconds of writes.** If the two hosts lose each other completely while both still reach the gateway (in arbitrated mode, the direct cable and the switched path failing together), both keep serving. When they reconnect, the writes made on one side during the cut are discarded, and an alert names the VMs concerned.
+- **A double network failure can cost the writes made during it.** If the two hosts lose each other completely while both still reach the gateway (in arbitrated mode, the direct cable and the switched path failing together), both keep serving. When they reconnect, the writes made on one side during the cut are discarded, and an alert names the VMs concerned. The longer the cut lasts, the more is lost.
 - **XCP-ng 8.3, x86_64.**
 
 ## How it is tested
