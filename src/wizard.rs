@@ -1036,10 +1036,166 @@ async fn pif_uuid_for_device(device: &str) -> Option<String> {
     (!u.is_empty()).then(|| u.to_string())
 }
 
+/// What to do with the peer's PIF on the direct-link network, given its
+/// current state.
+#[derive(Debug, PartialEq)]
+enum PeerEnd {
+    /// It already holds the expected address.
+    Done,
+    /// No address and a link: configure it.
+    Configure,
+    /// Something else is there; the operator decides.
+    Refuse(String),
+}
+
+fn peer_end_action(ip: &str, carrier: bool, management: bool, expected: Ipv4Addr) -> PeerEnd {
+    if management {
+        PeerEnd::Refuse("it is the peer's management interface".into())
+    } else if ip == expected.to_string() {
+        PeerEnd::Done
+    } else if !ip.is_empty() {
+        PeerEnd::Refuse(format!("it already has the address {ip}"))
+    } else if !carrier {
+        PeerEnd::Refuse("it shows no link (is the cable on another port of the peer?)".into())
+    } else {
+        PeerEnd::Configure
+    }
+}
+
+/// The peer's PIF on the same network as this host's `device`, if exactly one.
+async fn peer_pif_on_same_network(device: &str) -> Option<String> {
+    let (_, peer_host) = two_host_pool().await?;
+    let local = pif_uuid_for_device(device).await?;
+    let network = pif_params(&local).await.get("network-uuid").cloned()?;
+    let pif = cmd_output(
+        "xe",
+        &[
+            "pif-list",
+            &format!("host-uuid={peer_host}"),
+            &format!("network-uuid={network}"),
+            "--minimal",
+        ],
+    )
+    .await
+    .ok()?;
+    let pif = pif.trim();
+    (!pif.is_empty() && !pif.contains(',')).then(|| pif.to_string())
+}
+
+/// Give the peer's end of the direct link `peer_dl`/30, on the peer's PIF in
+/// the same network as `device` here. Both hosts are in one pool, so XAPI
+/// reaches the peer's PIF from here. Without this, the first node's setup
+/// pinged an address nobody had configured yet and always stopped.
+async fn configure_peer_end(device: &str, peer_dl: Ipv4Addr) -> Result<()> {
+    let manual = format!(
+        "configure the peer's end of the direct link by hand, on the peer:\n\
+         \x20 PIF=$(xe pif-list device=<its direct-link NIC> host-uuid=$(xe host-list hostname=$(hostname) --minimal) --minimal)\n\
+         \x20 xe pif-reconfigure-ip uuid=$PIF mode=static IP={peer_dl} netmask={DIRECT_LINK_NETMASK}\n\
+         then run setup here again"
+    );
+    let Some(peer_pif) = peer_pif_on_same_network(device).await else {
+        bail!("the peer has no single NIC on the same network as {device}; {manual}");
+    };
+    let p = pif_params(&peer_pif).await;
+    let peer_dev = p.get("device").cloned().unwrap_or_default();
+    let action = peer_end_action(
+        p.get("IP").map(String::as_str).unwrap_or(""),
+        p.get("carrier").is_some_and(|s| s == "true"),
+        p.get("management").is_some_and(|s| s == "true"),
+        peer_dl,
+    );
+    match action {
+        PeerEnd::Done => println!("  the peer's {peer_dev} already has {peer_dl}."),
+        PeerEnd::Refuse(why) => {
+            bail!("the peer's {peer_dev} cannot take {peer_dl}: {why}; {manual}")
+        }
+        PeerEnd::Configure => {
+            if !ask_yes_no(
+                &format!("Configure the peer's {peer_dev} with {peer_dl}/30 too?"),
+                true,
+            )? {
+                bail!("{manual}");
+            }
+            run_cmd(
+                "xe",
+                &[
+                    "pif-reconfigure-ip",
+                    &format!("uuid={peer_pif}"),
+                    "mode=static",
+                    &format!("IP={peer_dl}"),
+                    &format!("netmask={DIRECT_LINK_NETMASK}"),
+                ],
+            )
+            .await
+            .with_context(|| format!("reconfiguring the peer's {peer_dev} with {peer_dl}/30"))?;
+            println!("  configured the peer's {peer_dev} = {peer_dl}/30.");
+        }
+    }
+    // The peer applies the address on its side; give it a moment before the
+    // setup's own reachability check.
+    for _ in 0..20 {
+        if ping_once(&peer_dl.to_string()).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    bail!(
+        "{peer_dl} does not answer over {device}: the cable may sit on another NIC of the \
+         peer than {peer_dev}. Check the cabling, or {manual}"
+    )
+}
+
+async fn ping_once(ip: &str) -> bool {
+    tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "1", ip])
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success())
+}
+
+/// A non-management PIF of this host with a /30 address whose peer PIF on the
+/// same network has none: the direct link of an earlier setup run that
+/// stopped before the peer's end was configured. Returns the device and this
+/// host's address on it.
+async fn half_configured_link() -> Option<(String, Ipv4Addr)> {
+    let (this_host, _) = two_host_pool().await?;
+    let pifs = cmd_output(
+        "xe",
+        &["pif-list", &format!("host-uuid={this_host}"), "--minimal"],
+    )
+    .await
+    .ok()?;
+    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let p = pif_params(pif).await;
+        let (Some(dev), Some(ip)) = (
+            p.get("device"),
+            p.get("IP").and_then(|s| s.parse::<Ipv4Addr>().ok()),
+        ) else {
+            continue;
+        };
+        if p.get("management").is_some_and(|s| s == "true")
+            || p.get("netmask").map(String::as_str) != Some(DIRECT_LINK_NETMASK)
+            || p2p_peer(ip).is_none()
+        {
+            continue;
+        }
+        let Some(peer_pif) = peer_pif_on_same_network(dev).await else {
+            continue;
+        };
+        if pif_params(&peer_pif)
+            .await
+            .get("IP")
+            .is_none_or(|s| s.is_empty())
+        {
+            return Some((dev.clone(), ip));
+        }
+    }
+    None
+}
+
 /// Configure this host's end of the direct link with `local_dl`/30 via the
-/// persistent XAPI method, then confirm the address comes up. Only this node's
-/// end: the peer configures its own (dom0-to-dom0 SSH over the link doesn't
-/// work, and setup runs per-host anyway).
+/// persistent XAPI method, then confirm the address comes up. The peer's end
+/// is `configure_peer_end`.
 async fn configure_direct_link(device: &str, local_dl: Ipv4Addr) -> Result<()> {
     let uuid = pif_uuid_for_device(device)
         .await
@@ -1083,6 +1239,17 @@ async fn resolve_direct_link(
         .collect();
     ready.sort_by_key(|n| std::cmp::Reverse(n.point_to_point));
     let ready_ips: Vec<IpAddr> = ready.iter().map(|n| n.peer_ip).collect();
+    if ready.is_empty()
+        && let Some((device, local_dl)) = half_configured_link().await
+    {
+        let peer_dl = p2p_peer(local_dl).expect("checked by half_configured_link");
+        println!(
+            "\n{device} has {local_dl}/30 here, but the peer's end of that link has no address\n\
+             yet (an earlier setup stopped before configuring it)."
+        );
+        configure_peer_end(&device, peer_dl).await?;
+        return Ok(Some(IpAddr::V4(peer_dl)));
+    }
     // Only probe NICs if there's no ready network to offer.
     let carrier = if ready.is_empty() {
         carrier_nics_without_ip().await
@@ -1129,9 +1296,8 @@ async fn resolve_direct_link(
             println!("\nFound a cabled NIC with no IP: {device} (a likely direct link).");
             if ask_yes_no(&format!("Configure {device} as the direct link now?"), true)? {
                 println!(
-                    "This host takes one end of a point-to-point /30; the peer takes the\n\
-                     other. Use 10.99.99.1 on the first node and 10.99.99.2 on the second\n\
-                     (match what the first node printed)."
+                    "This host takes one end of a point-to-point /30 and the peer the other;\n\
+                     setup configures both. Pick another /30 if 10.99.99.0/30 is in use."
                 );
                 let local_dl = loop {
                     let Ok(ip) =
@@ -1155,7 +1321,7 @@ async fn resolve_direct_link(
                 let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
                 configure_direct_link(&device, local_dl).await?;
                 println!("  configured {device} = {local_dl}/30; the peer's end is {peer_dl}.");
-                println!("  when you run setup on the peer, give its end {peer_dl}.");
+                configure_peer_end(&device, peer_dl).await?;
                 Ok(Some(IpAddr::V4(peer_dl)))
             } else {
                 println!("\n{}", direct_link_instructions(&device));
@@ -1812,6 +1978,29 @@ mod tests {
     #[test]
     fn nothing_found_yields_none() {
         assert_eq!(decide_direct_link(&[], &[]), DirectLinkOutcome::None);
+    }
+
+    #[test]
+    fn peer_end_configured_only_when_blank_and_cabled() {
+        let want: Ipv4Addr = "10.99.99.2".parse().unwrap();
+        assert_eq!(peer_end_action("", true, false, want), PeerEnd::Configure);
+        assert_eq!(
+            peer_end_action("10.99.99.2", true, false, want),
+            PeerEnd::Done
+        );
+        assert!(matches!(
+            peer_end_action("192.0.2.7", true, false, want),
+            PeerEnd::Refuse(_)
+        ));
+        assert!(matches!(
+            peer_end_action("", false, false, want),
+            PeerEnd::Refuse(_)
+        ));
+        // Never touch the peer's management NIC, even blank and cabled.
+        assert!(matches!(
+            peer_end_action("", true, true, want),
+            PeerEnd::Refuse(_)
+        ));
     }
 
     #[test]
