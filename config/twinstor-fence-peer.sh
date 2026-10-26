@@ -387,29 +387,37 @@ read_keeper() {
 FROZEN_IO=0
 [ -n "$DIRECT_PEER" ] && FROZEN_IO=1
 PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-10}"
-peer_portal_answers() {
-    [ -n "$DIRECT_PEER" ] || return 1
+# One round of the window: the peer's DRBD port and iSCSI portal on both
+# addresses, all at once with 1 s each, so a dead peer costs one second a
+# round (one probe after another at 2 s each made a 10 s window last 17 s,
+# the survivor's I/O frozen all along) and a lossy link gets four chances.
+# Prints which ports answered.
+peer_probe_round() {
+    local p port
     for p in $PEER_ADDR $DIRECT_PEER; do
-        if timeout 2 bash -c "exec 3<>/dev/tcp/$p/$PORTAL_PORT" 2>/dev/null; then
-            return 0
-        fi
+        for port in $DRBD_PORT $PORTAL_PORT; do
+            ( timeout 1 bash -c "exec 3<>/dev/tcp/$p/$port" 2>/dev/null && echo "$port" ) &
+        done
     done
-    return 1
+    wait
 }
 peer_listening_within_window() {
-    local end
+    local end answered
     end=$(( $(date +%s) + PEER_SILENT_SECS ))
     log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it and its iSCSI portal for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
     while [ "$(date +%s)" -lt "$end" ]; do
-        if peer_drbd_listening; then
-            log "the peer's DRBD port answered within the window: the peer is alive -> tiebreak"
-            return 0
-        fi
-        if peer_portal_answers; then
-            log "the peer's iSCSI portal answered within the window: the peer serves -> tiebreak"
-            return 0
-        fi
-        sleep 0.5
+        answered=$(peer_probe_round)
+        case " $(echo $answered) " in
+            *" $DRBD_PORT "*)
+                log "the peer's DRBD port answered within the window: the peer is alive -> tiebreak"
+                return 0
+                ;;
+            *" $PORTAL_PORT "*)
+                log "the peer's iSCSI portal answered within the window: the peer serves -> tiebreak"
+                return 0
+                ;;
+        esac
+        sleep 0.2
     done
     log "the peer stayed silent for ${PEER_SILENT_SECS}s: the peer is gone"
     return 1
