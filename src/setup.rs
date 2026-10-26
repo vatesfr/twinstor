@@ -2439,6 +2439,7 @@ mod tests {
                      role) [ -f $S/role_fails ] && exit 1; cat $S/role ;;\n\
                      status) [ -f $S/status_fails ] && exit 1; echo \"$2 role:$(cat $S/role) suspended:$(cat $S/susp)\" ;;\n\
                      cstate) echo StandAlone ;;\n\
+                     get-gi) cat $S/gi 2>/dev/null ;;\n\
                      suspend-io) [ -f $S/suspend_rc ] && exit $(cat $S/suspend_rc); echo user,fencing > $S/susp; [ -f $S/suspend_hangs ] && sleep 30 ;;\n\
                      esac\nexit 0\n",
                         st = st.display()
@@ -2605,6 +2606,63 @@ mod tests {
         rig.set("ping_rc", "1");
         assert_eq!(rig.run(5), 1, "{}", rig.log());
         assert!(rig.marker().exists(), "an isolated node records its yield");
+    }
+
+    #[test]
+    fn fence_peer_a_standing_win_keeps_serving() {
+        if !fence_rig_usable() {
+            return;
+        }
+        let rig = FenceRig::new("keepwin");
+        let win = rig.root.join("state/win-claim");
+        std::fs::write(&win, "06B424565A635FA7\n").unwrap();
+        let run = |rig: &FenceRig| {
+            rig.command(5)
+                .env("TWINSTOR_WIN_CLAIM_MARKER", &win)
+                .status()
+                .unwrap()
+                .code()
+                .unwrap()
+        };
+        // Gateway down, serving, with the win of this split: the record
+        // names this node's bitmap generation (bit 0 aside). Keep serving.
+        rig.set("ping_rc", "1");
+        rig.set("susp", "none");
+        rig.set(
+            "gi",
+            "38DD10FC3F5DEEFF:06B424565A635FA7:264E6B831F610398:0:1:1:1:1:0:0:0:1:0:1:0:1",
+        );
+        assert_eq!(run(&rig), 4, "{}", rig.log());
+        assert!(rig.log().contains("keep_win"), "{}", rig.log());
+        assert!(!rig.marker().exists(), "no yield recorded");
+        // Frozen (a win recorded while frozen keeps its own rules): no keep_win.
+        rig.set("susp", "user");
+        assert_eq!(run(&rig), 1, "{}", rig.log());
+        assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
+        // A standing yield wins over the record.
+        assert!(rig.marker().exists());
+        rig.set("susp", "none");
+        let _ = run(&rig);
+        assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
+        // A record from an earlier episode (the bitmap generation moved on,
+        // or the pair is in sync): the gateway decides as before.
+        let _ = std::fs::remove_file(rig.marker());
+        rig.set(
+            "gi",
+            "38DD10FC3F5DEEFF:0000000000000000:06B424565A635FA6:0:1:1:1:1:0:0:0:1:0:1:0:1",
+        );
+        assert_eq!(run(&rig), 1, "{}", rig.log());
+        let _ = std::fs::remove_file(rig.marker());
+        rig.set(
+            "gi",
+            "38DD10FC3F5DEEFF:1111111111111110:06B424565A635FA6:0:1:1:1:1:0:0:0:1:0:1:0:1",
+        );
+        assert_eq!(run(&rig), 1, "{}", rig.log());
+        // No record: the gateway decides as before.
+        let _ = std::fs::remove_file(rig.marker());
+        std::fs::remove_file(&win).unwrap();
+        assert_eq!(run(&rig), 1, "{}", rig.log());
+        assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
     }
 
     #[test]

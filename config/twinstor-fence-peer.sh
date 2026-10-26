@@ -307,6 +307,34 @@ if [ -f "$YIELD_MARKER" ] && [ "$LOCAL_ROLE" != "Secondary" ]; then
     log "a yield marker is present ($(cat "$YIELD_MARKER" 2>/dev/null)) but this node's I/O is not suspended:user -> stale, deciding afresh"
 fi
 
+# A win of this split taken by the daemon (an arbitrated mutual-freeze
+# resolution, or a split-brain resolution this node won) stands for the rest
+# of the episode: this node serves and the peer's copy is the one discarded.
+# A later disconnect (the handshake the peer declines while still Primary)
+# must not make it yield again: frozen again, its guests fail over to the
+# peer's portal and write onto the copy about to be discarded. Only while
+# this node serves (Primary, no yield marker, not suspended:user); a node
+# that recorded a win while frozen keeps its yield above. The daemon removes
+# the record at every episode end, and the record counts only while it names
+# this node's bitmap generation: the generation both copies held when this
+# node resumed alone (it moved there at this node's first write since), so a
+# record left by an earlier episode never matches once the pair resynced.
+WIN_RECORD="${TWINSTOR_WIN_CLAIM_MARKER:-/var/lib/twinstor/split-brain-win-claim}"
+win_bound_here() {
+    local w bm
+    w=$(head -1 "$WIN_RECORD" 2>/dev/null | tr -d ' ')
+    case "$w" in [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;; *) return 1 ;; esac
+    bm=$(timeout 10 drbdadm get-gi "$RESOURCE" 2>/dev/null | head -1 | cut -d: -f2)
+    case "$bm" in [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;; *) return 1 ;; esac
+    # Bit 0 is DRBD's primary-at-the-time flag, not part of the generation.
+    [ $(( 0x$bm & ~1 )) -ne 0 ] && [ $(( 0x$w & ~1 )) -eq $(( 0x$bm & ~1 )) ]
+}
+if [ -f "$WIN_RECORD" ] && [ "$LOCAL_ROLE" = "Primary" ] && [ ! -f "$YIELD_MARKER" ] \
+    && [ "$(io_suspend_state)" = none ] && win_bound_here; then
+    log "this node holds the win of this split ($(head -1 "$WIN_RECORD" 2>/dev/null)) and serves -> keep serving (exit 4)"
+    verdict keep_win 4
+fi
+
 # Administrative-bounce guard. A deliberate replication bounce (the
 # daemon's stuck-WFBitMap auto-clear, or a runbook maintenance bounce)
 # advertises a trailing "B" token on the bouncing node's beacon line
