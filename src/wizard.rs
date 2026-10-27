@@ -1900,6 +1900,79 @@ async fn resolve_direct_link(
     }
 }
 
+/// How the second node takes up the first node's direct link.
+#[derive(Debug, PartialEq, Eq)]
+enum InheritedLink {
+    /// The first node's end answers: use it.
+    Use(IpAddr),
+    /// This host has no address on that link yet (a first node that only
+    /// configured its own end): configure this end, never fate-shared.
+    ConfigureHere,
+    /// This host has its end, and the first node's does not answer.
+    NoAnswer(IpAddr),
+}
+
+fn inherited_link_action(
+    first_end: Option<IpAddr>,
+    answers: bool,
+    has_local_end: bool,
+) -> InheritedLink {
+    match first_end {
+        Some(ip) if answers => InheritedLink::Use(ip),
+        Some(ip) if has_local_end => InheritedLink::NoAnswer(ip),
+        _ => InheritedLink::ConfigureHere,
+    }
+}
+
+/// The second node in arbitrated mode: follow the first node's direct link
+/// (it configured both ends) instead of choosing again, and never fall back
+/// to fate-shared, which would leave the two hosts on different topologies.
+async fn follow_inherited_direct_link(
+    nets: &[PeerNetwork],
+    peer_ip: IpAddr,
+    peer: &str,
+    first_end: Option<IpAddr>,
+) -> Result<IpAddr> {
+    let mut answers = false;
+    let mut has_local_end = false;
+    if let Some(ip) = first_end {
+        println!("Direct link: {peer}'s end is {ip} (set up by {peer}); checking it answers...");
+        for _ in 0..5 {
+            if ping_once(&ip.to_string()).await {
+                answers = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        has_local_end = match ip {
+            IpAddr::V4(v4) => p2p_collision(&host_ipv4_addrs().await, v4).is_some(),
+            IpAddr::V6(_) => true,
+        };
+    }
+    match inherited_link_action(first_end, answers, has_local_end) {
+        InheritedLink::Use(ip) => {
+            println!("  it answers.");
+            Ok(ip)
+        }
+        InheritedLink::NoAnswer(ip) => bail!(
+            "the direct link to {ip} ({peer}'s end) does not answer from this host: check the \
+             cable between the two hosts (both ports show a link), then run setup again"
+        ),
+        InheritedLink::ConfigureHere => {
+            println!("This host has no address on the direct link yet; set up its end now.");
+            match resolve_direct_link(nets, peer_ip, peer, false).await? {
+                Some(ip) if first_end.is_none_or(|f| f == ip) => Ok(ip),
+                Some(ip) => bail!(
+                    "the link set up here reaches {ip}, but {peer}'s end of the direct link is \
+                     {}: pick the NIC cabled to that end, then run setup again",
+                    first_end.map(|f| f.to_string()).unwrap_or_default()
+                ),
+                None => bail!("{peer} runs in arbitrated mode; this host needs the direct link"),
+            }
+        }
+    }
+}
+
 /// What an existing configuration on this host stands for.
 #[derive(Debug, PartialEq, Eq)]
 enum InstallState {
@@ -2245,9 +2318,11 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // default; arbitrated (direct link) suits a redundant/multi-switch network.
     let direct_ip: Option<IpAddr> = if let Some(inh) = &inherited {
         if inh.arbitrated {
-            println!("Inherited topology: arbitrated (direct link); configure this node's end.");
-            println!("\n{ARBITRATED_MODE_NOTE}\n");
-            resolve_direct_link(&nets, peer_ip, &peer_name, true).await?
+            println!(
+                "Topology: arbitrated, chosen on {peer_name}: replication uses a direct cable\n\
+                 between the two hosts, with the switched network as a fallback."
+            );
+            Some(follow_inherited_direct_link(&nets, peer_ip, &peer_name, inh.direct_ip).await?)
         } else {
             println!("Inherited topology: fate-shared (single path).");
             None
@@ -2624,6 +2699,31 @@ initiator_iqns = ["iqn.a"]
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_second_host_follows_the_first_hosts_direct_link() {
+        let first = Some(ip("10.99.99.1"));
+        assert_eq!(
+            inherited_link_action(first, true, true),
+            InheritedLink::Use(ip("10.99.99.1"))
+        );
+        // The first host configured both ends, but the cable is wrong.
+        assert_eq!(
+            inherited_link_action(first, false, true),
+            InheritedLink::NoAnswer(ip("10.99.99.1"))
+        );
+        // A first host that configured only its own end.
+        assert_eq!(
+            inherited_link_action(first, false, false),
+            InheritedLink::ConfigureHere
+        );
+        // A first host that published no address: set up this end, never
+        // fall back to fate-shared.
+        assert_eq!(
+            inherited_link_action(None, false, false),
+            InheritedLink::ConfigureHere
+        );
     }
 
     #[test]

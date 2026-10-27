@@ -136,6 +136,11 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
             inh.chap_check.as_deref(),
             &peer_name,
         )?;
+        if let Some(refusal) =
+            topology_mismatch(inh.arbitrated, inh.direct_ip, params.direct_ip, &peer_name)
+        {
+            return Err(refusal.into());
+        }
     }
     // An accidental re-run on a working pair must stop before any file is
     // rewritten or DRBD taken down, so the live-SR guard runs first.
@@ -707,6 +712,52 @@ fn second_node_chap_gate(given: Option<&str>, check: Option<&str>, peer: &str) -
             .into())
         }
         Some(_) => Ok(()),
+    }
+}
+
+/// The second node must run the first node's topology: a pair where one host
+/// replicates over a direct link and the other over the switch alone is not
+/// a supported configuration. None when they agree.
+fn topology_mismatch(
+    first_arbitrated: bool,
+    first_direct: Option<IpAddr>,
+    given_direct: Option<IpAddr>,
+    peer: &str,
+) -> Option<crate::render::CliError> {
+    let flag = first_direct
+        .map(|d| format!("--direct-ip {d}"))
+        .unwrap_or_else(|| "--direct-ip <its direct-link IP>".into());
+    match (first_arbitrated, given_direct) {
+        (true, None) => Some(
+            crate::render::CliError::new(
+                format!(
+                    "{peer} runs in arbitrated mode (a direct cable between the two hosts), and \
+                     this command sets up fate-shared mode; nothing was changed"
+                ),
+                format!("add {flag} to this command"),
+            )
+            .explain("both hosts of a pair must use the same topology"),
+        ),
+        (false, Some(_)) => Some(
+            crate::render::CliError::new(
+                format!(
+                    "{peer} runs in fate-shared mode (one network), and this command sets up a \
+                     direct link; nothing was changed"
+                ),
+                "drop --direct-ip from this command",
+            )
+            .explain("both hosts of a pair must use the same topology"),
+        ),
+        (true, Some(given)) if first_direct.is_some_and(|f| f != given) => {
+            Some(crate::render::CliError::new(
+                format!(
+                    "--direct-ip {given} is not {peer}'s end of the direct link; nothing was \
+                     changed"
+                ),
+                format!("use {flag}"),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -4360,5 +4411,19 @@ mod setup_flow_tests {
         assert!(t.contains("500 GB at 1000 Mb/s"), "{t}");
         let t = peer_wait_timeout_text("host-b", PEER_WAIT_SECS, None, Some(1000));
         assert!(t.contains("hours for large disks"), "{t}");
+    }
+
+    #[test]
+    fn the_second_host_must_follow_the_first_hosts_topology() {
+        let d: IpAddr = "10.99.99.1".parse().unwrap();
+        let other: IpAddr = "10.99.99.5".parse().unwrap();
+        let e = topology_mismatch(true, Some(d), None, "host-a").expect("refused");
+        assert!(format!("{e:?}").contains("--direct-ip 10.99.99.1"), "{e:?}");
+        assert!(topology_mismatch(false, None, Some(d), "host-a").is_some());
+        assert!(topology_mismatch(true, Some(d), Some(other), "host-a").is_some());
+        assert!(topology_mismatch(true, Some(d), Some(d), "host-a").is_none());
+        assert!(topology_mismatch(false, None, None, "host-a").is_none());
+        // A first node that published no direct-link address: any is taken.
+        assert!(topology_mismatch(true, None, Some(other), "host-a").is_none());
     }
 }
