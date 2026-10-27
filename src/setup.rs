@@ -588,8 +588,14 @@ initiator_iqns = [{iqn_list}]
         println!("\n======================================================================");
         println!("  Action required: now set up the other node ({peer_name}).");
         println!("======================================================================");
-        println!("  This node is configured and is now waiting for {peer_name} to connect.");
-        println!("  Nothing else happens until you set it up.");
+        println!("  This host is configured and is now waiting for {peer_name} to connect.");
+        println!(
+            "  Keep this window open: this host waits up to {} minutes for {peer_name}.",
+            PEER_WAIT_SECS / 60
+        );
+        println!("  If {peer_name} is set up later, it copies the whole disk from this host");
+        println!("  (hours for large disks). Do not press Ctrl-C here. If this window closes");
+        println!("  anyway, run `twinstor setup` here again: it offers to start over.");
         println!();
         println!("  On {peer_name}, simply run:");
         println!();
@@ -607,7 +613,7 @@ initiator_iqns = [{iqn_list}]
         println!("  (use --full-sync to promote this node immediately and sync later instead)");
         println!("======================================================================\n");
 
-        if wait_for_drbd_connected(res, 300).await {
+        if wait_for_drbd_connected(res, PEER_WAIT_SECS).await {
             println!("peer connected.");
             peer_connected = true;
             establish_skip_sync(res).await?;
@@ -615,8 +621,14 @@ initiator_iqns = [{iqn_list}]
             println!("promoting (dual-primary)...");
             run_cmd("drbdadm", &["primary", "--force", res]).await?;
         } else {
-            println!("peer did not connect within 5 minutes.");
-            println!("promoting anyway (full sync will happen when peer joins)...");
+            let size = cmd_output("blockdev", &["--getsize64", &backing.display().to_string()])
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            println!(
+                "{}",
+                peer_wait_timeout_text(&peer_name, PEER_WAIT_SECS, size, link_mbps)
+            );
             run_cmd("drbdadm", &["primary", "--force", res]).await?;
         }
     }
@@ -1822,6 +1834,47 @@ async fn open_firewall_ports(drbd_port: u16) {
                 .await;
         }
     }
+}
+
+/// How long the first node waits for the second before it promotes alone.
+/// Long enough to read the second host's prompts, free its disks and paste
+/// the CHAP password; after it, the second host copies the whole disk.
+const PEER_WAIT_SECS: u64 = 30 * 60;
+
+/// A rough duration for copying `bytes` over a `link_mbps` link, for the
+/// operator ("about 1 h 30 min"); DRBD's resync reaches most of the link.
+pub(crate) fn full_copy_estimate(bytes: u64, link_mbps: u32) -> String {
+    let usable_bytes_per_sec = (u64::from(link_mbps) * 1_000_000 / 8) * 8 / 10;
+    let secs = bytes / usable_bytes_per_sec.max(1);
+    let (h, m) = (secs / 3600, (secs % 3600).div_ceil(60));
+    match (h, m) {
+        (0, m) => format!("about {} min", m.max(1)),
+        (h, 0) => format!("about {h} h"),
+        (h, m) => format!("about {h} h {m} min"),
+    }
+}
+
+/// What the first node says when the second did not connect in time.
+fn peer_wait_timeout_text(
+    peer: &str,
+    waited_secs: u64,
+    bytes: Option<u64>,
+    link_mbps: Option<u32>,
+) -> String {
+    let copy = match (bytes, link_mbps) {
+        (Some(b), Some(l)) => format!(
+            " ({} for {} GB at {l} Mb/s)",
+            full_copy_estimate(b, l),
+            b / 1_000_000_000
+        ),
+        _ => " (hours for large disks)".to_string(),
+    };
+    format!(
+        "{peer} did not connect within {} minutes. This host now serves alone; when\n\
+         {peer} is set up, it copies the whole disk from this host{copy}.\n\
+         promoting this host...",
+        waited_secs / 60
+    )
 }
 
 async fn wait_for_peer(peer_ip: IpAddr, drbd_port: u16, timeout_secs: u64) -> bool {
@@ -4284,5 +4337,28 @@ mod setup_flow_tests {
         let own: anyhow::Error = crate::render::CliError::new("refused", "do this").into();
         let e = part_way_failure(own, true);
         assert_eq!(e.to_string(), "refused");
+    }
+
+    #[test]
+    fn full_copy_estimates_read_naturally() {
+        // 500 GB at 1 Gb/s: about 83 min at 80 % of the link.
+        assert_eq!(
+            full_copy_estimate(500_000_000_000, 1000),
+            "about 1 h 24 min"
+        );
+        assert_eq!(full_copy_estimate(1_000_000_000, 10_000), "about 1 min");
+        assert_eq!(full_copy_estimate(3_600_000_000_000, 10_000), "about 1 h");
+        // An unknown speed reported as 0 does not divide by zero.
+        assert!(full_copy_estimate(1, 0).starts_with("about"));
+    }
+
+    #[test]
+    fn the_wait_timeout_says_what_happens_next() {
+        let t = peer_wait_timeout_text("host-b", PEER_WAIT_SECS, Some(500_000_000_000), Some(1000));
+        assert!(t.contains("within 30 minutes"), "{t}");
+        assert!(t.contains("serves alone"), "{t}");
+        assert!(t.contains("500 GB at 1000 Mb/s"), "{t}");
+        let t = peer_wait_timeout_text("host-b", PEER_WAIT_SECS, None, Some(1000));
+        assert!(t.contains("hours for large disks"), "{t}");
     }
 }
