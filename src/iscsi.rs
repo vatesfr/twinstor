@@ -612,16 +612,23 @@ pub async fn remove_peer_portal_rule(peer_ip: &str, port: u16) -> bool {
 /// then completes onto the copy it discards without any initiator receiving
 /// the acknowledgement, and every login fails at once with a reset instead of
 /// timing out (a login timeout left LIO unable to remove the portal, wedging
-/// the teardown into a forced reboot). Removed after the teardown and by every
-/// `start()`.
-fn portal_block_rule(chain: &str, port: u16) -> Vec<String> {
-    let dir = if chain == "INPUT" {
-        "--dport"
+/// the teardown into a forced reboot). Removed by the next `start()`.
+///
+/// This host's own loopback session (over `lo`) is not cut: its guests are
+/// stopped before the loser lifts its I/O, and the crash boundary needs that
+/// path to close their disk handles. With it cut too, two losers (both peer
+/// portals fenced, both own portals cut) had no path left to the SR, neither
+/// boundary could finish, and the pair held down for an hour. `legacy` is the
+/// earlier form without the exemption, matched only to remove it.
+fn portal_block_rule(chain: &str, port: u16, legacy: bool) -> Vec<String> {
+    let (dir, iface) = if chain == "INPUT" {
+        ("--dport", "! -i lo")
     } else {
-        "--sport"
+        ("--sport", "! -o lo")
     };
+    let iface = if legacy { "" } else { iface };
     format!(
-        "-p tcp -m tcp {dir} {port} -m comment --comment twinstor-loser-portal-block \
+        "-p tcp {iface} -m tcp {dir} {port} -m comment --comment twinstor-loser-portal-block \
          -j REJECT --reject-with tcp-reset"
     )
     .split_whitespace()
@@ -629,12 +636,12 @@ fn portal_block_rule(chain: &str, port: u16) -> Vec<String> {
     .collect()
 }
 
-async fn iptables_portal_block(op: &str, chain: &str, port: u16) -> Option<bool> {
+async fn iptables_portal_block(op: &str, chain: &str, port: u16, legacy: bool) -> Option<bool> {
     let mut args: Vec<String> = vec!["-w".into(), "3".into(), op.into(), chain.into()];
     if op == "-I" {
         args.push("1".into());
     }
-    args.extend(portal_block_rule(chain, port));
+    args.extend(portal_block_rule(chain, port, legacy));
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new("iptables")
@@ -688,8 +695,8 @@ pub async fn ensure_stray_reset_rule(port: u16) {
 pub async fn block_portal_logins(port: u16) -> bool {
     let mut ok = true;
     for chain in ["INPUT", "OUTPUT"] {
-        ok &= iptables_portal_block("-C", chain, port).await == Some(true)
-            || iptables_portal_block("-I", chain, port).await == Some(true);
+        ok &= iptables_portal_block("-C", chain, port, false).await == Some(true)
+            || iptables_portal_block("-I", chain, port, false).await == Some(true);
     }
     ok
 }
@@ -698,15 +705,17 @@ pub async fn block_portal_logins(port: u16) -> bool {
 pub async fn unblock_portal_logins(port: u16) -> bool {
     let mut ok = true;
     for chain in ["INPUT", "OUTPUT"] {
-        let mut gone = false;
-        for _ in 0..8 {
-            if iptables_portal_block("-C", chain, port).await == Some(false) {
-                gone = true;
-                break;
+        for legacy in [false, true] {
+            let mut gone = false;
+            for _ in 0..8 {
+                if iptables_portal_block("-C", chain, port, legacy).await == Some(false) {
+                    gone = true;
+                    break;
+                }
+                let _ = iptables_portal_block("-D", chain, port, legacy).await;
             }
-            let _ = iptables_portal_block("-D", chain, port).await;
+            ok &= gone || iptables_portal_block("-C", chain, port, legacy).await == Some(false);
         }
-        ok &= gone || iptables_portal_block("-C", chain, port).await == Some(false);
     }
     ok
 }
@@ -1185,6 +1194,16 @@ poll_interval_ms = 10
         c.active = true;
         assert!(c.stop().await.is_err());
         assert!(!c.adoption_checked);
+    }
+
+    #[test]
+    fn loser_cut_spares_the_loopback_and_still_matches_the_legacy_form() {
+        let input = portal_block_rule("INPUT", 3260, false).join(" ");
+        let output = portal_block_rule("OUTPUT", 3260, false).join(" ");
+        assert!(input.contains("! -i lo") && input.contains("--dport 3260"), "{input}");
+        assert!(output.contains("! -o lo") && output.contains("--sport 3260"), "{output}");
+        let legacy = portal_block_rule("INPUT", 3260, true).join(" ");
+        assert!(!legacy.contains("-i lo") && legacy.contains("--dport 3260"), "{legacy}");
     }
 
     #[test]

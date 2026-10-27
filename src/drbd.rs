@@ -1272,6 +1272,26 @@ pub async fn local_gi_flags(resource: &str) -> Option<GiFlags> {
     parse_gi_flags(&text)
 }
 
+/// The four generation UUIDs of the `drbdadm show-gi` data line (current,
+/// bitmap, two history), bit 0 masked as DRBD compares them.
+pub fn parse_gi_uuids(text: &str) -> Option<[u64; 4]> {
+    let line = text.lines().find(|l| parse_gi_flags(l).is_some())?;
+    let mut out = [0u64; 4];
+    for (slot, field) in out.iter_mut().zip(line.trim().split(':')) {
+        *slot = u64::from_str_radix(field, 16).ok()? & !UUID_PRIMARY;
+    }
+    Some(out)
+}
+
+/// This node's generation UUIDs (`parse_gi_uuids`); `None` on any failure.
+pub async fn local_gi_uuids(resource: &str) -> Option<[u64; 4]> {
+    let res = format!("twinstor-{resource}");
+    let text = crate::cmd::cmd_output_for("drbdadm", &["show-gi", &res], 15)
+        .await
+        .ok()?;
+    parse_gi_uuids(&text)
+}
+
 /// The current generation UUID (bit 0 masked, as DRBD compares) from the
 /// `drbdadm show-gi` data line, the same line `parse_gi_flags` reads.
 pub fn parse_gi_current(text: &str) -> Option<u64> {
@@ -2010,6 +2030,15 @@ exists path name:twinstor-data peer-node-id:1 conn-name:twinstor-2 local:ipv4:19
         }
         let log = HANDSHAKE_LOG.replace("twinstor-data/0", "twinstor-data/1");
         assert!(parse_handshake_gen(&log, "twinstor-data").is_none());
+    }
+
+    #[test]
+    fn gi_uuids_are_read_with_bit_zero_masked() {
+        let u = parse_gi_uuids(SHOW_GI_CRASHED_PRIMARY).unwrap();
+        assert_eq!(u[0], 0x17F5075CE30B4AEA);
+        assert_eq!(u[1], 0xA0AE9A52B2646D6E);
+        assert_eq!(u[3], 0x76BC1F306EEECBE2);
+        assert!(parse_gi_uuids("garbage").is_none());
     }
 
     // Real `show-gi` output of a crashed Primary whose peer was never

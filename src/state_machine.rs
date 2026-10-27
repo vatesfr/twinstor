@@ -393,6 +393,23 @@ fn write_fork_record(path: &str, generation: Option<u64>) {
 
 /// Two generation UUIDs name the same generation (bit 0 is DRBD's
 /// primary-at-the-time flag, not part of the identity). Zero never matches.
+/// Both nodes yielded and hold down with their discard offers parked: which
+/// one may take the win without losing an acknowledged write. `local` is this
+/// node's generation UUIDs (current, bitmap, history), `peer` the generation
+/// the peer's beacon attests for its yield. Only when the peer has nothing this
+/// node lacks: its generation is this node's current one (the same data; the
+/// keeper takes it) or an ancestor of it (bitmap or history). Otherwise both
+/// keep holding for an operator: either choice would discard writes.
+fn mutual_yield_takes_win(local: [u64; 4], peer: u64, is_keeper: bool) -> bool {
+    if peer == 0 || local[0] == 0 {
+        return false;
+    }
+    if same_gen(local[0], peer) {
+        return is_keeper;
+    }
+    local[1..].iter().any(|&g| g != 0 && same_gen(g, peer))
+}
+
 fn same_gen(a: u64, b: u64) -> bool {
     let (a, b) = (a & !1, b & !1);
     a != 0 && a == b
@@ -4359,6 +4376,11 @@ const REPLICATION_FALLBACK_GRACE: Duration = Duration::from_secs(120);
 /// first hold is short so a replugged cable returns quickly; after a failback
 /// that flapped straight back the hold grows; past the last hold failback is
 /// latched manual-only.
+/// Ticks a yield-latched loser holds (offer parked) before checking whether
+/// its peer yielded too and this copy may take the win (`mutual_yield_take_win`):
+/// long enough for a winner that exists to reconnect and take the offer.
+const MUTUAL_YIELD_SETTLE_TICKS: u64 = 30;
+
 const FAILBACK_HOLDS: [Duration; 3] = [
     Duration::from_secs(150),
     Duration::from_secs(600),
@@ -24205,6 +24227,13 @@ impl StateMachine {
             }
             OfferAction::Hold => {
                 self.loser_holding_ticks = self.loser_holding_ticks.saturating_add(1);
+                if self.yield_latched()
+                    && self.loser_holding_ticks >= MUTUAL_YIELD_SETTLE_TICKS
+                    && self.loser_holding_ticks.is_multiple_of(10)
+                    && self.mutual_yield_take_win(restart_target).await
+                {
+                    return true;
+                }
                 if self.loser_holding_ticks.is_multiple_of(60) {
                     info!(
                         heal_event = "yield_loser_holding",
@@ -24248,6 +24277,71 @@ impl StateMachine {
                 true
             }
         }
+    }
+
+    /// A yield-latched loser holding with its offer parked, whose peer's beacon
+    /// says it yielded too: both hold and nobody serves. Takes the win when
+    /// `mutual_yield_takes_win` allows it, as the refused-handshake flip does:
+    /// win record bound to the peer's generation, offer abandoned, latch
+    /// cleared, re-promoted (which also drops DRBD's discard flag) and the
+    /// target restarted (rebuilt in place, its cut lifted), which gives the
+    /// peer its path to the SR back. The resolver finishes as the winner and
+    /// the peer, reading the win, takes the discard. `true` when it flipped.
+    async fn mutual_yield_take_win(&mut self, restart_target: bool) -> bool {
+        use crate::peer_signal::{ForkClaim, PeerClaim};
+        let PeerClaim::Claim(ForkClaim::Yielded(peer_gen)) = self.query_peer_claim().await else {
+            return false;
+        };
+        let Some(local) = crate::drbd::local_gi_uuids(&self.config.storage.drbd_resource).await
+        else {
+            return false;
+        };
+        let local_ud = matches!(self.drbd.status().await, Ok(s) if s.disk == DiskState::UpToDate);
+        let is_keeper = self.config.node.name < self.config.node.peer;
+        let takes = local_ud && mutual_yield_takes_win(local, peer_gen, is_keeper);
+        if !takes {
+            if self.loser_holding_ticks.is_multiple_of(60) {
+                info!(heal_event = "mutual_yield_hold",
+                      peer_yielded_gen = %format!("{peer_gen:016X}"),
+                      local_current = %format!("{:016X}", local[0]),
+                      local_uptodate = local_ud, is_keeper,
+                      "both nodes yielded; this copy may not take the win (the peer's may hold \
+                       writes it lacks, or the peer is the one to take it)");
+            }
+            return false;
+        }
+        warn!(heal_event = "mutual_yield_take_win",
+              peer_yielded_gen = %format!("{peer_gen:016X}"),
+              local_current = %format!("{:016X}", local[0]),
+              is_keeper,
+              "split-brain: both nodes yielded and hold down; the peer's copy holds nothing this \
+               one lacks, so this node takes the win and serves as the single sync source");
+        write_fork_record(&self.win_path, Some(peer_gen));
+        self.abandon_discard_offer();
+        let _ = std::fs::remove_file(&self.latch_path);
+        let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
+        let _ = std::fs::remove_file(&self.yield_path);
+        self.peer_portal_release = false;
+        self.sb_flip_winner = true;
+        self.discard_round_flipped = true;
+        self.boundary_defer_restarts();
+        if !restart_target {
+            return true;
+        }
+        let _ = self.drbd.force_primary().await;
+        if tokio::time::timeout(ISCSI_START_TIMEOUT, self.iscsi.start(&self.config))
+            .await
+            .is_err()
+        {
+            error!(
+                timeout_secs = ISCSI_START_TIMEOUT.as_secs(),
+                "split-brain: iSCSI target start did not return (wedged); self-fencing to recover"
+            );
+            self.self_fence("split-brain iSCSI start wedged").await;
+            return true;
+        }
+        self.demote_target_down = false;
+        true
     }
 
     /// Take the Primary role back after a reconnect that just landed. Waits
@@ -26180,6 +26274,25 @@ lun_serial = "twinstor0001"
 poll_interval_ms = 10
 "#;
         std::sync::Arc::new(toml::from_str(toml).unwrap())
+    }
+
+    #[test]
+    fn mutual_yield_take_win_only_when_the_peer_holds_nothing_this_copy_lacks() {
+        // The bmax wedge: demo-1's bitmap generation is demo-2's current one
+        // (demo-1 is ahead), demo-2 has no generation of demo-1's.
+        let demo1 = [0x355A43DD30F141B6, 0xF11F0E8D9DCA4F48, 0x4F327A0297E86FD8, 0x6453E865C0ECC86E];
+        let demo2 = [0xF11F0E8D9DCA4F48, 0, 0xD37D57142B3F2652, 0xF501772E41B98534];
+        assert!(mutual_yield_takes_win(demo1, 0xF11F0E8D9DCA4F48, false));
+        assert!(!mutual_yield_takes_win(demo2, 0x355A43DD30F141B6, true));
+        // The same data: the keeper alone takes it (bit 0 ignored).
+        assert!(mutual_yield_takes_win(demo2, 0xF11F0E8D9DCA4F49, true));
+        assert!(!mutual_yield_takes_win(demo2, 0xF11F0E8D9DCA4F49, false));
+        // An ancestor in the history counts; an unrelated generation never does.
+        assert!(mutual_yield_takes_win(demo2, 0xD37D57142B3F2652, false));
+        assert!(!mutual_yield_takes_win(demo1, 0x1111111111111110, true));
+        // Unknown generations never take the win.
+        assert!(!mutual_yield_takes_win(demo1, 0, true));
+        assert!(!mutual_yield_takes_win([0; 4], 0xF11F0E8D9DCA4F48, true));
     }
 
     fn starting_secondary() -> DrbdStatus {
