@@ -407,9 +407,9 @@ impl Cli {
                         }
                     }
                 };
-                setup::run_setup(params)
-                    .await
-                    .map_err(|e| setup::part_way_failure(e, setup::host_changed()))
+                setup::run_setup(params).await.map_err(|e| {
+                    setup::part_way_failure(e, setup::host_changed(), setup::service_stopped())
+                })
             }
             Command::Uninstall {
                 yes,

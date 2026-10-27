@@ -158,17 +158,57 @@ pub(crate) fn host_changed() -> bool {
 /// The error `twinstor setup` reports: a failure after setup started changing
 /// this host gets a `next:` line that says how to resume or undo it, unless
 /// it already carries its own guidance.
-pub(crate) fn part_way_failure(err: anyhow::Error, host_changed: bool) -> anyhow::Error {
+pub(crate) fn part_way_failure(
+    err: anyhow::Error,
+    host_changed: bool,
+    service_stopped: bool,
+) -> anyhow::Error {
     if !host_changed || err.downcast_ref::<crate::render::CliError>().is_some() {
         return err;
     }
+    let mut next = "fix the problem above, then run `twinstor setup` again, which says how to go \
+                    on, or `twinstor uninstall` to undo what it did"
+        .to_string();
+    if service_stopped {
+        next.push_str(
+            ". Setup stopped the twinstor service: if you do not run setup again, start it \
+             with `systemctl start twinstor`",
+        );
+    }
+    crate::render::CliError::new("setup stopped part-way on this host", next)
+        .caused_by(err)
+        .into()
+}
+
+/// The refusal when the DRBD resource cannot be taken down (the iSCSI target
+/// or a VM still holds it). Nothing was wiped; it says whether the service
+/// setup stopped is running again.
+fn down_refused(service_was_active: bool, restarted: bool) -> crate::render::CliError {
+    let service = match (service_was_active, restarted) {
+        (true, true) => " The twinstor service was started again.",
+        (true, false) => {
+            " Setup stopped the twinstor service and could not start it again: run \
+             `systemctl start twinstor` now."
+        }
+        (false, _) => "",
+    };
     crate::render::CliError::new(
-        "setup stopped part-way on this host",
-        "fix the problem above, then run `twinstor setup` again (it offers to run setup again \
-         from the start), or `twinstor uninstall` to undo what it did",
+        format!(
+            "could not take this host's DRBD resource down: something still uses it. Nothing \
+             was erased.{service}"
+        ),
+        "if VMs on this host use the TwinStor SR, move them to the other host or shut them \
+         down, then run `twinstor setup` again; or run `twinstor uninstall` to remove what \
+         setup did",
     )
-    .caused_by(err)
-    .into()
+}
+
+/// Set while setup has stopped the twinstor service and not started it
+/// again, so a failure in between says so.
+static SERVICE_STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn service_stopped() -> bool {
+    SERVICE_STOPPED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub async fn run_setup(params: SetupParams) -> Result<()> {
@@ -600,6 +640,7 @@ initiator_iqns = [{iqn_list}]
     if service_active {
         println!("stopping the twinstor service left by the previous run...");
         run_cmd("systemctl", &["stop", "twinstor"]).await?;
+        SERVICE_STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     let res_up = tokio::process::Command::new("drbdadm")
         .args(["status", res])
@@ -610,14 +651,13 @@ initiator_iqns = [{iqn_list}]
     if res_up {
         println!("previous DRBD resource is up, taking it down first...");
         if let Err(e) = run_cmd("drbdadm", &["down", res]).await {
-            return Err(crate::render::CliError::new(
-                "could not take this host's DRBD resource down: something still uses it",
-                "if VMs on this host use the TwinStor SR, move them to the other host or \
-                 shut them down, then run `twinstor setup` again; or run `twinstor uninstall` \
-                 to remove what setup did",
-            )
-            .caused_by(e)
-            .into());
+            // Nothing was wiped: give the resource back to the service.
+            let restarted =
+                service_active && run_cmd("systemctl", &["start", "twinstor"]).await.is_ok();
+            if restarted {
+                SERVICE_STOPPED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            return Err(down_refused(service_active, restarted).caused_by(e).into());
         }
     }
 
@@ -785,6 +825,7 @@ initiator_iqns = [{iqn_list}]
     if Path::new("/usr/lib/systemd/system/twinstor.service").exists() {
         run_cmd("systemctl", &["daemon-reload"]).await?;
         run_cmd("systemctl", &["enable", "--now", "twinstor"]).await?;
+        SERVICE_STOPPED.store(false, std::sync::atomic::Ordering::SeqCst);
         println!("twinstor service started");
     }
 
@@ -4603,7 +4644,7 @@ mod setup_flow_tests {
 
     #[test]
     fn a_failure_after_the_first_change_says_how_to_resume() {
-        let e = part_way_failure(anyhow::anyhow!("wipefs failed"), true);
+        let e = part_way_failure(anyhow::anyhow!("wipefs failed"), true, false);
         let g = e
             .downcast_ref::<crate::render::CliError>()
             .expect("guidance attached");
@@ -4612,12 +4653,25 @@ mod setup_flow_tests {
         assert!(text.contains("twinstor uninstall"), "{text}");
         assert!(e.chain().any(|c| c.to_string() == "wipefs failed"));
         // Before any change, the error stays as it is.
-        let e = part_way_failure(anyhow::anyhow!("bad flag"), false);
+        let e = part_way_failure(anyhow::anyhow!("bad flag"), false, false);
         assert!(e.downcast_ref::<crate::render::CliError>().is_none());
         // An error with its own guidance keeps it.
         let own: anyhow::Error = crate::render::CliError::new("refused", "do this").into();
-        let e = part_way_failure(own, true);
+        let e = part_way_failure(own, true, true);
         assert_eq!(e.to_string(), "refused");
+        // A failure while setup holds the service stopped says how to start it.
+        let e = part_way_failure(anyhow::anyhow!("wipefs failed"), true, true);
+        let text = format!("{:?}", e.downcast_ref::<crate::render::CliError>().unwrap());
+        assert!(text.contains("systemctl start twinstor"), "{text}");
+    }
+
+    #[test]
+    fn a_resource_that_stays_up_leaves_the_service_running() {
+        let msg = |a, r| format!("{:?}", down_refused(a, r));
+        assert!(msg(true, true).contains("started again"));
+        assert!(msg(true, false).contains("systemctl start twinstor"));
+        assert!(!msg(false, false).contains("systemctl start"));
+        assert!(msg(false, false).contains("Nothing was erased"));
     }
 
     #[test]
