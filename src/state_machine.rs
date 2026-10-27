@@ -12016,6 +12016,7 @@ impl StateMachine {
                 warn!(portal = %portal, "removing a peer-portal fence rule left without its marker");
                 let _ = crate::iscsi::remove_peer_portal_rule(&peer_ip, port).await;
             }
+            let _ = crate::iscsi::remove_peer_portal_reset(&peer_ip, port).await;
             return;
         }
         // A node without its local session (the split's loser takes its own
@@ -12050,7 +12051,9 @@ impl StateMachine {
             }
         }
         // Lift the firewall fence first: the session then recovers by itself.
-        if !crate::iscsi::remove_peer_portal_rule(&peer_ip, port).await {
+        if !crate::iscsi::remove_peer_portal_rule(&peer_ip, port).await
+            || !crate::iscsi::remove_peer_portal_reset(&peer_ip, port).await
+        {
             warn!(portal = %portal, "could not remove the peer-portal fence rule; retrying");
             return;
         }
@@ -21281,13 +21284,14 @@ impl StateMachine {
         // it completed there would be acknowledged onto the copy it discards.
         // Cut, those writes fail back to multipath and land on the local path.
         self.fence_peer_portal().await;
+        let peer_ip = self.config.network.peer_address.to_string();
+        let port = self.config.iscsi.portal_port;
+        // And reset the peer's side of those sessions: the peer's target, torn
+        // down when it steps down, must not wait on a connection this host no
+        // longer answers.
         if !cfg!(test)
-            && crate::iscsi::peer_portal_rule_state(
-                &self.config.network.peer_address.to_string(),
-                self.config.iscsi.portal_port,
-            )
-            .await
-                != Some(true)
+            && (crate::iscsi::peer_portal_rule_state(&peer_ip, port).await != Some(true)
+                || !crate::iscsi::add_peer_portal_reset(&peer_ip, port).await)
         {
             warn!(heal_event = "arb_mutual_freeze_fence_failed", incident = ?self.incident_id,
                   "arbitrated: could not cut the path through the peer's portal; the win is not \

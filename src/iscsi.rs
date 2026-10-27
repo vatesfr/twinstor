@@ -504,6 +504,61 @@ pub async fn remove_peer_portal_rule(peer_ip: &str, port: u16) -> bool {
     !peer_portal_rule_present(peer_ip, port).await
 }
 
+/// The counterpart of the peer-portal fence for the peer's side: replies
+/// from the peer's portal to this host get a TCP reset. The OUTPUT rule alone
+/// rejects this host's own packets locally, so the peer's target never sees
+/// the connection close and keeps retransmitting into it: its target
+/// teardown then waits on that session (seen wedging a split-brain loser
+/// into a forced reboot). With the reset the peer's session ends at its next
+/// packet. Used by the arbitrated mutual-freeze keep.
+fn peer_portal_reset_rule(peer_ip: &str, port: u16) -> Vec<String> {
+    format!(
+        "-s {peer_ip}/32 -p tcp -m tcp --sport {port} -m comment --comment \
+         twinstor-peer-portal-reset -j REJECT --reject-with tcp-reset"
+    )
+    .split_whitespace()
+    .map(str::to_string)
+    .collect()
+}
+
+async fn iptables_input_reset(op: &str, peer_ip: &str, port: u16) -> Option<bool> {
+    let mut args: Vec<String> = vec!["-w".into(), "3".into(), op.into(), "INPUT".into()];
+    if op == "-I" {
+        args.push("1".into());
+    }
+    args.extend(peer_portal_reset_rule(peer_ip, port));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("iptables")
+            .args(&args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.code() == Some(0) => Some(true),
+        Ok(Ok(o)) if o.status.code() == Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Install the peer-portal reset rule (idempotent). `false` on failure.
+pub async fn add_peer_portal_reset(peer_ip: &str, port: u16) -> bool {
+    iptables_input_reset("-C", peer_ip, port).await == Some(true)
+        || iptables_input_reset("-I", peer_ip, port).await == Some(true)
+}
+
+/// Remove every copy of the peer-portal reset rule. `false` if one stays.
+pub async fn remove_peer_portal_reset(peer_ip: &str, port: u16) -> bool {
+    for _ in 0..8 {
+        if iptables_input_reset("-C", peer_ip, port).await == Some(false) {
+            return true;
+        }
+        let _ = iptables_input_reset("-D", peer_ip, port).await;
+    }
+    iptables_input_reset("-C", peer_ip, port).await == Some(false)
+}
+
 /// The SCSI disks (`sdc`) attached through the session(s) to `portal`, from
 /// `iscsiadm -m session -P 3` (bounded). Empty on any failure.
 pub async fn session_disks(portal: &str) -> Vec<String> {
