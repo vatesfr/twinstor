@@ -4932,6 +4932,26 @@ const OPERATOR_DISCARD_REARM: Duration = Duration::from_secs(30);
 /// StandAlone until a manual reboot. Far above the normal case, far below a
 /// real hang.
 const ISCSI_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The split-brain loser's extra wait past `ISCSI_STOP_TIMEOUT` before it
+/// self-fences: it serves nobody, so a slow teardown costs only time.
+const LOSER_TEARDOWN_EXTRA: Duration = Duration::from_secs(60);
+
+/// What holds an iSCSI teardown: the targetcli and LIO kernel threads with
+/// their state and wait channel, and the kernel stack of those in
+/// uninterruptible sleep. Bounded; truncated for the log.
+async fn teardown_diagnostics() -> String {
+    if cfg!(test) {
+        return String::new();
+    }
+    let script = "ps -eo pid=,stat=,wchan:32=,args= | awk '/[t]argetcli|[i]scsi_(np|trx|ttx)|[t]cm_/'; \
+                  for p in $(ps -eo pid=,stat=,args= | awk '$2 ~ /D/ && /[t]argetcli|[i]scsi_|[t]cm_/ {print $1}'); \
+                  do echo \"== $p\"; cat /proc/$p/stack 2>/dev/null; done";
+    let out = crate::cmd::cmd_output_for("sh", &["-c", script], 10)
+        .await
+        .unwrap_or_else(|e| format!("unreadable: {e}"));
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(2000).collect()
+}
 
 /// Login attempts for re-establishing this node's own loopback session after
 /// a failback restart of the target, and the pause between them (the target
@@ -23668,9 +23688,29 @@ impl StateMachine {
             }
         }
         // (3) Time-bound the teardown; if it wedges unkillable, self-fence.
-        match tokio::time::timeout(ISCSI_STOP_TIMEOUT, self.iscsi.stop()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+        // This copy serves nobody and its guests are stopped, so a slow
+        // teardown (LIO waiting out a login negotiation, 15 s each) gets more
+        // time before the reboot; what holds it is logged at the first bound.
+        let stopped = {
+            let stop = self.iscsi.stop();
+            tokio::pin!(stop);
+            match tokio::time::timeout(ISCSI_STOP_TIMEOUT, &mut stop).await {
+                Ok(r) => Some(r),
+                Err(_) => {
+                    let stuck = teardown_diagnostics().await;
+                    warn!(heal_event = "loser_teardown_slow", waited_secs = ISCSI_STOP_TIMEOUT.as_secs(),
+                          stuck = %stuck,
+                          "split-brain: the iSCSI teardown has not returned yet; waiting longer \
+                           before self-fencing");
+                    tokio::time::timeout(LOSER_TEARDOWN_EXTRA, &mut stop)
+                        .await
+                        .ok()
+                }
+            }
+        };
+        match stopped {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
                 // stop() fails only when the backstore is still there, i.e. LIO
                 // may still export this doomed copy to a session that survived
                 // the portal close. Never discard under it: keep the copy, leave
@@ -23685,11 +23725,12 @@ impl StateMachine {
                 );
                 return;
             }
-            Err(_) => {
+            None => {
+                let stuck = teardown_diagnostics().await;
                 error!(
-                    timeout_secs = ISCSI_STOP_TIMEOUT.as_secs(),
-                    "split-brain: iSCSI teardown did not return (wedged on suspended \
-                     DRBD I/O); self-fencing to recover"
+                    timeout_secs = (ISCSI_STOP_TIMEOUT + LOSER_TEARDOWN_EXTRA).as_secs(),
+                    stuck = %stuck,
+                    "split-brain: iSCSI teardown did not return (wedged); self-fencing to recover"
                 );
                 self.self_fence("split-brain iSCSI teardown wedged").await;
                 return;
