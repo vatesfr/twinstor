@@ -4935,6 +4935,10 @@ const ISCSI_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The split-brain loser's extra wait past `ISCSI_STOP_TIMEOUT` before it
 /// self-fences: it serves nobody, so a slow teardown costs only time.
 const LOSER_TEARDOWN_EXTRA: Duration = Duration::from_secs(60);
+/// Diskless: how long the peer must stay away before this node stops its
+/// target (a single status read taken during a re-attach is not a lost peer).
+const DISKLESS_PEER_LOST_AFTER: Duration = Duration::from_secs(10);
+
 /// The arbitrated loser's wait between cutting its target off and tearing it
 /// down: past LIO's 15 s login timeout, so no login is still pending.
 const LOSER_LOGIN_DRAIN: Duration = Duration::from_secs(20);
@@ -6573,6 +6577,10 @@ pub struct StateMachine {
     // attempts, and when the degraded alert was last raised (for the
     // periodic reminder).
     degraded_ticks: u64,
+    /// Diskless: since when the peer has not been serving, and whether this
+    /// node stopped its target for it (`check_degraded`).
+    diskless_peer_lost_at: Option<std::time::Instant>,
+    diskless_target_stopped: bool,
     degraded_alert_at: Option<std::time::Instant>,
     // Sole-survivor escalation: last time the guided-manual alert was
     // delivered (stamped only on success so an undeliverable alert retries
@@ -7428,6 +7436,8 @@ impl StateMachine {
             tiebreaker_bad_streak: 0,
             tiebreaker_alert_at: None,
             degraded_ticks: 0,
+            diskless_peer_lost_at: None,
+            diskless_target_stopped: false,
             degraded_alert_at: None,
             cd_alert_at: None,
             cd_shape_since_mono: None,
@@ -9789,9 +9799,14 @@ impl StateMachine {
             self.set_state(NodeState::Degraded);
         } else {
             error!("local disk failed and no healthy peer reachable; stopping iSCSI");
+            // This host's own loopback session first: a target torn down under
+            // it answers the local guests' in-flight I/O with hard SCSI errors
+            // that multipath passes straight up instead of failing over.
+            self.logout_local_loopback().await;
             if let Err(e) = self.iscsi.stop().await {
                 error!(error = %e, "failed to stop iSCSI on disk failure");
             }
+            self.diskless_target_stopped = true;
             self.set_state(NodeState::Degraded);
         }
         // Latch only on delivery: a failed send leaves the timestamp unset so
@@ -9819,6 +9834,8 @@ impl StateMachine {
             info!("local disk back, going online");
             self.degraded_ticks = 0;
             self.degraded_alert_at = None;
+            self.diskless_peer_lost_at = None;
+            self.diskless_target_stopped = false;
             if let Err(e) = self.try_go_online().await {
                 error!(error = %e, "failed to go online after disk recovery");
             }
@@ -9826,11 +9843,36 @@ impl StateMachine {
         }
 
         // If we were serving diskless and the peer disappears too, there is
-        // no data path left at all: stop the target (no-op if already down).
+        // no data path left at all: stop the target. Only once the peer has
+        // been gone `DISKLESS_PEER_LOST_AFTER` (a read taken while a re-attach
+        // changes the disk state, or a moment's blip, is not a lost peer), and
+        // after the loopback logout (see `handle_diskless`). Back as soon as
+        // the peer serves again: this copy serves through it.
         let peer_serves = status.connection == crate::drbd::ConnectionState::Connected
             && status.peer_disk == Some(DiskState::UpToDate);
-        if !peer_serves {
-            let _ = self.iscsi.stop().await;
+        if peer_serves {
+            self.diskless_peer_lost_at = None;
+            if self.diskless_target_stopped {
+                info!(
+                    "local disk still failed, peer serving again: restarting iSCSI to serve through it"
+                );
+                match self.iscsi.start(&self.config).await {
+                    Ok(()) => self.diskless_target_stopped = false,
+                    Err(e) => warn!(error = %e, "could not restart iSCSI while diskless; retrying"),
+                }
+            }
+        } else {
+            let since = *self
+                .diskless_peer_lost_at
+                .get_or_insert_with(std::time::Instant::now);
+            if !self.diskless_target_stopped && since.elapsed() >= DISKLESS_PEER_LOST_AFTER {
+                warn!(connection = ?status.connection, peer_disk = ?status.peer_disk,
+                      "local disk failed and the peer no longer serves either: stopping iSCSI \
+                       (no data path left)");
+                self.logout_local_loopback().await;
+                let _ = self.iscsi.stop().await;
+                self.diskless_target_stopped = true;
+            }
         }
 
         // Throttled re-attach: succeeds the moment the backing device is
@@ -37616,6 +37658,54 @@ poll_interval_ms = 10
             .to_string();
         sm.guests = guests;
         (sm, marker)
+    }
+
+    #[tokio::test]
+    async fn diskless_target_stops_only_for_a_lasting_peer_loss_and_comes_back() {
+        // Serving diskless through the peer: one read without the peer (taken
+        // while a re-attach changes the disk state) must not stop the target;
+        // a lasting loss does; the peer serving again restarts it.
+        let mut st = online_no_peer();
+        st.disk = DiskState::Diskless;
+        st.connection = ConnectionState::Connecting;
+        let drbd = std::sync::Arc::new(MockDrbd::new(st));
+        let (start, stop) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(SharedIscsi {
+                start_called: start.clone(),
+                stop_called: stop.clone(),
+            }),
+        );
+        sm.check_degraded().await;
+        assert!(
+            !stop.load(Ordering::Relaxed),
+            "one read without the peer is not a lost peer"
+        );
+        sm.diskless_peer_lost_at =
+            Some(std::time::Instant::now() - DISKLESS_PEER_LOST_AFTER - Duration::from_secs(1));
+        sm.check_degraded().await;
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "a lasting loss stops the target"
+        );
+        assert!(sm.diskless_target_stopped);
+        {
+            let mut s = drbd.status.lock().unwrap();
+            s.connection = ConnectionState::Connected;
+            s.peer_disk = Some(DiskState::UpToDate);
+        }
+        sm.check_degraded().await;
+        assert!(
+            start.load(Ordering::Relaxed),
+            "the peer serves again: back up"
+        );
+        assert!(!sm.diskless_target_stopped);
+        assert!(sm.diskless_peer_lost_at.is_none());
     }
 
     #[tokio::test(start_paused = true)]
