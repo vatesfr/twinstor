@@ -4943,8 +4943,13 @@ async fn teardown_diagnostics() -> String {
     if cfg!(test) {
         return String::new();
     }
-    let script = "ps -eo pid=,stat=,wchan:32=,args= | awk '/[t]argetcli|[i]scsi_(np|trx|ttx)|[t]cm_/'; \
-                  for p in $(ps -eo pid=,stat=,args= | awk '$2 ~ /D/ && /[t]argetcli|[i]scsi_|[t]cm_/ {print $1}'); \
+    // Separate -o options: dom0's procps misreads a comma-joined list with
+    // empty headers. Every process in uninterruptible sleep is listed (the
+    // wedge may sit in DRBD or device-mapper rather than LIO), then the
+    // targetcli and LIO threads, then the kernel stacks of the D ones.
+    let script = "ps -e -o pid= -o stat= -o wchan:32= -o args= | awk '$2 ~ /^D/'; echo '--'; \
+                  ps -e -o pid= -o stat= -o wchan:32= -o args= | awk '/[t]argetcli|[i]scsi_(np|trx|ttx)|[t]cm_/'; \
+                  for p in $(ps -e -o pid= -o stat= | awk '$2 ~ /^D/ {print $1}'); \
                   do echo \"== $p\"; cat /proc/$p/stack 2>/dev/null; done";
     let out = crate::cmd::cmd_output_for("sh", &["-c", script], 10)
         .await
