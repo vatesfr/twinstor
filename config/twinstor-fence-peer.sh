@@ -52,7 +52,32 @@ log() {
 # Every exit goes through here: one line naming the verdict (a stable id),
 # and the same appended to $RUN/fence-verdict, whose new lines the daemon
 # logs (cleared with /run at reboot). The line before it says why.
+# A survive verdict lifts an entry freeze (below), from the newest run only:
+# DRBD ignores an older run's exit code, and the newer run decides for it.
+entry_freeze_release() {
+    [ -f "$ENTRY_FREEZE" ] || return 0
+    if [ "$(cat "$RUN/fence-peer.newest" 2>/dev/null)" != "$$" ]; then
+        log "a newer fence-peer run decides this disconnect: the entry freeze stays for it"
+        return 0
+    fi
+    local pid
+    timeout 10 drbdadm resume-io "$RESOURCE" >/dev/null 2>&1 9>&- &
+    pid=$!
+    for _ in $(seq 1 20); do
+        sleep 0.5
+        user_suspended || break
+        kill -0 "$pid" 2>/dev/null || { wait "$pid"; user_suspended || break; }
+    done
+    if user_suspended; then
+        log "WARNING: could not lift the entry freeze (drbdadm resume-io): this node stays frozen until the daemon lifts it"
+    else
+        rm -f "$ENTRY_FREEZE" 2>/dev/null
+        log "entry freeze lifted for the survive verdict"
+    fi
+}
+
 verdict() {
+    [ "$2" = 4 ] && entry_freeze_release
     log "verdict=$1 exit=$2 role=${LOCAL_ROLE:-unread} freeze=$FREEZE elapsed=$(( $(date +%s) - ${START_EPOCH:-$(date +%s)} ))s"
     mkdir -p "$RUN" 2>/dev/null
     echo "$(date +%s) $$ $1 $2" >> "$RUN/fence-verdict" 2>/dev/null
@@ -137,6 +162,85 @@ log "context: role=[${LOCAL_ROLE:-unreadable}] peer_address=[${PEER_ADDR:-none}]
 DRBD_PORT=$(sed -n 's/^drbd_port *= *\([0-9]*\).*/\1/p' "$ETC/twinstor.toml" 2>/dev/null | head -1)
 [ -n "$DRBD_PORT" ] || DRBD_PORT=7789
 
+user_suspended() {
+    local tok
+    tok=$(timeout 3 drbdadm status "$RESOURCE" 2>/dev/null | head -1 | grep -o 'suspended:[^ ]*' | head -1)
+    case ",${tok#suspended:}," in *,user,*) return 0;; esac
+    return 1
+}
+suspend_io_live() {
+    local pid i
+    # fd 9 (the handler lock) closed for the child: it can outlive this run
+    # by up to its timeout, and must not hold the next run off meanwhile.
+    timeout 10 drbdadm suspend-io "$RESOURCE" >/dev/null 2>&1 9>&- &
+    pid=$!
+    for i in $(seq 1 20); do
+        sleep 0.5
+        user_suspended && return 0
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid"
+            local rc=$?
+            [ "$rc" = 0 ] && return 0
+            user_suspended && return 0
+            return "$rc"
+        fi
+    done
+    wait "$pid"
+    user_suspended && return 0
+    return 124
+}
+# DRBD's own freeze can be missing. When a connection that came back while a
+# run was still deciding drops again, DRBD lifts the fencing suspend
+# ("susp-io( fencing -> no ) [after-fencing]"), ignores the pending run's exit
+# code and starts the next run with this node's I/O flowing. Seen on a
+# fate-shared test pool under 40% packet loss: both nodes served unfrozen, one
+# for 16 s, and the loser's acknowledged writes were discarded. Where this
+# handler relies on that freeze (arbitrated, fate-shared freeze mode), a
+# Primary holding a copy that finds its I/O not suspended while another run
+# is deciding, or started within the flap window, freezes it here, before
+# waiting or probing.
+# A survive verdict of the newest run lifts it (`verdict`); every other exit
+# leaves it in place, like DRBD's own freeze (the daemon lifts a leftover
+# suspend once the pair is Connected again).
+ENTRY_FREEZE="$RUN/fence-entry-freeze"
+ENTRY_FROZE=0
+mkdir -p "$RUN" 2>/dev/null
+# The previous run started within the flap window: it may still be deciding,
+# or have exited a moment before this run's check below.
+PREV_RUN_AT=$(stat -c %Y "$RUN/fence-peer.newest" 2>/dev/null || echo 0)
+RECENT_RUN=0
+[ $(( START_EPOCH - PREV_RUN_AT )) -lt "${TWINSTOR_FLAP_WINDOW:-120}" ] && RECENT_RUN=1
+echo "$$" > "$RUN/fence-peer.newest" 2>/dev/null
+# 0 suspended, 1 not suspended, 2 unreadable.
+io_suspended() {
+    local out tok
+    out=$(timeout 3 drbdadm status "$RESOURCE" 2>/dev/null | head -1)
+    [ -n "$out" ] || return 2
+    tok=$(echo "$out" | grep -o 'suspended:[^ ]*' | head -1)
+    case "${tok#suspended:}" in ""|no) return 1 ;; esac
+    return 0
+}
+# An entry freeze is in force only while a user suspend is: otherwise the
+# record is left over from an earlier episode.
+[ -f "$ENTRY_FREEZE" ] && ! user_suspended && rm -f "$ENTRY_FREEZE" 2>/dev/null
+other_run_deciding() {
+    command -v flock >/dev/null 2>&1 || return 1
+    (exec 8>>"$RUN/fence-peer.lock" && ! flock -n 8) 2>/dev/null
+}
+if { [ "$FREEZE" = 1 ] || [ -n "$DIRECT_PEER" ]; } && [ "$LOCAL_ROLE" = "Primary" ] \
+    && { [ "$RECENT_RUN" = 1 ] || other_run_deciding; }; then
+    io_suspended
+    if [ $? = 1 ] && [ "$(timeout 10 drbdadm dstate "$RESOURCE" 2>/dev/null | head -1 | cut -d/ -f1)" != "Diskless" ]; then
+        if suspend_io_live; then
+            ENTRY_FROZE=1
+            echo "$$" > "$ENTRY_FREEZE" 2>/dev/null
+            log "this node's I/O was not frozen at this disconnect (DRBD lifted its fencing suspend while another run was deciding): frozen now, before deciding"
+        else
+            log "WARNING: this node's I/O was not frozen at this disconnect and suspend-io failed: it keeps flowing while this run decides"
+        fi
+    fi
+fi
+
 # Fate-shared mode (no direct link): this node's copy keeps taking writes
 # while this handler decides (resource-only fencing), so from here on it may
 # hold acknowledged writes the peer's copy lacks. Its guests must never reach
@@ -191,33 +295,6 @@ fi
 # command applies the suspend within seconds but may not return before its
 # timeout (and a second call then fails on the suspend already in place), so
 # the yield was logged as failed and recorded ~10 s late.
-user_suspended() {
-    local tok
-    tok=$(timeout 3 drbdadm status "$RESOURCE" 2>/dev/null | head -1 | grep -o 'suspended:[^ ]*' | head -1)
-    case ",${tok#suspended:}," in *,user,*) return 0;; esac
-    return 1
-}
-suspend_io_live() {
-    local pid i
-    # fd 9 (the handler lock) closed for the child: it can outlive this run
-    # by up to its timeout, and must not hold the next run off meanwhile.
-    timeout 10 drbdadm suspend-io "$RESOURCE" >/dev/null 2>&1 9>&- &
-    pid=$!
-    for i in $(seq 1 20); do
-        sleep 0.5
-        user_suspended && return 0
-        if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid"
-            local rc=$?
-            [ "$rc" = 0 ] && return 0
-            user_suspended && return 0
-            return "$rc"
-        fi
-    done
-    wait "$pid"
-    user_suspended && return 0
-    return 124
-}
 suspend_and_mark() {
     suspend_io_live
     SUSP_RC=$?
@@ -322,7 +399,11 @@ io_suspend_state() {
         *) echo none ;;
     esac
 }
-if [ -f "$YIELD_MARKER" ] && [ "$LOCAL_ROLE" != "Secondary" ]; then
+# A run that froze this node itself at entry found no suspend in place, so any
+# marker is from an earlier episode.
+if [ -f "$YIELD_MARKER" ] && [ "$LOCAL_ROLE" != "Secondary" ] && [ "$ENTRY_FROZE" = 1 ]; then
+    log "a yield marker is present ($(cat "$YIELD_MARKER" 2>/dev/null)) but this node's I/O was not suspended when this run began -> stale, deciding afresh"
+elif [ -f "$YIELD_MARKER" ] && [ "$LOCAL_ROLE" != "Secondary" ]; then
     case "$(io_suspend_state)" in
         user)
             log "a yield of this episode is still in force (marker present, I/O suspended:user) -> keep it: stay frozen (exit 1)"

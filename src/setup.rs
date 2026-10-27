@@ -2447,6 +2447,7 @@ mod tests {
                      get-gi) cat $S/gi 2>/dev/null ;;\n\
                      dstate) cat $S/dstate 2>/dev/null || echo UpToDate/UpToDate ;;\n\
                      suspend-io) [ -f $S/suspend_rc ] && exit $(cat $S/suspend_rc); echo user,fencing > $S/susp; [ -f $S/suspend_hangs ] && sleep 30 ;;\n\
+                     resume-io) echo no > $S/susp ;;\n\
                      esac\nexit 0\n",
                         st = st.display()
                     ),
@@ -3197,6 +3198,80 @@ mod tests {
         assert_eq!(code, 1, "{}", rig.log());
         assert!(rig.log().contains("waiting for it"), "{}", rig.log());
         assert!(rig.log().contains("still in force"), "{}", rig.log());
+    }
+
+    /// Freeze mode with DRBD's fencing suspend gone (`susp` empty), as DRBD
+    /// leaves it when a connection that came back during a run drops again.
+    fn unfrozen_flap_rig(tag: &str) -> (FenceRig, FakeProc) {
+        let rig = FenceRig::new(tag);
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        rig.set("susp", "");
+        // A run started moments ago (the flap's first disconnect).
+        std::fs::write(rig.root.join("run/fence-peer.newest"), "1").unwrap();
+        (rig, daemon)
+    }
+
+    fn drbdadm_calls(rig: &FenceRig) -> String {
+        std::fs::read_to_string(rig.root.join("state/drbdadm.calls")).unwrap_or_default()
+    }
+
+    #[test]
+    fn fence_peer_refreezes_an_unfrozen_flap_and_lifts_it_to_survive() {
+        if !fence_rig_usable() {
+            return;
+        }
+        let (rig, _daemon) = unfrozen_flap_rig("flapsurvive");
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        let calls = drbdadm_calls(&rig);
+        let susp = calls.find("suspend-io").expect("frozen at entry");
+        let resume = calls.find("resume-io").expect("lifted for the survive");
+        assert!(susp < resume, "{calls}");
+        assert!(rig.log().contains("frozen now, before deciding"), "{}", rig.log());
+        assert!(!rig.root.join("run/fence-entry-freeze").exists());
+    }
+
+    #[test]
+    fn fence_peer_entry_freeze_holds_through_a_yield() {
+        if !fence_rig_usable() {
+            return;
+        }
+        let (rig, _daemon) = unfrozen_flap_rig("flapyield");
+        rig.set("ping_rc", "1");
+        assert_eq!(rig.run(5), 1, "{}", rig.log());
+        assert!(!drbdadm_calls(&rig).contains("resume-io"), "{}", drbdadm_calls(&rig));
+        assert!(rig.marker().exists());
+        assert!(std::fs::read_to_string(rig.root.join("state/susp")).unwrap().contains("user"));
+    }
+
+    #[test]
+    fn fence_peer_entry_freeze_reads_an_old_yield_marker_as_stale() {
+        if !fence_rig_usable() {
+            return;
+        }
+        let (rig, _daemon) = unfrozen_flap_rig("flapstale");
+        std::fs::write(rig.marker(), "2026-01-01 00:00:00").unwrap();
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert!(rig.log().contains("was not suspended when this run began"), "{}", rig.log());
+    }
+
+    #[test]
+    fn fence_peer_first_disconnect_is_not_frozen_by_the_handler() {
+        // No run in flight or recent, or not freeze mode: the handler never
+        // adds a suspend of its own before deciding (DRBD's freeze, or
+        // resource-only fencing, governs as before).
+        if !fence_rig_usable() {
+            return;
+        }
+        let (rig, _daemon) = unfrozen_flap_rig("flapfirst");
+        let _ = std::fs::remove_file(rig.root.join("run/fence-peer.newest"));
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert!(!drbdadm_calls(&rig).contains("suspend-io"), "{}", drbdadm_calls(&rig));
+        let rig = FenceRig::new("flapnofreeze");
+        rig.set("susp", "");
+        std::fs::write(rig.root.join("run/fence-peer.newest"), "1").unwrap();
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert!(!drbdadm_calls(&rig).contains("suspend-io"), "{}", drbdadm_calls(&rig));
     }
 
     #[test]
