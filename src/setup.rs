@@ -101,6 +101,17 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
         detect_default_gateway().await.is_some(),
         params.allow_no_tiebreaker,
     )?;
+    // The first node's handoff, present when this is the second node. Read
+    // before anything is written: a wrong CHAP password must stop here, not
+    // at the SR creation after this host's disk is wiped.
+    let inherited = inherited_shared_setup().await;
+    if let Some(inh) = &inherited {
+        second_node_chap_gate(
+            params.chap_password.as_deref(),
+            inh.chap_check.as_deref(),
+            &peer_name,
+        )?;
+    }
     let local_ip = match params.local_ip {
         Some(ip) => ip,
         None => detect_local_ip(params.peer_ip).await?,
@@ -467,6 +478,7 @@ initiator_iqns = [{iqn_list}]
             drbd_port: port,
             chap_user: chap_user.clone(),
             publisher_uuid: local_host_uuid().await.unwrap_or_default(),
+            chap_check: Some(chap_check_value(&chap_password)),
         })
         .await;
     }
@@ -582,6 +594,7 @@ initiator_iqns = [{iqn_list}]
         create_sr(
             local_ip,
             params.peer_ip,
+            &peer_name,
             &iqn,
             &chap_user,
             &chap_password,
@@ -612,6 +625,55 @@ initiator_iqns = [{iqn_list}]
     }
 
     Ok(())
+}
+
+/// The second node must carry the first node's CHAP password: refuse a
+/// missing one, and one the first node's published check value disproves.
+fn second_node_chap_gate(given: Option<&str>, check: Option<&str>, peer: &str) -> Result<()> {
+    let next = format!(
+        "pass the password {peer} printed with --chap-password <password> (it is also in \
+         /etc/twinstor/twinstor.toml on {peer}, key chap_password), or run `twinstor setup` \
+         with no arguments for the wizard"
+    );
+    let why = format!(
+        "with another password the iSCSI login to {peer} fails at the very end, after this \
+         host's disk is wiped; nothing was changed on this host"
+    );
+    match given {
+        None => Err(crate::render::CliError::new(
+            format!("{peer} is already set up and waiting, and this host needs its CHAP password"),
+            next,
+        )
+        .explain(why)
+        .into()),
+        Some(p) if chap_verdict(p, check) == ChapVerdict::Differs => {
+            Err(crate::render::CliError::new(
+                format!("this is not the CHAP password {peer} printed"),
+                next,
+            )
+            .explain(why)
+            .into())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// The SR-creation failure when the first node's iSCSI target never accepts
+/// this host's login: almost always a CHAP password that differs from the
+/// first node's, or a first node whose service is not running.
+fn iscsi_login_refused(peer_name: &str, peer_ip: IpAddr) -> crate::render::CliError {
+    crate::render::CliError::new(
+        format!("{peer_name} ({peer_ip}) refused the iSCSI login after {PROBE_ATTEMPTS} attempts"),
+        format!(
+            "check the CHAP password on both hosts (chap_password in \
+             /etc/twinstor/twinstor.toml) and that `systemctl status twinstor` shows it active \
+             on {peer_name}; then run `twinstor setup` here again and choose r"
+        ),
+    )
+    .explain(format!(
+        "most likely the CHAP password given here differs from the one {peer_name} printed, \
+         or the twinstor service is not running on {peer_name}"
+    ))
 }
 
 /// Hostnames matter: drbdadm matches `on <name>` sections against `uname -n`,
@@ -1270,6 +1332,7 @@ const PROBE_RETRY_SECS: u64 = 2;
 async fn create_sr(
     local_ip: IpAddr,
     peer_ip: IpAddr,
+    peer_name: &str,
     iqn: &str,
     chap_user: &str,
     chap_password: &str,
@@ -1369,12 +1432,8 @@ async fn create_sr(
             }
         }
 
-        let scsi_id = match scsi_id {
-            Some(id) => id,
-            None => bail!(
-                "could not determine SCSI ID from iSCSI probe after {PROBE_ATTEMPTS} attempts \
-                 (peer target {peer_ip} not answering CHAP discovery)"
-            ),
+        let Some(scsi_id) = scsi_id else {
+            return Err(iscsi_login_refused(peer_name, peer_ip).into());
         };
         println!("  SCSI ID: {scsi_id}");
 
@@ -1779,6 +1838,11 @@ pub struct SharedSetup {
     /// UUID of the host that published this, so a first-node re-run does not
     /// mistake its own handoff for an inherited one.
     pub publisher_uuid: String,
+    /// A short check value of the first node's CHAP password
+    /// (`chap_check_value`), so the second node can tell a wrong paste before
+    /// it wipes anything. None from a first node that predates it: the paste
+    /// is then accepted unchecked, as before.
+    pub chap_check: Option<String>,
 }
 
 impl SharedSetup {
@@ -1794,7 +1858,7 @@ impl SharedSetup {
             .join(",");
         let direct = self.direct_ip.map(|d| d.to_string()).unwrap_or_default();
         format!(
-            "v=1;arbitrated={};peer_ip={};direct_ip={};ping={};full_sync={};drbd_port={};chap_user={};publisher={}",
+            "v=1;arbitrated={};peer_ip={};direct_ip={};ping={};full_sync={};drbd_port={};chap_user={};publisher={};chap_check={}",
             self.arbitrated as u8,
             self.peer_ip,
             direct,
@@ -1803,6 +1867,7 @@ impl SharedSetup {
             self.drbd_port,
             self.chap_user,
             self.publisher_uuid,
+            self.chap_check.as_deref().unwrap_or_default(),
         )
     }
 
@@ -1840,8 +1905,131 @@ impl SharedSetup {
             drbd_port: map.get("drbd_port")?.parse().ok()?,
             chap_user: map.get("chap_user")?.to_string(),
             publisher_uuid: map.get("publisher")?.to_string(),
+            // An added key, so the format stays v=1: an older second node
+            // ignores it, and an older first node simply does not publish it.
+            chap_check: map
+                .get("chap_check")
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_string()),
         })
     }
+}
+
+/// SHA-256 of `data` (FIPS 180-4). Only for the CHAP check value below, which
+/// does not justify a crypto dependency.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in block.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// The check value the first node publishes for its CHAP password: the first
+/// 8 hex digits of SHA-256 over a fixed prefix and the password. Enough to
+/// catch a wrong or truncated paste on the second node, too short to say
+/// anything useful about the password itself.
+pub(crate) fn chap_check_value(password: &str) -> String {
+    sha256(format!("twinstor-chap:{password}").as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// What a CHAP password typed on the second node is worth against the check
+/// value the first node published.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChapVerdict {
+    /// It is the first node's password.
+    Matches,
+    /// It is not: setup would fail at the very end, after the wipe.
+    Differs,
+    /// The first node published no check value (an older version): accepted
+    /// unchecked.
+    Unchecked,
+}
+
+pub(crate) fn chap_verdict(password: &str, published: Option<&str>) -> ChapVerdict {
+    match published {
+        None => ChapVerdict::Unchecked,
+        Some(c) if c.eq_ignore_ascii_case(&chap_check_value(password)) => ChapVerdict::Matches,
+        Some(_) => ChapVerdict::Differs,
+    }
+}
+
+/// A CHAP password as pasted: surrounding blanks and quotes dropped, and the
+/// `CHAP password:` label removed when the whole line was copied from the
+/// first node's banner.
+pub(crate) fn normalize_chap_paste(raw: &str) -> String {
+    let mut s = raw.trim();
+    let label = "chap password";
+    if s.len() >= label.len()
+        && s.is_char_boundary(label.len())
+        && s[..label.len()].eq_ignore_ascii_case(label)
+    {
+        s = s[label.len()..].trim_start().trim_start_matches(':').trim();
+    }
+    s.trim_matches(|c| c == '"' || c == '\'').trim().to_string()
 }
 
 async fn pool_uuid() -> Option<String> {
@@ -3236,7 +3424,7 @@ mod tests {
         }
     }
     use super::{
-        SharedSetup, drbd_topology, ha_timeout_secs, iqn_is_lio_compatible,
+        SharedSetup, chap_check_value, drbd_topology, ha_timeout_secs, iqn_is_lio_compatible,
         patch_lvm_global_filter, peer_uuid_from_pool, resync_fill_target, resync_min_rate,
         sanitize_iqn,
     };
@@ -3332,6 +3520,7 @@ mod tests {
             drbd_port: 7789,
             chap_user: "twinstor".to_string(),
             publisher_uuid: "5e5e0004-0000-4000-8000-000000000004".to_string(),
+            chap_check: Some(chap_check_value("s3cret")),
         };
         assert_eq!(SharedSetup::decode(&s.encode()), Some(s));
     }
@@ -3347,6 +3536,7 @@ mod tests {
             drbd_port: 7790,
             chap_user: "twinstor".to_string(),
             publisher_uuid: "abc".to_string(),
+            chap_check: None,
         };
         assert_eq!(SharedSetup::decode(&s.encode()), Some(s));
     }
@@ -3776,5 +3966,108 @@ resource twinstor-data {
         let p = parse_res_file(v0, "twinstor-2", "twinstor-1");
         assert_eq!(p.local_backing.as_deref(), Some("/dev/disk/by-id/nvme-Z"));
         assert_eq!(p.drbd_dev.as_deref(), Some("/dev/drbd0"));
+    }
+}
+
+#[cfg(test)]
+mod chap_tests {
+    use super::*;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn sha256_matches_the_standard_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Two blocks: the padding spills into a second one.
+        assert_eq!(
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn chap_check_is_short_stable_and_discriminating() {
+        let c = chap_check_value("Abcdef0123456789");
+        assert_eq!(c.len(), 8);
+        assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(c, chap_check_value("Abcdef0123456789"));
+        assert_ne!(c, chap_check_value("Abcdef012345678"), "a truncated paste");
+        assert_ne!(c, chap_check_value("abcdef0123456789"), "a case slip");
+    }
+
+    #[test]
+    fn chap_verdict_checks_only_when_a_value_was_published() {
+        let check = chap_check_value("right");
+        assert_eq!(chap_verdict("right", Some(&check)), ChapVerdict::Matches);
+        assert_eq!(
+            chap_verdict("right", Some(&check.to_uppercase())),
+            ChapVerdict::Matches
+        );
+        assert_eq!(chap_verdict("wrong", Some(&check)), ChapVerdict::Differs);
+        // A first node that predates the check value: accepted unchecked.
+        assert_eq!(chap_verdict("anything", None), ChapVerdict::Unchecked);
+    }
+
+    #[test]
+    fn pasted_chap_lines_are_cleaned() {
+        assert_eq!(normalize_chap_paste("  Xy12  "), "Xy12");
+        assert_eq!(normalize_chap_paste("CHAP password:  Xy12"), "Xy12");
+        assert_eq!(normalize_chap_paste("chap password: \"Xy12\""), "Xy12");
+        assert_eq!(normalize_chap_paste("'Xy12'"), "Xy12");
+        assert_eq!(normalize_chap_paste(""), "");
+        assert_eq!(normalize_chap_paste("CHAP password:"), "");
+        // A password that merely starts like the label is kept whole.
+        assert_eq!(normalize_chap_paste("chapXy12"), "chapXy12");
+    }
+
+    #[test]
+    fn second_node_refuses_a_missing_or_disproved_password() {
+        let check = chap_check_value("right");
+        let err = second_node_chap_gate(None, Some(&check), "host-a").unwrap_err();
+        let g = err
+            .downcast_ref::<crate::render::CliError>()
+            .expect("guidance");
+        assert!(g.to_string().contains("host-a"), "{g}");
+        let err = second_node_chap_gate(Some("wrong"), Some(&check), "host-a")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not the CHAP password host-a printed"),
+            "{err}"
+        );
+        assert!(second_node_chap_gate(Some("right"), Some(&check), "host-a").is_ok());
+        // No check value published (an older first node): only the empty
+        // password is refused.
+        assert!(second_node_chap_gate(Some("x"), None, "host-a").is_ok());
+        assert!(second_node_chap_gate(None, None, "host-a").is_err());
+    }
+
+    #[test]
+    fn handoff_without_a_check_value_still_decodes() {
+        // As a first node before the check value existed published it.
+        let old = "v=1;arbitrated=0;peer_ip=192.0.2.20;direct_ip=;ping=;full_sync=0;\
+                   drbd_port=7789;chap_user=twinstor;publisher=abc";
+        let s = SharedSetup::decode(old).expect("decodes");
+        assert_eq!(s.chap_check, None);
+    }
+
+    #[test]
+    fn iscsi_refusal_names_chap_and_the_service() {
+        let e = iscsi_login_refused("host-a", "192.0.2.11".parse().unwrap());
+        let text = format!("{e} {e:?}");
+        assert!(text.contains("refused the iSCSI login"), "{text}");
+        assert!(text.contains("CHAP password"), "{text}");
+        assert!(text.contains("systemctl status twinstor"), "{text}");
     }
 }

@@ -40,10 +40,16 @@ fn ask(question: &str, default: Option<&str>) -> Result<String> {
     }
     std::io::stdout().flush()?;
     let mut line = String::new();
-    std::io::stdin()
+    let read = std::io::stdin()
         .lock()
         .read_line(&mut line)
         .context("reading input")?;
+    // End of input (Ctrl-D, a closed pipe): stop instead of looping on a
+    // question that has no default.
+    if read == 0 {
+        println!();
+        bail!("input closed; nothing more was changed");
+    }
     let line = line.trim().to_string();
     if line.is_empty() {
         Ok(default.unwrap_or("").to_string())
@@ -945,6 +951,53 @@ async fn two_host_pool() -> Option<(String, String)> {
     match (this_uuid, peer_uuid) {
         (Some(t), Some(p)) if others == 1 => Some((t, p)),
         _ => None,
+    }
+}
+
+/// The other host's hostname, for messages ("paste the password <name>
+/// printed"); None when the pool cannot be read.
+async fn peer_host_name() -> Option<String> {
+    let (_, peer) = two_host_pool().await?;
+    cmd_output(
+        "xe",
+        &[
+            "host-param-get",
+            &format!("uuid={peer}"),
+            "param-name=hostname",
+        ],
+    )
+    .await
+    .ok()
+    .map(|n| n.trim().to_string())
+    .filter(|n| !n.is_empty())
+}
+
+/// Ask for the CHAP password on the second node until the paste is plausible:
+/// never empty (Enter would generate a new password that the first node's
+/// target refuses at the very end), and equal to the first node's when it
+/// published a check value.
+fn ask_second_node_chap(peer: &str, check: Option<&str>) -> Result<String> {
+    use crate::setup::{ChapVerdict, chap_verdict, normalize_chap_paste};
+    loop {
+        let raw = ask(
+            &format!("CHAP password (paste the one {peer} printed)"),
+            None,
+        )?;
+        let pw = normalize_chap_paste(&raw);
+        if pw.is_empty() {
+            println!(
+                "  Paste the CHAP password that {peer} printed (it is required on this host)."
+            );
+            continue;
+        }
+        if chap_verdict(&pw, check) == ChapVerdict::Differs {
+            println!(
+                "  This is not the password {peer} printed. Paste it again (it is also in\n\
+                 \x20 /etc/twinstor/twinstor.toml on {peer}, key chap_password)."
+            );
+            continue;
+        }
+        return Ok(pw);
     }
 }
 
@@ -1876,14 +1929,17 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // password. An inherited handoff is the strong signal; fall back to a live
     // DRBD-port probe when there is none (e.g. the key was already cleared).
     let peer_already_up = inherited.is_some() || peer_drbd_listening(peer_ip).await;
+    let peer_name = peer_host_name()
+        .await
+        .unwrap_or_else(|| "the other host".to_string());
     if peer_already_up {
-        println!("The other node is already running TwinStor and waiting for this one.");
-        println!("This node joins it as the second node and creates the shared SR.");
+        println!("{peer_name} already runs TwinStor and is waiting for this host.");
+        println!("This host joins it as the second host and creates the shared SR.");
         if inherited.is_some() {
             println!("Shared settings are inherited from it; you only choose this host's disk");
-            println!("and paste node A's CHAP password below.");
+            println!("and paste the CHAP password {peer_name} printed.");
         } else {
-            println!("Have node A's CHAP password ready to paste when asked below.");
+            println!("Have the CHAP password {peer_name} printed ready to paste when asked below.");
         }
         println!();
     }
@@ -2062,15 +2118,21 @@ pub async fn run() -> Result<Option<SetupParams>> {
             false,
         )?,
     };
-    // When the peer is already up this is the second node: pasting node A's
-    // password is required, not optional, so point straight at that.
-    let chap_prompt = if peer_already_up {
-        "CHAP password (paste the one shown on node A)"
+    // When the peer is already up this is the second node: the first node's
+    // password is required, and checked against the value it published.
+    let chap_password = if peer_already_up {
+        Some(ask_second_node_chap(
+            &peer_name,
+            inherited.as_ref().and_then(|i| i.chap_check.as_deref()),
+        )?)
     } else {
-        "CHAP password (Enter to auto-generate on the first node; paste node A's on the second)"
+        let chap = ask(
+            &format!("CHAP password (Enter to generate one; you will paste it on {peer_name})"),
+            Some(""),
+        )?;
+        let chap = crate::setup::normalize_chap_paste(&chap);
+        if chap.is_empty() { None } else { Some(chap) }
     };
-    let chap = ask(chap_prompt, Some(""))?;
-    let chap_password = if chap.is_empty() { None } else { Some(chap) };
     let mut allow_no_tiebreaker = false;
     let ping_targets: Vec<IpAddr> = if let Some(inh) = &inherited {
         // Cluster-shared choice made on the first node. If it accepted a
