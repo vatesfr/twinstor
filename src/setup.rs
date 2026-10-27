@@ -213,9 +213,10 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
     // An accidental re-run on a working pair must stop before any file is
     // rewritten or DRBD taken down, so the live-SR guard runs first.
     let pair = live_pair_state().await;
+    let live = pair.live(inherited.is_some());
     if let Some(refusal) = rerun_refusal(
         rerun_guard(
-            pair.sr_exists,
+            live,
             params.full_sync,
             pair.local_uptodate,
             pair.peer_uptodate,
@@ -223,6 +224,14 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
         &peer_name,
     ) {
         return Err(refusal.into());
+    }
+    // A rebuild of a live pair copies back from the peer: make sure its
+    // DRBD answers now, before anything is stopped or wiped. Without it the
+    // run would take the first-node path and promote an empty disk.
+    if live && !wait_for_peer(params.peer_ip, params.drbd_port.unwrap_or(7789), 15).await {
+        return Err(rerun_refusal(RerunGuard::PeerUnknown, &peer_name)
+            .expect("a refusal")
+            .into());
     }
     let local_ip = match params.local_ip {
         Some(ip) => ip,
@@ -295,14 +304,14 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
     let port = params.drbd_port.unwrap_or(7789);
     let res = "twinstor-data";
     let drbd_dev = "/dev/drbd0";
-    let iqn = format!("iqn.2025-01.com.xcp-ng:{res}");
+    let iqn = TARGET_IQN.to_string();
 
     let chap_user = "twinstor".to_string();
     // Rebuilding this host of a live pair keeps the password the SR was
     // created with: a new one would lock this host out of its own SR.
     let chap_password = match params.chap_password {
         Some(p) => p,
-        None => match pair.sr_exists.then(existing_chap_password).flatten() {
+        None => match live.then(existing_chap_password).flatten() {
             Some(p) => p,
             None => generate_chap_password()?,
         },
@@ -636,7 +645,9 @@ initiator_iqns = [{iqn_list}]
     // First node: hand the choices common to both nodes to the second node via the
     // pool DB, so its wizard inherits them instead of re-asking (the per-host
     // backing device is the only thing it then needs to choose). Best-effort.
-    if !peer_exists {
+    // A live pair never reaches here without its peer (checked above); never
+    // publish a first-node handoff on a pool that already has a pair.
+    if !peer_exists && !live {
         publish_shared_setup(&SharedSetup {
             arbitrated: direct.is_some(),
             peer_ip: local_ip,
@@ -705,6 +716,13 @@ initiator_iqns = [{iqn_list}]
             println!("promoting (dual-primary)...");
             run_cmd("drbdadm", &["primary", "--force", res]).await?;
         }
+    } else if params.full_sync && live {
+        // A rebuild whose peer stopped answering after the check above: an
+        // empty disk must never be promoted on a live pair.
+        bail!(
+            "{peer_name} stopped answering during the rebuild, so this host was not promoted. \
+             Bring {peer_name} back, then run `twinstor setup` here again"
+        );
     } else if params.full_sync {
         // First node with --full-sync: promote immediately, sync starts when peer joins
         println!("no peer found yet, promoting (full sync will start when peer joins)...");
@@ -896,7 +914,7 @@ fn iscsi_login_refused(peer_name: &str, peer_ip: IpAddr) -> crate::render::CliEr
         format!(
             "check the CHAP password on both hosts (chap_password in \
              /etc/twinstor/twinstor.toml) and that `systemctl status twinstor` shows it active \
-             on {peer_name}; then run `twinstor setup` here again (it offers to run setup again)"
+             on {peer_name}; then run `twinstor setup` here again and choose r"
         ),
     )
     .explain(format!(
@@ -960,25 +978,62 @@ async fn local_xapi_hostname() -> Option<String> {
     .filter(|n| !n.is_empty())
 }
 
+/// The iSCSI target name setup gives the TwinStor LUN; the SR's PBDs carry
+/// it in their device-config, which finds the SR whatever its name.
+pub(crate) const TARGET_IQN: &str = "iqn.2025-01.com.xcp-ng:twinstor-data";
+
 /// What setup sees of an existing installation, read before it changes
 /// anything.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PairState {
-    /// The pool has a TwinStor SR: the pair holds real data.
+    /// The pool has a TwinStor SR, found by any of: the SR uuid the daemon
+    /// recorded, a PBD whose target is TwinStor's IQN, or the name setup
+    /// gave it.
     pub sr_exists: bool,
     /// This host's DRBD disk is UpToDate (the resource is up here).
     pub local_uptodate: bool,
+    /// This host's DRBD resource is connected to the peer.
+    pub connected: bool,
     /// The peer's disk is UpToDate as this host sees it right now.
     pub peer_uptodate: bool,
 }
 
+impl PairState {
+    /// DRBD on this host holds or replicates a current copy: a pair that may
+    /// serve data, even when no SR is found (renamed, or XAPI did not
+    /// answer). Detection fails closed on it.
+    pub(crate) fn drbd_live(&self) -> bool {
+        self.local_uptodate || self.connected
+    }
+
+    /// Whether this is a live pair that setup must not wipe. `second_pending`
+    /// is the other host's handoff still in the pool DB: the cluster was not
+    /// formed (the handoff is removed once the SR exists), so a live DRBD
+    /// alone then means a second host whose setup stopped before the SR.
+    pub(crate) fn live(&self, second_pending: bool) -> bool {
+        self.sr_exists || (self.drbd_live() && !second_pending)
+    }
+}
+
+/// Whether the TwinStor SR exists, by any of the three signals. Each one
+/// alone is enough: a renamed SR misses the name, a fresh install has no
+/// recorded uuid.
+pub(crate) fn sr_signals(recorded_uuid_exists: bool, by_iqn: bool, by_name: bool) -> bool {
+    recorded_uuid_exists || by_iqn || by_name
+}
+
 pub(crate) async fn twinstor_sr_exists() -> bool {
-    cmd_output(
-        "xe",
-        &["sr-list", "name-label=twinstor", "params=uuid", "--minimal"],
+    let recorded = match crate::xapi::read_recorded_sr_uuid() {
+        Some(u) => crate::xapi::sr_uuid_exists(&u).await,
+        None => false,
+    };
+    sr_signals(
+        recorded,
+        crate::xapi::discover_sr_uuid_by_iqn(TARGET_IQN)
+            .await
+            .is_some(),
+        crate::xapi::twinstor_sr_uuid_by_name().await.is_some(),
     )
-    .await
-    .ok()
-    .is_some_and(|u| !u.trim().is_empty())
 }
 
 pub(crate) async fn live_pair_state() -> PairState {
@@ -989,10 +1044,11 @@ pub(crate) async fn live_pair_state() -> PairState {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| crate::drbd::parse_drbdadm_text(&String::from_utf8_lossy(&o.stdout)).ok());
-    use crate::drbd::DiskState::UpToDate;
+    use crate::drbd::{ConnectionState::Connected, DiskState::UpToDate};
     PairState {
         sr_exists: twinstor_sr_exists().await,
         local_uptodate: status.as_ref().is_some_and(|s| s.disk == UpToDate),
+        connected: status.as_ref().is_some_and(|s| s.connection == Connected),
         peer_uptodate: status
             .as_ref()
             .is_some_and(|s| s.peer_disk == Some(UpToDate)),
@@ -1009,30 +1065,42 @@ fn existing_chap_password() -> Option<String> {
 /// Whether a setup run may go on, given what already exists.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RerunGuard {
-    /// No TwinStor SR yet (a first install, or one that stopped part-way),
-    /// or a deliberate rebuild of this host from a peer that holds the data.
+    /// No live pair (a first install, or one that stopped before the SR), or
+    /// a rebuild of this host while it sees the peer's copy UpToDate.
     Proceed,
-    /// A live SR and no rebuild asked: an accidental re-run.
+    /// A live pair and no rebuild asked: an accidental re-run.
     LiveSr,
     /// A rebuild asked while this host holds the only current copy: wiping
     /// it would lose the data.
     OnlyCurrentCopy,
+    /// A rebuild asked while this host cannot see the peer's copy UpToDate
+    /// (its DRBD is down, or the peer is): nothing proves a good copy
+    /// survives the wipe.
+    PeerUnknown,
 }
 
 pub(crate) fn rerun_guard(
-    sr_exists: bool,
+    live: bool,
     full_sync: bool,
     local_uptodate: bool,
     peer_uptodate: bool,
 ) -> RerunGuard {
-    if backing_wipe_blocked(sr_exists, full_sync) {
+    if !live {
+        RerunGuard::Proceed
+    } else if !full_sync {
         RerunGuard::LiveSr
-    } else if sr_exists && local_uptodate && !peer_uptodate {
+    } else if peer_uptodate {
+        RerunGuard::Proceed
+    } else if local_uptodate {
         RerunGuard::OnlyCurrentCopy
     } else {
-        RerunGuard::Proceed
+        RerunGuard::PeerUnknown
     }
 }
+
+/// The documented way to give a host of a live pair a fresh copy.
+const REPLACE_BACKING_HINT: &str = "to give this host a new disk, use `twinstor replace-backing \
+     <new-device>`, which copies the data back from the other host";
 
 /// The refusal for a guard that stops setup, with the way out.
 pub(crate) fn rerun_refusal(guard: RerunGuard, peer: &str) -> Option<crate::render::CliError> {
@@ -1040,18 +1108,14 @@ pub(crate) fn rerun_refusal(guard: RerunGuard, peer: &str) -> Option<crate::rend
         RerunGuard::Proceed => None,
         RerunGuard::LiveSr => Some(
             crate::render::CliError::new(
-                "this pool already has a TwinStor SR, so this host's copy is live; nothing was \
-                 changed",
+                "this pool already has a live TwinStor pair, so this host's copy is live; \
+                 nothing was changed",
                 format!(
-                    "if the pair works, there is nothing to do (check it with `twinstor status`). \
-                     To rebuild only this host's copy from {peer} (it keeps serving), run \
-                     `twinstor setup` again and accept the rebuild, or pass --full-sync"
+                    "if the pair works, there is nothing to do (check it with `twinstor \
+                     status`); {REPLACE_BACKING_HINT}"
                 ),
             )
-            .explain(
-                "running setup again erases this host's TwinStor disk and copies it back from \
-                 the other host",
-            ),
+            .explain("running setup again would erase this host's TwinStor disk"),
         ),
         RerunGuard::OnlyCurrentCopy => Some(
             crate::render::CliError::new(
@@ -1059,23 +1123,23 @@ pub(crate) fn rerun_refusal(guard: RerunGuard, peer: &str) -> Option<crate::rend
                     "this host holds the only current copy of the data ({peer}'s copy is not \
                      UpToDate); nothing was changed"
                 ),
-                format!(
-                    "wait until `twinstor status` shows both copies UpToDate, then rebuild, or \
-                     rebuild {peer} instead (run `twinstor setup` there)"
-                ),
+                "wait until `twinstor status` shows both copies UpToDate",
             )
             .explain("rebuilding this host would erase the only good copy"),
         ),
+        RerunGuard::PeerUnknown => Some(
+            crate::render::CliError::new(
+                format!(
+                    "this pool already has a TwinStor SR, and this host cannot see {peer}'s \
+                     copy as UpToDate; nothing was changed"
+                ),
+                format!(
+                    "bring {peer} back and check `twinstor status` there; {REPLACE_BACKING_HINT}"
+                ),
+            )
+            .explain("erasing this host's disk is only safe while the other copy is current"),
+        ),
     }
-}
-
-/// Whether to block the destructive backing-device wipe on a setup re-run.
-/// The wipe is safe on a fresh install or after an aborted run (no twinstor SR
-/// exists yet) and is intended on a rejoin or re-init (signalled with
-/// `--full-sync`, which then resyncs a fresh copy from the peer). It loses data
-/// only when a live twinstor SR already exists and no such intent was given.
-fn backing_wipe_blocked(twinstor_sr_exists: bool, full_sync: bool) -> bool {
-    twinstor_sr_exists && !full_sync
 }
 
 /// Refuse a deployment whose fence-peer would have nothing to probe. The
@@ -4231,18 +4295,6 @@ mod tests {
     }
 
     #[test]
-    fn backing_wipe_guard_blocks_only_accidental_reruns() {
-        use super::backing_wipe_blocked;
-        // Fresh install or aborted run: no SR yet, so the wipe is safe.
-        assert!(!backing_wipe_blocked(false, false));
-        assert!(!backing_wipe_blocked(false, true));
-        // Live SR and no rejoin intent: an accidental re-run, blocked.
-        assert!(backing_wipe_blocked(true, false));
-        // Live SR, but --full-sync signals an intended rejoin or re-init: allowed.
-        assert!(!backing_wipe_blocked(true, true));
-    }
-
-    #[test]
     fn sanitize_iqn_repairs_single_label_authority() {
         // The main case: keep the date and unique id, fix the authority.
         let fixed = sanitize_iqn("iqn.2026-06.home:371e5ce6").unwrap();
@@ -4480,21 +4532,55 @@ mod setup_flow_tests {
 
     #[test]
     fn rerun_guard_protects_a_live_pair() {
-        // Fresh install, or one that stopped before the SR existed.
+        // Fresh install, or one that stopped before the pair was live.
         assert_eq!(rerun_guard(false, false, false, false), RerunGuard::Proceed);
-        assert_eq!(rerun_guard(false, false, true, true), RerunGuard::Proceed);
-        // A live SR and no rebuild asked: an accidental re-run.
+        assert_eq!(rerun_guard(false, true, false, false), RerunGuard::Proceed);
+        // A live pair and no rebuild asked: an accidental re-run.
         assert_eq!(rerun_guard(true, false, true, true), RerunGuard::LiveSr);
-        // A rebuild from a peer that holds the data.
+        // A rebuild while this host sees the peer's copy UpToDate.
         assert_eq!(rerun_guard(true, true, true, true), RerunGuard::Proceed);
+        assert_eq!(rerun_guard(true, true, false, true), RerunGuard::Proceed);
         // A rebuild of the host that holds the only current copy.
         assert_eq!(
             rerun_guard(true, true, true, false),
             RerunGuard::OnlyCurrentCopy
         );
-        // This host's copy is not current (down, or still syncing): the
-        // rebuild is what it needs.
-        assert_eq!(rerun_guard(true, true, false, false), RerunGuard::Proceed);
+        // This host's DRBD is down or the peer is not seen: nothing proves a
+        // good copy survives the wipe.
+        assert_eq!(
+            rerun_guard(true, true, false, false),
+            RerunGuard::PeerUnknown
+        );
+    }
+
+    #[test]
+    fn a_pair_reads_live_on_any_signal() {
+        // A renamed SR is still found by its recorded uuid or its target IQN.
+        assert!(sr_signals(true, false, false));
+        assert!(sr_signals(false, true, false));
+        assert!(sr_signals(false, false, true));
+        assert!(!sr_signals(false, false, false));
+        let renamed = PairState {
+            sr_exists: sr_signals(true, true, false),
+            ..Default::default()
+        };
+        assert!(renamed.live(false));
+        assert!(renamed.live(true), "an SR always means live");
+        // No SR found (XAPI silent), but DRBD holds a current copy here.
+        let uptodate = PairState {
+            local_uptodate: true,
+            ..Default::default()
+        };
+        assert!(uptodate.live(false));
+        let connected = PairState {
+            connected: true,
+            ..Default::default()
+        };
+        assert!(connected.live(false));
+        // The same DRBD state while the other host's handoff is still there:
+        // a second host whose setup stopped before the SR.
+        assert!(!connected.live(true));
+        assert!(!PairState::default().live(false));
     }
 
     #[test]
@@ -4503,8 +4589,12 @@ mod setup_flow_tests {
         let live = rerun_refusal(RerunGuard::LiveSr, "host-a").expect("refused");
         let text = format!("{live} {live:?}");
         assert!(text.contains("nothing was changed"), "{text}");
-        assert!(text.contains("--full-sync"), "{text}");
+        assert!(text.contains("replace-backing"), "{text}");
         assert!(text.contains("twinstor status"), "{text}");
+        let unknown = rerun_refusal(RerunGuard::PeerUnknown, "host-a").expect("refused");
+        let text = format!("{unknown} {unknown:?}");
+        assert!(text.contains("nothing was changed"), "{text}");
+        assert!(text.contains("replace-backing"), "{text}");
         let only = rerun_refusal(RerunGuard::OnlyCurrentCopy, "host-a").expect("refused");
         let text = format!("{only} {only:?}");
         assert!(text.contains("only current copy"), "{text}");
