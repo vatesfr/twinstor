@@ -696,6 +696,7 @@ struct ClaimPaths {
     /// The keeper's announced intent to take a mutual-yield win
     /// (`mutual_yield_take_win`): no claim is served while it stands.
     take_intent: String,
+    publish: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// The beacon updater's claim read (see `beacon_claim`). It also latches a
@@ -753,6 +754,7 @@ async fn compute_beacon_claim(
             );
             // Not on a node that took a win meanwhile (its flip removes the
             // marker and the latch while this read runs).
+            let _publish = p.publish.lock().unwrap_or_else(|e| e.into_inner());
             if read_fork_record(&p.win).is_some() || !std::path::Path::new(&p.yield_marker).exists()
             {
                 return None;
@@ -7336,6 +7338,10 @@ pub struct StateMachine {
     /// Set once the peer claimed it froze with guests (`G`) this episode:
     /// its copy may hold writes the keeper's lacks, so no keeper fallback.
     peer_guests_path: String,
+    /// Serializes a take-win commit (or intent) with the beacon updater's
+    /// publish and relatch, so a claim computed before the commit is never
+    /// published after it.
+    claim_publish: std::sync::Arc<std::sync::Mutex<()>>,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
     arb_yield_xapi_wait_since: Option<std::time::Instant>,
@@ -7650,10 +7656,19 @@ impl StateMachine {
             own_target_cut_at: None,
             mutual_hold_since: None,
             mutual_intent: None,
-            take_intent_path: std::env::var("TWINSTOR_TAKE_INTENT_MARKER")
-                .unwrap_or_else(|_| "/run/twinstor/mutual-take-intent".to_string()),
-            peer_guests_path: std::env::var("TWINSTOR_PEER_GUESTS_MARKER")
-                .unwrap_or_else(|_| "/run/twinstor/peer-had-guests".to_string()),
+            take_intent_path: test_private_path(
+                "take-intent",
+                std::env::var("TWINSTOR_TAKE_INTENT_MARKER")
+                    .unwrap_or_else(|_| "/run/twinstor/mutual-take-intent".to_string()),
+            ),
+            // Durable: a reboot of this node during the episode must not forget
+            // that the peer froze with guests (cleared at the episode end).
+            peer_guests_path: test_private_path(
+                "peer-guests",
+                std::env::var("TWINSTOR_PEER_GUESTS_MARKER")
+                    .unwrap_or_else(|_| "/var/lib/twinstor/peer-had-guests".to_string()),
+            ),
+            claim_publish: std::sync::Arc::new(std::sync::Mutex::new(())),
             arb_yield_hold_alerted: false,
             arb_yield_xapi_wait_since: None,
             frozen_domains: None,
@@ -8047,6 +8062,7 @@ impl StateMachine {
                 arbitrated: self.arbitrated,
                 give_way: self.give_way_path.clone(),
                 take_intent: self.take_intent_path.clone(),
+                publish: self.claim_publish.clone(),
             };
             let guests = self.guests.clone();
             tokio::spawn(async move {
@@ -8077,8 +8093,16 @@ impl StateMachine {
                     let claim = compute_beacon_claim(&drbd, guests.as_ref(), &claim_paths).await;
                     // A flip (latch, win or intent changed) while this read ran:
                     // its claim is stale, and the flip has published its own.
-                    if records(&claim_paths) != before {
-                        continue;
+                    // Checked and published under the lock a flip holds.
+                    {
+                        let _publish = claim_paths
+                            .publish
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if records(&claim_paths) != before {
+                            continue;
+                        }
+                        beacon.set_claim(claim);
                     }
                     // The peer decides on this claim: every change is logged.
                     if claim != served_claim {
@@ -8103,7 +8127,6 @@ impl StateMachine {
                         claim_logged_at = Some(std::time::Instant::now());
                         claim_changes_unlogged = 0;
                     }
-                    beacon.set_claim(claim);
                     round += 1;
                     if round % 5 != 1 {
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -19963,9 +19986,11 @@ impl StateMachine {
         // The counterpart rule lets the peer claim the win it cannot read
         // from our marker: a non-yielded loser whose discard handshake is
         // refused (both sides offered --discard-my-data) flips to winner (see
-        // `sb_flip_winner`). A mutual yield still cannot mass-discard: both
-        // hold down and the worst case is a held, alerted outage, never data
-        // loss.
+        // `sb_flip_winner`). A mutual yield never mass-discards: both hold
+        // down until exactly one takes the win (`mutual_yield_take_win`: the
+        // copy that contains the other's, or on a fate-shared freeze-mode pool
+        // the keeper when neither does and the peer never froze with guests);
+        // otherwise it is a held, alerted outage, never data loss.
         if self.latched_yield_loser().await {
             warn!(
                 heal_event = "yielded_loser",
@@ -24464,6 +24489,11 @@ impl StateMachine {
     /// `true` when it flipped.
     async fn mutual_yield_take_win(&mut self, restart_target: bool, held: Duration) -> bool {
         use crate::peer_signal::{ForkClaim, PeerClaim};
+        // Fate-shared only: an arbitrated pool's mutual freeze has its own
+        // keeper decision (`arb_mutual_freeze_tick`), which this must not race.
+        if self.arbitrated {
+            return false;
+        }
         let still_yielded = |c: PeerClaim, g: u64| matches!(c, PeerClaim::Claim(ForkClaim::Yielded(u)) if same_gen(u, g));
         let claim = self.query_peer_claim().await;
         let PeerClaim::Claim(ForkClaim::Yielded(peer_gen)) = claim else {
@@ -24488,7 +24518,11 @@ impl StateMachine {
             return self.mutual_yield_commit(peer_gen, restart_target).await;
         }
         let peer_had_guests = std::path::Path::new(&self.peer_guests_path).exists();
+        // Only in freeze mode, where a node frozen with guests serves `G`
+        // before it can step down (so the record above is reliable); elsewhere
+        // a latched yield may have had guests that took writes.
         let fallback = local_ud
+            && self.fs_freeze()
             && !peer_had_guests
             && mutual_yield_takes_win(
                 local,
@@ -24515,8 +24549,11 @@ impl StateMachine {
                 false
             }
             None => {
-                let _ = std::fs::write(&self.take_intent_path, format!("{peer_gen:016X}\n"));
-                self.beacon.set_claim(None);
+                {
+                    let _publish = self.claim_publish.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = std::fs::write(&self.take_intent_path, format!("{peer_gen:016X}\n"));
+                    self.beacon.set_claim(None);
+                }
                 self.mutual_intent = Some((std::time::Instant::now(), peer_gen));
                 warn!(heal_event = "mutual_yield_intent",
                       peer_yielded_gen = %format!("{peer_gen:016X}"),
@@ -24528,7 +24565,16 @@ impl StateMachine {
             }
             Some((t, _)) if t.elapsed() < MUTUAL_INTENT_WAIT => false,
             Some(_) => {
-                if !still_yielded(self.query_peer_claim().await, peer_gen) {
+                // A lossy beacon read is retried, as `peer_fork_claim` does.
+                let mut last = self.query_peer_claim().await;
+                for _ in 0..2 {
+                    if last != PeerClaim::Unreachable {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    last = self.query_peer_claim().await;
+                }
+                if !still_yielded(last, peer_gen) {
                     self.withdraw_take_intent("the peer's claim changed during the intent");
                     return false;
                 }
@@ -24559,14 +24605,17 @@ impl StateMachine {
     /// discard flag) and the target restarted (rebuilt in place, its cut
     /// lifted), which gives the peer its path to the SR back.
     async fn mutual_yield_commit(&mut self, peer_gen: u64, restart_target: bool) -> bool {
-        write_fork_record(&self.win_path, Some(peer_gen));
-        self.beacon
-            .set_claim(Some(crate::peer_signal::ForkClaim::Won(peer_gen)));
-        let _ = std::fs::remove_file(&self.yield_path);
-        let _ = std::fs::remove_file(&self.latch_path);
-        let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
+        {
+            let _publish = self.claim_publish.lock().unwrap_or_else(|e| e.into_inner());
+            write_fork_record(&self.win_path, Some(peer_gen));
+            self.beacon
+                .set_claim(Some(crate::peer_signal::ForkClaim::Won(peer_gen)));
+            let _ = std::fs::remove_file(&self.yield_path);
+            let _ = std::fs::remove_file(&self.latch_path);
+            let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
+            let _ = std::fs::remove_file(&self.take_intent_path);
+        }
         self.mutual_intent = None;
-        let _ = std::fs::remove_file(&self.take_intent_path);
         self.abandon_discard_offer();
         self.peer_portal_release = false;
         self.sb_flip_winner = true;
@@ -38478,6 +38527,51 @@ poll_interval_ms = 10
     }
 
     #[tokio::test]
+    async fn a_take_win_intent_or_a_win_record_is_never_served_as_or_turned_into_a_yield() {
+        use crate::peer_signal::ForkClaim;
+        let mut status = online_no_peer();
+        status.suspended_user = true;
+        let drbd = MockDrbd::new(status);
+        let g = 0x1D42_C287_8DFB_6D5A;
+        *drbd.current_uuid.lock().unwrap() = Some(g);
+        let guests = crate::loser_boundary::fake::FakeGuests::with_guests(vec![]);
+        let path = |t: &str| test_private_path(t, String::new());
+        let p = ClaimPaths {
+            yield_marker: path("i-yield"),
+            latch: path("i-latch"),
+            win: path("i-win"),
+            discard_request: path("i-discard"),
+            yield_guests: path("i-guests"),
+            fs_freeze_off: path("i-off"),
+            peer_fs_freeze: path("i-peer-freeze"),
+            fs_freeze_allowed: true,
+            arbitrated: false,
+            give_way: path("i-give-way"),
+            take_intent: path("i-intent"),
+            publish: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        // A guest-free yield is latched and served as Y.
+        std::fs::write(&p.yield_marker, "yielded\n").unwrap();
+        assert_eq!(
+            compute_beacon_claim(&drbd, &guests, &p).await,
+            Some(ForkClaim::Yielded(g))
+        );
+        // The keeper's intent: nothing served.
+        std::fs::write(&p.take_intent, "x\n").unwrap();
+        assert_eq!(compute_beacon_claim(&drbd, &guests, &p).await, None);
+        let _ = std::fs::remove_file(&p.take_intent);
+        // A node that took the win is never relatched by a read that still
+        // sees its yield marker.
+        let _ = std::fs::remove_file(&p.latch);
+        write_fork_record(&p.win, Some(0x5555_5555_5555_5554));
+        let _ = compute_beacon_claim(&drbd, &guests, &p).await;
+        assert!(read_fork_record(&p.latch).is_none());
+        for f in [&p.yield_marker, &p.latch, &p.win] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[tokio::test]
     async fn arbitrated_frozen_yield_with_guests_is_served_as_g() {
         use crate::peer_signal::ForkClaim;
         let mut status = online_no_peer();
@@ -38499,6 +38593,7 @@ poll_interval_ms = 10
             arbitrated: true,
             give_way: path("g-give-way"),
             take_intent: path("g-intent"),
+            publish: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         std::fs::write(&p.yield_marker, "yielded\n").unwrap();
         assert_eq!(
