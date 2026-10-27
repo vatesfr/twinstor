@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -1809,6 +1809,71 @@ async fn show_current_install() {
     println!();
 }
 
+/// The setup that rebuilds this host of a working pair with its current
+/// settings (same peer, topology, disk, password and tiebreakers), from the
+/// config and the files setup wrote. Free of I/O so it can be unit-tested.
+fn rebuild_params(
+    cfg: &crate::config::Config,
+    direct_peer: Option<&str>,
+    ping_targets: Option<&str>,
+) -> SetupParams {
+    let direct_ip = direct_peer.and_then(|t| {
+        crate::setup::parse_ping_targets(t)
+            .first()
+            .and_then(|l| l.parse().ok())
+    });
+    let ping_targets = ping_targets
+        .map(crate::setup::parse_ping_targets)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    SetupParams {
+        peer_ip: cfg.network.peer_address,
+        backing_device: Some(cfg.storage.backing_device.clone()),
+        local_ip: None,
+        drbd_port: Some(cfg.network.drbd_port),
+        full_sync: true,
+        chap_password: cfg.iscsi.chap_password.clone(),
+        ping_targets,
+        direct_ip,
+        allow_no_tiebreaker: cfg.network.allow_no_tiebreaker,
+    }
+}
+
+/// Show what a rebuild of this host does and ask for the typed confirmation.
+fn confirm_rebuild(peer: &str) -> Result<Option<SetupParams>> {
+    let cfg = crate::config::Config::load(std::path::Path::new("/etc/twinstor/twinstor.toml"))
+        .context("reading this host's TwinStor configuration")?;
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    let params = rebuild_params(
+        &cfg,
+        read(crate::setup::DIRECT_PEER_PATH).as_deref(),
+        read(crate::setup::PING_TARGETS_PATH).as_deref(),
+    );
+    println!("\nRebuild of this host, with its current settings:");
+    println!("  peer:    {peer} ({})", params.peer_ip);
+    match params.direct_ip {
+        Some(d) => println!("  mode:    arbitrated (direct link to {d})"),
+        None => println!("  mode:    fate-shared (one network)"),
+    }
+    println!(
+        "  device:  {} (ALL DATA ON IT WILL BE ERASED, then copied back from {peer})",
+        params
+            .backing_device
+            .as_deref()
+            .unwrap_or(Path::new("?"))
+            .display()
+    );
+    println!("  the copy takes a while on large disks; follow it with: twinstor status");
+    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
+    if confirm != "yes" {
+        bail!("aborted by user; nothing was changed");
+    }
+    println!();
+    Ok(Some(params))
+}
+
 /// Run the interactive wizard. Returns `Some(params)` when a (re)install
 /// should proceed, `None` when the session was handled in place (status
 /// shown, uninstall performed, or the user quit).
@@ -1831,7 +1896,29 @@ pub async fn run() -> Result<Option<SetupParams>> {
             }
             "r" => {
                 println!();
-                // fall through into the normal wizard below
+                // A working pair is checked now, not after every question:
+                // setup would refuse it at the end anyway.
+                let pair = crate::setup::live_pair_state().await;
+                if pair.sr_exists {
+                    let peer = peer_host_name()
+                        .await
+                        .unwrap_or_else(|| "the other host".to_string());
+                    println!("This pool already has a TwinStor SR, so this host's copy is live.");
+                    println!(
+                        "Setup can rebuild only this host: it erases this host's TwinStor disk"
+                    );
+                    println!("and copies it back from {peer}, which keeps serving meanwhile.");
+                    use crate::setup::{rerun_guard, rerun_refusal};
+                    let guard = rerun_guard(true, true, pair.local_uptodate, pair.peer_uptodate);
+                    if let Some(refusal) = rerun_refusal(guard, &peer) {
+                        return Err(refusal.into());
+                    }
+                    if !ask_yes_no(&format!("Rebuild this host's copy from {peer}?"), false)? {
+                        println!("nothing changed.");
+                        return Ok(None);
+                    }
+                    return confirm_rebuild(&peer);
+                }
             }
             _ => {
                 println!("nothing changed.");
@@ -2253,6 +2340,54 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn sample_config() -> crate::config::Config {
+        toml::from_str(
+            r#"
+[node]
+name = "host-b"
+peer = "host-a"
+[network]
+peer_address = "192.0.2.11"
+drbd_port = 7790
+[storage]
+drbd_resource = "data"
+backing_device = "/dev/disk/by-id/wwn-0x5000"
+drbd_device = "/dev/drbd0"
+[iscsi]
+target_iqn = "iqn.2025-01.com.xcp-ng:twinstor-data"
+lun_serial = "twinstor-data"
+chap_user = "twinstor"
+chap_password = "Kept0123456789ab"
+initiator_iqns = ["iqn.a"]
+"#,
+        )
+        .expect("sample config parses")
+    }
+
+    #[test]
+    fn rebuild_keeps_every_current_setting() {
+        let cfg = sample_config();
+        let p = rebuild_params(
+            &cfg,
+            Some("# peer direct-link IP (arbitrated mode)\n10.99.99.1\n"),
+            Some("# comment\n\n192.0.2.250\n192.0.2.251 # switch\n"),
+        );
+        assert_eq!(p.peer_ip, ip("192.0.2.11"));
+        assert_eq!(p.drbd_port, Some(7790));
+        assert_eq!(
+            p.backing_device.as_deref(),
+            Some(Path::new("/dev/disk/by-id/wwn-0x5000"))
+        );
+        assert_eq!(p.chap_password.as_deref(), Some("Kept0123456789ab"));
+        assert_eq!(p.direct_ip, Some(ip("10.99.99.1")));
+        assert_eq!(p.ping_targets, vec![ip("192.0.2.250"), ip("192.0.2.251")]);
+        assert!(p.full_sync, "a rebuild copies the whole disk back");
+        // Fate-shared, no extra targets.
+        let p = rebuild_params(&cfg, None, Some("# Example:\n#   192.0.2.2\n"));
+        assert_eq!(p.direct_ip, None);
+        assert!(p.ping_targets.is_empty());
     }
 
     #[test]
