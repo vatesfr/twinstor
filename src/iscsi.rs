@@ -614,12 +614,14 @@ pub async fn remove_peer_portal_rule(peer_ip: &str, port: u16) -> bool {
 /// timing out (a login timeout left LIO unable to remove the portal, wedging
 /// the teardown into a forced reboot). Removed by the next `start()`.
 ///
-/// This host's own loopback session (over `lo`) is not cut: its guests are
-/// stopped before the loser lifts its I/O, and the crash boundary needs that
-/// path to close their disk handles. With it cut too, two losers (both peer
-/// portals fenced, both own portals cut) had no path left to the SR, neither
-/// boundary could finish, and the pair held down for an hour. `legacy` is the
-/// earlier form without the exemption, matched only to remove it.
+/// In fate-shared mode the cut first spares this host's own loopback session
+/// (over `lo`): its guests are stopped before the loser lifts its I/O, and the
+/// crash boundary needs that path to close their disk handles. With it cut
+/// too, two losers (both peer portals fenced, both own portals cut) had no
+/// path left to the SR, neither boundary could finish, and the pair held down
+/// for an hour. The teardown then cuts `lo` too (the loopback is logged out by
+/// then), before the device is released: a session over `lo` must never reach
+/// the LUN-less target. `legacy` is the full form (no exemption).
 fn portal_block_rule(chain: &str, port: u16, legacy: bool) -> Vec<String> {
     let (dir, iface) = if chain == "INPUT" {
         ("--dport", "! -i lo")
@@ -677,13 +679,19 @@ fn stray_reset_rule(port: u16) -> Vec<String> {
 /// Insert the stray-segment reset rule (`stray_reset_rule`) unless present.
 pub async fn ensure_stray_reset_rule(port: u16) {
     let rule = stray_reset_rule(port);
-    let mut check = vec!["-C".to_string(), "INPUT".to_string()];
+    let mut check = vec!["-w".to_string(), "3".to_string(), "-C".to_string(), "INPUT".to_string()];
     check.extend(rule.iter().cloned());
     let check: Vec<&str> = check.iter().map(String::as_str).collect();
     if crate::cmd::run_cmd_quiet("iptables", &check).await.is_ok() {
         return;
     }
-    let mut insert = vec!["-I".to_string(), "INPUT".to_string(), "1".to_string()];
+    let mut insert = vec![
+        "-w".to_string(),
+        "3".to_string(),
+        "-I".to_string(),
+        "INPUT".to_string(),
+        "1".to_string(),
+    ];
     insert.extend(rule);
     let insert: Vec<&str> = insert.iter().map(String::as_str).collect();
     if let Err(e) = crate::cmd::run_cmd_quiet("iptables", &insert).await {
@@ -691,12 +699,15 @@ pub async fn ensure_stray_reset_rule(port: u16) {
     }
 }
 
-/// Cut this host's target off from every initiator. `false` on failure.
-pub async fn block_portal_logins(port: u16) -> bool {
+/// Cut this host's target off from every initiator; `spare_loopback` leaves
+/// this host's own session over `lo` (see `portal_block_rule`). `false` on
+/// failure.
+pub async fn block_portal_logins(port: u16, spare_loopback: bool) -> bool {
+    let legacy = !spare_loopback;
     let mut ok = true;
     for chain in ["INPUT", "OUTPUT"] {
-        ok &= iptables_portal_block("-C", chain, port, false).await == Some(true)
-            || iptables_portal_block("-I", chain, port, false).await == Some(true);
+        ok &= iptables_portal_block("-C", chain, port, legacy).await == Some(true)
+            || iptables_portal_block("-I", chain, port, legacy).await == Some(true);
     }
     ok
 }

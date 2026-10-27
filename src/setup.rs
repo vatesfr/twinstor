@@ -2468,7 +2468,10 @@ mod tests {
                 ("logger", "#!/bin/sh\nexit 0\n".to_string()),
                 (
                     "dmesg",
-                    format!("#!/bin/sh\ncat {}/dmesg 2>/dev/null\n", st.display()),
+                    format!(
+                        "#!/bin/sh\ncat {s}/dmesg 2>/dev/null; cat {s}/kmsg 2>/dev/null; cat {s}/dmesg_after 2>/dev/null\n",
+                        s = st.display()
+                    ),
                 ),
             ];
             for (name, body) in shims {
@@ -2501,6 +2504,7 @@ mod tests {
                 .env("TWINSTOR_RUN_DIR", self.root.join("run"))
                 .env("TWINSTOR_FENCE_LOG", self.root.join("fence.log"))
                 .env("TWINSTOR_FENCE_LOCK_WAIT", lock_wait.to_string())
+                .env("TWINSTOR_KMSG", self.root.join("state/kmsg"))
                 .env("DRBD_RESOURCE", "twinstor-data")
                 .env("TWINSTOR_DAEMON_EXE", self.daemon_exe());
             c
@@ -3283,24 +3287,27 @@ mod tests {
         if !fence_rig_usable() {
             return;
         }
-        let newer = "[99999999.000001] drbd twinstor-data twinstor-1: conn( Connected -> NetworkFailure ) peer( Primary -> Unknown )\n";
-        let older = "[1.000001] drbd twinstor-data twinstor-1: conn( Connected -> NetworkFailure ) peer( Primary -> Unknown )\n";
+        // Log order, not timestamps: a printk clock ahead of /proc/uptime
+        // stamps the triggering disconnect later than the run's start.
+        let line = "[99999999.000001] drbd twinstor-data twinstor-1: conn( Connected -> NetworkFailure ) peer( Primary -> Unknown )\n";
         let rig = FenceRig::new("stale");
         let daemon = rig.fake_process("daemon");
         rig.flag(daemon.pid());
-        // The triggering disconnect predates the run: survive as before.
-        rig.set("dmesg", older);
+        // The triggering disconnect is logged before the run's marker:
+        // survive as before, whatever its timestamp.
+        rig.set("dmesg", line);
         assert_eq!(rig.run(5), 4, "{}", rig.log());
-        // The connection dropped again after the run started: stay frozen,
-        // no yield recorded, the newer run decides.
-        rig.set("dmesg", &format!("{older}{newer}"));
+        // The connection dropped again after the marker: stay frozen, no
+        // yield recorded, the newer run decides.
+        let _ = std::fs::remove_file(rig.root.join("state/kmsg"));
+        rig.set("dmesg_after", line);
         assert_eq!(rig.run(5), 1, "{}", rig.log());
         assert!(rig.log().contains("verdict is stale"), "{}", rig.log());
         assert!(!rig.marker().exists());
         drop(daemon);
         // Fate-shared without freeze mode (resource-only): unchanged.
         let rig = FenceRig::new("stalenofreeze");
-        rig.set("dmesg", newer);
+        rig.set("dmesg_after", line);
         assert_eq!(rig.run(5), 4, "{}", rig.log());
     }
 

@@ -391,8 +391,6 @@ fn write_fork_record(path: &str, generation: Option<u64>) {
     let _ = std::fs::write(path, body);
 }
 
-/// Two generation UUIDs name the same generation (bit 0 is DRBD's
-/// primary-at-the-time flag, not part of the identity). Zero never matches.
 /// Both nodes yielded and hold down with their discard offers parked: which
 /// one may take the win without losing an acknowledged write. `local` is this
 /// node's generation UUIDs (current, bitmap, history), `peer` the generation
@@ -410,6 +408,8 @@ fn mutual_yield_takes_win(local: [u64; 4], peer: u64, is_keeper: bool) -> bool {
     local[1..].iter().any(|&g| g != 0 && same_gen(g, peer))
 }
 
+/// Two generation UUIDs name the same generation (bit 0 is DRBD's
+/// primary-at-the-time flag, not part of the identity). Zero never matches.
 fn same_gen(a: u64, b: u64) -> bool {
     let (a, b) = (a & !1, b & !1);
     a != 0 && a == b
@@ -566,6 +566,20 @@ fn freeze_budget(ha_armed: Option<bool>, xha_timeout: Option<u32>) -> Duration {
     let watchdog = Duration::from_secs(u64::from(timeout) + 15);
     let xha = watchdog.saturating_sub(FREEZE_XHA_MARGIN + FREEZE_YIELD_LEAD);
     FREEZE_GUEST_BUDGET.min(xha).max(Duration::from_secs(20))
+}
+
+/// The budget after which a frozen node with guests steps down. Both nodes
+/// frozen with guests and neither deciding used to reach their budgets within
+/// seconds of each other, both step down, and both hold as losers. The
+/// non-keeper steps down at 70% of the budget instead, and the keeper, still
+/// frozen, reads its yield and keeps its copy (`freeze_standalone_step`). The
+/// keeper keeps the whole budget: it is bounded by the XHA statefile watchdog.
+fn freeze_step_down_budget(budget: Duration, is_keeper: bool) -> Duration {
+    if is_keeper {
+        budget
+    } else {
+        budget * 7 / 10
+    }
 }
 
 /// Whether a fence-peer yield is decisive on its own: no guest domain on this
@@ -4372,15 +4386,15 @@ fn demoted_survivor_decision(
 /// Longer than a defused flap episode, much shorter than an operator visit.
 const REPLICATION_FALLBACK_GRACE: Duration = Duration::from_secs(120);
 
+/// How long a yield-latched loser holds (offer parked) before checking whether
+/// its peer yielded too and this copy may take the win (`mutual_yield_take_win`):
+/// long enough for a winner that exists to reconnect and take the offer.
+const MUTUAL_YIELD_SETTLE: Duration = Duration::from_secs(30);
+
 /// Replication failback: escalating stability holds before failing back. The
 /// first hold is short so a replugged cable returns quickly; after a failback
 /// that flapped straight back the hold grows; past the last hold failback is
 /// latched manual-only.
-/// Ticks a yield-latched loser holds (offer parked) before checking whether
-/// its peer yielded too and this copy may take the win (`mutual_yield_take_win`):
-/// long enough for a winner that exists to reconnect and take the offer.
-const MUTUAL_YIELD_SETTLE_TICKS: u64 = 30;
-
 const FAILBACK_HOLDS: [Duration; 3] = [
     Duration::from_secs(150),
     Duration::from_secs(600),
@@ -7277,6 +7291,9 @@ pub struct StateMachine {
     /// When this host cut its own target off as a split-brain loser
     /// (`cut_own_target`); cleared once the teardown has released the device.
     own_target_cut_at: Option<std::time::Instant>,
+    /// When this yield-latched loser first held with its offer parked in the
+    /// current episode (`mutual_yield_take_win`); cleared at the episode end.
+    mutual_hold_since: Option<std::time::Instant>,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
     arb_yield_xapi_wait_since: Option<std::time::Instant>,
@@ -7589,6 +7606,7 @@ impl StateMachine {
             ),
             arb_keep_retry_at: None,
             own_target_cut_at: None,
+            mutual_hold_since: None,
             arb_yield_hold_alerted: false,
             arb_yield_xapi_wait_since: None,
             frozen_domains: None,
@@ -13012,7 +13030,7 @@ impl StateMachine {
 
             // Checked on its own: installs whose ACCEPT rules are already in
             // place get it too.
-            crate::iscsi::ensure_stray_reset_rule(3260).await;
+            crate::iscsi::ensure_stray_reset_rule(self.config.iscsi.portal_port).await;
 
             if let Some(backing) = self.config.storage.backing_device.to_str() {
                 debug!(device = %backing, "try_go_online: activating backing LV");
@@ -20471,12 +20489,16 @@ impl StateMachine {
                 }
                 return;
             }
+            let step_down_after = freeze_step_down_budget(
+                budget,
+                self.config.node.name < self.config.node.peer,
+            );
             if !self.yield_latched()
                 && s.connection != ConnectionState::Connected
-                && since.elapsed() >= budget
+                && since.elapsed() >= step_down_after
             {
                 warn!(heal_event = "freeze_budget_step_down", frozen_secs = since.elapsed().as_secs(),
-                      budget_secs = budget.as_secs(), incident = ?self.incident_id,
+                      budget_secs = step_down_after.as_secs(), incident = ?self.incident_id,
                       "freeze mode: this node's guests reached the freeze budget without a decision; \
                        stopping them (nothing they wrote was acknowledged) and stepping down before \
                        the I/O stack could fail their frozen I/O, no reboot");
@@ -20698,10 +20720,28 @@ impl StateMachine {
                 Some(h) => self.peer_fork_claim(h).await,
                 None => None,
             };
+            // A peer that stepped down (its yield latched: `Y`, bound to this
+            // fork) stopped its guests and never serves this fork again: it
+            // gives way as surely as an explicit `R`, and its loser round
+            // offers --discard-my-data. Without this, both nodes frozen with
+            // guests stepped down at their budgets and held. Only where the
+            // lineage keeps this copy (`freshness_verdict`: ahead, the fork's
+            // larger side, or the same generation): a peer that holds more may
+            // have served before it froze, and its writes are not discarded
+            // here (this node holds, or steps down when merely behind).
+            let peer_stepped_down = match (&claim, &hs) {
+                (Some(ForkClaim::Yielded(_)), Some(h)) => {
+                    matches!(
+                        freshness_verdict(h).0,
+                        FreshnessVerdict::Keep | FreshnessVerdict::Defer
+                    )
+                }
+                _ => false,
+            };
             // The budget itself is enforced every pass, in any connection
             // state (`freeze_tick`).
             match claim {
-                Some(ForkClaim::GiveWay(_)) => {
+                Some(ForkClaim::GiveWay(_)) | Some(ForkClaim::Yielded(_)) if matches!(claim, Some(ForkClaim::GiveWay(_))) || peer_stepped_down => {
                     // The peer is Secondary and offers --discard-my-data. This
                     // copy wrote nothing since the freeze, so DRBD sees it as
                     // merely behind and would refuse it as a sync source while
@@ -21469,7 +21509,11 @@ impl StateMachine {
         if cfg!(test) || self.own_target_cut_at.is_some() {
             return;
         }
-        if crate::iscsi::block_portal_logins(self.config.iscsi.portal_port).await {
+        // Arbitrated keeps the full cut (no dual-loser hold there); fate-shared
+        // spares the loopback until the teardown (`portal_block_rule`).
+        if crate::iscsi::block_portal_logins(self.config.iscsi.portal_port, !self.arbitrated)
+            .await
+        {
             self.own_target_cut_at = Some(std::time::Instant::now());
             warn!(heal_event = "loser_target_cut", incident = ?self.incident_id,
                   "split-brain loser: this host's iSCSI target is cut off from every initiator \
@@ -21736,6 +21780,7 @@ impl StateMachine {
             info!(heal_event = "incident_end", incident = %id, "freeze or yield incident over (pair converged)");
         }
         self.arb_yield_hold_alerted = false;
+        self.mutual_hold_since = None;
         self.peer_portal_release = false;
         self.sb_refused_first = None;
         self.sb_refused_last = None;
@@ -23801,6 +23846,15 @@ impl StateMachine {
         // still running in LIO when the backstore goes.
         self.cut_own_target().await;
         let blocked = self.own_target_cut_at.is_some();
+        // The loopback is logged out by now: cut `lo` too before the device is
+        // released (a no-op where the cut already covers it).
+        if blocked
+            && !self.arbitrated
+            && !cfg!(test)
+            && !crate::iscsi::block_portal_logins(self.config.iscsi.portal_port, false).await
+        {
+            warn!("split-brain: could not extend this host's target cut to its loopback");
+        }
         if let Some(at) = self.own_target_cut_at {
             let wait = LOSER_LOGIN_DRAIN.saturating_sub(at.elapsed());
             if !wait.is_zero() {
@@ -24227,8 +24281,14 @@ impl StateMachine {
             }
             OfferAction::Hold => {
                 self.loser_holding_ticks = self.loser_holding_ticks.saturating_add(1);
+                // Timed from the first hold of the episode: a refused mutual
+                // discard re-parks the offer (Rearm), which resets the hold
+                // counter, and must not keep this check from ever running.
+                let since = *self
+                    .mutual_hold_since
+                    .get_or_insert_with(std::time::Instant::now);
                 if self.yield_latched()
-                    && self.loser_holding_ticks >= MUTUAL_YIELD_SETTLE_TICKS
+                    && since.elapsed() >= MUTUAL_YIELD_SETTLE
                     && self.loser_holding_ticks.is_multiple_of(10)
                     && self.mutual_yield_take_win(restart_target).await
                 {
@@ -26274,6 +26334,16 @@ lun_serial = "twinstor0001"
 poll_interval_ms = 10
 "#;
         std::sync::Arc::new(toml::from_str(toml).unwrap())
+    }
+
+    #[test]
+    fn freeze_budgets_are_staggered_so_the_keeper_outlasts_the_other_node() {
+        let b = Duration::from_secs(100);
+        assert_eq!(freeze_step_down_budget(b, true), b);
+        assert_eq!(freeze_step_down_budget(b, false), Duration::from_secs(70));
+        // The smallest budget still leaves the keeper a window.
+        let min = Duration::from_secs(20);
+        assert!(freeze_step_down_budget(min, false) < freeze_step_down_budget(min, true));
     }
 
     #[test]

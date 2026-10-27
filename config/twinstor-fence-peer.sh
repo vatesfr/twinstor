@@ -83,20 +83,25 @@ entry_freeze_release() {
 # queued during the freeze were acknowledged in the moment between the two,
 # and discarded. In the modes that rely on the freeze, such a run stays frozen
 # instead (exit 1, no yield marker) and leaves the decision to the newer run.
-# The newer disconnect is read from DRBD's own kernel log line, stamped after
-# this run started. Not when the pair is Connected again (writes replicate),
-# nor for an arbitrated keep, which stands for the episode.
-START_UPTIME=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+# The newer disconnect is DRBD's own kernel log line after this run's marker
+# in the kernel log, in log order: the printk clock and /proc/uptime drift
+# apart by tenths of a second on a dom0 (measured), more than the gap between
+# the triggering disconnect and this run's start. No marker (it could not be
+# written) reads as no newer disconnect. Not when the pair is Connected again
+# (writes replicate), nor for an arbitrated keep, which stands for the episode.
+KMSG="${TWINSTOR_KMSG:-/dev/kmsg}"
+RUN_MARK="twinstor-fence-peer run $$ $(date +%s%N) start"
+echo "$RUN_MARK" > "$KMSG" 2>/dev/null
 superseded_survive() {
     { [ "$FREEZE" = 1 ] || [ -n "$DIRECT_PEER" ]; } || return 1
-    [ "$LOCAL_ROLE" = "Primary" ] && [ -n "$START_UPTIME" ] || return 1
+    [ "$LOCAL_ROLE" = "Primary" ] || return 1
     case "$(timeout 5 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)" in
         Connected|Sync*|"") return 1 ;;
     esac
-    timeout 5 dmesg 2>/dev/null \
-        | grep -F "drbd $RESOURCE " | grep -F "conn( Connected -> " \
-        | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p' \
-        | awk -v s="$START_UPTIME" '$1 > s { found = 1 } END { exit !found }'
+    timeout 5 dmesg 2>/dev/null | awk -v m="$RUN_MARK" -v r="drbd $RESOURCE " '
+        index($0, m) { seen = 1; next }
+        seen && index($0, r) && index($0, "conn( Connected -> ") { found = 1 }
+        END { exit !found }'
 }
 
 verdict() {
