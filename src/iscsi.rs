@@ -79,6 +79,11 @@ pub trait IscsiControl: Send + Sync {
     async fn release_device(&mut self) -> Result<()> {
         self.stop().await
     }
+    /// Whether this process exports the target (started, not stopped or
+    /// released since).
+    fn is_active(&self) -> bool {
+        true
+    }
 }
 
 /// The targetcli commands the controller issues, behind a seam so the
@@ -355,6 +360,10 @@ impl IscsiControl for IscsiController {
         }
         info!("iSCSI target stopped");
         Ok(())
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
     }
 
     async fn release_device(&mut self) -> Result<()> {

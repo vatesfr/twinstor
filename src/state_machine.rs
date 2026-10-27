@@ -9307,6 +9307,13 @@ impl StateMachine {
                     {
                         // The Online tick never promotes: bring-up does.
                         self.set_state(NodeState::Init);
+                    } else if !self.iscsi.is_active() {
+                        // A split-brain loser's teardown released the target
+                        // (behind its cut) and this reconnect ended the episode
+                        // instead of its own convergence: bring-up starts the
+                        // target through the readiness gate (and lifts the cut).
+                        info!("iSCSI target not running after the reconnect; bring-up starts it");
+                        self.set_state(NodeState::Init);
                     }
                     return;
                 }
