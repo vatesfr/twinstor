@@ -3305,6 +3305,41 @@ mod tests {
     }
 
     #[test]
+    fn fence_peer_freeze_probes_a_silent_drbd_port_before_surviving() {
+        // Freeze mode, gateway up, the peer's DRBD port missed at the first
+        // probe (a lossy link) and answering a moment later: the handler
+        // finds it within the window instead of surviving beside it.
+        if !fence_rig_usable() {
+            return;
+        }
+        let port = bind_or_wait("127.0.0.5", 0).local_addr().unwrap().port();
+        let rig = FenceRig::new("fzwindow");
+        std::fs::write(
+            rig.root.join("etc/twinstor.toml"),
+            format!("peer_address = \"127.0.0.5\"\ndrbd_port = {port}\n"),
+        )
+        .unwrap();
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            let l = bind_or_wait("127.0.0.5", port);
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            drop(l);
+        });
+        rig.run(60);
+        assert!(rig.log().contains("probing it on ports"), "{}", rig.log());
+        assert!(rig.log().contains("answered within the window"), "{}", rig.log());
+        opener.join().unwrap();
+        // The port stays closed: the peer reads as gone after the window.
+        let rig = FenceRig::new("fzwindowgone");
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        assert_eq!(rig.run(60), 4, "{}", rig.log());
+        assert!(rig.log().contains("stayed silent for 6s"), "{}", rig.log());
+    }
+
+    #[test]
     fn fence_peer_lock_timeout_freezes_without_outdating() {
         if !fence_rig_usable() {
             return;

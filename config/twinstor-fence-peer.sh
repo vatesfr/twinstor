@@ -509,11 +509,15 @@ freeze_peer_reconnecting() {
 # half a minute to tear the old connection down and listen again while it
 # already serves (a test pool forked on that). A peer whose target is down
 # serves nobody and still reads as gone. A dead keeper costs the survivor
-# this window. Not in fate-shared freeze mode, which has no keeper at the
-# tiebreak: there the window made both nodes yield frozen under sustained
-# loss, both reached the freeze budget, both stepped down, and nobody served
-# (test pool). Under resource-only fencing this node's copy takes writes
-# while it decides, so nothing waits there either.
+# this window. In fate-shared freeze mode, which has no keeper, both nodes
+# probe (a shorter window, on the DRBD port). Without it, under 40% packet loss
+# both nodes missed the peer within one probe, both survived on their
+# gateway and the lineage discarded one side's acknowledged writes. With it
+# both may yield frozen under sustained loss; the daemons then settle where
+# the guests ran, and if both reach the freeze budget both step down and the
+# pair recovers by itself within minutes, with no acknowledged write lost.
+# Under resource-only fencing this node's copy takes writes while it decides,
+# so nothing waits there.
 # Read where the decision needs it (a promote-time or isolated run never does).
 read_keeper() {
     MY_NAME=$(hostname)
@@ -527,17 +531,24 @@ read_keeper() {
     { [ -z "$PEER_NAME" ] || [ "$MY_NAME" \< "$PEER_NAME" ]; } && IS_KEEPER=1
 }
 FROZEN_IO=0
-[ -n "$DIRECT_PEER" ] && FROZEN_IO=1
+{ [ -n "$DIRECT_PEER" ] || [ "$FREEZE" = 1 ]; } && FROZEN_IO=1
 PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-10}"
-# One round of the window: the peer's DRBD port and iSCSI portal on both
-# addresses, all at once with 1 s each, so a dead peer costs one second a
-# round (one probe after another at 2 s each made a 10 s window last 17 s,
-# the survivor's I/O frozen all along) and a lossy link gets four chances.
-# Prints which ports answered.
+[ "$FREEZE" = 1 ] && PEER_SILENT_SECS="${TWINSTOR_PEER_SILENT_SECS:-6}"
+# Freeze mode probes the DRBD port alone (the portal is the path this handler
+# just fenced; a live peer daemon whose DRBD port stays closed has its own
+# wait below), twice at once: two independent chances per round on a lossy
+# link.
+PROBE_PORTS="$DRBD_PORT $PORTAL_PORT"
+[ "$FREEZE" = 1 ] && PROBE_PORTS="$DRBD_PORT $DRBD_PORT"
+# One round of the window: the peer's DRBD port and iSCSI portal (in freeze
+# mode the DRBD port twice) on every address, all at once with 1 s
+# each, so a dead peer costs one second a round (one probe after another at
+# 2 s each made a 10 s window last 17 s, the survivor's I/O frozen all along)
+# and a lossy link gets several chances. Prints which ports answered.
 peer_probe_round() {
     local p port
     for p in $PEER_ADDR $DIRECT_PEER; do
-        for port in $DRBD_PORT $PORTAL_PORT; do
+        for port in $PROBE_PORTS; do
             ( timeout 1 bash -c "exec 3<>/dev/tcp/$p/$port" 2>/dev/null && echo "$port" ) &
         done
     done
@@ -546,7 +557,7 @@ peer_probe_round() {
 peer_listening_within_window() {
     local end answered
     end=$(( $(date +%s) + PEER_SILENT_SECS ))
-    log "the peer's DRBD port did not answer one probe; not the keeper, I/O frozen: probing it and its iSCSI portal for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
+    log "the peer's DRBD port did not answer one probe; I/O frozen$([ "$FREEZE" = 1 ] && echo ' (freeze mode)' || echo ', not the keeper'): probing it on ports ${PROBE_PORTS} for up to ${PEER_SILENT_SECS}s before reading the peer as gone (a lossy link drops single probes)"
     while [ "$(date +%s)" -lt "$end" ]; do
         answered=$(peer_probe_round)
         case " $(echo $answered) " in
@@ -637,7 +648,7 @@ for target in $TARGETS; do
         # true-partition path (peer not listening) is unchanged and instant.
         [ "$LOCAL_ROLE" != "Secondary" ] && read_keeper
         if [ "$LOCAL_ROLE" != "Secondary" ] && { peer_drbd_listening || freeze_peer_reconnecting \
-            || { [ "$FROZEN_IO" = 1 ] && [ "$IS_KEEPER" = 0 ] && peer_listening_within_window; }; }; then
+            || { [ "$FROZEN_IO" = 1 ] && { [ "$IS_KEEPER" = 0 ] || [ "$FREEZE" = 1 ]; } && peer_listening_within_window; }; }; then
             for _ in 1 2 3 4; do
                 sleep 1
                 CSTATE=$(timeout 5 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)
