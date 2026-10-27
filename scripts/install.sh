@@ -55,21 +55,24 @@ else
   errors=$((errors + 1))
 fi
 
-# Version: the bundled dependencies target XCP-ng 8.3 (el7). Other versions
-# are a warning, not a hard stop, in case you know what you are doing.
+# Version: the bundled DRBD module and dependencies are built for XCP-ng 8.3
+# (el7). On any other version they do not install or do not load, and the
+# failure then looks like a kernel problem, so stop here and say so.
 xcp_ver="$( ( . /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}" ) || true )"
 case "$xcp_ver" in
   8.3*) ok "XCP-ng $xcp_ver" ;;
-  "")   warn "could not detect the XCP-ng version (expected 8.3)" ;;
-  *)    warn "detected version $xcp_ver; bundled deps target XCP-ng 8.3 (el7)" ;;
+  "")   warn "could not detect the XCP-ng version (this bundle is built for XCP-ng 8.3)" ;;
+  *)    fail "this bundle is built for XCP-ng 8.3; this host runs $xcp_ver (supported: 8.3)"
+        errors=$((errors + 1)) ;;
 esac
 
 # Up to date: a pending kernel/xen/xcp-ng update means the host should be
 # patched and rebooted first, otherwise the DRBD module built for the
 # updated kernel will not match the running one.
 if command -v yum >/dev/null 2>&1; then
+  echo "    checking for updates (up to a minute without network)..."
   rc=0
-  updates="$(yum check-update -q 2>/dev/null)" || rc=$?
+  updates="$(timeout 60 yum check-update -q 2>/dev/null)" || rc=$?
   if [ "$rc" -eq 100 ]; then
     if printf '%s\n' "$updates" | grep -qiE '^(kernel|kmod|xen|xcp-ng|microcode)'; then
       warn "core updates pending (kernel/xen/xcp-ng): patch and reboot before installing"
@@ -78,6 +81,8 @@ if command -v yum >/dev/null 2>&1; then
     fi
   elif [ "$rc" -eq 0 ]; then
     ok "host is up to date"
+  elif [ "$rc" -eq 124 ]; then
+    warn "the update check did not answer within a minute (no network?); skipping"
   else
     warn "could not check for updates (no network or repo issue); skipping"
   fi
@@ -116,6 +121,26 @@ if ls "$DIR"/deps/*.rpm >/dev/null 2>&1; then
   if printf '%s' "$dep_out" | grep -q 'Nothing to do'; then
     ok "runtime dependencies already present"
   fi
+  # yum's exit status is not usable here (see above), so check the result:
+  # every bundled package must now be installed. A dependency conflict or
+  # unreachable repositories otherwise only show in the scrolled yum output,
+  # and the module check below would then blame the kernel.
+  missing=""
+  for rpm_file in "$DIR"/deps/*.rpm; do
+    name="$(rpm -qp --qf '%{NAME}' "$rpm_file" 2>/dev/null || true)"
+    if [ -n "$name" ] && ! rpm -q "$name" >/dev/null 2>&1; then
+      missing="${missing:+$missing, }$name"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    fail "yum could not install: $missing (see the yum output above)"
+    echo "    If this host has no Internet access, install from the bundle only:" >&2
+    echo "        yum --disablerepo='*' install -y $DIR/deps/*.rpm" >&2
+    echo "    If yum reports a conflict, update the host first (yum update, then" >&2
+    echo "    reboot), then run ./install.sh again." >&2
+    exit 1
+  fi
+  ok "runtime dependencies installed"
 else
   echo "    no bundled deps/ found, assuming dependencies are already installed"
 fi
@@ -166,8 +191,9 @@ if modprobe drbd 2>/dev/null; then
   ok "DRBD module loaded (kernel $(uname -r))"
 else
   fail "DRBD module failed to load for kernel $(uname -r)"
-  echo "    The kmod-drbd build does not match the running kernel. The host is" >&2
-  echo "    most likely updated but not rebooted (or not fully patched). Run:" >&2
+  echo "    The DRBD module package is installed but does not match the running" >&2
+  echo "    kernel. The host is most likely updated but not rebooted (or not" >&2
+  echo "    fully patched). Run:" >&2
   echo "        yum update && reboot" >&2
   echo "    then re-run ./install.sh." >&2
   verify_failed=1
@@ -224,6 +250,9 @@ if [ "$was_installed" -eq 1 ]; then
   echo "    it; do not improvise a rolling reboot."
 else
   echo "twinstor installed and verified on this host."
+  echo
+  echo "Both hosts must be in the same pool before setup (xe pool-join, or \"Add"
+  echo "host\" in Xen Orchestra)."
   echo
   echo "Next, set up the cluster with the interactive wizard. Run it on the"
   echo "FIRST host, then the SECOND; it detects the peer, picks this host's"
