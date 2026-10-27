@@ -284,6 +284,11 @@ initiator_iqns = [{iqn_list}]
             }
             AlreadyDisabled => println!("  cache:   {disk}: volatile write cache already disabled"),
             Disabled => println!("  cache:   {disk}: volatile write cache disabled"),
+            ControllerDelegated(driver) => println!(
+                "  cache:   {disk}: hardware RAID volume ({driver}); the controller owns the\n\
+                 \x20          cache: keep it battery- or flash-backed and the disks' own\n\
+                 \x20          cache off (the controller's settings)"
+            ),
             ZvolDelegated => println!(
                 "  cache:   {disk}: ZFS zvol; flush durability is ZFS's job; keep the\n\
                  \x20          dataset's sync property at 'standard' (never 'disabled')"

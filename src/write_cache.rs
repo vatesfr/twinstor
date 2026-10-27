@@ -33,6 +33,11 @@ pub enum CacheState {
     NoVolatileCache,
     Enabled,
     Disabled,
+    /// A volume of a hardware RAID controller (the named driver): the
+    /// controller owns the cache. Durable when its cache is battery- or
+    /// flash-backed and the member disks' own caches are off, which only the
+    /// controller's tools can tell.
+    ControllerManaged(String),
     /// State could not be determined (unsupported bus, query failure).
     Unknown(String),
 }
@@ -43,6 +48,10 @@ impl CacheState {
             CacheState::NoVolatileCache => "none (durable on completion)",
             CacheState::Enabled => "enabled (not durable on host reset)",
             CacheState::Disabled => "disabled (durable)",
+            CacheState::ControllerManaged(_) => {
+                "managed by the RAID controller (keep its cache battery- or flash-backed \
+                 and the disks' own cache off)"
+            }
             CacheState::Unknown(_) => "unknown",
         }
     }
@@ -52,6 +61,7 @@ impl CacheState {
             CacheState::NoVolatileCache => "none",
             CacheState::Enabled => "enabled",
             CacheState::Disabled => "disabled",
+            CacheState::ControllerManaged(_) => "controller",
             CacheState::Unknown(_) => "unknown",
         }
     }
@@ -70,6 +80,8 @@ pub enum EnforceOutcome {
     /// operator-facing lines describe it correctly instead of showing a
     /// misleading hdparm failure.
     ZvolDelegated,
+    /// Hardware RAID volume: the controller owns the cache (driver named).
+    ControllerDelegated(String),
     Failed(String),
 }
 
@@ -107,6 +119,7 @@ pub async fn enforce(backing: &Path) -> Vec<(String, EnforceOutcome)> {
         let was = query_disk(&disk).await;
         let outcome = match was {
             CacheState::NoVolatileCache => EnforceOutcome::NoVolatileCache,
+            CacheState::ControllerManaged(driver) => EnforceOutcome::ControllerDelegated(driver),
             // Enabled, Disabled (possibly a stale read), or Unknown: a
             // volatile cache exists, so disable it regardless of the read.
             _ => match disable_disk(&disk).await {
@@ -141,7 +154,11 @@ async fn query_disk(disk: &str) -> CacheState {
             Err(e) => CacheState::Unknown(e),
         }
     } else if disk.starts_with("sd") {
-        sata_vwc_state(disk).await
+        match sd_kind(disk) {
+            SdKind::Ata => sata_vwc_state(disk).await,
+            SdKind::Raid(driver) => CacheState::ControllerManaged(driver),
+            SdKind::Scsi => scsi_cache_state(disk),
+        }
     } else {
         CacheState::Unknown(format!("unsupported device type: {disk}"))
     }
@@ -150,12 +167,106 @@ async fn query_disk(disk: &str) -> CacheState {
 async fn disable_disk(disk: &str) -> Result<(), String> {
     if disk.starts_with("nvme") {
         nvme_set_vwc(disk, false)
+    } else if disk.starts_with("sd") && sd_kind(disk) == SdKind::Scsi {
+        scsi_set_write_through(disk)
     } else {
         // SET FEATURES via hdparm; ships in dom0. Bounded: hdparm can block on
         // a wedged disk, and this runs on the tick (enforce_write_cache).
         crate::cmd::run_cmd_for("hdparm", &["-W0", &format!("/dev/{disk}")], 15)
             .await
             .map_err(|e| format!("hdparm -W0: {e}"))
+    }
+}
+
+/// How an `sd` disk's cache is reached.
+#[derive(Debug, PartialEq, Eq)]
+enum SdKind {
+    /// An ATA disk (libata, or SATA behind a pass-through HBA): hdparm.
+    Ata,
+    /// A volume of a hardware RAID controller (its driver): the controller's.
+    Raid(String),
+    /// Any other SCSI disk (SAS, for one): the kernel's caching mode page.
+    Scsi,
+}
+
+/// SCSI host drivers of hardware RAID controllers, whose `sd` devices are
+/// controller volumes (Dell PERC and Broadcom MegaRAID, Microchip/Adaptec
+/// SmartRAID, HPE Smart Array, Areca).
+const RAID_DRIVERS: [&str; 6] = [
+    "megaraid_sas",
+    "smartpqi",
+    "hpsa",
+    "aacraid",
+    "arcmsr",
+    "megaraid",
+];
+
+fn classify_sd(vendor: &str, host_driver: &str) -> SdKind {
+    if vendor.trim() == "ATA" {
+        SdKind::Ata
+    } else if RAID_DRIVERS.contains(&host_driver.trim()) {
+        SdKind::Raid(host_driver.trim().to_string())
+    } else {
+        SdKind::Scsi
+    }
+}
+
+fn sd_kind(disk: &str) -> SdKind {
+    let dev = Path::new("/sys/block").join(disk).join("device");
+    let vendor = std::fs::read_to_string(dev.join("vendor")).unwrap_or_default();
+    // The device path runs through its SCSI host (`.../host2/target2:2:0/...`).
+    let host_driver = std::fs::canonicalize(&dev)
+        .ok()
+        .and_then(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .find(|c| c.starts_with("host") && c[4..].chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .and_then(|h| std::fs::read_to_string(format!("/sys/class/scsi_host/{h}/proc_name")).ok())
+        .unwrap_or_default();
+    classify_sd(&vendor, &host_driver)
+}
+
+/// The kernel's `cache_type` for a SCSI disk (its caching mode page).
+fn parse_cache_type(text: &str) -> CacheState {
+    let t = text.trim();
+    if t.starts_with("write back") {
+        CacheState::Enabled
+    } else if t.starts_with("write through") {
+        CacheState::Disabled
+    } else if t.starts_with("none") {
+        CacheState::NoVolatileCache
+    } else {
+        CacheState::Unknown(format!("unparsable cache_type: {t}"))
+    }
+}
+
+/// The sysfs `cache_type` file of an `sd` disk.
+fn scsi_cache_type_path(disk: &str) -> Option<std::path::PathBuf> {
+    let dir = Path::new("/sys/block")
+        .join(disk)
+        .join("device")
+        .join("scsi_disk");
+    let entry = std::fs::read_dir(dir).ok()?.flatten().next()?;
+    Some(entry.path().join("cache_type"))
+}
+
+fn scsi_cache_state(disk: &str) -> CacheState {
+    match scsi_cache_type_path(disk).map(std::fs::read_to_string) {
+        Some(Ok(t)) => parse_cache_type(&t),
+        Some(Err(e)) => CacheState::Unknown(format!("cache_type: {e}")),
+        None => CacheState::Unknown("no scsi_disk cache_type".into()),
+    }
+}
+
+/// Turn a SCSI disk's write cache off: the kernel sends the MODE SELECT
+/// (WCE=0) when `write through` is written to its `cache_type`.
+fn scsi_set_write_through(disk: &str) -> Result<(), String> {
+    let path = scsi_cache_type_path(disk).ok_or("no scsi_disk cache_type")?;
+    std::fs::write(&path, "write through").map_err(|e| format!("cache_type: {e}"))?;
+    match scsi_cache_state(disk) {
+        CacheState::Disabled | CacheState::NoVolatileCache => Ok(()),
+        other => Err(format!("cache_type reads {} after the write", other.word())),
     }
 }
 
@@ -368,6 +479,38 @@ mod tests {
 
     fn touch(root: &Path, path: &str) {
         std::fs::write(root.join(path), "").unwrap();
+    }
+
+    #[test]
+    fn sd_disks_are_classified_by_vendor_then_host_driver() {
+        assert_eq!(classify_sd("ATA     ", "ahci"), SdKind::Ata);
+        assert_eq!(
+            classify_sd("ATA     ", "megaraid_sas"),
+            SdKind::Ata,
+            "SATA pass-through"
+        );
+        assert_eq!(
+            classify_sd("DELL    ", "megaraid_sas\n"),
+            SdKind::Raid("megaraid_sas".into())
+        );
+        assert_eq!(
+            classify_sd("HPE     ", "smartpqi"),
+            SdKind::Raid("smartpqi".into())
+        );
+        assert_eq!(classify_sd("SEAGATE ", "mpt3sas"), SdKind::Scsi);
+        assert_eq!(classify_sd("", ""), SdKind::Scsi);
+    }
+
+    #[test]
+    fn scsi_cache_type_is_parsed() {
+        assert_eq!(parse_cache_type("write back\n"), CacheState::Enabled);
+        assert_eq!(
+            parse_cache_type("write back, no read (daft)"),
+            CacheState::Enabled
+        );
+        assert_eq!(parse_cache_type("write through\n"), CacheState::Disabled);
+        assert_eq!(parse_cache_type("none"), CacheState::NoVolatileCache);
+        assert!(matches!(parse_cache_type("bogus"), CacheState::Unknown(_)));
     }
 
     #[test]

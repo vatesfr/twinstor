@@ -1777,7 +1777,9 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
     let cache_sev = |s: &crate::write_cache::CacheState| -> Sev {
         use crate::write_cache::CacheState::*;
         match s {
-            NoVolatileCache | Disabled => Sev::Good,
+            // The controller owns a RAID volume's cache: the label says what
+            // to keep, nothing here can verify it, and it is not degraded.
+            NoVolatileCache | Disabled | ControllerManaged(_) => Sev::Good,
             Enabled => Sev::Bad,
             Unknown(_) => Sev::Warn,
         }
