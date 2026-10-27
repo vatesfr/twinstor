@@ -24020,6 +24020,17 @@ impl StateMachine {
         //    data may yet win, so availability is preserved while the
         //    episode settles.
         if self.yield_latched() {
+            // Both yielded: a refused mutual discard leaves this node
+            // StandAlone, where the standing-offer hold (and its check) never
+            // runs; check here too, once the episode's hold has settled.
+            let since = *self
+                .mutual_hold_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= MUTUAL_YIELD_SETTLE
+                && self.mutual_yield_take_win(restart_target).await
+            {
+                return;
+            }
             warn!(
                 heal_event = "yield_loser_holding",
                 "split-brain: nobody took the discard yet; this node yielded, staying \
