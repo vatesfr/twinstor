@@ -693,6 +693,9 @@ struct ClaimPaths {
     /// for the keeper's mutual-freeze decision (`arb_mutual_freeze_tick`).
     arbitrated: bool,
     give_way: String,
+    /// The keeper's announced intent to take a mutual-yield win
+    /// (`mutual_yield_take_win`): no claim is served while it stands.
+    take_intent: String,
 }
 
 /// The beacon updater's claim read (see `beacon_claim`). It also latches a
@@ -708,6 +711,9 @@ async fn compute_beacon_claim(
 ) -> Option<crate::peer_signal::ForkClaim> {
     // A node an operator is discarding claims nothing: its copy is given up.
     if std::path::Path::new(&p.discard_request).exists() {
+        return None;
+    }
+    if std::path::Path::new(&p.take_intent).exists() {
         return None;
     }
     let marker = std::path::Path::new(&p.yield_marker).exists();
@@ -745,6 +751,12 @@ async fn compute_beacon_claim(
                 "fence-peer yield with no guest on the SR here; latching the loser \
                      verdict for this fork and announcing it on the beacon"
             );
+            // Not on a node that took a win meanwhile (its flip removes the
+            // marker and the latch while this read runs).
+            if read_fork_record(&p.win).is_some() || !std::path::Path::new(&p.yield_marker).exists()
+            {
+                return None;
+            }
             write_fork_record(&p.latch, current);
             latch = Some(current);
         }
@@ -4408,6 +4420,12 @@ const MUTUAL_YIELD_SETTLE: Duration = Duration::from_secs(30);
 /// (and its claim reads `W`) by then.
 const MUTUAL_YIELD_KEEPER_FALLBACK: Duration = Duration::from_secs(90);
 
+/// The keeper's announced intent to take a mutual-yield win stands this long
+/// before it commits (`mutual_yield_take_win`): far longer than a non-keeper
+/// needs between its last read of the keeper's claim and publishing its own
+/// win, so a race between the two always ends with one of them backing off.
+const MUTUAL_INTENT_WAIT: Duration = Duration::from_secs(45);
+
 /// Replication failback: escalating stability holds before failing back. The
 /// first hold is short so a replugged cable returns quickly; after a failback
 /// that flapped straight back the hold grows; past the last hold failback is
@@ -7311,6 +7329,13 @@ pub struct StateMachine {
     /// When this yield-latched loser first held with its offer parked in the
     /// current episode (`mutual_yield_take_win`); cleared at the episode end.
     mutual_hold_since: Option<std::time::Instant>,
+    /// The keeper's announced intent to take a mutual-yield win, and the
+    /// peer generation it was announced for (`mutual_yield_take_win`).
+    mutual_intent: Option<(std::time::Instant, u64)>,
+    take_intent_path: String,
+    /// Set once the peer claimed it froze with guests (`G`) this episode:
+    /// its copy may hold writes the keeper's lacks, so no keeper fallback.
+    peer_guests_path: String,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
     arb_yield_xapi_wait_since: Option<std::time::Instant>,
@@ -7624,6 +7649,11 @@ impl StateMachine {
             arb_keep_retry_at: None,
             own_target_cut_at: None,
             mutual_hold_since: None,
+            mutual_intent: None,
+            take_intent_path: std::env::var("TWINSTOR_TAKE_INTENT_MARKER")
+                .unwrap_or_else(|_| "/run/twinstor/mutual-take-intent".to_string()),
+            peer_guests_path: std::env::var("TWINSTOR_PEER_GUESTS_MARKER")
+                .unwrap_or_else(|_| "/run/twinstor/peer-had-guests".to_string()),
             arb_yield_hold_alerted: false,
             arb_yield_xapi_wait_since: None,
             frozen_domains: None,
@@ -7897,6 +7927,9 @@ impl StateMachine {
             info!(heal_event = "startup_state_files", files = %all.join("; "),
                   "every state file at startup (path=first line)");
         }
+        // A keeper's take-win intent lives in this process only: a restart
+        // withdraws it (the claim reads Y again) and the check starts over.
+        let _ = std::fs::remove_file(&self.take_intent_path);
     }
 
     /// Spawn `plug_and_multipath` unless a previous run is still in flight.
@@ -8013,6 +8046,7 @@ impl StateMachine {
                 fs_freeze_allowed: !self.arbitrated,
                 arbitrated: self.arbitrated,
                 give_way: self.give_way_path.clone(),
+                take_intent: self.take_intent_path.clone(),
             };
             let guests = self.guests.clone();
             tokio::spawn(async move {
@@ -8032,7 +8066,20 @@ impl StateMachine {
                     // The split-brain claim every second: a survivor resolves
                     // a few seconds after the reconnect handshake and must
                     // already see a yield that happened during the partition.
+                    let records = |p: &ClaimPaths| {
+                        (
+                            read_fork_record(&p.latch),
+                            read_fork_record(&p.win),
+                            std::path::Path::new(&p.take_intent).exists(),
+                        )
+                    };
+                    let before = records(&claim_paths);
                     let claim = compute_beacon_claim(&drbd, guests.as_ref(), &claim_paths).await;
+                    // A flip (latch, win or intent changed) while this read ran:
+                    // its claim is stale, and the flip has published its own.
+                    if records(&claim_paths) != before {
+                        continue;
+                    }
                     // The peer decides on this claim: every change is logged.
                     if claim != served_claim {
                         // At most one line per 2 s (a claim flapping every
@@ -20340,13 +20387,17 @@ impl StateMachine {
     /// first in arbitrated mode, then the replication address).
     async fn query_peer_claim(&self) -> crate::peer_signal::PeerClaim {
         #[cfg(test)]
-        {
-            self.test_peer_claim
-        }
+        let claim = self.test_peer_claim;
         #[cfg(not(test))]
+        let claim = read_peer_claim(self.claim_read_args()).await;
+        if matches!(
+            claim,
+            crate::peer_signal::PeerClaim::Claim(crate::peer_signal::ForkClaim::FrozenGuests(_))
+        ) && !std::path::Path::new(&self.peer_guests_path).exists()
         {
-            read_peer_claim(self.claim_read_args()).await
+            let _ = std::fs::write(&self.peer_guests_path, "G\n");
         }
+        claim
     }
 
     /// What `read_peer_claim` needs, owned, so a read can run off the tick.
@@ -21820,6 +21871,9 @@ impl StateMachine {
         }
         self.arb_yield_hold_alerted = false;
         self.mutual_hold_since = None;
+        self.mutual_intent = None;
+        let _ = std::fs::remove_file(&self.take_intent_path);
+        let _ = std::fs::remove_file(&self.peer_guests_path);
         self.peer_portal_release = false;
         self.sb_refused_first = None;
         self.sb_refused_last = None;
@@ -24395,15 +24449,25 @@ impl StateMachine {
 
     /// A yield-latched loser holding with its offer parked, whose peer's beacon
     /// says it yielded too: both hold and nobody serves. Takes the win when
-    /// `mutual_yield_takes_win` allows it, as the refused-handshake flip does:
-    /// win record bound to the peer's generation, offer abandoned, latch
-    /// cleared, re-promoted (which also drops DRBD's discard flag) and the
-    /// target restarted (rebuilt in place, its cut lifted), which gives the
-    /// peer its path to the SR back. The resolver finishes as the winner and
-    /// the peer, reading the win, takes the discard. `true` when it flipped.
+    /// `mutual_yield_takes_win` allows it, as the refused-handshake flip does
+    /// (`mutual_yield_commit`). Exactly one node may take it:
+    ///
+    /// - By lineage (this copy contains the peer's), the peer's claim is read
+    ///   again right before the commit, which publishes `W` at once.
+    /// - The keeper's fallback is two-phase: it first announces its intent
+    ///   (no claim served, so a non-keeper reading it never commits), waits
+    ///   `MUTUAL_INTENT_WAIT`, and commits only if the peer still claims it
+    ///   yielded for the same generation; a peer that committed meanwhile
+    ///   claims `W`, and the intent is withdrawn. Never when the peer froze
+    ///   with guests this episode (its copy may hold writes this one lacks).
+    ///
+    /// `true` when it flipped.
     async fn mutual_yield_take_win(&mut self, restart_target: bool, held: Duration) -> bool {
         use crate::peer_signal::{ForkClaim, PeerClaim};
-        let PeerClaim::Claim(ForkClaim::Yielded(peer_gen)) = self.query_peer_claim().await else {
+        let still_yielded = |c: PeerClaim, g: u64| matches!(c, PeerClaim::Claim(ForkClaim::Yielded(u)) if same_gen(u, g));
+        let claim = self.query_peer_claim().await;
+        let PeerClaim::Claim(ForkClaim::Yielded(peer_gen)) = claim else {
+            self.withdraw_take_intent("the peer no longer claims it yielded");
             return false;
         };
         let Some(local) = crate::drbd::local_gi_uuids(&self.config.storage.drbd_resource).await
@@ -24412,50 +24476,98 @@ impl StateMachine {
         };
         let local_ud = matches!(self.drbd.status().await, Ok(s) if s.disk == DiskState::UpToDate);
         let is_keeper = self.config.node.name < self.config.node.peer;
-        let by_lineage = mutual_yield_takes_win(local, peer_gen, is_keeper, false);
-        let takes = local_ud
+        if local_ud && mutual_yield_takes_win(local, peer_gen, is_keeper, false) {
+            if !still_yielded(self.query_peer_claim().await, peer_gen) {
+                return false;
+            }
+            warn!(heal_event = "mutual_yield_take_win", rule = "lineage",
+                  peer_yielded_gen = %format!("{peer_gen:016X}"),
+                  local_current = %format!("{:016X}", local[0]), is_keeper,
+                  "split-brain: both nodes yielded and hold down; this copy contains the \
+                   peer's, so this node takes the win and serves as the single sync source");
+            return self.mutual_yield_commit(peer_gen, restart_target).await;
+        }
+        let peer_had_guests = std::path::Path::new(&self.peer_guests_path).exists();
+        let fallback = local_ud
+            && !peer_had_guests
             && mutual_yield_takes_win(
                 local,
                 peer_gen,
                 is_keeper,
                 held >= MUTUAL_YIELD_KEEPER_FALLBACK,
             );
-        // The keeper's fallback: a non-keeper whose lineage entitles it may
-        // have flipped in the same moment; its claim reads W within a second.
-        // Read the claim again a little later and take the win only if the
-        // peer still says it yielded.
-        if takes && !by_lineage {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            if !matches!(
-                self.query_peer_claim().await,
-                PeerClaim::Claim(ForkClaim::Yielded(u)) if same_gen(u, peer_gen)
-            ) {
-                return false;
-            }
-        }
-        if !takes {
+        if !fallback {
+            self.withdraw_take_intent("the keeper fallback no longer applies");
             if self.loser_holding_ticks.is_multiple_of(60) {
                 info!(heal_event = "mutual_yield_hold",
                       peer_yielded_gen = %format!("{peer_gen:016X}"),
                       local_current = %format!("{:016X}", local[0]),
-                      local_uptodate = local_ud, is_keeper,
-                      "both nodes yielded; not taking the win yet (the peer takes it if this \
-                       copy is behind it; otherwise the keeper takes it once the hold reaches \
-                       90 s)");
+                      local_uptodate = local_ud, is_keeper, peer_had_guests,
+                      "both nodes yielded; not taking the win (the peer takes it if this copy \
+                       is behind it; otherwise the keeper takes it after a 90 s hold, unless \
+                       the peer froze with guests, which needs an operator)");
             }
             return false;
         }
-        warn!(heal_event = "mutual_yield_take_win",
-              peer_yielded_gen = %format!("{peer_gen:016X}"),
-              local_current = %format!("{:016X}", local[0]),
-              is_keeper,
-              "split-brain: both nodes yielded and hold down; the peer's copy holds nothing this \
-               one lacks, so this node takes the win and serves as the single sync source");
+        match self.mutual_intent {
+            Some((_, g)) if !same_gen(g, peer_gen) => {
+                self.withdraw_take_intent("the peer's yielded generation moved");
+                false
+            }
+            None => {
+                let _ = std::fs::write(&self.take_intent_path, format!("{peer_gen:016X}\n"));
+                self.beacon.set_claim(None);
+                self.mutual_intent = Some((std::time::Instant::now(), peer_gen));
+                warn!(heal_event = "mutual_yield_intent",
+                      peer_yielded_gen = %format!("{peer_gen:016X}"),
+                      wait_secs = MUTUAL_INTENT_WAIT.as_secs(),
+                      "split-brain: both nodes yielded and neither copy contains the other; the \
+                       keeper announces it takes the win (no claim served meanwhile) and \
+                       commits if the peer still claims it yielded");
+                false
+            }
+            Some((t, _)) if t.elapsed() < MUTUAL_INTENT_WAIT => false,
+            Some(_) => {
+                if !still_yielded(self.query_peer_claim().await, peer_gen) {
+                    self.withdraw_take_intent("the peer's claim changed during the intent");
+                    return false;
+                }
+                warn!(heal_event = "mutual_yield_take_win", rule = "keeper",
+                      peer_yielded_gen = %format!("{peer_gen:016X}"),
+                      local_current = %format!("{:016X}", local[0]),
+                      "split-brain: both nodes yielded, neither copy contains the other and \
+                       neither served during the fork; the keeper takes the win");
+                self.mutual_yield_commit(peer_gen, restart_target).await
+            }
+        }
+    }
+
+    fn withdraw_take_intent(&mut self, why: &str) {
+        if self.mutual_intent.take().is_some() {
+            let _ = std::fs::remove_file(&self.take_intent_path);
+            info!(
+                heal_event = "mutual_yield_intent_withdrawn",
+                why, "split-brain: the keeper withdraws its intent to take the win"
+            );
+        }
+    }
+
+    /// The flip of `mutual_yield_take_win`: win record bound to the peer's
+    /// generation and `W` published at once, then the yield marker and latch
+    /// removed (in that order, so the beacon updater never relatches this
+    /// node), the offer abandoned, re-promoted (which also drops DRBD's
+    /// discard flag) and the target restarted (rebuilt in place, its cut
+    /// lifted), which gives the peer its path to the SR back.
+    async fn mutual_yield_commit(&mut self, peer_gen: u64, restart_target: bool) -> bool {
         write_fork_record(&self.win_path, Some(peer_gen));
-        self.abandon_discard_offer();
+        self.beacon
+            .set_claim(Some(crate::peer_signal::ForkClaim::Won(peer_gen)));
+        let _ = std::fs::remove_file(&self.yield_path);
         let _ = std::fs::remove_file(&self.latch_path);
         let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
-        let _ = std::fs::remove_file(&self.yield_path);
+        self.mutual_intent = None;
+        let _ = std::fs::remove_file(&self.take_intent_path);
+        self.abandon_discard_offer();
         self.peer_portal_release = false;
         self.sb_flip_winner = true;
         self.discard_round_flipped = true;
@@ -24463,7 +24575,10 @@ impl StateMachine {
         if !restart_target {
             return true;
         }
-        let _ = self.drbd.force_primary().await;
+        if let Err(e) = self.drbd.force_primary().await {
+            warn!(error = %e, "split-brain: could not promote after taking the win; bring-up retries");
+            return true;
+        }
         if tokio::time::timeout(ISCSI_START_TIMEOUT, self.iscsi.start(&self.config))
             .await
             .is_err()
@@ -38383,6 +38498,7 @@ poll_interval_ms = 10
             fs_freeze_allowed: false,
             arbitrated: true,
             give_way: path("g-give-way"),
+            take_intent: path("g-intent"),
         };
         std::fs::write(&p.yield_marker, "yielded\n").unwrap();
         assert_eq!(

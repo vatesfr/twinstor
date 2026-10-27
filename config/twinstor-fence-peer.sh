@@ -834,6 +834,13 @@ done
 # is the loser regardless of what its (possibly stale) pool role claims. The
 # marker lives under /run, so a reboot (which makes the node a clean rejoiner
 # again) clears it automatically.
+# Not on a promote-time run (Secondary): this node is not serving, so there is
+# no yield to record; the promote is refused instead. A yield recorded here
+# relatched a node that had just taken a split-brain win, and both nodes held.
+if [ "$LOCAL_ROLE" = "Secondary" ]; then
+    log "promote-time: no target reachable -> refusing to outdate the peer, the promote fails (exit 1, no yield recorded)"
+    verdict promote_refuse_isolated 1
+fi
 suspend_and_mark
 if [ "$BRIEFLY_CUT" = 1 ]; then
     log "freeze mode: cut off until moments ago -> stay frozen, served nobody (exit 1, yield recorded)"
