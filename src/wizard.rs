@@ -1756,6 +1756,24 @@ async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bo
     )
 }
 
+/// The device of this host's PIF that holds `ip`, if any.
+async fn device_with_ip(ip: IpAddr) -> Option<String> {
+    let (this_uuid, _) = two_host_pool().await?;
+    let pifs = cmd_output(
+        "xe",
+        &["pif-list", &format!("host-uuid={this_uuid}"), "--minimal"],
+    )
+    .await
+    .ok()?;
+    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let p = pif_params(pif).await;
+        if p.get("IP").is_some_and(|i| *i == ip.to_string()) {
+            return p.get("device").cloned().filter(|d| !d.is_empty());
+        }
+    }
+    None
+}
+
 /// MACs the bridge learned on `port` other than `allowed`, from
 /// `ovs-appctl fdb/show <bridge>` (`port VLAN MAC age` rows).
 fn foreign_macs(fdb: &str, port: &str, allowed: &[String]) -> Vec<String> {
@@ -1942,6 +1960,22 @@ async fn resolve_direct_link(
                     _ => println!("  pick a number from the list"),
                 }
             };
+            // The same check as for a link the wizard sets up: only the peer
+            // may sit behind this port. The addresses are the operator's, so
+            // nothing is undone.
+            if let Some(device) = device_with_ip(chosen.local_ip).await
+                && let Some(peer_pif) = peer_pif_on_same_network(&device).await
+                && let Some(foreign) = foreign_macs_on_link(&device, &peer_pif).await
+                && !foreign.is_empty()
+            {
+                bail!(
+                    "{device} sees {} other device(s) besides {peer}: \"{}\" looks like a \
+                     switched network, not a cable between the two hosts. Pick the network of \
+                     the direct cable, or connect one, then run setup again",
+                    foreign.len(),
+                    chosen.name
+                );
+            }
             Ok(Some(chosen.peer_ip))
         }
         DirectLinkOutcome::NeedsConfig { devices } => {
