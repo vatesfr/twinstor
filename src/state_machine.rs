@@ -12985,6 +12985,10 @@ impl StateMachine {
                 .await;
             }
 
+            // Checked on its own: installs whose ACCEPT rules are already in
+            // place get it too.
+            crate::iscsi::ensure_stray_reset_rule(3260).await;
+
             if let Some(backing) = self.config.storage.backing_device.to_str() {
                 debug!(device = %backing, "try_go_online: activating backing LV");
                 let _ = crate::cmd::run_cmd_quiet("lvchange", &["-ay", backing]).await;

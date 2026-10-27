@@ -650,6 +650,40 @@ async fn iptables_portal_block(op: &str, chain: &str, port: u16) -> Option<bool>
     }
 }
 
+/// A segment from a peer's iSCSI portal that belongs to no connection this
+/// host still tracks is answered with a TCP reset. Without it the stock XCP-ng
+/// chain answers with ICMP host-prohibited, which Linux treats as a soft error
+/// on an established socket: a portal whose login reply an initiator gave up
+/// on (its logins stalled while the I/O was frozen) retransmits for about 15
+/// minutes, and LIO's portal thread accepts no other login meanwhile. Nothing
+/// is accepted by this rule.
+fn stray_reset_rule(port: u16) -> Vec<String> {
+    format!(
+        "-p tcp -m tcp --sport {port} ! --tcp-flags SYN,RST,ACK SYN -m conntrack --ctstate NEW \
+         -m comment --comment twinstor-portal-stray-reset -j REJECT --reject-with tcp-reset"
+    )
+    .split_whitespace()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Insert the stray-segment reset rule (`stray_reset_rule`) unless present.
+pub async fn ensure_stray_reset_rule(port: u16) {
+    let rule = stray_reset_rule(port);
+    let mut check = vec!["-C".to_string(), "INPUT".to_string()];
+    check.extend(rule.iter().cloned());
+    let check: Vec<&str> = check.iter().map(String::as_str).collect();
+    if crate::cmd::run_cmd_quiet("iptables", &check).await.is_ok() {
+        return;
+    }
+    let mut insert = vec!["-I".to_string(), "INPUT".to_string(), "1".to_string()];
+    insert.extend(rule);
+    let insert: Vec<&str> = insert.iter().map(String::as_str).collect();
+    if let Err(e) = crate::cmd::run_cmd_quiet("iptables", &insert).await {
+        warn!(error = %e, "could not insert the iSCSI stray-segment reset rule");
+    }
+}
+
 /// Cut this host's target off from every initiator. `false` on failure.
 pub async fn block_portal_logins(port: u16) -> bool {
     let mut ok = true;
@@ -1151,6 +1185,16 @@ poll_interval_ms = 10
         c.active = true;
         assert!(c.stop().await.is_err());
         assert!(!c.adoption_checked);
+    }
+
+    #[test]
+    fn stray_reset_rule_only_resets_untracked_non_syn_segments_from_the_portal() {
+        let r = stray_reset_rule(3260).join(" ");
+        assert!(r.contains("--sport 3260"), "{r}");
+        assert!(r.contains("! --tcp-flags SYN,RST,ACK SYN"), "{r}");
+        assert!(r.contains("--ctstate NEW -m"), "{r}");
+        assert!(r.ends_with("-j REJECT --reject-with tcp-reset"), "{r}");
+        assert!(!r.contains("ACCEPT"), "{r}");
     }
 
     #[test]
