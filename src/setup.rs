@@ -115,7 +115,7 @@ pub(crate) fn confirmation(yes: bool, from_wizard: bool, tty: bool) -> Confirmat
 /// The `twinstor setup` command that runs the same setup without questions,
 /// printed by the wizard for admins who prefer to run commands themselves.
 /// The disk path is this host's own; the password is left out when setup
-/// generates it.
+/// generates it, and shown as a placeholder when it was given.
 pub(crate) fn equivalent_command(p: &SetupParams) -> String {
     let mut cmd = format!("twinstor setup --peer-ip {}", p.peer_ip);
     if let Some(l) = p.local_ip {
@@ -136,8 +136,10 @@ pub(crate) fn equivalent_command(p: &SetupParams) -> String {
     if p.full_sync {
         cmd.push_str(" --full-sync");
     }
-    if let Some(pw) = &p.chap_password {
-        cmd.push_str(&format!(" --chap-password {pw}"));
+    // Never the password itself: this line is meant to be copied into notes
+    // and scripts.
+    if p.chap_password.is_some() {
+        cmd.push_str(" --chap-password '<the CHAP password the first host printed>'");
     }
     if p.allow_no_tiebreaker {
         cmd.push_str(" --allow-no-tiebreaker");
@@ -4750,8 +4752,12 @@ mod setup_flow_tests {
         assert_eq!(
             equivalent_command(&p),
             "twinstor setup --peer-ip 192.0.2.12 --backing-device /dev/disk/by-id/wwn-0x5000 \
-             --ping-target 192.0.2.250 --drbd-port 7790 --full-sync --chap-password Xy12 \
-             --allow-no-tiebreaker --yes"
+             --ping-target 192.0.2.250 --drbd-port 7790 --full-sync --chap-password \
+             '<the CHAP password the first host printed>' --allow-no-tiebreaker --yes"
+        );
+        assert!(
+            !equivalent_command(&p).contains("Xy12"),
+            "never the password itself"
         );
     }
 }
