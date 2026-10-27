@@ -76,7 +76,34 @@ entry_freeze_release() {
     fi
 }
 
+# A survive verdict is stale when the connection came back and dropped again
+# while this run decided: DRBD acts on it once this run exits (it lifts the
+# freeze), and only then starts the run for the newer disconnect, which may
+# yield. Seen on a fate-shared test pool under 40% packet loss: the writes
+# queued during the freeze were acknowledged in the moment between the two,
+# and discarded. In the modes that rely on the freeze, such a run stays frozen
+# instead (exit 1, no yield marker) and leaves the decision to the newer run.
+# The newer disconnect is read from DRBD's own kernel log line, stamped after
+# this run started. Not when the pair is Connected again (writes replicate),
+# nor for an arbitrated keep, which stands for the episode.
+START_UPTIME=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+superseded_survive() {
+    { [ "$FREEZE" = 1 ] || [ -n "$DIRECT_PEER" ]; } || return 1
+    [ "$LOCAL_ROLE" = "Primary" ] && [ -n "$START_UPTIME" ] || return 1
+    case "$(timeout 5 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)" in
+        Connected|Sync*|"") return 1 ;;
+    esac
+    timeout 5 dmesg 2>/dev/null \
+        | grep -F "drbd $RESOURCE " | grep -F "conn( Connected -> " \
+        | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p' \
+        | awk -v s="$START_UPTIME" '$1 > s { found = 1 } END { exit !found }'
+}
+
 verdict() {
+    if [ "$2" = 4 ] && [ "$1" != keep_win ] && superseded_survive; then
+        log "the connection came back and dropped again while this run decided: its $1 verdict is stale, the run for the newer disconnect decides -> stay frozen (exit 1, no yield marker)"
+        set -- superseded_survive 1
+    fi
     [ "$2" = 4 ] && entry_freeze_release
     log "verdict=$1 exit=$2 role=${LOCAL_ROLE:-unread} freeze=$FREEZE elapsed=$(( $(date +%s) - ${START_EPOCH:-$(date +%s)} ))s"
     mkdir -p "$RUN" 2>/dev/null
