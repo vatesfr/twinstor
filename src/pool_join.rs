@@ -90,29 +90,79 @@ pub(crate) fn suggest_name(local: &str, remote: &str) -> String {
     format!("{local}-twin")
 }
 
+/// The terminal settings saved before echo was turned off, for the signal
+/// handler below.
+static SAVED_TERMIOS: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+/// Ctrl-C (or a kill) at the password prompt: put echo back before exiting,
+/// or the shell is left typing blind. tcsetattr and _exit are
+/// async-signal-safe.
+extern "C" fn restore_echo_and_exit(sig: libc::c_int) {
+    if let Some(t) = SAVED_TERMIOS.get() {
+        // SAFETY: fd 0 is the terminal the settings were read from, and `t`
+        // is a fully initialised termios that is never written again.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, t);
+        }
+    }
+    // SAFETY: _exit ends the process at once; no Rust state is touched.
+    unsafe { libc::_exit(128 + sig) }
+}
+
+/// Echo off on the terminal for as long as this lives, with SIGINT and
+/// SIGTERM restoring it; dropped, it restores echo and the previous signal
+/// handlers.
+struct NoEcho {
+    saved: libc::termios,
+    old_int: libc::sighandler_t,
+    old_term: libc::sighandler_t,
+}
+
+impl NoEcho {
+    fn new() -> Option<Self> {
+        // SAFETY: tcgetattr fills the zeroed termios on success; on failure
+        // (stdin is not a terminal) nothing is changed and None is returned.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) != 0 {
+                return None;
+            }
+            let saved = t;
+            let _ = SAVED_TERMIOS.set(saved);
+            let handler = restore_echo_and_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            let old_int = libc::signal(libc::SIGINT, handler);
+            let old_term = libc::signal(libc::SIGTERM, handler);
+            t.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+            Some(NoEcho {
+                saved,
+                old_int,
+                old_term,
+            })
+        }
+    }
+}
+
+impl Drop for NoEcho {
+    fn drop(&mut self) {
+        // SAFETY: restores the settings and handlers saved in `new`.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.saved);
+            libc::signal(libc::SIGINT, self.old_int);
+            libc::signal(libc::SIGTERM, self.old_term);
+        }
+    }
+}
+
 /// Read a secret from the terminal without echoing it.
 fn ask_secret(prompt: &str) -> Result<String> {
     print!("{prompt}: ");
     std::io::stdout().flush()?;
-    let tty = || std::fs::File::open("/dev/tty");
-    let echo_off = tty()
-        .ok()
-        .and_then(|t| {
-            std::process::Command::new("stty")
-                .arg("-echo")
-                .stdin(t)
-                .status()
-                .ok()
-        })
-        .is_some_and(|s| s.success());
     let mut line = String::new();
-    let read = std::io::stdin().read_line(&mut line);
-    if echo_off && let Ok(t) = tty() {
-        let _ = std::process::Command::new("stty")
-            .arg("echo")
-            .stdin(t)
-            .status();
-    }
+    let read = {
+        let _no_echo = NoEcho::new();
+        std::io::stdin().read_line(&mut line)
+    };
     println!();
     if read.context("reading input")? == 0 {
         bail!("input closed; nothing was changed");
@@ -120,13 +170,24 @@ fn ask_secret(prompt: &str) -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+/// What a failure after a rename must add: the host keeps its new name.
+pub(crate) fn renamed_note(renamed_to: Option<&str>) -> String {
+    match renamed_to {
+        Some(n) => format!(" This host was already renamed to \"{n}\" and keeps that name."),
+        None => " Nothing was changed.".to_string(),
+    }
+}
+
 /// A root-only password file for `xe -pwf`, removed when dropped.
 struct PasswordFile(std::path::PathBuf);
 
 impl PasswordFile {
     fn new(password: &str) -> Result<Self> {
-        let path =
-            std::path::PathBuf::from(format!("/run/twinstor-join-{}.pw", std::process::id()));
+        Self::new_in(std::path::Path::new("/run"), password)
+    }
+
+    fn new_in(dir: &std::path::Path, password: &str) -> Result<Self> {
+        let path = dir.join(format!("twinstor-join-{}.pw", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -193,25 +254,33 @@ pub(crate) async fn offer() -> Result<bool> {
         println!("  not a valid IP address, try again");
     };
     let password = ask_secret(&format!("Root password of {addr}"))?;
-    let pw = PasswordFile::new(&password)?;
 
     println!("Reading the other host...");
-    let remote_hosts = remote_xe(&addr, &pw, &["host-list", "--minimal"])
-        .await
-        .with_context(|| {
-            format!(
-                "could not log in to {addr} as root (wrong password, wrong address, or its \
-                 toolstack is down); nothing was changed"
-            )
-        })?;
-    let remote_uuids: Vec<&str> = remote_hosts
-        .split(',')
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .collect();
-    let remote_uuid = remote_uuids.first().copied().unwrap_or_default();
-    let remote_hostname = remote_host_param(&addr, &pw, remote_uuid, "hostname").await;
-    let remote_label = remote_host_param(&addr, &pw, remote_uuid, "name-label").await;
+    // The password file lives only for these reads: it is removed when `pw`
+    // drops at the end of the block, on success and on every error.
+    let (remote_count, remote_hostname, remote_label) = {
+        let pw = PasswordFile::new(&password)?;
+        let remote_hosts = remote_xe(&addr, &pw, &["host-list", "--minimal"])
+            .await
+            .with_context(|| {
+                format!(
+                    "could not log in to {addr} as root (wrong password, wrong address, or its \
+                     toolstack is down); nothing was changed"
+                )
+            })?;
+        let remote_uuids: Vec<String> = remote_hosts
+            .split(',')
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(String::from)
+            .collect();
+        let remote_uuid = remote_uuids.first().cloned().unwrap_or_default();
+        (
+            remote_uuids.len(),
+            remote_host_param(&addr, &pw, &remote_uuid, "hostname").await,
+            remote_host_param(&addr, &pw, &remote_uuid, "name-label").await,
+        )
+    };
 
     let local_uuid = crate::setup::local_host_uuid()
         .await
@@ -248,7 +317,7 @@ pub(crate) async fn offer() -> Result<bool> {
         local_label,
         remote_hostname: remote_hostname.clone(),
         remote_label,
-        remote_hosts: remote_uuids.len(),
+        remote_hosts: remote_count,
         local_running_vms,
     };
     let rename = match join_plan(&facts) {
@@ -299,7 +368,7 @@ pub(crate) async fn offer() -> Result<bool> {
             ],
         )
         .await
-        .context("renaming this host")?;
+        .with_context(|| format!("renaming this host;{}", renamed_note(None)))?;
         crate::cmd::run_cmd(
             "xe",
             &[
@@ -309,13 +378,22 @@ pub(crate) async fn offer() -> Result<bool> {
             ],
         )
         .await
-        .context("setting this host's name in XCP-ng")?;
+        .with_context(|| {
+            format!(
+                "setting this host's name in XCP-ng (its hostname is already \"{n}\"; set the \
+                 name by hand: xe host-param-set uuid={local_uuid} name-label={n})"
+            )
+        })?;
         println!("  this host is now \"{n}\".");
     }
+    let after = renamed_note(new_name.as_deref());
 
     println!("  joining the pool of {addr}...");
     // Not through crate::cmd: its runners put the whole command line, with
-    // the password, in the log and in the error.
+    // the password, in the log and in the error. xe pool-join takes the
+    // master's password only as a command-line parameter (no file or stdin
+    // form exists), so it is visible in the process list for the duration
+    // of this one call.
     let out = tokio::time::timeout(
         Duration::from_secs(300),
         tokio::process::Command::new("xe")
@@ -332,15 +410,15 @@ pub(crate) async fn offer() -> Result<bool> {
     match out {
         Ok(Ok(o)) if o.status.success() => {}
         Ok(Ok(o)) => bail!(
-            "xe pool-join failed: {}",
+            "xe pool-join failed: {}.{after}",
             String::from_utf8_lossy(&o.stderr)
                 .trim()
                 .replace(&password, "********")
         ),
-        Ok(Err(e)) => bail!("could not run xe pool-join: {e}"),
-        Err(_) => {
-            bail!("xe pool-join did not finish within 5 minutes; check the pool in Xen Orchestra")
-        }
+        Ok(Err(e)) => bail!("could not run xe pool-join: {e}.{after}"),
+        Err(_) => bail!(
+            "xe pool-join did not finish within 5 minutes; check the pool in Xen Orchestra.{after}"
+        ),
     }
 
     // The toolstack restarts as a pool member: wait until it lists both hosts.
@@ -402,6 +480,26 @@ mod tests {
         let mut f = facts();
         f.local_running_vms = 3;
         assert!(matches!(join_plan(&f), JoinPlan::Refuse(w) if w.contains("3 VM(s)")));
+    }
+
+    #[test]
+    fn a_failed_join_says_whether_the_host_was_renamed() {
+        assert!(renamed_note(Some("host-2")).contains("renamed to \"host-2\""));
+        assert!(renamed_note(None).contains("Nothing was changed"));
+    }
+
+    #[test]
+    fn the_password_file_is_private_and_removed() {
+        let path;
+        {
+            let f = PasswordFile::new_in(&std::env::temp_dir(), "s3cret").expect("created");
+            path = f.0.clone();
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cret");
+        }
+        assert!(!path.exists(), "removed when dropped");
     }
 
     #[test]

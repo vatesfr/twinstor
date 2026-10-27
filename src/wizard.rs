@@ -1756,6 +1756,24 @@ async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bo
     )
 }
 
+/// The device of this host's PIF that holds `ip`, if any.
+async fn device_with_ip(ip: IpAddr) -> Option<String> {
+    let (this_uuid, _) = two_host_pool().await?;
+    let pifs = cmd_output(
+        "xe",
+        &["pif-list", &format!("host-uuid={this_uuid}"), "--minimal"],
+    )
+    .await
+    .ok()?;
+    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let p = pif_params(pif).await;
+        if p.get("IP").is_some_and(|i| *i == ip.to_string()) {
+            return p.get("device").cloned().filter(|d| !d.is_empty());
+        }
+    }
+    None
+}
+
 /// MACs the bridge learned on `port` other than `allowed`, from
 /// `ovs-appctl fdb/show <bridge>` (`port VLAN MAC age` rows).
 fn foreign_macs(fdb: &str, port: &str, allowed: &[String]) -> Vec<String> {
@@ -1942,6 +1960,22 @@ async fn resolve_direct_link(
                     _ => println!("  pick a number from the list"),
                 }
             };
+            // The same check as for a link the wizard sets up: only the peer
+            // may sit behind this port. The addresses are the operator's, so
+            // nothing is undone.
+            if let Some(device) = device_with_ip(chosen.local_ip).await
+                && let Some(peer_pif) = peer_pif_on_same_network(&device).await
+                && let Some(foreign) = foreign_macs_on_link(&device, &peer_pif).await
+                && !foreign.is_empty()
+            {
+                bail!(
+                    "{device} sees {} other device(s) besides {peer}: \"{}\" looks like a \
+                     switched network, not a cable between the two hosts. Pick the network of \
+                     the direct cable, or connect one, then run setup again",
+                    foreign.len(),
+                    chosen.name
+                );
+            }
             Ok(Some(chosen.peer_ip))
         }
         DirectLinkOutcome::NeedsConfig { devices } => {
@@ -2102,42 +2136,68 @@ async fn follow_inherited_direct_link(
 /// What an existing configuration on this host stands for.
 #[derive(Debug, PartialEq, Eq)]
 enum InstallState {
-    /// The pool has the TwinStor SR: a working (or degraded) pair.
+    /// A live pair: the pool has the TwinStor SR (found by any signal), or
+    /// DRBD here holds or replicates a current copy. Setup never wipes it.
     Live,
     /// This host finished its part and waits for the other host: it
     /// published the handoff, and its service runs.
     WaitingForPeer,
-    /// A setup that stopped part-way: a config, but no SR and no host
-    /// waiting for its peer.
+    /// The second host's setup stopped after DRBD connected but before the
+    /// SR was created: the first host's handoff is still in the pool DB.
+    SecondUnfinished,
+    /// A setup that stopped part-way, with no sign of a live pair.
     Unfinished,
 }
 
-fn install_state(sr_exists: bool, own_handoff: bool, daemon_active: bool) -> InstallState {
-    if sr_exists {
+/// Classify an existing configuration. Fails closed: any live signal reads
+/// as Live, except the two states where the handoff proves the SR was never
+/// created.
+fn install_state(
+    pair: &crate::setup::PairState,
+    own_handoff: bool,
+    other_handoff: bool,
+    daemon_active: bool,
+) -> InstallState {
+    if pair.sr_exists {
         InstallState::Live
     } else if own_handoff && daemon_active {
         InstallState::WaitingForPeer
+    } else if pair.drbd_live() && other_handoff {
+        InstallState::SecondUnfinished
+    } else if pair.drbd_live() {
+        InstallState::Live
     } else {
         InstallState::Unfinished
     }
 }
 
 /// The menu for an existing configuration: its lines and the default
-/// choice. Resuming is the default only where it is what the user wants.
+/// choice. Resuming is the default only where nothing live can be lost; a
+/// live pair is never offered a re-run.
 fn install_menu(state: &InstallState, peer: &str) -> (Vec<String>, &'static str) {
     match state {
         InstallState::Live => (
             vec![
-                "  q) quit: leave everything as it is".into(),
-                format!("  r) rebuild this host's copy from {peer} (erases this host's TwinStor disk)"),
+                "  q) quit: leave everything as it is (check the pair with `twinstor status`)"
+                    .into(),
                 "  u) uninstall: remove TwinStor from this host".into(),
+                "  To give this host a new disk, run: twinstor replace-backing <new-device>".into(),
             ],
             "q",
         ),
         InstallState::WaitingForPeer => (
             vec![
                 format!("  q) quit: leave this host waiting, and run `twinstor setup` on {peer}"),
-                "  r) start setup again on this host (erases this host's TwinStor disk)".into(),
+                "  u) uninstall: remove what setup did on this host".into(),
+            ],
+            "q",
+        ),
+        InstallState::SecondUnfinished => (
+            vec![
+                "  q) quit: leave everything as it is".into(),
+                "  r) run setup again on this host (erases this host's TwinStor disk; no SR \
+                 exists yet)"
+                    .into(),
                 "  u) uninstall: remove what setup did on this host".into(),
             ],
             "q",
@@ -2154,6 +2214,13 @@ fn install_menu(state: &InstallState, peer: &str) -> (Vec<String>, &'static str)
     }
 }
 
+/// Whether a menu offers the choice `key` ("r", "u").
+fn menu_offers(lines: &[String], key: &str) -> bool {
+    lines
+        .iter()
+        .any(|l| l.trim_start().starts_with(&format!("{key})")))
+}
+
 /// Show the current installation: persisted settings plus a quick live view,
 /// and what it means.
 async fn show_current_install(state: &InstallState, peer: &str) {
@@ -2162,6 +2229,10 @@ async fn show_current_install(state: &InstallState, peer: &str) {
         InstallState::WaitingForPeer => {
             println!("TwinStor is set up on this host and waits for {peer}.\n")
         }
+        InstallState::SecondUnfinished => println!(
+            "The setup of this host stopped before the shared SR was created ({peer}'s\n\
+             setup is still waiting for it).\n"
+        ),
         InstallState::Unfinished => println!(
             "A previous setup on this host did not finish (there is no TwinStor SR yet).\n"
         ),
@@ -2210,41 +2281,6 @@ async fn show_current_install(state: &InstallState, peer: &str) {
     }
 }
 
-/// The setup that rebuilds this host of a working pair with its current
-/// settings (same peer, topology, disk, password and tiebreakers), from the
-/// config and the files setup wrote. Free of I/O so it can be unit-tested.
-fn rebuild_params(
-    cfg: &crate::config::Config,
-    direct_peer: Option<&str>,
-    ping_targets: Option<&str>,
-) -> SetupParams {
-    let direct_ip = direct_peer.and_then(|t| {
-        crate::setup::parse_ping_targets(t)
-            .first()
-            .and_then(|l| l.parse().ok())
-    });
-    let ping_targets = ping_targets
-        .map(crate::setup::parse_ping_targets)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    SetupParams {
-        peer_ip: cfg.network.peer_address,
-        backing_device: Some(cfg.storage.backing_device.clone()),
-        local_ip: None,
-        drbd_port: Some(cfg.network.drbd_port),
-        full_sync: true,
-        chap_password: cfg.iscsi.chap_password.clone(),
-        ping_targets,
-        direct_ip,
-        allow_no_tiebreaker: cfg.network.allow_no_tiebreaker,
-        from_wizard: true,
-        yes: true,
-        force_device: false,
-    }
-}
-
 /// The tiebreaker line of the summary, from what was actually chosen.
 fn ping_summary(targets: &[IpAddr], no_tiebreaker: bool) -> String {
     let extra = targets
@@ -2274,39 +2310,6 @@ If unsure, choose 1. Details:
 https://docs.vates.tech/tech-preview/twinstor/installation/#pick-your-topology
 ";
 
-/// Show what a rebuild of this host does and ask for the typed confirmation.
-fn confirm_rebuild(peer: &str) -> Result<Option<SetupParams>> {
-    let cfg = crate::config::Config::load(std::path::Path::new("/etc/twinstor/twinstor.toml"))
-        .context("reading this host's TwinStor configuration")?;
-    let read = |p: &str| std::fs::read_to_string(p).ok();
-    let params = rebuild_params(
-        &cfg,
-        read(crate::setup::DIRECT_PEER_PATH).as_deref(),
-        read(crate::setup::PING_TARGETS_PATH).as_deref(),
-    );
-    println!("\nRebuild of this host, with its current settings:");
-    println!("  peer:    {peer} ({})", params.peer_ip);
-    match params.direct_ip {
-        Some(d) => println!("  mode:    arbitrated (direct link to {d})"),
-        None => println!("  mode:    fate-shared (one network)"),
-    }
-    println!(
-        "  device:  {} (ALL DATA ON IT WILL BE ERASED, then copied back from {peer})",
-        params
-            .backing_device
-            .as_deref()
-            .unwrap_or(Path::new("?"))
-            .display()
-    );
-    println!("  the copy takes a while on large disks; follow it with: twinstor status");
-    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
-    if confirm != "yes" {
-        bail!("aborted by user; nothing was changed");
-    }
-    println!();
-    Ok(Some(params))
-}
-
 /// Run the interactive wizard. Returns `Some(params)` when a (re)install
 /// should proceed, `None` when the session was handled in place (status
 /// shown, uninstall performed, or the user quit).
@@ -2317,8 +2320,9 @@ pub async fn run() -> Result<Option<SetupParams>> {
             .await
             .is_ok_and(|s| s.trim() == "active");
         let state = install_state(
-            pair.sr_exists,
+            &pair,
             crate::setup::own_shared_setup_published().await,
+            crate::setup::inherited_shared_setup().await.is_some(),
             daemon_active,
         );
         let peer = peer_host_name()
@@ -2331,35 +2335,14 @@ pub async fn run() -> Result<Option<SetupParams>> {
         }
         let choice = ask("Choice", Some(default))?;
         match choice.to_lowercase().as_str() {
-            "u" => {
+            "u" if menu_offers(&lines, "u") => {
                 let keep = ask_yes_no("Keep the backing data (skip deleting the volume)?", false)?;
                 // uninstall has its own confirmation prompt. The interactive
                 // path never forces past the VM-safety check.
                 crate::uninstall::run_uninstall(false, keep, false).await?;
                 return Ok(None);
             }
-            "r" => {
-                println!();
-                // A working pair is checked now, not after every question:
-                // setup would refuse it at the end anyway.
-                if pair.sr_exists {
-                    println!("This pool already has a TwinStor SR, so this host's copy is live.");
-                    println!(
-                        "Setup can rebuild only this host: it erases this host's TwinStor disk"
-                    );
-                    println!("and copies it back from {peer}, which keeps serving meanwhile.");
-                    use crate::setup::{rerun_guard, rerun_refusal};
-                    let guard = rerun_guard(true, true, pair.local_uptodate, pair.peer_uptodate);
-                    if let Some(refusal) = rerun_refusal(guard, &peer) {
-                        return Err(refusal.into());
-                    }
-                    if !ask_yes_no(&format!("Rebuild this host's copy from {peer}?"), false)? {
-                        println!("nothing changed.");
-                        return Ok(None);
-                    }
-                    return confirm_rebuild(&peer);
-                }
-            }
+            "r" if menu_offers(&lines, "r") => println!(),
             _ => {
                 println!("nothing changed.");
                 return Ok(None);
@@ -2816,79 +2799,85 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn sample_config() -> crate::config::Config {
-        toml::from_str(
-            r#"
-[node]
-name = "host-b"
-peer = "host-a"
-[network]
-peer_address = "192.0.2.11"
-drbd_port = 7790
-[storage]
-drbd_resource = "data"
-backing_device = "/dev/disk/by-id/wwn-0x5000"
-drbd_device = "/dev/drbd0"
-[iscsi]
-target_iqn = "iqn.2025-01.com.xcp-ng:twinstor-data"
-lun_serial = "twinstor-data"
-chap_user = "twinstor"
-chap_password = "Kept0123456789ab"
-initiator_iqns = ["iqn.a"]
-"#,
-        )
-        .expect("sample config parses")
-    }
-
     #[test]
-    fn an_existing_config_is_read_as_live_waiting_or_unfinished() {
-        assert_eq!(install_state(true, false, true), InstallState::Live);
-        assert_eq!(install_state(true, true, false), InstallState::Live);
+    fn an_existing_config_is_read_fail_closed() {
+        use crate::setup::PairState;
+        let sr = PairState {
+            sr_exists: true,
+            ..Default::default()
+        };
+        let uptodate = PairState {
+            local_uptodate: true,
+            ..Default::default()
+        };
+        let connected = PairState {
+            connected: true,
+            ..Default::default()
+        };
+        let nothing = PairState::default();
+        // A renamed SR still found by its uuid or IQN reads Live, whatever
+        // else is true.
+        assert_eq!(install_state(&sr, true, true, true), InstallState::Live);
+        assert_eq!(install_state(&sr, false, false, false), InstallState::Live);
         // The first host after its part: handoff published, service up.
         assert_eq!(
-            install_state(false, true, true),
+            install_state(&uptodate, true, false, true),
             InstallState::WaitingForPeer
         );
-        // The first host whose window was closed during the wait: no service.
-        assert_eq!(install_state(false, true, false), InstallState::Unfinished);
-        // The second host after a failed SR creation (its service started).
-        assert_eq!(install_state(false, false, true), InstallState::Unfinished);
-        assert_eq!(install_state(false, false, false), InstallState::Unfinished);
+        // No SR found, but DRBD holds a current copy here: Live, never
+        // Unfinished.
+        assert_eq!(
+            install_state(&uptodate, false, false, true),
+            InstallState::Live
+        );
+        assert_eq!(
+            install_state(&connected, false, false, false),
+            InstallState::Live
+        );
+        assert_eq!(
+            install_state(&uptodate, true, false, false),
+            InstallState::Live
+        );
+        // The second host after a failed SR creation: the first host's
+        // handoff is still there.
+        assert_eq!(
+            install_state(&connected, false, true, true),
+            InstallState::SecondUnfinished
+        );
+        // Nothing live: the first host whose window was closed during the
+        // wait, or any setup that stopped early.
+        assert_eq!(
+            install_state(&nothing, true, false, false),
+            InstallState::Unfinished
+        );
+        assert_eq!(
+            install_state(&nothing, false, false, true),
+            InstallState::Unfinished
+        );
     }
 
     #[test]
-    fn the_menu_defaults_to_resuming_only_an_unfinished_setup() {
-        let (lines, d) = install_menu(&InstallState::Unfinished, "host-a");
-        assert_eq!(d, "r");
-        assert!(lines[0].contains("run setup again"), "{lines:?}");
+    fn a_live_pair_is_never_offered_a_rerun() {
         let (lines, d) = install_menu(&InstallState::Live, "host-a");
         assert_eq!(d, "q");
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("rebuild this host's copy from host-a"))
-        );
+        assert!(!menu_offers(&lines, "r"), "{lines:?}");
+        assert!(menu_offers(&lines, "u"));
+        assert!(lines.iter().any(|l| l.contains("replace-backing")));
         let (lines, d) = install_menu(&InstallState::WaitingForPeer, "host-a");
         assert_eq!(d, "q");
+        assert!(!menu_offers(&lines, "r"), "{lines:?}");
         assert!(
             lines
                 .iter()
                 .any(|l| l.contains("`twinstor setup` on host-a"))
         );
-        // Every menu offers the three choices.
-        for st in [
-            InstallState::Live,
-            InstallState::WaitingForPeer,
-            InstallState::Unfinished,
-        ] {
-            let (lines, _) = install_menu(&st, "p");
-            for key in ["q)", "r)", "u)"] {
-                assert!(
-                    lines.iter().any(|l| l.trim_start().starts_with(key)),
-                    "{st:?}"
-                );
-            }
-        }
+        let (lines, d) = install_menu(&InstallState::SecondUnfinished, "host-a");
+        assert_eq!(d, "q", "a live DRBD never defaults to a re-run");
+        assert!(menu_offers(&lines, "r"));
+        let (lines, d) = install_menu(&InstallState::Unfinished, "host-a");
+        assert_eq!(d, "r");
+        assert!(lines[0].contains("run setup again"), "{lines:?}");
+        assert!(menu_offers(&lines, "u") && menu_offers(&lines, "q"));
     }
 
     #[test]
@@ -2987,30 +2976,6 @@ initiator_iqns = ["iqn.a"]
             .contains("wipefs -a")
         );
         assert!(why(DeviceFacts::default()).contains("not a free local disk"));
-    }
-
-    #[test]
-    fn rebuild_keeps_every_current_setting() {
-        let cfg = sample_config();
-        let p = rebuild_params(
-            &cfg,
-            Some("# peer direct-link IP (arbitrated mode)\n10.99.99.1\n"),
-            Some("# comment\n\n192.0.2.250\n192.0.2.251 # switch\n"),
-        );
-        assert_eq!(p.peer_ip, ip("192.0.2.11"));
-        assert_eq!(p.drbd_port, Some(7790));
-        assert_eq!(
-            p.backing_device.as_deref(),
-            Some(Path::new("/dev/disk/by-id/wwn-0x5000"))
-        );
-        assert_eq!(p.chap_password.as_deref(), Some("Kept0123456789ab"));
-        assert_eq!(p.direct_ip, Some(ip("10.99.99.1")));
-        assert_eq!(p.ping_targets, vec![ip("192.0.2.250"), ip("192.0.2.251")]);
-        assert!(p.full_sync, "a rebuild copies the whole disk back");
-        // Fate-shared, no extra targets.
-        let p = rebuild_params(&cfg, None, Some("# Example:\n#   192.0.2.2\n"));
-        assert_eq!(p.direct_ip, None);
-        assert!(p.ping_targets.is_empty());
     }
 
     #[test]
