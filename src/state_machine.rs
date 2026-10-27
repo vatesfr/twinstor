@@ -23740,11 +23740,8 @@ impl StateMachine {
             }
         }
         // (2b) Arbitrated: refuse new logins to this host's portal and wait out
-        // LIO's login timeout before the teardown removes the portal. The
-        // removal waits in the kernel for the portal thread, and a login the
-        // peer's side abandoned (its path to this portal cut by a mutual-freeze
-        // keep) held it past any bound (`block_portal_logins`).
-        let portal_port = self.config.iscsi.portal_port;
+        // LIO's login timeout before the teardown, so no login negotiation is
+        // still running in LIO when the backstore goes.
         self.cut_own_target().await;
         let blocked = self.own_target_cut_at.is_some();
         if let Some(at) = self.own_target_cut_at {
@@ -23757,8 +23754,18 @@ impl StateMachine {
         // This copy serves nobody and its guests are stopped, so a slow
         // teardown (LIO waiting out a login negotiation, 15 s each) gets more
         // time before the reboot; what holds it is logged at the first bound.
+        // Behind the cut, only the backstore is deleted (`release_device`):
+        // the portal delete is the step LIO can hang on for good, and the
+        // cut, kept until the next target start, keeps the LUN-less target
+        // out of every initiator's reach.
         let stopped = {
-            let stop = self.iscsi.stop();
+            let stop = async {
+                if blocked {
+                    self.iscsi.release_device().await
+                } else {
+                    self.iscsi.stop().await
+                }
+            };
             tokio::pin!(stop);
             match tokio::time::timeout(ISCSI_STOP_TIMEOUT, &mut stop).await {
                 Ok(r) => Some(r),
@@ -23774,18 +23781,11 @@ impl StateMachine {
                 }
             }
         };
-        if blocked {
-            if crate::iscsi::unblock_portal_logins(portal_port).await {
-                self.own_target_cut_at = None;
-            } else {
-                warn!(
-                    "split-brain: could not lift the cut of this host's iSCSI target; the next \
-                     target start retries"
-                );
-            }
-        }
         match stopped {
-            Some(Ok(())) => {}
+            Some(Ok(())) => {
+                // The cut itself stays until the next target start lifts it.
+                self.own_target_cut_at = None;
+            }
             Some(Err(e)) => {
                 // stop() fails only when the backstore is still there, i.e. LIO
                 // may still export this doomed copy to a session that survived

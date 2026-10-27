@@ -40,10 +40,45 @@ fn device_sectors(device: &Path) -> Option<u64> {
         .ok()
 }
 
+/// Whether `device` presents its real size, retried briefly (see the
+/// atomic-publish gate in start()).
+async fn device_presents_real_size(device: &Path) -> bool {
+    for attempt in 0..DEVICE_READY_TRIES {
+        match device_sectors(device) {
+            Some(s) if !is_phantom_size(s) => return true,
+            other => warn!(
+                device = %device.display(),
+                sectors = ?other,
+                "DRBD device not presenting its real size yet (phantom/half-attached); \
+                 waiting before building the iSCSI target"
+            ),
+        }
+        if attempt + 1 < DEVICE_READY_TRIES {
+            tokio::time::sleep(DEVICE_READY_GAP).await;
+        }
+    }
+    false
+}
+
+/// Lift a cut of this host's portal left by a loser's teardown, once the
+/// target exports nothing or a complete LUN.
+async fn lift_leftover_cut(port: u16) {
+    if !cfg!(test) && !unblock_portal_logins(port).await {
+        warn!("could not remove a leftover block on this host's iSCSI portal");
+    }
+}
+
 #[async_trait::async_trait]
 pub trait IscsiControl: Send + Sync {
     async fn start(&mut self, config: &Config) -> Result<()>;
     async fn stop(&mut self) -> Result<()>;
+    /// Release the DRBD device (the backstore, and with it the LUN) but leave
+    /// the target and its portal in place, for the next start() to rebuild the
+    /// LUN in place. Only while the portal is cut (`block_portal_logins`): a
+    /// reachable LUN-less target answers on a virtual, write-protected LUN 0.
+    async fn release_device(&mut self) -> Result<()> {
+        self.stop().await
+    }
 }
 
 /// The targetcli commands the controller issues, behind a seam so the
@@ -90,6 +125,10 @@ pub struct IscsiController {
     // itself exists (see stop()). `active` starts false on every daemon start
     // while LIO keeps whatever an earlier run exported.
     adoption_checked: bool,
+    // release_device() left this process's target and portal in place
+    // (`portal_spec`), LUN-less behind the cut: start() rebuilds the LUN
+    // without touching the portal.
+    released_in_place: bool,
     cli: Box<dyn TargetCli>,
 }
 
@@ -103,6 +142,7 @@ impl IscsiController {
             active: false,
             portal_spec: None,
             adoption_checked: false,
+            released_in_place: false,
             cli,
         }
     }
@@ -120,10 +160,9 @@ impl IscsiControl for IscsiController {
         let port = config.iscsi.portal_port;
         let serial = &config.iscsi.lun_serial;
         info!(iqn = %iqn, device = %device.display(), serial = %serial, "starting iSCSI target");
-        // A loser's teardown block left behind (a crash between its block and
-        // its unblock) would keep every initiator out of this target.
-        if !cfg!(test) && !unblock_portal_logins(port).await {
-            warn!("could not remove a leftover block on this host's iSCSI portal");
+
+        if self.released_in_place {
+            return self.rebuild_lun_in_place(device, serial).await;
         }
 
         // Check if iSCSI is already configured and serving
@@ -132,6 +171,7 @@ impl IscsiControl for IscsiController {
             && config.iscsi.initiator_iqns.is_some();
         if self.is_configured(iqn, chap_expected).await {
             info!("iSCSI target already configured, skipping setup");
+            lift_leftover_cut(port).await;
             self.active = true;
             self.adoption_checked = true;
             self.portal_spec = Some((iqn.clone(), port));
@@ -149,6 +189,9 @@ impl IscsiControl for IscsiController {
         if let Err(e) = self.cli.run("clearconfig confirm=True").await {
             warn!(error = %e, "clearconfig failed (may be empty, continuing)");
         }
+        // Nothing is exported now, and the portal opens last: a cut left over
+        // from a loser's teardown can go.
+        lift_leftover_cut(port).await;
 
         // Atomic-publish gate: never build the backstore on a device that is
         // not presenting its real size. LIO records the device size when the
@@ -161,25 +204,7 @@ impl IscsiControl for IscsiController {
         // can only reach a correctly sized LUN. On a persistent phantom, bail;
         // the caller holds and retries, and the cleared config gives the
         // loopback connection-refused, never a malformed LUN.
-        let mut sane = false;
-        for attempt in 0..DEVICE_READY_TRIES {
-            match device_sectors(device) {
-                Some(s) if !is_phantom_size(s) => {
-                    sane = true;
-                    break;
-                }
-                other => warn!(
-                    device = %device.display(),
-                    sectors = ?other,
-                    "DRBD device not presenting its real size yet (phantom/half-attached); \
-                     waiting before building the iSCSI target"
-                ),
-            }
-            if attempt + 1 < DEVICE_READY_TRIES {
-                tokio::time::sleep(DEVICE_READY_GAP).await;
-            }
-        }
-        if !sane {
+        if !device_presents_real_size(device).await {
             bail!(
                 "iSCSI target not built: DRBD device {} is not presenting its real size \
                  (phantom/half-attached); holding to avoid publishing a malformed LUN",
@@ -331,9 +356,79 @@ impl IscsiControl for IscsiController {
         info!("iSCSI target stopped");
         Ok(())
     }
+
+    async fn release_device(&mut self) -> Result<()> {
+        // Only a target this process built and still exports; anything else
+        // gets the full teardown.
+        if !self.active || self.portal_spec.is_none() {
+            return self.stop().await;
+        }
+        // Deleting the portal or the target resets LIO's portal thread, which
+        // a login timed out under frozen I/O can leave unable to answer: the
+        // delete then hangs in the kernel for good. The backstore alone holds
+        // the device, and its delete never waits on that thread.
+        info!("releasing the DRBD device from the iSCSI target; the cut portal stays in place");
+        let gone = self
+            .cli
+            .run("/backstores/block delete twinstor")
+            .await
+            .is_ok()
+            || !self.target_left_over().await;
+        if !gone {
+            bail!("iSCSI backstore delete failed: LIO may still hold the device");
+        }
+        self.active = false;
+        self.adoption_checked = true;
+        self.released_in_place = true;
+        Ok(())
+    }
 }
 
 impl IscsiController {
+    /// start() after release_device(): the target, its access settings and
+    /// its portal are still in place, cut off; put the backstore and the LUN
+    /// back, then lift the cut. The portal is never touched.
+    async fn rebuild_lun_in_place(&mut self, device: &Path, serial: &str) -> Result<()> {
+        let Some((iqn, port)) = self.portal_spec.clone() else {
+            self.released_in_place = false;
+            bail!("iSCSI target released in place without a known portal");
+        };
+        if !device_presents_real_size(device).await {
+            bail!(
+                "iSCSI LUN not rebuilt: DRBD device {} is not presenting its real size \
+                 (phantom/half-attached); holding to avoid publishing a malformed LUN",
+                device.display()
+            );
+        }
+        // From here LIO may hold the device again until this completes; a
+        // failure part-way leaves the next start() the full rebuild.
+        self.adoption_checked = false;
+        self.released_in_place = false;
+        self.cli
+            .run(&format!(
+                "/backstores/block create twinstor {}",
+                device.display()
+            ))
+            .await?;
+        let serial_path = "/sys/kernel/config/target/core/iblock_0/twinstor/wwn/vpd_unit_serial";
+        tokio::fs::write(serial_path, format!("{serial}\n"))
+            .await
+            .with_context(|| format!("setting LUN serial at {serial_path}"))?;
+        // The ACLs' mapped LUNs went with the LUN: map it to them again,
+        // whatever the host's auto_add_mapped_luns preference says.
+        self.cli
+            .run(&format!(
+                "/iscsi/{iqn}/tpg1/luns create /backstores/block/twinstor add_mapped_luns=true"
+            ))
+            .await?;
+        self.cli.run("saveconfig").await?;
+        lift_leftover_cut(port).await;
+        self.active = true;
+        self.adoption_checked = true;
+        info!("iSCSI target started (LUN rebuilt in place)");
+        Ok(())
+    }
+
     async fn is_configured(&self, iqn: &str, chap_expected: bool) -> bool {
         // Check that our own target exists with a LUN mapped. Return false
         // only when it is certainly not configured; on any error (targetcli
@@ -992,6 +1087,54 @@ poll_interval_ms = 10
                 "saveconfig".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn release_deletes_only_the_backstore_and_start_never_touches_the_portal() {
+        // Behind the loser's cut, the portal and the target stay: deleting
+        // either resets LIO's portal thread, the step that hangs for good.
+        let (mut c, log) = fresh(Some(EMPTY));
+        c.active = true;
+        c.adoption_checked = true;
+        c.portal_spec = Some((IQN.to_string(), 3260));
+        c.release_device().await.unwrap();
+        assert_eq!(*log.lock().unwrap(), ["/backstores/block delete twinstor"]);
+        assert!(!c.active && c.adoption_checked && c.released_in_place);
+        // A later stop() has nothing left to release.
+        c.stop().await.unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        // start() rebuilds in place: whatever happens (here the device is not
+        // a real volume, so it holds), no clearconfig and no portal command.
+        let cfg: Config = toml::from_str(&format!(
+            "[node]\nname = \"a\"\npeer = \"b\"\n[network]\nbond = \"bond0\"\n\
+             peer_address = \"10.0.0.2\"\ndrbd_port = 7789\n[storage]\n\
+             drbd_resource = \"data\"\nbacking_device = \"/dev/null\"\n\
+             drbd_device = \"/nonexistent/drbd\"\n[iscsi]\ntarget_iqn = \"{IQN}\"\n\
+             lun_serial = \"twinstor0001\"\n"
+        ))
+        .unwrap();
+        assert!(c.start(&cfg).await.is_err());
+        assert!(c.released_in_place, "a device not ready yet keeps the in-place rebuild");
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("clearconfig") || l.contains("portals"))
+        );
+    }
+
+    #[tokio::test]
+    async fn release_without_a_target_built_here_is_the_full_stop() {
+        let (mut c, log) = fresh(Some(LEFT_OVER));
+        c.release_device().await.unwrap();
+        assert!(!c.released_in_place);
+        assert!(log.lock().unwrap().iter().any(|l| l == "clearconfig confirm=True"));
+        // And a failed backstore delete is an error that keeps the target.
+        let (mut c, _log) = failing(Some(LEFT_OVER), "/backstores/block delete");
+        c.active = true;
+        c.portal_spec = Some((IQN.to_string(), 3260));
+        assert!(c.release_device().await.is_err());
+        assert!(c.active && !c.released_in_place);
     }
 
     #[tokio::test]
