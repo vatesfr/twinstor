@@ -1860,9 +1860,13 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
     // field itself points at the line to fix.
     // An unanswered iSCSI probe (targetcli wedged on dead backing) is not
     // "not exported": it degrades the verdict but does not make it critical.
-    let critical = !daemon_active
-        || drbd_status.is_none()
-        || (!receiving && (!readiness.can_serve() || iscsi_active == Some(false)));
+    let critical = critical_now(
+        daemon_active,
+        drbd_status.is_some(),
+        readiness.can_serve(),
+        iscsi_active,
+        receiving,
+    );
     let degraded = drbd_sev > Sev::Good
         || readiness_sev > Sev::Good
         || iscsi_active.is_none()
@@ -1882,6 +1886,10 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             "daemon not running (storage unprotected)".to_string()
         } else if drbd_status.is_none() {
             "cannot read DRBD status".to_string()
+        } else if receiving {
+            "serving an incomplete copy: this host's iSCSI target is open while it still \
+             receives its copy from the peer"
+                .to_string()
         } else if !readiness.can_serve() {
             format!("not serving ({})", readiness.reason())
         } else {
@@ -1889,48 +1897,59 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         };
         (Sev::Bad, "critical", reason)
     } else if degraded {
+        // Everything else that degrades the verdict. While this host receives
+        // its copy, a single path is expected and is not reported; a missing
+        // multipath map still is.
+        let other_reason = |copying: bool| -> Option<String> {
+            Some(if iscsi_active.is_none() {
+                "iSCSI target state unknown (targetcli timed out or could not run; backing may be wedged)"
+                .to_string()
+            } else if let Some(h) = &heal {
+                format!("auto-heal in progress: {}", h.summary)
+            } else if ha_enabled == Some(false) {
+                "pool HA disabled (no automatic host failover)".to_string()
+            } else if ha_enabled.is_none() {
+                "pool HA unknown (XAPI did not answer)".to_string()
+            } else if cap_sev > Sev::Good {
+                format!(
+                    "SR {}% full (guests hit ENOSPC when it fills)",
+                    capacity.unwrap_or(0)
+                )
+            } else if worst_cache > Sev::Good {
+                "volatile write cache on a backing disk (not durable)".to_string()
+            } else if tb_targets.is_empty() {
+                "no partition tiebreaker configured".to_string()
+            } else if let Some(r) = path_degraded
+                .as_ref()
+                .filter(|_| !copying || mp_sev == Sev::Bad)
+            {
+                r.clone()
+            } else if !mpath_answered && mp_sev > Sev::Good {
+                "multipath state unknown (multipath -ll did not answer)".to_string()
+            } else if mpath.is_none() && mp_sev > Sev::Good {
+                "no twinstor multipath device visible (path probe skipped)".to_string()
+            } else if on_fallback {
+                "replication on switch fallback".to_string()
+            } else if config_stale {
+                format!(
+                    "DRBD config file format v{} behind this binary (v{})",
+                    res_version.unwrap_or(0),
+                    crate::setup::CONFIG_VERSION
+                )
+            } else if !missing_kernels.is_empty() {
+                "installed kernel(s) without a DRBD module".to_string()
+            } else {
+                return None;
+            })
+        };
         let reason = if receiving {
-            receiving_reason(sync.as_ref())
+            with_receiving(receiving_reason(sync.as_ref()), other_reason(true))
         } else if let Some((pct, _)) = &sync {
             format!("resyncing (peer catching up, {pct:.1}%)")
         } else if readiness_sev > Sev::Good {
             readiness.reason().to_string()
-        } else if iscsi_active.is_none() {
-            "iSCSI target state unknown (targetcli timed out or could not run; backing may be wedged)"
-                .to_string()
-        } else if let Some(h) = &heal {
-            format!("auto-heal in progress: {}", h.summary)
-        } else if ha_enabled == Some(false) {
-            "pool HA disabled (no automatic host failover)".to_string()
-        } else if ha_enabled.is_none() {
-            "pool HA unknown (XAPI did not answer)".to_string()
-        } else if cap_sev > Sev::Good {
-            format!(
-                "SR {}% full (guests hit ENOSPC when it fills)",
-                capacity.unwrap_or(0)
-            )
-        } else if worst_cache > Sev::Good {
-            "volatile write cache on a backing disk (not durable)".to_string()
-        } else if tb_targets.is_empty() {
-            "no partition tiebreaker configured".to_string()
-        } else if let Some(r) = &path_degraded {
-            r.clone()
-        } else if !mpath_answered && mp_sev > Sev::Good {
-            "multipath state unknown (multipath -ll did not answer)".to_string()
-        } else if mpath.is_none() && mp_sev > Sev::Good {
-            "no twinstor multipath device visible (path probe skipped)".to_string()
-        } else if on_fallback {
-            "replication on switch fallback".to_string()
-        } else if config_stale {
-            format!(
-                "DRBD config file format v{} behind this binary (v{})",
-                res_version.unwrap_or(0),
-                crate::setup::CONFIG_VERSION
-            )
-        } else if !missing_kernels.is_empty() {
-            "installed kernel(s) without a DRBD module".to_string()
         } else {
-            "replication degraded (see drbd section)".to_string()
+            other_reason(false).unwrap_or_else(|| "replication degraded (see drbd section)".into())
         };
         (Sev::Warn, "degraded", reason)
     } else {
@@ -2521,6 +2540,34 @@ fn receiving_copy(s: &crate::drbd::DrbdStatus) -> bool {
         && s.connection == ConnectionState::Connected
         && s.peer_disk == Some(DiskState::UpToDate)
         && s.replication == Some(Replication::SyncTarget)
+}
+
+/// Whether the status verdict is critical: the node is not safely serving.
+/// While this host receives its copy it is expected not to serve, but an open
+/// local target then serves an incomplete copy, which is critical.
+fn critical_now(
+    daemon_active: bool,
+    drbd_read: bool,
+    can_serve: bool,
+    iscsi_active: Option<bool>,
+    receiving: bool,
+) -> bool {
+    !daemon_active
+        || !drbd_read
+        || if receiving {
+            iscsi_active == Some(true)
+        } else {
+            !can_serve || iscsi_active == Some(false)
+        }
+}
+
+/// The degraded reason while this host receives its copy: anything else that
+/// is wrong comes first, so the expected copy never hides it.
+fn with_receiving(receiving: String, other: Option<String>) -> String {
+    match other {
+        Some(o) => format!("{o}; also {receiving}"),
+        None => receiving,
+    }
 }
 
 fn receiving_reason(sync: Option<&(f64, String)>) -> String {
@@ -3544,7 +3591,36 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
 
 #[cfg(test)]
 mod tests {
-    use super::{receiving_copy, receiving_reason};
+    use super::{critical_now, receiving_copy, receiving_reason, with_receiving};
+
+    #[test]
+    fn an_open_target_during_the_initial_copy_is_critical() {
+        // Receiving, local target closed: expected, not critical.
+        assert!(!critical_now(true, true, false, Some(false), true));
+        // Receiving, local target open: it serves an incomplete copy.
+        assert!(critical_now(true, true, false, Some(true), true));
+        // Receiving does not hide a stopped daemon or unreadable DRBD.
+        assert!(critical_now(false, true, false, Some(false), true));
+        assert!(critical_now(true, false, false, Some(false), true));
+        // Not receiving: the usual rules.
+        assert!(critical_now(true, true, false, Some(true), false));
+        assert!(critical_now(true, true, true, Some(false), false));
+        assert!(!critical_now(true, true, true, Some(true), false));
+    }
+
+    #[test]
+    fn the_initial_copy_does_not_hide_other_problems() {
+        let r = with_receiving(
+            "receiving this host's copy".into(),
+            Some("pool HA disabled (no automatic host failover)".into()),
+        );
+        assert!(r.starts_with("pool HA disabled"), "{r}");
+        assert!(r.contains("receiving this host's copy"), "{r}");
+        assert_eq!(
+            with_receiving("receiving this host's copy".into(), None),
+            "receiving this host's copy"
+        );
+    }
 
     fn drbd(text: &str) -> crate::drbd::DrbdStatus {
         crate::drbd::parse_drbdadm_text(text).expect("parses")
