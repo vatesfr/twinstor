@@ -229,6 +229,14 @@ enum Command {
         /// freeze-on-disconnect semantics.
         #[arg(long = "allow-no-tiebreaker", default_value_t = false)]
         allow_no_tiebreaker: bool,
+        /// Confirm erasing the backing device without a prompt (needed when
+        /// there is no terminal to ask on).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Use a backing device the wizard would not offer (a disk with a
+        /// partition table, for example). Setup erases it.
+        #[arg(long = "force-device", default_value_t = false)]
+        force_device: bool,
     },
     /// Move replication back to the direct link now (arbitrated mode)
     ///
@@ -344,6 +352,8 @@ impl Cli {
                 ping_target,
                 direct_ip,
                 allow_no_tiebreaker,
+                yes,
+                force_device,
             } => {
                 let params = match peer_ip {
                     Some(peer_ip) => setup::SetupParams {
@@ -357,6 +367,8 @@ impl Cli {
                         direct_ip,
                         allow_no_tiebreaker,
                         from_wizard: false,
+                        yes,
+                        force_device,
                     },
                     None => {
                         let other_args_given = backing_device.is_some()
@@ -366,7 +378,9 @@ impl Cli {
                             || chap_password.is_some()
                             || !ping_target.is_empty()
                             || direct_ip.is_some()
-                            || allow_no_tiebreaker;
+                            || allow_no_tiebreaker
+                            || yes
+                            || force_device;
                         if other_args_given {
                             return Err(crate::render::CliError::new(
                                 "--peer-ip is required when other setup flags are given",

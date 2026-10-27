@@ -120,8 +120,10 @@ async fn host_name(uuid: &str) -> String {
 }
 
 /// Run the checks and print the checklist. Errors only on what makes setup
-/// impossible (no pool of two); warnings ask before going on.
-pub(crate) async fn run() -> Result<()> {
+/// impossible (no pool of two); warnings ask before going on when
+/// `interactive`, and are only printed on the non-interactive path (the
+/// operator who scripted the command decides from the output).
+pub(crate) async fn run(interactive: bool) -> Result<()> {
     println!(
         "Checking the requirements (https://docs.vates.tech/tech-preview/twinstor/installation/#requirements):"
     );
@@ -229,7 +231,9 @@ pub(crate) async fn run() -> Result<()> {
     println!("  [info] set \"Restore on AC power loss\" to Power On in both hosts' BIOS, so the");
     println!("         pool comes back by itself after a power cut (not checkable from here).");
 
-    if warned && !crate::wizard::ask_yes_no("\nContinue the setup anyway?", false)? {
+    if warned && !interactive {
+        println!("  (non-interactive: going on despite the warnings above)");
+    } else if warned && !crate::wizard::ask_yes_no("\nContinue the setup anyway?", false)? {
         bail!("setup stopped at the requirements check; fix the warnings above and run it again");
     }
     println!();

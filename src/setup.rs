@@ -84,6 +84,66 @@ pub struct SetupParams {
     /// arbitrated-mode note and asked for the confirmation; the flag path
     /// shows and asks them itself.
     pub from_wizard: bool,
+    /// The operator confirmed the destructive steps up front (`--yes`, or
+    /// the wizard's typed confirmation).
+    pub yes: bool,
+    /// Use a backing device the wizard would not offer (`--force-device`).
+    pub force_device: bool,
+}
+
+/// What asking for the destructive confirmation comes down to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// Already given: `--yes`, or the wizard asked.
+    Given,
+    /// Ask on the terminal.
+    Ask,
+    /// No terminal to ask on and no `--yes`: refuse.
+    Refuse,
+}
+
+pub(crate) fn confirmation(yes: bool, from_wizard: bool, tty: bool) -> Confirmation {
+    if yes || from_wizard {
+        Confirmation::Given
+    } else if tty {
+        Confirmation::Ask
+    } else {
+        Confirmation::Refuse
+    }
+}
+
+/// The `twinstor setup` command that runs the same setup without questions,
+/// printed by the wizard for admins who prefer to run commands themselves.
+/// The disk path is this host's own; the password is left out when setup
+/// generates it.
+pub(crate) fn equivalent_command(p: &SetupParams) -> String {
+    let mut cmd = format!("twinstor setup --peer-ip {}", p.peer_ip);
+    if let Some(l) = p.local_ip {
+        cmd.push_str(&format!(" --local-ip {l}"));
+    }
+    if let Some(d) = &p.backing_device {
+        cmd.push_str(&format!(" --backing-device {}", d.display()));
+    }
+    if let Some(d) = p.direct_ip {
+        cmd.push_str(&format!(" --direct-ip {d}"));
+    }
+    for t in &p.ping_targets {
+        cmd.push_str(&format!(" --ping-target {t}"));
+    }
+    if let Some(port) = p.drbd_port.filter(|port| *port != 7789) {
+        cmd.push_str(&format!(" --drbd-port {port}"));
+    }
+    if p.full_sync {
+        cmd.push_str(" --full-sync");
+    }
+    if let Some(pw) = &p.chap_password {
+        cmd.push_str(&format!(" --chap-password {pw}"));
+    }
+    if p.allow_no_tiebreaker {
+        cmd.push_str(" --allow-no-tiebreaker");
+    }
+    cmd.push_str(" --yes");
+    cmd
 }
 
 /// Set once `run_setup` starts changing this host (the config write), so a
@@ -112,6 +172,10 @@ pub(crate) fn part_way_failure(err: anyhow::Error, host_changed: bool) -> anyhow
 }
 
 pub async fn run_setup(params: SetupParams) -> Result<()> {
+    // The wizard ran the requirement checks before its first question.
+    if !params.from_wizard {
+        crate::preflight::run(false).await?;
+    }
     let local_name = hostname::get()
         .context("hostname")?
         .to_string_lossy()
@@ -197,6 +261,25 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
             if !dev.exists() {
                 bail!("{} does not exist", dev.display());
             }
+            // The same checks as the wizard's disk list, except for the
+            // device this host already uses (a re-run or a rebuild, which
+            // DRBD holds).
+            let current = crate::config::Config::load(Path::new(CONFIG_PATH))
+                .ok()
+                .and_then(|c| std::fs::canonicalize(c.storage.backing_device).ok());
+            let same_as_current = current.is_some() && current == std::fs::canonicalize(&dev).ok();
+            if !params.from_wizard
+                && !params.force_device
+                && !same_as_current
+                && let Some(why) = crate::wizard::backing_device_refusal(&dev)
+            {
+                return Err(crate::render::CliError::new(
+                    format!("{} is not a device setup can erase: {why}", dev.display()),
+                    "run `twinstor setup` with no arguments to see the disks it offers and why \
+                     others are not; if you are sure, add --force-device",
+                )
+                .into());
+            }
             dev
         }
         None => bail!(
@@ -262,6 +345,40 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
     println!("  CHAP user:     {chap_user}");
     println!("  CHAP password: {chap_password}");
     println!();
+
+    // The destructive step, confirmed before anything is written.
+    match confirmation(
+        params.yes,
+        params.from_wizard,
+        crate::wizard::stdin_is_tty(),
+    ) {
+        Confirmation::Given => {}
+        Confirmation::Ask => {
+            println!(
+                "This erases {} on {local_name}.",
+                crate::wizard::describe_device(&backing)
+            );
+            print!("Type 'yes' to proceed (anything else aborts): ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim() != "yes" {
+                bail!("aborted by user; nothing was changed");
+            }
+        }
+        Confirmation::Refuse => {
+            return Err(crate::render::CliError::new(
+                format!(
+                    "setup would erase {} and has no terminal to confirm it on; nothing was \
+                     changed",
+                    crate::wizard::describe_device(&backing)
+                ),
+                "add --yes to confirm, or run `twinstor setup` from a terminal",
+            )
+            .into());
+        }
+    }
 
     tokio::fs::create_dir_all(CONFIG_DIR)
         .await
@@ -4448,5 +4565,49 @@ mod setup_flow_tests {
         assert!(topology_mismatch(false, None, None, "host-a").is_none());
         // A first node that published no direct-link address: any is taken.
         assert!(topology_mismatch(true, None, Some(other), "host-a").is_none());
+    }
+
+    #[test]
+    fn the_flag_path_confirms_before_erasing() {
+        assert_eq!(confirmation(true, false, false), Confirmation::Given);
+        assert_eq!(confirmation(false, true, false), Confirmation::Given);
+        assert_eq!(confirmation(false, false, true), Confirmation::Ask);
+        assert_eq!(confirmation(false, false, false), Confirmation::Refuse);
+    }
+
+    fn params(direct: Option<&str>, chap: Option<&str>) -> SetupParams {
+        SetupParams {
+            peer_ip: "192.0.2.12".parse().unwrap(),
+            backing_device: Some("/dev/disk/by-id/wwn-0x5000".into()),
+            local_ip: None,
+            drbd_port: None,
+            full_sync: false,
+            chap_password: chap.map(String::from),
+            ping_targets: vec!["192.0.2.250".parse().unwrap()],
+            direct_ip: direct.map(|d| d.parse().unwrap()),
+            allow_no_tiebreaker: false,
+            from_wizard: true,
+            yes: true,
+            force_device: false,
+        }
+    }
+
+    #[test]
+    fn the_equivalent_command_repeats_every_choice() {
+        assert_eq!(
+            equivalent_command(&params(Some("10.99.99.2"), None)),
+            "twinstor setup --peer-ip 192.0.2.12 --backing-device /dev/disk/by-id/wwn-0x5000 \
+             --direct-ip 10.99.99.2 --ping-target 192.0.2.250 --yes"
+        );
+        let mut p = params(None, Some("Xy12"));
+        p.full_sync = true;
+        p.drbd_port = Some(7790);
+        p.allow_no_tiebreaker = true;
+        assert_eq!(
+            equivalent_command(&p),
+            "twinstor setup --peer-ip 192.0.2.12 --backing-device /dev/disk/by-id/wwn-0x5000 \
+             --ping-target 192.0.2.250 --drbd-port 7790 --full-sync --chap-password Xy12 \
+             --allow-no-tiebreaker --yes"
+        );
     }
 }

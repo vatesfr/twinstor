@@ -843,6 +843,132 @@ fn candidate_disks() -> Vec<CandidateDisk> {
     out
 }
 
+/// What setup knows about a device given with `--backing-device`, to tell
+/// why the wizard would not offer it.
+#[derive(Debug, Default)]
+struct DeviceFacts {
+    /// The wizard's list offers it.
+    offered: bool,
+    /// Mounted, or used as swap.
+    busy: bool,
+    /// A local SR sits on it (its name, or its uuid).
+    sr: Option<String>,
+    lvm_pv: bool,
+    /// Something is stacked on it (DRBD, multipath, md, device-mapper).
+    holders: bool,
+    /// A partition of the system disk or of a dormant XCP-ng install disk
+    /// that is not labelled for TwinStor.
+    on_os_disk: bool,
+    /// A whole disk that carries a partition table.
+    has_partitions: bool,
+}
+
+/// Why setup refuses a device the wizard would not offer, or None when the
+/// wizard would offer it. Free of I/O so it can be unit-tested.
+fn device_refusal(f: &DeviceFacts) -> Option<String> {
+    if f.offered {
+        return None;
+    }
+    Some(if f.busy {
+        "it is mounted or used as swap".to_string()
+    } else if let Some(sr) = &f.sr {
+        format!("it holds the local SR \"{sr}\"")
+    } else if f.lvm_pv {
+        "it is an LVM physical volume (an SR or a volume group uses it)".to_string()
+    } else if f.holders {
+        "something is stacked on it (DRBD, multipath, md RAID or LVM)".to_string()
+    } else if f.on_os_disk {
+        "it is on the system disk (there, only a partition labelled for TwinStor is used)"
+            .to_string()
+    } else if f.has_partitions {
+        "it has partitions: give one of them, or clear the partition table first (wipefs -a)"
+            .to_string()
+    } else {
+        "it is not a free local disk or partition (too small, or not a local block device)"
+            .to_string()
+    })
+}
+
+/// The `/sys/class/block` directory of a canonical `/dev/<name>` path.
+fn sys_block(canon: &Path) -> Option<PathBuf> {
+    let name = canon.file_name()?.to_string_lossy().to_string();
+    Some(PathBuf::from(format!("/sys/class/block/{name}")))
+}
+
+/// Why `dev` is not a device the wizard would offer as the backing device,
+/// or None when it is. A device that cannot be resolved is left to setup's
+/// own existence check.
+pub(crate) fn backing_device_refusal(dev: &Path) -> Option<String> {
+    let canon = std::fs::canonicalize(dev).ok()?;
+    let offered = candidate_disks()
+        .iter()
+        .any(|d| std::fs::canonicalize(format!("/dev/{}", d.kernel)).is_ok_and(|c| c == canon));
+    let sys = sys_block(&canon)?;
+    let is_partition = sys.join("partition").exists();
+    let has_children = |p: &Path| {
+        std::fs::read_dir(p)
+            .map(|d| d.flatten().any(|c| c.path().join("partition").exists()))
+            .unwrap_or(false)
+    };
+    // The whole disk a partition belongs to: its parent directory in sysfs.
+    let parent = if is_partition {
+        std::fs::canonicalize(&sys).ok().and_then(|p| {
+            p.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+        })
+    } else {
+        None
+    };
+    let os_disks = xcp_os_disks();
+    let system = system_disk();
+    let facts = DeviceFacts {
+        offered,
+        busy: busy_sources().contains(&canon),
+        sr: local_sr_blockers()
+            .into_iter()
+            .find(|b| std::fs::canonicalize(&b.dev).is_ok_and(|c| c == canon))
+            .map(|b| b.name.unwrap_or(b.uuid)),
+        lvm_pv: lvm_pv_paths().contains(&canon),
+        holders: std::fs::read_dir(sys.join("holders"))
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false),
+        on_os_disk: parent
+            .as_ref()
+            .is_some_and(|p| os_disks.contains(p) || system.as_ref() == Some(p)),
+        has_partitions: !is_partition && has_children(&sys),
+    };
+    device_refusal(&facts)
+}
+
+/// "/dev/sdb, 1920 GB, PERC H755N" for the confirmation prompt.
+pub(crate) fn describe_device(dev: &Path) -> String {
+    let Ok(canon) = std::fs::canonicalize(dev) else {
+        return dev.display().to_string();
+    };
+    let mut parts = vec![canon.display().to_string()];
+    if let Some(sys) = sys_block(&canon) {
+        if let Some(gb) = std::fs::read_to_string(sys.join("size"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|sectors| sectors * 512 / 1_000_000_000)
+        {
+            parts.push(format!("{gb} GB"));
+        }
+        let model_dir = if sys.join("partition").exists() {
+            sys.join("../device")
+        } else {
+            sys.join("device")
+        };
+        if let Ok(m) = std::fs::read_to_string(model_dir.join("model"))
+            && !m.trim().is_empty()
+        {
+            parts.push(m.trim().to_string());
+        }
+    }
+    parts.join(", ")
+}
+
 /// Parse `parted -m <dev> unit B print free` machine output into the
 /// unallocated ("free") regions as (start, end, size) byte triples, largest
 /// first. Each machine line is `num:start:end:size:fs:name:flags;`; a free
@@ -2114,6 +2240,8 @@ fn rebuild_params(
         direct_ip,
         allow_no_tiebreaker: cfg.network.allow_no_tiebreaker,
         from_wizard: true,
+        yes: true,
+        force_device: false,
     }
 }
 
@@ -2241,7 +2369,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
 
     print_banner();
     println!("TwinStor interactive setup. Press Enter to accept defaults.\n");
-    crate::preflight::run().await?;
+    crate::preflight::run(true).await?;
     let peer_label = peer_host_name()
         .await
         .unwrap_or_else(|| "the other host".to_string());
@@ -2655,13 +2783,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
         "  ping:    {}",
         ping_summary(&ping_targets, allow_no_tiebreaker)
     );
-    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
-    if confirm != "yes" {
-        bail!("aborted by user");
-    }
-    println!();
-
-    Ok(Some(SetupParams {
+    let params = SetupParams {
         peer_ip,
         backing_device: Some(backing_device),
         local_ip,
@@ -2672,7 +2794,18 @@ pub async fn run() -> Result<Option<SetupParams>> {
         direct_ip,
         allow_no_tiebreaker,
         from_wizard: true,
-    }))
+        yes: true,
+        force_device: false,
+    };
+    println!("\nSame setup without questions (for scripts, or to run it yourself):");
+    println!("  {}", crate::setup::equivalent_command(&params));
+    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
+    if confirm != "yes" {
+        bail!("aborted by user");
+    }
+    println!();
+
+    Ok(Some(params))
 }
 
 #[cfg(test)]
@@ -2800,6 +2933,60 @@ initiator_iqns = ["iqn.a"]
         assert!(!TOPOLOGY_QUESTION.contains("redundant networks"));
         assert!(TOPOLOGY_QUESTION.contains("#pick-your-topology"));
         assert!(TOPOLOGY_QUESTION.lines().all(|l| l.len() <= 80));
+    }
+
+    #[test]
+    fn a_device_the_wizard_would_not_offer_is_refused_with_the_reason() {
+        let offered = DeviceFacts {
+            offered: true,
+            ..Default::default()
+        };
+        assert_eq!(device_refusal(&offered), None);
+        let why = |f: DeviceFacts| device_refusal(&f).expect("refused");
+        assert!(
+            why(DeviceFacts {
+                busy: true,
+                ..Default::default()
+            })
+            .contains("mounted")
+        );
+        assert!(
+            why(DeviceFacts {
+                sr: Some("Local storage".into()),
+                lvm_pv: true,
+                ..Default::default()
+            })
+            .contains("\"Local storage\"")
+        );
+        assert!(
+            why(DeviceFacts {
+                lvm_pv: true,
+                ..Default::default()
+            })
+            .contains("LVM")
+        );
+        assert!(
+            why(DeviceFacts {
+                holders: true,
+                ..Default::default()
+            })
+            .contains("stacked")
+        );
+        assert!(
+            why(DeviceFacts {
+                on_os_disk: true,
+                ..Default::default()
+            })
+            .contains("system disk")
+        );
+        assert!(
+            why(DeviceFacts {
+                has_partitions: true,
+                ..Default::default()
+            })
+            .contains("wipefs -a")
+        );
+        assert!(why(DeviceFacts::default()).contains("not a free local disk"));
     }
 
     #[test]
