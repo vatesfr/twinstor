@@ -1142,53 +1142,56 @@ fn is_point_to_point(netmask: &str) -> bool {
     matches!(netmask, "255.255.255.252" | "255.255.255.254")
 }
 
-/// One line per non-management NIC of this host: device, link, IP. Shown
-/// when no direct link is found, so a back-to-back cable without a link (a
-/// DAC whose port is down, a cable in the wrong port) is visible at once.
-async fn nic_link_lines() -> Vec<String> {
-    let Some((this_uuid, _peer)) = two_host_pool().await else {
-        return vec![];
-    };
-    let pifs = cmd_output(
-        "xe",
-        &["pif-list", &format!("host-uuid={this_uuid}"), "--minimal"],
-    )
-    .await
-    .unwrap_or_default();
-    let mut out = Vec::new();
-    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let p = pif_params(pif).await;
-        if let Some(l) = nic_link_line(&p) {
-            out.push(l);
-        }
-    }
-    out.sort();
-    out
+/// A NIC of this host as a candidate end of a new direct link.
+#[derive(Debug, Clone, PartialEq)]
+struct NicChoice {
+    device: String,
+    speed_mbps: Option<u32>,
+    /// Why it cannot be the direct link; None when it can.
+    exclusion: Option<String>,
 }
 
-fn nic_link_line(p: &std::collections::HashMap<String, String>) -> Option<String> {
-    let device = p.get("device").filter(|d| !d.is_empty())?;
-    if p.get("management").is_some_and(|m| m == "true")
-        || p.get("physical").is_some_and(|m| m == "false")
-    {
-        return None;
-    }
-    let link = if p.get("carrier").is_some_and(|c| c == "true") {
-        "link up"
+/// Why a NIC cannot be offered as an end of a new direct link, from its
+/// `xe pif-param-list` fields and the number of VM interfaces on its pool
+/// network. On XCP-ng a NIC that carries only VM traffic also has a link and
+/// no IP, so "link up, no IP" alone is no evidence of a cable to the peer.
+fn direct_link_exclusion(
+    p: &std::collections::HashMap<String, String>,
+    vifs: usize,
+) -> Option<String> {
+    let set = |k: &str| {
+        p.get(k)
+            .is_some_and(|v| !v.is_empty() && v != "<not in database>")
+    };
+    if let Some(why) = pif_unusable(p) {
+        Some(why.to_string())
+    } else if set("IP") {
+        Some(format!("it already has the address {}", p["IP"]))
+    } else if p.get("carrier").is_none_or(|c| c != "true") {
+        Some("no link (no cable, or the port at the other end is down)".into())
+    } else if set("VLAN-slave-of") {
+        Some("it carries VLAN networks".into())
+    } else if vifs > 0 {
+        Some(format!(
+            "its network carries VM traffic ({vifs} virtual interface(s))"
+        ))
     } else {
-        "no link"
-    };
-    let ip = p
-        .get("IP")
-        .filter(|i| !i.is_empty())
-        .map(|i| format!(", IP {i}"))
-        .unwrap_or_else(|| ", no IP".into());
-    Some(format!("{device}: {link}{ip}"))
+        None
+    }
 }
 
-/// This host's NICs that have a cable/carrier but no IP and aren't the
-/// management interface: candidates for an as-yet-unconfigured direct link.
-async fn carrier_nics_without_ip() -> Vec<String> {
+/// The link speed the kernel reports for `device`, in Mb/s.
+fn nic_speed_mbps(device: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{device}/speed"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|s| *s > 0)
+        .and_then(|s| u32::try_from(s).ok())
+}
+
+/// This host's physical NICs other than the management one, each with the
+/// reason it cannot be a new direct link, if any. Sorted by device.
+async fn direct_link_nics() -> Vec<NicChoice> {
     let Some((this_uuid, _peer)) = two_host_pool().await else {
         return vec![];
     };
@@ -1202,16 +1205,45 @@ async fn carrier_nics_without_ip() -> Vec<String> {
     for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let p = pif_params(pif).await;
         let device = p.get("device").cloned().unwrap_or_default();
-        let has_ip = p.get("IP").map(|s| !s.is_empty()).unwrap_or(false);
-        let carrier = p.get("carrier").map(|s| s == "true").unwrap_or(false);
-        if device.is_empty() || has_ip || !carrier || pif_unusable(&p).is_some() {
+        if device.is_empty()
+            || p.get("management").is_some_and(|m| m == "true")
+            || p.get("physical").is_none_or(|m| m != "true")
+        {
             continue;
         }
-        out.push(device);
+        let vifs = match p.get("network-uuid").filter(|n| !n.is_empty()) {
+            Some(net) => cmd_output(
+                "xe",
+                &["vif-list", &format!("network-uuid={net}"), "--minimal"],
+            )
+            .await
+            .unwrap_or_default()
+            .split(',')
+            .filter(|v| !v.trim().is_empty())
+            .count(),
+            None => 0,
+        };
+        out.push(NicChoice {
+            speed_mbps: nic_speed_mbps(&device),
+            exclusion: direct_link_exclusion(&p, vifs),
+            device,
+        });
     }
-    out.sort();
-    out.dedup();
+    out.sort_by(|a, b| a.device.cmp(&b.device));
+    out.dedup_by(|a, b| a.device == b.device);
     out
+}
+
+/// One line of the NIC list: device, speed, and why it is not offered.
+fn nic_choice_line(n: &NicChoice) -> String {
+    let speed = n
+        .speed_mbps
+        .map(|s| format!("{s} Mb/s"))
+        .unwrap_or_else(|| "speed unknown".into());
+    match &n.exclusion {
+        None => format!("{:<8} {speed}", n.device),
+        Some(why) => format!("{:<8} {speed}, not offered: {why}", n.device),
+    }
 }
 
 /// What resolving a direct link for arbitrated mode produced.
@@ -1219,21 +1251,25 @@ async fn carrier_nics_without_ip() -> Vec<String> {
 enum DirectLinkOutcome {
     /// A second shared network is already usable; carries the peer's IP on it.
     Ready(IpAddr),
-    /// A cabled-but-unconfigured NIC looks like the intended direct link.
-    NeedsConfig { device: String },
+    /// Unconfigured NICs that could be the direct link; the operator picks.
+    NeedsConfig { devices: Vec<String> },
     /// Nothing suitable found.
     None,
 }
 
-/// A ready peer IP wins; otherwise a cabled NIC to configure; otherwise
-/// nothing. Free of I/O so it can be unit-tested.
-fn decide_direct_link(ready_peer_ips: &[IpAddr], carrier_no_ip: &[String]) -> DirectLinkOutcome {
+/// A ready peer IP wins; otherwise the NICs that could take a new link (never
+/// a guess among them); otherwise nothing. Free of I/O so it can be
+/// unit-tested.
+fn decide_direct_link(ready_peer_ips: &[IpAddr], nics: &[NicChoice]) -> DirectLinkOutcome {
+    let devices: Vec<String> = nics
+        .iter()
+        .filter(|n| n.exclusion.is_none())
+        .map(|n| n.device.clone())
+        .collect();
     if let Some(ip) = ready_peer_ips.first() {
         DirectLinkOutcome::Ready(*ip)
-    } else if let Some(dev) = carrier_no_ip.first() {
-        DirectLinkOutcome::NeedsConfig {
-            device: dev.clone(),
-        }
+    } else if !devices.is_empty() {
+        DirectLinkOutcome::NeedsConfig { devices }
     } else {
         DirectLinkOutcome::None
     }
@@ -1540,15 +1576,30 @@ async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bo
         println!("  the peer's {peer_dev} already has {peer_dl}.");
     }
     // Both ends apply their address asynchronously.
+    let mut answered = false;
     for _ in 0..20 {
         if host_ipv4_addrs().await.contains(&local_dl) && ping_once(&peer_dl.to_string()).await {
-            return Ok(());
+            answered = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // A ping also answers through a switch. The bridge's forwarding table
+    // tells a cable (only the peer behind the port) from a switch port
+    // (other devices too); when it cannot be read, the link is taken as is.
+    let foreign = if answered {
+        foreign_macs_on_link(device, &peer_pif)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if answered && foreign.is_empty() {
+        return Ok(());
+    }
     // A wrong pairing (pool networks pair NICs by device name, so the cable
-    // may sit on another NIC of the peer): undo what this run set, so a later
-    // run does not take it for a working link.
+    // may sit on another NIC of the peer), or a switch port: undo what this
+    // run set, so a later run does not take it for a working link.
     let mut undone = Vec::new();
     if action == PeerEnd::Configure && clear_link_end(&peer_pif).await.is_ok() {
         undone.push(format!("the peer's {peer_dev}"));
@@ -1564,10 +1615,66 @@ async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bo
             undone.join(" and ")
         )
     };
+    if !foreign.is_empty() {
+        bail!(
+            "{device} sees {} other device(s) besides the peer: this looks like a switch port, \
+             not a cable between the two hosts.{undone} Pick the NIC that is cabled straight to \
+             the other host. If {device} really is, configure the link by hand:\n{}",
+            foreign.len(),
+            direct_link_instructions(device)
+        );
+    }
     bail!(
         "{peer_dl} does not answer over {device}: the cable may sit on another NIC of the \
          peer than {peer_dev}.{undone} Check the cabling, or {manual}"
     )
+}
+
+/// MACs the bridge learned on `port` other than `allowed`, from
+/// `ovs-appctl fdb/show <bridge>` (`port VLAN MAC age` rows).
+fn foreign_macs(fdb: &str, port: &str, allowed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in fdb.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 3
+            && f[0] == port
+            && !allowed.iter().any(|a| a.eq_ignore_ascii_case(f[2]))
+            && !out.iter().any(|m| m.eq_ignore_ascii_case(f[2]))
+        {
+            out.push(f[2].to_string());
+        }
+    }
+    out
+}
+
+/// The devices other than the peer that this host's bridge has seen behind
+/// `device`; None when the bridge cannot be read (a Linux-bridge network
+/// backend, or the tools fail), so no check is possible.
+async fn foreign_macs_on_link(device: &str, peer_pif: &str) -> Option<Vec<String>> {
+    let local_pif = pif_uuid_for_device(device).await?;
+    let net = pif_params(&local_pif).await.get("network-uuid").cloned()?;
+    let bridge = cmd_output(
+        "xe",
+        &[
+            "network-param-get",
+            &format!("uuid={net}"),
+            "param-name=bridge",
+        ],
+    )
+    .await
+    .ok()?;
+    let port = cmd_output("ovs-vsctl", &["get", "Interface", device, "ofport"])
+        .await
+        .ok()?;
+    let fdb = cmd_output("ovs-appctl", &["fdb/show", bridge.trim()])
+        .await
+        .ok()?;
+    let peer_mac = pif_params(peer_pif)
+        .await
+        .get("MAC")
+        .cloned()
+        .unwrap_or_default();
+    Some(foreign_macs(&fdb, port.trim(), &[peer_mac]))
 }
 
 /// A direct link this wizard configured on this host (tagged
@@ -1623,10 +1730,14 @@ fn default_local_dl(peer_ip: Option<Ipv4Addr>, peer_mask: Option<&str>) -> Ipv4A
 }
 
 /// Resolve the direct link for arbitrated mode interactively. Returns the
-/// peer's direct-link IP to use, or `None` to fall back to fate-shared.
+/// peer's direct-link IP to use, or `None` to fall back to fate-shared, which
+/// is offered only when `allow_fate_shared` (the first host choosing its
+/// topology; the second host must follow the first).
 async fn resolve_direct_link(
     nets: &[PeerNetwork],
     replication_peer_ip: IpAddr,
+    peer: &str,
+    allow_fate_shared: bool,
 ) -> Result<Option<IpAddr>> {
     // A shared network whose peer endpoint is not the replication peer is a
     // candidate direct link. Matching on the peer IP (not the network name) is
@@ -1643,26 +1754,42 @@ async fn resolve_direct_link(
     {
         let peer_dl = p2p_peer(local_dl).expect("checked by half_configured_link");
         println!(
-            "\n{device} has {local_dl}/30 here (set by an earlier setup), but the peer's end\n\
+            "\n{device} has {local_dl}/30 here (set by an earlier setup), but {peer}'s end\n\
              of that link has no address yet."
         );
         bring_up_direct_link(&device, local_dl, true).await?;
         return Ok(Some(IpAddr::V4(peer_dl)));
     }
     // Only probe NICs if there's no ready network to offer.
-    let carrier = if ready.is_empty() {
-        carrier_nics_without_ip().await
+    let nics = if ready.is_empty() {
+        direct_link_nics().await
     } else {
         vec![]
     };
+    let none_choice = if allow_fate_shared {
+        "none of these: use fate-shared (one network) instead"
+    } else {
+        "none of these: stop setup here"
+    };
+    let decline = || -> Result<Option<IpAddr>> {
+        if allow_fate_shared {
+            println!("  using fate-shared mode.");
+            Ok(None)
+        } else {
+            bail!(
+                "{peer} runs in arbitrated mode, so this host needs its end of the direct link: \
+                 check the cable between the two hosts, then run setup again"
+            )
+        }
+    };
 
-    match decide_direct_link(&ready_ips, &carrier) {
+    match decide_direct_link(&ready_ips, &nics) {
         DirectLinkOutcome::Ready(_) => {
             // The operator must confirm which network is the direct link: a
             // switched second path is not a valid direct link (it shares fate
             // with the first), so we can't auto-pick even when there's one.
-            println!("Which network is the back-to-back direct link (a host-to-host");
-            println!("cable, not a switched network)?");
+            println!("Which network is the direct link (a cable between the two hosts, with no");
+            println!("switch on it)?");
             for (i, n) in ready.iter().enumerate() {
                 let hint = if n.point_to_point {
                     "  (looks point-to-point)"
@@ -1678,90 +1805,96 @@ async fn resolve_direct_link(
                     hint
                 );
             }
-            println!("  0) none of these / use fate-shared instead");
+            println!("  0) {none_choice}");
+            // A default only when the answer is not a guess: one network,
+            // addressed as a point-to-point link.
+            let default = (ready.len() == 1 && ready[0].point_to_point).then_some("1");
             let chosen = loop {
-                match ask("Choice", Some("1"))?.parse::<usize>() {
-                    Ok(0) => {
-                        println!("  using fate-shared mode.");
-                        return Ok(None);
-                    }
+                match ask("Choice", default)?.parse::<usize>() {
+                    Ok(0) => return decline(),
                     Ok(k) if k >= 1 && k <= ready.len() => break ready[k - 1],
                     _ => println!("  pick a number from the list"),
                 }
             };
             Ok(Some(chosen.peer_ip))
         }
-        DirectLinkOutcome::NeedsConfig { device } => {
-            println!("\nFound a cabled NIC with no IP: {device} (a likely direct link).");
-            if ask_yes_no(&format!("Configure {device} as the direct link now?"), true)? {
-                println!(
-                    "This host takes one end of a point-to-point /30 and the peer the other;\n\
-                     setup configures both. Pick another /30 if 10.99.99.0/30 is in use."
-                );
-                // The peer's end may already hold its half of a /30 (the
-                // manual command, an earlier run): offer the other half.
-                let peer_now = match peer_pif_on_same_network(&device).await {
-                    Some(pp) => pif_params(&pp).await,
-                    None => Default::default(),
-                };
-                let default_dl = default_local_dl(
-                    peer_now.get("IP").and_then(|s| s.parse().ok()),
-                    peer_now.get("netmask").map(String::as_str),
-                )
-                .to_string();
-                let local_dl = loop {
-                    let Ok(ip) =
-                        ask("This host's direct-link IP", Some(&default_dl))?.parse::<Ipv4Addr>()
-                    else {
-                        println!("  not a valid IPv4 address");
-                        continue;
-                    };
-                    if p2p_peer(ip).is_none() {
-                        println!("  {ip} is not a usable /30 host address (use e.g. .1 or .2)");
-                        continue;
-                    }
-                    if let Some(c) = p2p_collision(&host_ipv4_addrs().await, ip) {
-                        println!(
-                            "  the /30 around {ip} is already in use on this host ({c}); pick another /30."
-                        );
-                        continue;
-                    }
-                    break ip;
-                };
-                let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
-                bring_up_direct_link(&device, local_dl, false).await?;
-                Ok(Some(IpAddr::V4(peer_dl)))
-            } else {
-                println!("\n{}", direct_link_instructions(&device));
-                if ask_yes_no("Continue in fate-shared mode for now instead?", true)? {
-                    Ok(None)
-                } else {
-                    bail!(
-                        "configure the direct link, then re-run setup and choose arbitrated mode"
-                    );
-                }
+        DirectLinkOutcome::NeedsConfig { devices } => {
+            println!("\nWhich NIC is cabled directly to {peer} (a cable between the two hosts,");
+            println!("no switch)? NICs with VM traffic, an address or no link are not offered.");
+            for (i, d) in devices.iter().enumerate() {
+                let n = nics.iter().find(|n| &n.device == d).expect("listed above");
+                println!("  {}) {}", i + 1, nic_choice_line(n));
             }
+            println!("  0) {none_choice}");
+            for n in nics.iter().filter(|n| n.exclusion.is_some()) {
+                println!("     {}", nic_choice_line(n));
+            }
+            let device = loop {
+                match ask("Choice", None)?.parse::<usize>() {
+                    Ok(0) => return decline(),
+                    Ok(k) if k >= 1 && k <= devices.len() => break devices[k - 1].clone(),
+                    _ => println!("  pick a number from the list"),
+                }
+            };
+            println!(
+                "This host takes one end of a point-to-point /30 and {peer} the other;\n\
+                 setup configures both. Pick another /30 if 10.99.99.0/30 is in use."
+            );
+            // The peer's end may already hold its half of a /30 (the
+            // manual command, an earlier run): offer the other half.
+            let peer_now = match peer_pif_on_same_network(&device).await {
+                Some(pp) => pif_params(&pp).await,
+                None => Default::default(),
+            };
+            let default_dl = default_local_dl(
+                peer_now.get("IP").and_then(|s| s.parse().ok()),
+                peer_now.get("netmask").map(String::as_str),
+            )
+            .to_string();
+            let local_dl = loop {
+                let Ok(ip) =
+                    ask("This host's direct-link IP", Some(&default_dl))?.parse::<Ipv4Addr>()
+                else {
+                    println!("  not a valid IPv4 address");
+                    continue;
+                };
+                if p2p_peer(ip).is_none() {
+                    println!("  {ip} is not a usable /30 host address (use e.g. .1 or .2)");
+                    continue;
+                }
+                if let Some(c) = p2p_collision(&host_ipv4_addrs().await, ip) {
+                    println!(
+                        "  the /30 around {ip} is already in use on this host ({c}); pick another /30."
+                    );
+                    continue;
+                }
+                break ip;
+            };
+            let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
+            bring_up_direct_link(&device, local_dl, false).await?;
+            Ok(Some(IpAddr::V4(peer_dl)))
         }
         DirectLinkOutcome::None => {
-            println!("\nNo second network or spare cabled NIC found for a direct link.");
-            let nics = nic_link_lines().await;
+            println!("\nNo NIC of this host can take a direct link.");
             if !nics.is_empty() {
                 println!("This host's other NICs:");
-                for l in &nics {
-                    println!("  {l}");
+                for n in &nics {
+                    println!("  {}", nic_choice_line(n));
                 }
-                println!(
-                    "A direct-link NIC must show a link (cable plugged in, the other host powered\n\
-                     on, the port up on both ends) and have no IP yet."
-                );
             }
-            if ask_yes_no(
-                "Arbitrated mode needs a dedicated back-to-back link. Continue in fate-shared mode instead?",
-                true,
-            )? {
+            println!(
+                "A direct-link NIC is cabled straight to {peer} (link up on both ends), has no\n\
+                 IP yet, and carries no VM network."
+            );
+            if allow_fate_shared
+                && ask_yes_no("Use fate-shared mode (one network) instead?", false)?
+            {
                 Ok(None)
             } else {
-                bail!("connect the direct link, then re-run setup and choose arbitrated mode")
+                bail!(
+                    "connect the direct link (a cable between the two hosts), then run setup \
+                     again and choose arbitrated mode"
+                )
             }
         }
     }
@@ -2114,7 +2247,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
         if inh.arbitrated {
             println!("Inherited topology: arbitrated (direct link); configure this node's end.");
             println!("\n{ARBITRATED_MODE_NOTE}\n");
-            resolve_direct_link(&nets, peer_ip).await?
+            resolve_direct_link(&nets, peer_ip, &peer_name, true).await?
         } else {
             println!("Inherited topology: fate-shared (single path).");
             None
@@ -2126,7 +2259,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
         let mode = ask("Choice", Some("1"))?.trim().to_lowercase();
         if matches!(mode.as_str(), "2" | "a" | "arbitrated") {
             println!("\n{ARBITRATED_MODE_NOTE}\n");
-            resolve_direct_link(&nets, peer_ip).await?
+            resolve_direct_link(&nets, peer_ip, &peer_name, true).await?
         } else {
             None
         }
@@ -2535,34 +2668,92 @@ initiator_iqns = ["iqn.a"]
         assert_eq!(g[1].2, vec!["/dev/nvme0n1p3"]);
     }
 
+    fn pif(kv: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn nic_link_lines_show_link_and_ip() {
-        let m = |kv: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
-            kv.iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
+    fn only_a_free_cabled_nic_can_take_a_new_direct_link() {
+        let free = [
+            ("device", "eth4"),
+            ("physical", "true"),
+            ("VLAN", "-1"),
+            ("carrier", "true"),
+            ("IP", ""),
+            ("VLAN-slave-of", ""),
+            ("bond-slave-of", "<not in database>"),
+        ];
+        assert_eq!(direct_link_exclusion(&pif(&free), 0), None);
+        let with = |k: &'static str, v: &'static str| {
+            let mut p = pif(&free);
+            p.insert(k.to_string(), v.to_string());
+            p
+        };
+        // A NIC that only carries VM traffic: link up and no IP as well.
+        assert!(
+            direct_link_exclusion(&pif(&free), 2)
+                .unwrap()
+                .contains("VM traffic")
+        );
+        assert!(
+            direct_link_exclusion(&with("carrier", "false"), 0)
+                .unwrap()
+                .contains("no link")
+        );
+        assert!(
+            direct_link_exclusion(&with("IP", "192.0.2.5"), 0)
+                .unwrap()
+                .contains("192.0.2.5")
+        );
+        assert!(
+            direct_link_exclusion(&with("VLAN-slave-of", "OpaqueRef:1"), 0)
+                .unwrap()
+                .contains("VLAN")
+        );
+        assert!(
+            direct_link_exclusion(&with("bond-slave-of", "OpaqueRef:2"), 0)
+                .unwrap()
+                .contains("bond")
+        );
+        assert!(direct_link_exclusion(&with("management", "true"), 0).is_some());
+    }
+
+    #[test]
+    fn nic_lines_show_speed_and_reason() {
+        let n = NicChoice {
+            device: "eth4".into(),
+            speed_mbps: Some(25000),
+            exclusion: None,
+        };
+        assert_eq!(nic_choice_line(&n).trim_end(), "eth4     25000 Mb/s");
+        let n = NicChoice {
+            device: "eth1".into(),
+            speed_mbps: None,
+            exclusion: Some("no link".into()),
         };
         assert_eq!(
-            nic_link_line(&m(&[
-                ("device", "eth3"),
-                ("carrier", "false"),
-                ("IP", ""),
-                ("physical", "true")
-            ]))
-            .as_deref(),
-            Some("eth3: no link, no IP")
+            nic_choice_line(&n),
+            "eth1     speed unknown, not offered: no link"
         );
+    }
+
+    #[test]
+    fn only_the_peer_may_sit_behind_a_direct_link_port() {
+        let fdb = " port  VLAN  MAC                Age\n\
+                   \x20   1     0  aa:bb:cc:00:00:01    3\n\
+                   \x20   2     0  aa:bb:cc:00:00:02    1\n\
+                   \x20   2     0  aa:bb:cc:00:00:03   12\n\
+                   LOCAL     0  aa:bb:cc:00:00:09    0\n";
+        // Port 1 sees only the peer (case does not matter).
+        assert!(foreign_macs(fdb, "1", &["AA:BB:CC:00:00:01".into()]).is_empty());
+        // Port 2 sees two devices besides the peer: a switch port.
         assert_eq!(
-            nic_link_line(&m(&[
-                ("device", "eth1"),
-                ("carrier", "true"),
-                ("IP", "10.0.0.2")
-            ]))
-            .as_deref(),
-            Some("eth1: link up, IP 10.0.0.2")
+            foreign_macs(fdb, "2", &["aa:bb:cc:00:00:01".into()]),
+            vec!["aa:bb:cc:00:00:02", "aa:bb:cc:00:00:03"]
         );
-        assert!(nic_link_line(&m(&[("device", "eth0"), ("management", "true")])).is_none());
-        assert!(nic_link_line(&m(&[("device", "bond0"), ("physical", "false")])).is_none());
+        assert!(foreign_macs("", "1", &[]).is_empty());
     }
 
     #[test]
@@ -2637,19 +2828,34 @@ initiator_iqns = ["iqn.a"]
         assert!(parse_free_regions(out).is_empty());
     }
 
+    fn nic(device: &str, exclusion: Option<&str>) -> NicChoice {
+        NicChoice {
+            device: device.into(),
+            speed_mbps: None,
+            exclusion: exclusion.map(String::from),
+        }
+    }
+
     #[test]
     fn ready_network_wins_over_unconfigured_nic() {
-        let out = decide_direct_link(&[ip("198.51.100.2")], &["eth0".to_string()]);
+        let out = decide_direct_link(&[ip("198.51.100.2")], &[nic("eth0", None)]);
         assert_eq!(out, DirectLinkOutcome::Ready(ip("198.51.100.2")));
     }
 
     #[test]
-    fn cabled_nic_suggested_when_no_ready_network() {
-        let out = decide_direct_link(&[], &["eth0".to_string(), "eth3".to_string()]);
+    fn every_free_nic_is_offered_and_none_is_picked() {
+        let out = decide_direct_link(
+            &[],
+            &[
+                nic("eth1", Some("its network carries VM traffic")),
+                nic("eth3", None),
+                nic("eth4", None),
+            ],
+        );
         assert_eq!(
             out,
             DirectLinkOutcome::NeedsConfig {
-                device: "eth0".to_string()
+                devices: vec!["eth3".to_string(), "eth4".to_string()]
             }
         );
     }
@@ -2657,6 +2863,11 @@ initiator_iqns = ["iqn.a"]
     #[test]
     fn nothing_found_yields_none() {
         assert_eq!(decide_direct_link(&[], &[]), DirectLinkOutcome::None);
+        // Only excluded NICs: nothing to offer either.
+        assert_eq!(
+            decide_direct_link(&[], &[nic("eth1", Some("no link"))]),
+            DirectLinkOutcome::None
+        );
     }
 
     #[test]
