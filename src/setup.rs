@@ -3830,7 +3830,11 @@ mod tests {
         let susp = calls.find("suspend-io").expect("frozen at entry");
         let resume = calls.find("resume-io").expect("lifted for the survive");
         assert!(susp < resume, "{calls}");
-        assert!(rig.log().contains("frozen now, before deciding"), "{}", rig.log());
+        assert!(
+            rig.log().contains("frozen now, before deciding"),
+            "{}",
+            rig.log()
+        );
         assert!(!rig.root.join("run/fence-entry-freeze").exists());
     }
 
@@ -3842,9 +3846,17 @@ mod tests {
         let (rig, _daemon) = unfrozen_flap_rig("flapyield");
         rig.set("ping_rc", "1");
         assert_eq!(rig.run(5), 1, "{}", rig.log());
-        assert!(!drbdadm_calls(&rig).contains("resume-io"), "{}", drbdadm_calls(&rig));
+        assert!(
+            !drbdadm_calls(&rig).contains("resume-io"),
+            "{}",
+            drbdadm_calls(&rig)
+        );
         assert!(rig.marker().exists());
-        assert!(std::fs::read_to_string(rig.root.join("state/susp")).unwrap().contains("user"));
+        assert!(
+            std::fs::read_to_string(rig.root.join("state/susp"))
+                .unwrap()
+                .contains("user")
+        );
     }
 
     #[test]
@@ -3855,7 +3867,11 @@ mod tests {
         let (rig, _daemon) = unfrozen_flap_rig("flapstale");
         std::fs::write(rig.marker(), "2026-01-01 00:00:00").unwrap();
         assert_eq!(rig.run(5), 4, "{}", rig.log());
-        assert!(rig.log().contains("was not suspended when this run began"), "{}", rig.log());
+        assert!(
+            rig.log().contains("was not suspended when this run began"),
+            "{}",
+            rig.log()
+        );
     }
 
     #[test]
@@ -3869,12 +3885,20 @@ mod tests {
         let (rig, _daemon) = unfrozen_flap_rig("flapfirst");
         let _ = std::fs::remove_file(rig.root.join("run/fence-peer.newest"));
         assert_eq!(rig.run(5), 4, "{}", rig.log());
-        assert!(!drbdadm_calls(&rig).contains("suspend-io"), "{}", drbdadm_calls(&rig));
+        assert!(
+            !drbdadm_calls(&rig).contains("suspend-io"),
+            "{}",
+            drbdadm_calls(&rig)
+        );
         let rig = FenceRig::new("flapnofreeze");
         rig.set("susp", "");
         std::fs::write(rig.root.join("run/fence-peer.newest"), "1").unwrap();
         assert_eq!(rig.run(5), 4, "{}", rig.log());
-        assert!(!drbdadm_calls(&rig).contains("suspend-io"), "{}", drbdadm_calls(&rig));
+        assert!(
+            !drbdadm_calls(&rig).contains("suspend-io"),
+            "{}",
+            drbdadm_calls(&rig)
+        );
     }
 
     #[test]
@@ -3931,7 +3955,11 @@ mod tests {
         });
         rig.run(60);
         assert!(rig.log().contains("probing it on ports"), "{}", rig.log());
-        assert!(rig.log().contains("answered within the window"), "{}", rig.log());
+        assert!(
+            rig.log().contains("answered within the window"),
+            "{}",
+            rig.log()
+        );
         opener.join().unwrap();
         // The port stays closed: the peer reads as gone after the window.
         let rig = FenceRig::new("fzwindowgone");

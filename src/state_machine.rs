@@ -575,11 +575,7 @@ fn freeze_budget(ha_armed: Option<bool>, xha_timeout: Option<u32>) -> Duration {
 /// frozen, reads its yield and keeps its copy (`freeze_standalone_step`). The
 /// keeper keeps the whole budget: it is bounded by the XHA statefile watchdog.
 fn freeze_step_down_budget(budget: Duration, is_keeper: bool) -> Duration {
-    if is_keeper {
-        budget
-    } else {
-        budget * 7 / 10
-    }
+    if is_keeper { budget } else { budget * 7 / 10 }
 }
 
 /// Whether a fence-peer yield is decisive on its own: no guest domain on this
@@ -20496,10 +20492,8 @@ impl StateMachine {
                 }
                 return;
             }
-            let step_down_after = freeze_step_down_budget(
-                budget,
-                self.config.node.name < self.config.node.peer,
-            );
+            let step_down_after =
+                freeze_step_down_budget(budget, self.config.node.name < self.config.node.peer);
             if !self.yield_latched()
                 && s.connection != ConnectionState::Connected
                 && since.elapsed() >= step_down_after
@@ -20748,7 +20742,9 @@ impl StateMachine {
             // The budget itself is enforced every pass, in any connection
             // state (`freeze_tick`).
             match claim {
-                Some(ForkClaim::GiveWay(_)) | Some(ForkClaim::Yielded(_)) if matches!(claim, Some(ForkClaim::GiveWay(_))) || peer_stepped_down => {
+                Some(ForkClaim::GiveWay(_)) | Some(ForkClaim::Yielded(_))
+                    if matches!(claim, Some(ForkClaim::GiveWay(_))) || peer_stepped_down =>
+                {
                     // The peer is Secondary and offers --discard-my-data. This
                     // copy wrote nothing since the freeze, so DRBD sees it as
                     // merely behind and would refuse it as a sync source while
@@ -21504,9 +21500,11 @@ impl StateMachine {
         }
         if crate::iscsi::unblock_portal_logins(self.config.iscsi.portal_port).await {
             self.own_target_cut_at = None;
-            warn!(heal_event = "loser_target_cut_lifted",
-                  "the pair converged while this host's iSCSI target was still cut off from \
-                   its initiators (the loser's teardown did not run): cut lifted");
+            warn!(
+                heal_event = "loser_target_cut_lifted",
+                "the pair converged while this host's iSCSI target was still cut off from \
+                   its initiators (the loser's teardown did not run): cut lifted"
+            );
         }
     }
 
@@ -21518,8 +21516,7 @@ impl StateMachine {
         }
         // Arbitrated keeps the full cut (no dual-loser hold there); fate-shared
         // spares the loopback until the teardown (`portal_block_rule`).
-        if crate::iscsi::block_portal_logins(self.config.iscsi.portal_port, !self.arbitrated)
-            .await
+        if crate::iscsi::block_portal_logins(self.config.iscsi.portal_port, !self.arbitrated).await
         {
             self.own_target_cut_at = Some(std::time::Instant::now());
             warn!(heal_event = "loser_target_cut", incident = ?self.incident_id,
@@ -26357,8 +26354,18 @@ poll_interval_ms = 10
     fn mutual_yield_take_win_only_when_the_peer_holds_nothing_this_copy_lacks() {
         // The bmax wedge: demo-1's bitmap generation is demo-2's current one
         // (demo-1 is ahead), demo-2 has no generation of demo-1's.
-        let demo1 = [0x355A43DD30F141B6, 0xF11F0E8D9DCA4F48, 0x4F327A0297E86FD8, 0x6453E865C0ECC86E];
-        let demo2 = [0xF11F0E8D9DCA4F48, 0, 0xD37D57142B3F2652, 0xF501772E41B98534];
+        let demo1 = [
+            0x355A43DD30F141B6,
+            0xF11F0E8D9DCA4F48,
+            0x4F327A0297E86FD8,
+            0x6453E865C0ECC86E,
+        ];
+        let demo2 = [
+            0xF11F0E8D9DCA4F48,
+            0,
+            0xD37D57142B3F2652,
+            0xF501772E41B98534,
+        ];
         assert!(mutual_yield_takes_win(demo1, 0xF11F0E8D9DCA4F48, false));
         assert!(!mutual_yield_takes_win(demo2, 0x355A43DD30F141B6, true));
         // The same data: the keeper alone takes it (bit 0 ignored).

@@ -688,7 +688,12 @@ fn stray_reset_rule(port: u16) -> Vec<String> {
 /// Insert the stray-segment reset rule (`stray_reset_rule`) unless present.
 pub async fn ensure_stray_reset_rule(port: u16) {
     let rule = stray_reset_rule(port);
-    let mut check = vec!["-w".to_string(), "3".to_string(), "-C".to_string(), "INPUT".to_string()];
+    let mut check = vec![
+        "-w".to_string(),
+        "3".to_string(),
+        "-C".to_string(),
+        "INPUT".to_string(),
+    ];
     check.extend(rule.iter().cloned());
     let check: Vec<&str> = check.iter().map(String::as_str).collect();
     if crate::cmd::run_cmd_quiet("iptables", &check).await.is_ok() {
@@ -1177,7 +1182,10 @@ poll_interval_ms = 10
         ))
         .unwrap();
         assert!(c.start(&cfg).await.is_err());
-        assert!(c.released_in_place, "a device not ready yet keeps the in-place rebuild");
+        assert!(
+            c.released_in_place,
+            "a device not ready yet keeps the in-place rebuild"
+        );
         assert!(
             !log.lock()
                 .unwrap()
@@ -1191,7 +1199,12 @@ poll_interval_ms = 10
         let (mut c, log) = fresh(Some(LEFT_OVER));
         c.release_device().await.unwrap();
         assert!(!c.released_in_place);
-        assert!(log.lock().unwrap().iter().any(|l| l == "clearconfig confirm=True"));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "clearconfig confirm=True")
+        );
         // And a failed backstore delete is an error that keeps the target.
         let (mut c, _log) = failing(Some(LEFT_OVER), "/backstores/block delete");
         c.active = true;
@@ -1220,10 +1233,19 @@ poll_interval_ms = 10
     fn loser_cut_spares_the_loopback_and_still_matches_the_legacy_form() {
         let input = portal_block_rule("INPUT", 3260, false).join(" ");
         let output = portal_block_rule("OUTPUT", 3260, false).join(" ");
-        assert!(input.contains("! -i lo") && input.contains("--dport 3260"), "{input}");
-        assert!(output.contains("! -o lo") && output.contains("--sport 3260"), "{output}");
+        assert!(
+            input.contains("! -i lo") && input.contains("--dport 3260"),
+            "{input}"
+        );
+        assert!(
+            output.contains("! -o lo") && output.contains("--sport 3260"),
+            "{output}"
+        );
         let legacy = portal_block_rule("INPUT", 3260, true).join(" ");
-        assert!(!legacy.contains("-i lo") && legacy.contains("--dport 3260"), "{legacy}");
+        assert!(
+            !legacy.contains("-i lo") && legacy.contains("--dport 3260"),
+            "{legacy}"
+        );
     }
 
     #[test]
