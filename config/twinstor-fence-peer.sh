@@ -310,6 +310,34 @@ if { [ "$FREEZE" = 1 ] || [ -n "$DIRECT_PEER" ]; } && [ "$LOCAL_ROLE" = "Primary
     fi
 fi
 
+# Fate-shared freeze mode: while this run decides, a link that comes back
+# (Connected, both copies UpToDate) gets its freeze lifted at once, so the
+# writes held since the disconnect replicate. DRBD keeps the freeze while the
+# pair is Connected and lifts it at its next state change; when that is the
+# link dropping again, the held writes complete onto this copy alone, already
+# acknowledged, and the next run's freeze comes too late for them (a test pool
+# under 40% packet loss lost writes that way, twice). The daemon lifts such a
+# leftover freeze too, but only after the connection has held for 5 s.
+reconnect_watch() {
+    local said=0
+    while :; do
+        sleep 0.3
+        [ "$(timeout 2 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)" = "Connected" ] || continue
+        [ "$(timeout 2 drbdadm dstate "$RESOURCE" 2>/dev/null | head -1)" = "UpToDate/UpToDate" ] || continue
+        io_suspended || continue
+        timeout 10 drbdadm resume-io "$RESOURCE" >/dev/null 2>&1
+        if [ "$said" = 0 ]; then
+            log "the link is back (Connected, both UpToDate) while this run decides: freeze lifted now, so the held writes replicate"
+            said=1
+        fi
+    done
+}
+if [ "$FREEZE" = 1 ] && [ "$LOCAL_ROLE" = "Primary" ]; then
+    reconnect_watch 9>&- &
+    WATCH_PID=$!
+    trap 'kill "$WATCH_PID" 2>/dev/null' EXIT
+fi
+
 # Fate-shared mode (no direct link): this node's copy keeps taking writes
 # while this handler decides (resource-only fencing), so from here on it may
 # hold acknowledged writes the peer's copy lacks. Its guests must never reach

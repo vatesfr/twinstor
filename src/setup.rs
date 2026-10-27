@@ -3986,11 +3986,8 @@ mod tests {
             "{}",
             drbdadm_calls(&rig)
         );
-        assert!(
-            rig.log().contains("the freeze is lifted now"),
-            "{}",
-            rig.log()
-        );
+        // Lifted by the reconnect watcher or by the verdict itself.
+        assert!(rig.log().contains("lifted now"), "{}", rig.log());
         // Not connected: DRBD's own handling, unchanged.
         let rig = FenceRig::new("connliftno");
         let daemon = rig.fake_process("daemon");
@@ -3998,6 +3995,41 @@ mod tests {
         assert_eq!(rig.run(5), 4, "{}", rig.log());
         assert!(
             !drbdadm_calls(&rig).contains("resume-io"),
+            "{}",
+            drbdadm_calls(&rig)
+        );
+    }
+
+    #[test]
+    fn fence_peer_lifts_the_freeze_when_the_link_comes_back_while_it_waits() {
+        // Freeze mode: another run holds the lock; the pair reconnects
+        // meanwhile. The held writes must replicate now, not be released by
+        // DRBD onto this copy alone at the next disconnect.
+        if !fence_rig_usable() {
+            return;
+        }
+        let rig = FenceRig::new("watch");
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        rig.set("cstate", "Connected");
+        let st = rig.root.join("state");
+        let mut holder = std::process::Command::new("flock")
+            .arg(rig.lock())
+            .args([
+                "sh",
+                "-c",
+                &format!("touch {}; sleep 3", st.join("held").display()),
+            ])
+            .spawn()
+            .unwrap();
+        while !st.join("held").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        rig.run(10);
+        holder.wait().unwrap();
+        assert!(rig.log().contains("freeze lifted now"), "{}", rig.log());
+        assert!(
+            drbdadm_calls(&rig).contains("resume-io"),
             "{}",
             drbdadm_calls(&rig)
         );
