@@ -11,6 +11,7 @@ mod iscsi;
 mod loser_boundary;
 mod multipath;
 mod peer_signal;
+mod pool_join;
 mod preflight;
 mod readiness;
 mod reboot_drain;

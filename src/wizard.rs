@@ -33,7 +33,7 @@ fn print_banner() {
 }
 
 /// Ask a question; empty input returns the default (when there is one).
-fn ask(question: &str, default: Option<&str>) -> Result<String> {
+pub(crate) fn ask(question: &str, default: Option<&str>) -> Result<String> {
     match default {
         Some(d) if !d.is_empty() => print!("{question} [{d}]: "),
         _ => print!("{question}: "),

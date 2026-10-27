@@ -128,19 +128,31 @@ pub(crate) async fn run(interactive: bool) -> Result<()> {
         "Checking the requirements (https://docs.vates.tech/tech-preview/twinstor/installation/#requirements):"
     );
 
-    // 1. A pool of exactly two hosts.
-    let Some(list) = xe(&["host-list", "--minimal"]).await else {
-        bail!(
-            "XAPI does not answer on this host, so the pool cannot be read. Restart the \
-             toolstack (xe-toolstack-restart), wait a minute, and run setup again."
-        );
+    // 1. A pool of exactly two hosts. When this host is alone, the wizard
+    // offers to run the join itself, then checks again.
+    let hosts = loop {
+        let Some(list) = xe(&["host-list", "--minimal"]).await else {
+            bail!(
+                "XAPI does not answer on this host, so the pool cannot be read. Restart the \
+                 toolstack (xe-toolstack-restart), wait a minute, and run setup again."
+            );
+        };
+        let hosts: Vec<String> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(String::from)
+            .collect();
+        if interactive && pool_verdict(hosts.len()) == PoolVerdict::Alone {
+            println!(
+                "  [FAIL] this host is alone in its pool; TwinStor pairs two hosts of one pool."
+            );
+            if crate::pool_join::offer().await? {
+                continue;
+            }
+        }
+        break hosts;
     };
-    let hosts: Vec<String> = list
-        .split(',')
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .map(String::from)
-        .collect();
     match pool_verdict(hosts.len()) {
         PoolVerdict::Pair => {
             let (a, b) = (host_name(&hosts[0]).await, host_name(&hosts[1]).await);
