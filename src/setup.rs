@@ -82,6 +82,31 @@ pub struct SetupParams {
     pub allow_no_tiebreaker: bool,
 }
 
+/// Set once `run_setup` starts changing this host (the config write), so a
+/// failure after it is reported as a part-way setup with the way to resume.
+static HOST_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the setup run in this process changed this host before failing.
+pub(crate) fn host_changed() -> bool {
+    HOST_CHANGED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The error `twinstor setup` reports: a failure after setup started changing
+/// this host gets a `next:` line that says how to resume or undo it, unless
+/// it already carries its own guidance.
+pub(crate) fn part_way_failure(err: anyhow::Error, host_changed: bool) -> anyhow::Error {
+    if !host_changed || err.downcast_ref::<crate::render::CliError>().is_some() {
+        return err;
+    }
+    crate::render::CliError::new(
+        "setup stopped part-way on this host",
+        "fix the problem above, then run `twinstor setup` again (it offers to run setup again \
+         from the start), or `twinstor uninstall` to undo what it did",
+    )
+    .caused_by(err)
+    .into()
+}
+
 pub async fn run_setup(params: SetupParams) -> Result<()> {
     let local_name = hostname::get()
         .context("hostname")?
@@ -268,6 +293,8 @@ initiator_iqns = [{iqn_list}]
         backing = backing.display(),
         allow_no_tiebreaker = params.allow_no_tiebreaker
     );
+    // From here on a failure leaves this host part-way set up.
+    HOST_CHANGED.store(true, std::sync::atomic::Ordering::SeqCst);
     // The config contains the CHAP password: created root-only, never readable
     // by others even briefly (an older config keeps its mode, so set it after).
     crate::cli::write_atomic(std::path::Path::new(CONFIG_PATH), config_text.as_bytes())
@@ -427,7 +454,16 @@ initiator_iqns = [{iqn_list}]
     open_firewall_ports(port).await;
 
     // Re-runnable after an aborted attempt: a previous run may have left the
-    // resource up, and wipefs/create-md need the device closed.
+    // service running and the resource up, and wipefs/create-md need the
+    // device closed. The service goes first: it manages the resource and
+    // would bring it back up behind setup's back.
+    let service_active = cmd_output("systemctl", &["is-active", "twinstor"])
+        .await
+        .is_ok_and(|s| s.trim() == "active");
+    if service_active {
+        println!("stopping the twinstor service left by the previous run...");
+        run_cmd("systemctl", &["stop", "twinstor"]).await?;
+    }
     let res_up = tokio::process::Command::new("drbdadm")
         .args(["status", res])
         .output()
@@ -436,7 +472,16 @@ initiator_iqns = [{iqn_list}]
         .unwrap_or(false);
     if res_up {
         println!("previous DRBD resource is up, taking it down first...");
-        let _ = run_cmd("drbdadm", &["down", res]).await;
+        if let Err(e) = run_cmd("drbdadm", &["down", res]).await {
+            return Err(crate::render::CliError::new(
+                "could not take this host's DRBD resource down: something still uses it",
+                "if VMs on this host use the TwinStor SR, move them to the other host or \
+                 shut them down, then run `twinstor setup` again; or run `twinstor uninstall` \
+                 to remove what setup did",
+            )
+            .caused_by(e)
+            .into());
+        }
     }
 
     run_cmd("wipefs", &["-a", &backing.display().to_string()]).await?;
@@ -662,7 +707,7 @@ fn iscsi_login_refused(peer_name: &str, peer_ip: IpAddr) -> crate::render::CliEr
         format!(
             "check the CHAP password on both hosts (chap_password in \
              /etc/twinstor/twinstor.toml) and that `systemctl status twinstor` shows it active \
-             on {peer_name}; then run `twinstor setup` here again and choose r"
+             on {peer_name}; then run `twinstor setup` here again (it offers to run setup again)"
         ),
     )
     .explain(format!(
@@ -2165,6 +2210,24 @@ async fn publish_shared_setup(s: &SharedSetup) {
 /// published by this host (a first-node re-run reading its own handoff). Only a
 /// real second node gets a value back, so the wizard can key inheritance on it.
 pub async fn inherited_shared_setup() -> Option<SharedSetup> {
+    let s = published_shared_setup().await?;
+    if local_host_uuid().await.as_deref() == Some(s.publisher_uuid.as_str()) {
+        return None; // our own handoff: we are the first node re-running
+    }
+    Some(s)
+}
+
+/// Whether this host published the handoff that is in the pool DB now: it
+/// is the first node, and the second has not created the SR yet.
+pub(crate) async fn own_shared_setup_published() -> bool {
+    match (published_shared_setup().await, local_host_uuid().await) {
+        (Some(s), Some(me)) => s.publisher_uuid == me,
+        _ => false,
+    }
+}
+
+/// The handoff in the pool DB, whoever published it.
+async fn published_shared_setup() -> Option<SharedSetup> {
     let pool = pool_uuid().await?;
     let raw = cmd_output(
         "xe",
@@ -2177,11 +2240,7 @@ pub async fn inherited_shared_setup() -> Option<SharedSetup> {
     )
     .await
     .ok()?;
-    let s = SharedSetup::decode(&raw)?;
-    if local_host_uuid().await.as_deref() == Some(s.publisher_uuid.as_str()) {
-        return None; // our own handoff: we are the first node re-running
-    }
-    Some(s)
+    SharedSetup::decode(&raw)
 }
 
 /// Remove the shared-setup handoff key. Called once the cluster is formed (the
@@ -4206,5 +4265,24 @@ mod setup_flow_tests {
         let text = format!("{only} {only:?}");
         assert!(text.contains("only current copy"), "{text}");
         assert!(text.contains("host-a"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_after_the_first_change_says_how_to_resume() {
+        let e = part_way_failure(anyhow::anyhow!("wipefs failed"), true);
+        let g = e
+            .downcast_ref::<crate::render::CliError>()
+            .expect("guidance attached");
+        let text = format!("{g:?}");
+        assert!(text.contains("twinstor setup"), "{text}");
+        assert!(text.contains("twinstor uninstall"), "{text}");
+        assert!(e.chain().any(|c| c.to_string() == "wipefs failed"));
+        // Before any change, the error stays as it is.
+        let e = part_way_failure(anyhow::anyhow!("bad flag"), false);
+        assert!(e.downcast_ref::<crate::render::CliError>().is_none());
+        // An error with its own guidance keeps it.
+        let own: anyhow::Error = crate::render::CliError::new("refused", "do this").into();
+        let e = part_way_failure(own, true);
+        assert_eq!(e.to_string(), "refused");
     }
 }

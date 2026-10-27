@@ -1767,12 +1767,75 @@ async fn resolve_direct_link(
     }
 }
 
-/// Show the current installation: persisted settings plus a quick live view.
-async fn show_current_install() {
-    println!("TwinStor is already installed on this node.\n");
-    if let Ok(cfg) =
-        crate::config::Config::load(std::path::Path::new("/etc/twinstor/twinstor.toml"))
-    {
+/// What an existing configuration on this host stands for.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallState {
+    /// The pool has the TwinStor SR: a working (or degraded) pair.
+    Live,
+    /// This host finished its part and waits for the other host: it
+    /// published the handoff, and its service runs.
+    WaitingForPeer,
+    /// A setup that stopped part-way: a config, but no SR and no host
+    /// waiting for its peer.
+    Unfinished,
+}
+
+fn install_state(sr_exists: bool, own_handoff: bool, daemon_active: bool) -> InstallState {
+    if sr_exists {
+        InstallState::Live
+    } else if own_handoff && daemon_active {
+        InstallState::WaitingForPeer
+    } else {
+        InstallState::Unfinished
+    }
+}
+
+/// The menu for an existing configuration: its lines and the default
+/// choice. Resuming is the default only where it is what the user wants.
+fn install_menu(state: &InstallState, peer: &str) -> (Vec<String>, &'static str) {
+    match state {
+        InstallState::Live => (
+            vec![
+                "  q) quit: leave everything as it is".into(),
+                format!("  r) rebuild this host's copy from {peer} (erases this host's TwinStor disk)"),
+                "  u) uninstall: remove TwinStor from this host".into(),
+            ],
+            "q",
+        ),
+        InstallState::WaitingForPeer => (
+            vec![
+                format!("  q) quit: leave this host waiting, and run `twinstor setup` on {peer}"),
+                "  r) start setup again on this host (erases this host's TwinStor disk)".into(),
+                "  u) uninstall: remove what setup did on this host".into(),
+            ],
+            "q",
+        ),
+        InstallState::Unfinished => (
+            vec![
+                "  r) run setup again from the start (recommended; erases this host's TwinStor disk)"
+                    .into(),
+                "  u) remove what the previous setup did on this host (uninstall)".into(),
+                "  q) quit: leave everything as it is".into(),
+            ],
+            "r",
+        ),
+    }
+}
+
+/// Show the current installation: persisted settings plus a quick live view,
+/// and what it means.
+async fn show_current_install(state: &InstallState, peer: &str) {
+    match state {
+        InstallState::Live => println!("TwinStor is installed on this host.\n"),
+        InstallState::WaitingForPeer => {
+            println!("TwinStor is set up on this host and waits for {peer}.\n")
+        }
+        InstallState::Unfinished => println!(
+            "A previous setup on this host did not finish (there is no TwinStor SR yet).\n"
+        ),
+    }
+    let cfg = crate::config::Config::load(Path::new("/etc/twinstor/twinstor.toml")).ok();
+    if let Some(cfg) = &cfg {
         println!(
             "  node:    {} (peer: {} @ {})",
             cfg.node.name, cfg.node.peer, cfg.network.peer_address
@@ -1807,6 +1870,12 @@ async fn show_current_install() {
         println!("  SR:      {}", sr.trim());
     }
     println!();
+    if *state == InstallState::WaitingForPeer
+        && let Some(pw) = cfg.and_then(|c| c.iscsi.chap_password)
+    {
+        println!("On {peer}, run `twinstor setup` and paste this CHAP password when asked:");
+        println!("\n      CHAP password:  {pw}\n");
+    }
 }
 
 /// The setup that rebuilds this host of a working pair with its current
@@ -1879,13 +1948,24 @@ fn confirm_rebuild(peer: &str) -> Result<Option<SetupParams>> {
 /// shown, uninstall performed, or the user quit).
 pub async fn run() -> Result<Option<SetupParams>> {
     if std::path::Path::new("/etc/twinstor/twinstor.toml").exists() {
-        show_current_install().await;
-        println!("  q) quit: leave everything as it is");
-        println!("  u) uninstall: remove TwinStor from this node");
-        println!(
-            "  r) reconfigure: uninstall is not run; setup re-runs and wipes the backing device"
+        let pair = crate::setup::live_pair_state().await;
+        let daemon_active = cmd_output("systemctl", &["is-active", "twinstor"])
+            .await
+            .is_ok_and(|s| s.trim() == "active");
+        let state = install_state(
+            pair.sr_exists,
+            crate::setup::own_shared_setup_published().await,
+            daemon_active,
         );
-        let choice = ask("Choice", Some("q"))?;
+        let peer = peer_host_name()
+            .await
+            .unwrap_or_else(|| "the other host".to_string());
+        show_current_install(&state, &peer).await;
+        let (lines, default) = install_menu(&state, &peer);
+        for l in &lines {
+            println!("{l}");
+        }
+        let choice = ask("Choice", Some(default))?;
         match choice.to_lowercase().as_str() {
             "u" => {
                 let keep = ask_yes_no("Keep the backing data (skip deleting the volume)?", false)?;
@@ -1898,11 +1978,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
                 println!();
                 // A working pair is checked now, not after every question:
                 // setup would refuse it at the end anyway.
-                let pair = crate::setup::live_pair_state().await;
                 if pair.sr_exists {
-                    let peer = peer_host_name()
-                        .await
-                        .unwrap_or_else(|| "the other host".to_string());
                     println!("This pool already has a TwinStor SR, so this host's copy is live.");
                     println!(
                         "Setup can rebuild only this host: it erases this host's TwinStor disk"
@@ -2364,6 +2440,57 @@ initiator_iqns = ["iqn.a"]
 "#,
         )
         .expect("sample config parses")
+    }
+
+    #[test]
+    fn an_existing_config_is_read_as_live_waiting_or_unfinished() {
+        assert_eq!(install_state(true, false, true), InstallState::Live);
+        assert_eq!(install_state(true, true, false), InstallState::Live);
+        // The first host after its part: handoff published, service up.
+        assert_eq!(
+            install_state(false, true, true),
+            InstallState::WaitingForPeer
+        );
+        // The first host whose window was closed during the wait: no service.
+        assert_eq!(install_state(false, true, false), InstallState::Unfinished);
+        // The second host after a failed SR creation (its service started).
+        assert_eq!(install_state(false, false, true), InstallState::Unfinished);
+        assert_eq!(install_state(false, false, false), InstallState::Unfinished);
+    }
+
+    #[test]
+    fn the_menu_defaults_to_resuming_only_an_unfinished_setup() {
+        let (lines, d) = install_menu(&InstallState::Unfinished, "host-a");
+        assert_eq!(d, "r");
+        assert!(lines[0].contains("run setup again"), "{lines:?}");
+        let (lines, d) = install_menu(&InstallState::Live, "host-a");
+        assert_eq!(d, "q");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("rebuild this host's copy from host-a"))
+        );
+        let (lines, d) = install_menu(&InstallState::WaitingForPeer, "host-a");
+        assert_eq!(d, "q");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`twinstor setup` on host-a"))
+        );
+        // Every menu offers the three choices.
+        for st in [
+            InstallState::Live,
+            InstallState::WaitingForPeer,
+            InstallState::Unfinished,
+        ] {
+            let (lines, _) = install_menu(&st, "p");
+            for key in ["q)", "r)", "u)"] {
+                assert!(
+                    lines.iter().any(|l| l.trim_start().starts_with(key)),
+                    "{st:?}"
+                );
+            }
+        }
     }
 
     #[test]

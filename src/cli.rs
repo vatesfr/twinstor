@@ -392,7 +392,9 @@ impl Cli {
                         }
                     }
                 };
-                setup::run_setup(params).await
+                setup::run_setup(params)
+                    .await
+                    .map_err(|e| setup::part_way_failure(e, setup::host_changed()))
             }
             Command::Uninstall {
                 yes,
