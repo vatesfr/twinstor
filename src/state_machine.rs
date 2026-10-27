@@ -391,21 +391,36 @@ fn write_fork_record(path: &str, generation: Option<u64>) {
     let _ = std::fs::write(path, body);
 }
 
-/// Both nodes yielded and hold down with their discard offers parked: which
-/// one may take the win without losing an acknowledged write. `local` is this
-/// node's generation UUIDs (current, bitmap, history), `peer` the generation
-/// the peer's beacon attests for its yield. Only when the peer has nothing this
-/// node lacks: its generation is this node's current one (the same data; the
-/// keeper takes it) or an ancestor of it (bitmap or history). Otherwise both
-/// keep holding for an operator: either choice would discard writes.
-fn mutual_yield_takes_win(local: [u64; 4], peer: u64, is_keeper: bool) -> bool {
+/// Both nodes yielded and hold down with their discard offers parked: whether
+/// this one takes the win. A yield latch means its node served nobody during
+/// this fork (frozen from the disconnect; its writes since are in-flight or
+/// drained ones nobody was acknowledged for), so with both latched either
+/// copy is safe: what matters is that exactly one node takes it.
+///
+/// - The peer's yielded generation is this node's current one (the keeper
+///   takes it) or an ancestor of it (bitmap or history): the peer holds
+///   nothing this copy lacks, this node takes it at once.
+/// - Otherwise only the keeper takes it, and only with `keeper_fallback`
+///   (after a longer hold than the first rule's): a non-keeper ahead of the
+///   keeper takes it by the first rule first, and its claim then reads `W`,
+///   never `Y`, so the keeper never takes a second win.
+/// - Unknown generations never take it.
+fn mutual_yield_takes_win(
+    local: [u64; 4],
+    peer: u64,
+    is_keeper: bool,
+    keeper_fallback: bool,
+) -> bool {
     if peer == 0 || local[0] == 0 {
         return false;
     }
     if same_gen(local[0], peer) {
         return is_keeper;
     }
-    local[1..].iter().any(|&g| g != 0 && same_gen(g, peer))
+    if local[1..].iter().any(|&g| g != 0 && same_gen(g, peer)) {
+        return true;
+    }
+    is_keeper && keeper_fallback
 }
 
 /// Two generation UUIDs name the same generation (bit 0 is DRBD's
@@ -4386,6 +4401,12 @@ const REPLICATION_FALLBACK_GRACE: Duration = Duration::from_secs(120);
 /// its peer yielded too and this copy may take the win (`mutual_yield_take_win`):
 /// long enough for a winner that exists to reconnect and take the offer.
 const MUTUAL_YIELD_SETTLE: Duration = Duration::from_secs(30);
+
+/// How long a mutual yield holds before the keeper takes the win on its own
+/// (`mutual_yield_takes_win`): past the settle hold plus the non-keeper's
+/// checks, so a non-keeper entitled to the win by its lineage has taken it
+/// (and its claim reads `W`) by then.
+const MUTUAL_YIELD_KEEPER_FALLBACK: Duration = Duration::from_secs(90);
 
 /// Replication failback: escalating stability holds before failing back. The
 /// first hold is short so a replugged cable returns quickly; after a failback
@@ -20252,7 +20273,7 @@ impl StateMachine {
             && self
                 .log_pace
                 .due("mutual_yield_init_check", Duration::from_secs(10))
-            && self.mutual_yield_take_win(false).await
+            && self.mutual_yield_take_win(false, since.elapsed()).await
         {
             self.latch_hold_since = None;
             self.clear_heal_state_if_stage("yield_latch_hold");
@@ -24041,7 +24062,9 @@ impl StateMachine {
                 .mutual_hold_since
                 .get_or_insert_with(std::time::Instant::now);
             if since.elapsed() >= MUTUAL_YIELD_SETTLE
-                && self.mutual_yield_take_win(restart_target).await
+                && self
+                    .mutual_yield_take_win(restart_target, since.elapsed())
+                    .await
             {
                 return;
             }
@@ -24319,7 +24342,9 @@ impl StateMachine {
                 if self.yield_latched()
                     && since.elapsed() >= MUTUAL_YIELD_SETTLE
                     && self.loser_holding_ticks.is_multiple_of(10)
-                    && self.mutual_yield_take_win(restart_target).await
+                    && self
+                        .mutual_yield_take_win(restart_target, since.elapsed())
+                        .await
                 {
                     return true;
                 }
@@ -24376,7 +24401,7 @@ impl StateMachine {
     /// target restarted (rebuilt in place, its cut lifted), which gives the
     /// peer its path to the SR back. The resolver finishes as the winner and
     /// the peer, reading the win, takes the discard. `true` when it flipped.
-    async fn mutual_yield_take_win(&mut self, restart_target: bool) -> bool {
+    async fn mutual_yield_take_win(&mut self, restart_target: bool, held: Duration) -> bool {
         use crate::peer_signal::{ForkClaim, PeerClaim};
         let PeerClaim::Claim(ForkClaim::Yielded(peer_gen)) = self.query_peer_claim().await else {
             return false;
@@ -24387,15 +24412,36 @@ impl StateMachine {
         };
         let local_ud = matches!(self.drbd.status().await, Ok(s) if s.disk == DiskState::UpToDate);
         let is_keeper = self.config.node.name < self.config.node.peer;
-        let takes = local_ud && mutual_yield_takes_win(local, peer_gen, is_keeper);
+        let by_lineage = mutual_yield_takes_win(local, peer_gen, is_keeper, false);
+        let takes = local_ud
+            && mutual_yield_takes_win(
+                local,
+                peer_gen,
+                is_keeper,
+                held >= MUTUAL_YIELD_KEEPER_FALLBACK,
+            );
+        // The keeper's fallback: a non-keeper whose lineage entitles it may
+        // have flipped in the same moment; its claim reads W within a second.
+        // Read the claim again a little later and take the win only if the
+        // peer still says it yielded.
+        if takes && !by_lineage {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if !matches!(
+                self.query_peer_claim().await,
+                PeerClaim::Claim(ForkClaim::Yielded(u)) if same_gen(u, peer_gen)
+            ) {
+                return false;
+            }
+        }
         if !takes {
             if self.loser_holding_ticks.is_multiple_of(60) {
                 info!(heal_event = "mutual_yield_hold",
                       peer_yielded_gen = %format!("{peer_gen:016X}"),
                       local_current = %format!("{:016X}", local[0]),
                       local_uptodate = local_ud, is_keeper,
-                      "both nodes yielded; this copy may not take the win (the peer's may hold \
-                       writes it lacks, or the peer is the one to take it)");
+                      "both nodes yielded; not taking the win yet (the peer takes it if this \
+                       copy is behind it; otherwise the keeper takes it once the hold reaches \
+                       90 s)");
             }
             return false;
         }
@@ -26376,7 +26422,7 @@ poll_interval_ms = 10
     }
 
     #[test]
-    fn mutual_yield_take_win_only_when_the_peer_holds_nothing_this_copy_lacks() {
+    fn mutual_yield_has_exactly_one_taker() {
         // The bmax wedge: demo-1's bitmap generation is demo-2's current one
         // (demo-1 is ahead), demo-2 has no generation of demo-1's.
         let demo1 = [
@@ -26391,17 +26437,60 @@ poll_interval_ms = 10
             0xD37D57142B3F2652,
             0xF501772E41B98534,
         ];
-        assert!(mutual_yield_takes_win(demo1, 0xF11F0E8D9DCA4F48, false));
-        assert!(!mutual_yield_takes_win(demo2, 0x355A43DD30F141B6, true));
+        assert!(mutual_yield_takes_win(
+            demo1,
+            0xF11F0E8D9DCA4F48,
+            false,
+            false
+        ));
+        assert!(!mutual_yield_takes_win(
+            demo2,
+            0x355A43DD30F141B6,
+            true,
+            false
+        ));
         // The same data: the keeper alone takes it (bit 0 ignored).
-        assert!(mutual_yield_takes_win(demo2, 0xF11F0E8D9DCA4F49, true));
-        assert!(!mutual_yield_takes_win(demo2, 0xF11F0E8D9DCA4F49, false));
+        assert!(mutual_yield_takes_win(
+            demo2,
+            0xF11F0E8D9DCA4F49,
+            true,
+            false
+        ));
+        assert!(!mutual_yield_takes_win(
+            demo2,
+            0xF11F0E8D9DCA4F49,
+            false,
+            true
+        ));
         // An ancestor in the history counts; an unrelated generation never does.
-        assert!(mutual_yield_takes_win(demo2, 0xD37D57142B3F2652, false));
-        assert!(!mutual_yield_takes_win(demo1, 0x1111111111111110, true));
+        assert!(mutual_yield_takes_win(
+            demo2,
+            0xD37D57142B3F2652,
+            false,
+            false
+        ));
+        assert!(!mutual_yield_takes_win(
+            demo1,
+            0x1111111111111110,
+            true,
+            false
+        ));
+        // Both copies moved on after their yields (tonight's wedge): neither
+        // is an ancestor; the keeper alone takes it, after the longer hold,
+        // and the non-keeper never does.
+        let d1 = [0x1D42C2878DFB6D5A, 0x57A6C82D8AAAAAA0, 0, 0];
+        let d2 = [0xB1BDF70790C84346, 0x57A6C82D8BBBBBB0, 0, 0];
+        assert!(!mutual_yield_takes_win(d1, d2[0], true, false));
+        assert!(mutual_yield_takes_win(d1, d2[0], true, true));
+        assert!(!mutual_yield_takes_win(d2, d1[0], false, true));
         // Unknown generations never take the win.
-        assert!(!mutual_yield_takes_win(demo1, 0, true));
-        assert!(!mutual_yield_takes_win([0; 4], 0xF11F0E8D9DCA4F48, true));
+        assert!(!mutual_yield_takes_win(demo1, 0, true, true));
+        assert!(!mutual_yield_takes_win(
+            [0; 4],
+            0xF11F0E8D9DCA4F48,
+            true,
+            true
+        ));
     }
 
     fn starting_secondary() -> DrbdStatus {
