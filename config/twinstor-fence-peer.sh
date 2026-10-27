@@ -157,11 +157,34 @@ connected_now() {
     return 1
 }
 
+# DRBD processes a returned fence-peer run at its next state change: when that
+# is the link dropping again moments after the return (a run that ended
+# because the pair reconnected), it lifts the fresh freeze at once ("susp-io(
+# fencing -> no ) [after-fencing]"), whatever the exit code, and the writes in
+# flight complete onto this copy alone. A disconnect while a run is still
+# pending keeps its freeze. So a run that ends while Connected stays until the
+# link has held for a while; if the link drops meanwhile, DRBD's next run
+# starts frozen and this one's answer is ignored.
+LINGER_SECS="${TWINSTOR_LINGER_SECS:-20}"
+linger_while_connected() {
+    local held=0
+    while [ "$held" -lt "$((LINGER_SECS * 4))" ]; do
+        sleep 0.25
+        if ! connected_now; then
+            log "the link dropped again while this run stayed: exiting; the next run starts frozen"
+            return 0
+        fi
+        held=$((held + 1))
+    done
+    return 0
+}
+
 verdict() {
     if [ "$2" = 4 ] && [ "$1" != keep_win ] && { [ "$FREEZE" = 1 ] || [ -n "$DIRECT_PEER" ]; } \
         && [ "$LOCAL_ROLE" = "Primary" ] && connected_now; then
         resume_if_connected
         if ! io_suspended; then
+            linger_while_connected
             log "verdict=$1 given while Connected again: freeze lifted here; no fencing reported to DRBD (exit 1), so the next disconnect freezes afresh"
             set -- "${1}_connected" 1
         fi

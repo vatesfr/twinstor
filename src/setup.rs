@@ -3206,6 +3206,7 @@ mod tests {
                 .env("TWINSTOR_RUN_DIR", self.root.join("run"))
                 .env("TWINSTOR_FENCE_LOG", self.root.join("fence.log"))
                 .env("TWINSTOR_FENCE_LOCK_WAIT", lock_wait.to_string())
+                .env("TWINSTOR_LINGER_SECS", "1")
                 .env("TWINSTOR_KMSG", self.root.join("state/kmsg"))
                 .env("DRBD_RESOURCE", "twinstor-data")
                 .env("TWINSTOR_DAEMON_EXE", self.daemon_exe());
