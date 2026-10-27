@@ -4935,8 +4935,8 @@ const ISCSI_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The split-brain loser's extra wait past `ISCSI_STOP_TIMEOUT` before it
 /// self-fences: it serves nobody, so a slow teardown costs only time.
 const LOSER_TEARDOWN_EXTRA: Duration = Duration::from_secs(60);
-/// The arbitrated loser's wait between closing its portal to new logins and
-/// tearing the target down: past LIO's 15 s login timeout.
+/// The arbitrated loser's wait between cutting its target off and tearing it
+/// down: past LIO's 15 s login timeout, so no login is still pending.
 const LOSER_LOGIN_DRAIN: Duration = Duration::from_secs(20);
 
 /// What holds an iSCSI teardown: the targetcli and LIO kernel threads with
@@ -7244,6 +7244,9 @@ pub struct StateMachine {
     /// handler reads it as `keep_win`), and when the link was last taken down.
     arb_keep_path: String,
     arb_keep_retry_at: Option<std::time::Instant>,
+    /// When this host cut its own target off as an arbitrated split-brain
+    /// loser (`cut_own_target`); cleared once lifted after the teardown.
+    own_target_cut_at: Option<std::time::Instant>,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
     arb_yield_xapi_wait_since: Option<std::time::Instant>,
@@ -7553,6 +7556,7 @@ impl StateMachine {
                     .unwrap_or_else(|_| "/run/twinstor/arb-mutual-keep".to_string()),
             ),
             arb_keep_retry_at: None,
+            own_target_cut_at: None,
             arb_yield_hold_alerted: false,
             arb_yield_xapi_wait_since: None,
             frozen_domains: None,
@@ -11633,11 +11637,7 @@ impl StateMachine {
     /// freezes I/O at the disconnect, so its failover is safe; a Secondary
     /// has nothing local the peer lacks.
     async fn peer_portal_allowed(&self) -> bool {
-        // Arbitrated mode freezes I/O at the disconnect, so a failover there
-        // carries no gap; except after a mutual-freeze keep (`arb_keep_path`),
-        // where the peer lifts its own suspend to step down while its target
-        // may still hold this host's writes.
-        if cfg!(test) || (self.arbitrated && !std::path::Path::new(&self.arb_keep_path).exists()) {
+        if self.arbitrated || cfg!(test) {
             return true;
         }
         match self.drbd.status().await {
@@ -12044,7 +12044,6 @@ impl StateMachine {
                 warn!(portal = %portal, "removing a peer-portal fence rule left without its marker");
                 let _ = crate::iscsi::remove_peer_portal_rule(&peer_ip, port).await;
             }
-            let _ = crate::iscsi::remove_peer_portal_reset(&peer_ip, port).await;
             return;
         }
         // A node without its local session (the split's loser takes its own
@@ -12079,9 +12078,7 @@ impl StateMachine {
             }
         }
         // Lift the firewall fence first: the session then recovers by itself.
-        if !crate::iscsi::remove_peer_portal_rule(&peer_ip, port).await
-            || !crate::iscsi::remove_peer_portal_reset(&peer_ip, port).await
-        {
+        if !crate::iscsi::remove_peer_portal_rule(&peer_ip, port).await {
             warn!(portal = %portal, "could not remove the peer-portal fence rule; retrying");
             return;
         }
@@ -21303,31 +21300,11 @@ impl StateMachine {
                peer's copy is behind from now on: its guests are stopped and restarted and it \
                resyncs from this node");
         // The keep intent first: from here on the fence-peer handler keeps this
-        // node serving (`keep_win`), and the path through the peer's portal is
-        // not allowed until the pair is Connected again.
+        // node serving (`keep_win`). No write of this node's guests can be
+        // acknowledged from the peer's copy: the peer cuts its own target off
+        // before it lifts its frozen I/O to step down (`resolve_as_loser`).
         write_fork_record(&self.arb_keep_path, Some(peer_gen));
-        // Then cut this host's path to the peer's portal: frozen this long,
-        // the guests' multipath may hold writes on that path, and the peer,
-        // stepping down, lifts its own suspend before its target goes; a write
-        // it completed there would be acknowledged onto the copy it discards.
-        // Cut, those writes fail back to multipath and land on the local path.
-        self.fence_peer_portal().await;
-        let peer_ip = self.config.network.peer_address.to_string();
-        let port = self.config.iscsi.portal_port;
-        // And reset the peer's side of those sessions: the peer's target, torn
-        // down when it steps down, must not wait on a connection this host no
-        // longer answers.
-        if !cfg!(test)
-            && (crate::iscsi::peer_portal_rule_state(&peer_ip, port).await != Some(true)
-                || !crate::iscsi::add_peer_portal_reset(&peer_ip, port).await)
-        {
-            warn!(heal_event = "arb_mutual_freeze_fence_failed", incident = ?self.incident_id,
-                  "arbitrated: could not cut the path through the peer's portal; the win is not \
-                   published yet, retrying");
-            let _ = std::fs::remove_file(&self.arb_keep_path);
-            return;
-        }
-        // Only now the win the peer acts on, and out of the reconnect cycle.
+        // The win the peer acts on, and out of the reconnect cycle.
         write_fork_record(&self.win_path, Some(peer_gen));
         let _ = self.drbd.disconnect().await;
         self.arb_mutual_since = None;
@@ -21390,6 +21367,25 @@ impl StateMachine {
              frozen; they are restarted and the peer resyncs from this node.",
         )
         .await;
+    }
+
+    /// Arbitrated split-brain loser: cut this host's target off from every
+    /// initiator (`block_portal_logins`), once per episode. Not in tests.
+    async fn cut_own_target(&mut self) {
+        if !self.arbitrated || cfg!(test) || self.own_target_cut_at.is_some() {
+            return;
+        }
+        if crate::iscsi::block_portal_logins(self.config.iscsi.portal_port).await {
+            self.own_target_cut_at = Some(std::time::Instant::now());
+            warn!(heal_event = "loser_target_cut", incident = ?self.incident_id,
+                  "split-brain loser: this host's iSCSI target is cut off from every initiator \
+                   before its frozen I/O is lifted, so nothing written to this copy from now on \
+                   is acknowledged to anyone");
+        } else {
+            warn!(heal_event = "loser_target_cut_failed", incident = ?self.incident_id,
+                  "split-brain loser: could not cut this host's iSCSI target off; retrying at the \
+                   teardown");
+        }
     }
 
     fn arb_mutual_reset(&mut self) {
@@ -22816,6 +22812,12 @@ impl StateMachine {
         restart_target: bool,
         evidence: crate::loser_boundary::ForkEvidence,
     ) {
+        // Arbitrated: cut this host's target off from every initiator before
+        // anything lifts this copy's frozen I/O (the crash boundary's lift, the
+        // teardown's): writes held in the suspended DRBD then complete onto the
+        // copy that is discarded without any initiator, the peer's guests
+        // included, receiving the acknowledgement (`block_portal_logins`).
+        self.cut_own_target().await;
         // Crash boundary first, before any admission change (loopback logout,
         // target teardown, disconnect, discard): guests on this host that could
         // be reading the losing history are stopped and confirmed gone, or
@@ -23701,15 +23703,13 @@ impl StateMachine {
         // peer's side abandoned (its path to this portal cut by a mutual-freeze
         // keep) held it past any bound (`block_portal_logins`).
         let portal_port = self.config.iscsi.portal_port;
-        let blocked =
-            self.arbitrated && !cfg!(test) && crate::iscsi::block_portal_logins(portal_port).await;
-        if blocked {
-            info!(
-                heal_event = "loser_portal_block",
-                "split-brain: this host's iSCSI portal refuses new logins; waiting out any \
-                   login in progress before the teardown"
-            );
-            tokio::time::sleep(LOSER_LOGIN_DRAIN).await;
+        self.cut_own_target().await;
+        let blocked = self.own_target_cut_at.is_some();
+        if let Some(at) = self.own_target_cut_at {
+            let wait = LOSER_LOGIN_DRAIN.saturating_sub(at.elapsed());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
         }
         // (3) Time-bound the teardown; if it wedges unkillable, self-fence.
         // This copy serves nobody and its guests are stopped, so a slow
@@ -23732,11 +23732,15 @@ impl StateMachine {
                 }
             }
         };
-        if blocked && !crate::iscsi::unblock_portal_logins(portal_port).await {
-            warn!(
-                "split-brain: could not lift the block on this host's iSCSI portal; the next \
-                   target start retries"
-            );
+        if blocked {
+            if crate::iscsi::unblock_portal_logins(portal_port).await {
+                self.own_target_cut_at = None;
+            } else {
+                warn!(
+                    "split-brain: could not lift the cut of this host's iSCSI target; the next \
+                     target start retries"
+                );
+            }
         }
         match stopped {
             Some(Ok(())) => {}

@@ -509,72 +509,24 @@ pub async fn remove_peer_portal_rule(peer_ip: &str, port: u16) -> bool {
     !peer_portal_rule_present(peer_ip, port).await
 }
 
-/// The counterpart of the peer-portal fence for the peer's side: replies
-/// from the peer's portal to this host get a TCP reset. The OUTPUT rule alone
-/// rejects this host's own packets locally, so the peer's target never sees
-/// the connection close and keeps retransmitting into it: its target
-/// teardown then waits on that session (seen wedging a split-brain loser
-/// into a forced reboot). With the reset the peer's session ends at its next
-/// packet. Used by the arbitrated mutual-freeze keep.
-fn peer_portal_reset_rule(peer_ip: &str, port: u16) -> Vec<String> {
+/// This host's own iSCSI target cut off from every initiator (this host's
+/// own loopback session included): new connections to its portal are reset
+/// (INPUT), and its target's replies are rejected (OUTPUT, which also resets
+/// the target's side of each session). The arbitrated split-brain loser sets
+/// it before anything lifts its frozen I/O: a write held in its suspended DRBD
+/// then completes onto the copy it discards without any initiator receiving
+/// the acknowledgement, and every login fails at once with a reset instead of
+/// timing out (a login timeout left LIO unable to remove the portal, wedging
+/// the teardown into a forced reboot). Removed after the teardown and by every
+/// `start()`.
+fn portal_block_rule(chain: &str, port: u16) -> Vec<String> {
+    let dir = if chain == "INPUT" {
+        "--dport"
+    } else {
+        "--sport"
+    };
     format!(
-        "-s {peer_ip}/32 -p tcp -m tcp --sport {port} -m comment --comment \
-         twinstor-peer-portal-reset -j REJECT --reject-with tcp-reset"
-    )
-    .split_whitespace()
-    .map(str::to_string)
-    .collect()
-}
-
-async fn iptables_input_reset(op: &str, peer_ip: &str, port: u16) -> Option<bool> {
-    let mut args: Vec<String> = vec!["-w".into(), "3".into(), op.into(), "INPUT".into()];
-    if op == "-I" {
-        args.push("1".into());
-    }
-    args.extend(peer_portal_reset_rule(peer_ip, port));
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new("iptables")
-            .args(&args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    match out {
-        Ok(Ok(o)) if o.status.code() == Some(0) => Some(true),
-        Ok(Ok(o)) if o.status.code() == Some(1) => Some(false),
-        _ => None,
-    }
-}
-
-/// Install the peer-portal reset rule (idempotent). `false` on failure.
-pub async fn add_peer_portal_reset(peer_ip: &str, port: u16) -> bool {
-    iptables_input_reset("-C", peer_ip, port).await == Some(true)
-        || iptables_input_reset("-I", peer_ip, port).await == Some(true)
-}
-
-/// Remove every copy of the peer-portal reset rule. `false` if one stays.
-pub async fn remove_peer_portal_reset(peer_ip: &str, port: u16) -> bool {
-    for _ in 0..8 {
-        if iptables_input_reset("-C", peer_ip, port).await == Some(false) {
-            return true;
-        }
-        let _ = iptables_input_reset("-D", peer_ip, port).await;
-    }
-    iptables_input_reset("-C", peer_ip, port).await == Some(false)
-}
-
-/// This host's own portal closed to new iSCSI logins (any initiator): the
-/// split-brain loser sets it before tearing its target down. Removing a
-/// network portal waits in the kernel (`iscsit_reset_np_thread`) for the
-/// portal thread, and one busy with a login negotiation that will never
-/// complete (an initiator whose side was cut) held a loser's teardown until
-/// it self-fenced. With new logins refused and the login timeout waited out,
-/// no login is in progress when the portal goes. Removed after the teardown
-/// and by every `start()`.
-fn portal_block_rule(port: u16) -> Vec<String> {
-    format!(
-        "-p tcp -m tcp --dport {port} -m comment --comment twinstor-loser-portal-block \
+        "-p tcp -m tcp {dir} {port} -m comment --comment twinstor-loser-portal-block \
          -j REJECT --reject-with tcp-reset"
     )
     .split_whitespace()
@@ -582,12 +534,12 @@ fn portal_block_rule(port: u16) -> Vec<String> {
     .collect()
 }
 
-async fn iptables_portal_block(op: &str, port: u16) -> Option<bool> {
-    let mut args: Vec<String> = vec!["-w".into(), "3".into(), op.into(), "INPUT".into()];
+async fn iptables_portal_block(op: &str, chain: &str, port: u16) -> Option<bool> {
+    let mut args: Vec<String> = vec!["-w".into(), "3".into(), op.into(), chain.into()];
     if op == "-I" {
         args.push("1".into());
     }
-    args.extend(portal_block_rule(port));
+    args.extend(portal_block_rule(chain, port));
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new("iptables")
@@ -603,21 +555,31 @@ async fn iptables_portal_block(op: &str, port: u16) -> Option<bool> {
     }
 }
 
-/// Refuse new logins to this host's portal. `false` on failure.
+/// Cut this host's target off from every initiator. `false` on failure.
 pub async fn block_portal_logins(port: u16) -> bool {
-    iptables_portal_block("-C", port).await == Some(true)
-        || iptables_portal_block("-I", port).await == Some(true)
+    let mut ok = true;
+    for chain in ["INPUT", "OUTPUT"] {
+        ok &= iptables_portal_block("-C", chain, port).await == Some(true)
+            || iptables_portal_block("-I", chain, port).await == Some(true);
+    }
+    ok
 }
 
-/// Accept logins to this host's portal again. `false` if a block stays.
+/// Lift the cut. `false` if a rule stays.
 pub async fn unblock_portal_logins(port: u16) -> bool {
-    for _ in 0..8 {
-        if iptables_portal_block("-C", port).await == Some(false) {
-            return true;
+    let mut ok = true;
+    for chain in ["INPUT", "OUTPUT"] {
+        let mut gone = false;
+        for _ in 0..8 {
+            if iptables_portal_block("-C", chain, port).await == Some(false) {
+                gone = true;
+                break;
+            }
+            let _ = iptables_portal_block("-D", chain, port).await;
         }
-        let _ = iptables_portal_block("-D", port).await;
+        ok &= gone || iptables_portal_block("-C", chain, port).await == Some(false);
     }
-    iptables_portal_block("-C", port).await == Some(false)
+    ok
 }
 
 /// The SCSI disks (`sdc`) attached through the session(s) to `portal`, from
