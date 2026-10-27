@@ -7252,8 +7252,8 @@ pub struct StateMachine {
     /// handler reads it as `keep_win`), and when the link was last taken down.
     arb_keep_path: String,
     arb_keep_retry_at: Option<std::time::Instant>,
-    /// When this host cut its own target off as an arbitrated split-brain
-    /// loser (`cut_own_target`); cleared once lifted after the teardown.
+    /// When this host cut its own target off as a split-brain loser
+    /// (`cut_own_target`); cleared once the teardown has released the device.
     own_target_cut_at: Option<std::time::Instant>,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
@@ -8498,6 +8498,9 @@ impl StateMachine {
             self.log_fence_verdict().await;
             step!(self, "check_peer_object", self.check_peer_object().await);
             step!(self, "fence_peer_portal", self.fence_peer_portal().await);
+            if self.own_target_cut_at.is_some() {
+                self.lift_stale_own_cut().await;
+            }
             step!(
                 self,
                 "release_winner_freeze",
@@ -21415,10 +21418,33 @@ impl StateMachine {
         .await;
     }
 
-    /// Arbitrated split-brain loser: cut this host's target off from every
-    /// initiator (`block_portal_logins`), once per episode. Not in tests.
+    /// A loser cut whose teardown never ran (the resolution stopped before it,
+    /// and the episode ended another way) still blocks a target that exports
+    /// its LUN: lifted once the pair is Connected with both copies UpToDate. A
+    /// completed teardown clears `own_target_cut_at` itself, and the next
+    /// target start lifts the cut.
+    async fn lift_stale_own_cut(&mut self) {
+        let converged = matches!(
+            self.drbd.status().await,
+            Ok(s) if s.connection == ConnectionState::Connected
+                && s.disk == DiskState::UpToDate
+                && s.peer_disk == Some(DiskState::UpToDate)
+        );
+        if !converged || cfg!(test) {
+            return;
+        }
+        if crate::iscsi::unblock_portal_logins(self.config.iscsi.portal_port).await {
+            self.own_target_cut_at = None;
+            warn!(heal_event = "loser_target_cut_lifted",
+                  "the pair converged while this host's iSCSI target was still cut off from \
+                   its initiators (the loser's teardown did not run): cut lifted");
+        }
+    }
+
+    /// Split-brain loser: cut this host's target off from every initiator
+    /// (`block_portal_logins`), once per episode. Not in tests.
     async fn cut_own_target(&mut self) {
-        if !self.arbitrated || cfg!(test) || self.own_target_cut_at.is_some() {
+        if cfg!(test) || self.own_target_cut_at.is_some() {
             return;
         }
         if crate::iscsi::block_portal_logins(self.config.iscsi.portal_port).await {
@@ -22858,11 +22884,16 @@ impl StateMachine {
         restart_target: bool,
         evidence: crate::loser_boundary::ForkEvidence,
     ) {
-        // Arbitrated: cut this host's target off from every initiator before
-        // anything lifts this copy's frozen I/O (the crash boundary's lift, the
+        // Cut this host's target off from every initiator before anything
+        // lifts this copy's frozen I/O (the crash boundary's lift, the
         // teardown's): writes held in the suspended DRBD then complete onto the
         // copy that is discarded without any initiator, the peer's guests
-        // included, receiving the acknowledgement (`block_portal_logins`).
+        // included, receiving the acknowledgement (`block_portal_logins`). In
+        // fate-shared mode too: the winner fences its path to this portal only
+        // from its handler or its next tick, and a link back for a second
+        // reopens it (seen under 30% packet loss: a peer guest's writes held
+        // here were acknowledged at the teardown's lift, then discarded, and
+        // its filesystem needed a manual fsck).
         self.cut_own_target().await;
         // Crash boundary first, before any admission change (loopback logout,
         // target teardown, disconnect, discard): guests on this host that could
@@ -23743,7 +23774,7 @@ impl StateMachine {
                 }
             }
         }
-        // (2b) Arbitrated: refuse new logins to this host's portal and wait out
+        // (2b) Refuse new logins to this host's portal and wait out
         // LIO's login timeout before the teardown, so no login negotiation is
         // still running in LIO when the backstore goes.
         self.cut_own_target().await;
