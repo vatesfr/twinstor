@@ -44,18 +44,18 @@ const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 /// interactive wizard and the non-interactive CLI path so the operator makes
 /// this choice with the known scope in front of them.
 pub const ARBITRATED_MODE_NOTE: &str = "\
-Note: arbitrated (direct-link) mode replicates over the back-to-back cable,
-with the switched network as a fallback path, so a switch failure does not
-split DRBD. If the whole switch dies, each host reads over the cable that its
-peer lost the gateway too; after 15 s both disarm local XHA fencing and keep
-their VMs running (unreachable by clients until the switch returns), then
-re-arm HA. A router outage seen by both hosts holds the same way, HA disarmed
-until the gateway returns. A host that loses only its own switch link is
-stood down after a confirmation window, so its VMs restart on the other host;
-a host that loses only its gateway while the peer still answers over the
-gateway (management) network is not stood down. That check applies only when
-the peer address is on that network. The direct link protects the storage
-path, not the guest network. How to choose the mode:
+Note: in arbitrated mode, replication runs over the direct cable, with the
+switched network as a fallback path, so a switch failure does not split the
+two copies. If the whole switch dies, each host still sees the other over the
+cable and learns that it lost the gateway too; after 15 s both pause the
+automatic HA reboot (fencing) and keep their VMs running (unreachable by
+clients until the switch returns), then turn it back on. A router outage seen
+by both hosts is handled the same way. A host that loses only its own switch
+link is stopped after a confirmation window, so its VMs restart on the other
+host; a host that loses only its gateway while the other host still answers
+over the management network is not stopped. That check applies only when the
+other host's address is on that network. The direct link protects the storage
+path, not the VMs' network. How to choose the mode:
 https://docs.vates.tech/tech-preview/twinstor/installation/";
 
 pub struct SetupParams {
@@ -80,9 +80,102 @@ pub struct SetupParams {
     /// death, freezes this node's storage until the peer returns. Only for
     /// sites that knowingly accept freeze-on-disconnect semantics.
     pub allow_no_tiebreaker: bool,
+    /// Set by the interactive wizard, which already showed the
+    /// arbitrated-mode note and asked for the confirmation; the flag path
+    /// shows and asks them itself.
+    pub from_wizard: bool,
+    /// The operator confirmed the destructive steps up front (`--yes`, or
+    /// the wizard's typed confirmation).
+    pub yes: bool,
+    /// Use a backing device the wizard would not offer (`--force-device`).
+    pub force_device: bool,
+}
+
+/// What asking for the destructive confirmation comes down to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// Already given: `--yes`, or the wizard asked.
+    Given,
+    /// Ask on the terminal.
+    Ask,
+    /// No terminal to ask on and no `--yes`: refuse.
+    Refuse,
+}
+
+pub(crate) fn confirmation(yes: bool, from_wizard: bool, tty: bool) -> Confirmation {
+    if yes || from_wizard {
+        Confirmation::Given
+    } else if tty {
+        Confirmation::Ask
+    } else {
+        Confirmation::Refuse
+    }
+}
+
+/// The `twinstor setup` command that runs the same setup without questions,
+/// printed by the wizard for admins who prefer to run commands themselves.
+/// The disk path is this host's own; the password is left out when setup
+/// generates it.
+pub(crate) fn equivalent_command(p: &SetupParams) -> String {
+    let mut cmd = format!("twinstor setup --peer-ip {}", p.peer_ip);
+    if let Some(l) = p.local_ip {
+        cmd.push_str(&format!(" --local-ip {l}"));
+    }
+    if let Some(d) = &p.backing_device {
+        cmd.push_str(&format!(" --backing-device {}", d.display()));
+    }
+    if let Some(d) = p.direct_ip {
+        cmd.push_str(&format!(" --direct-ip {d}"));
+    }
+    for t in &p.ping_targets {
+        cmd.push_str(&format!(" --ping-target {t}"));
+    }
+    if let Some(port) = p.drbd_port.filter(|port| *port != 7789) {
+        cmd.push_str(&format!(" --drbd-port {port}"));
+    }
+    if p.full_sync {
+        cmd.push_str(" --full-sync");
+    }
+    if let Some(pw) = &p.chap_password {
+        cmd.push_str(&format!(" --chap-password {pw}"));
+    }
+    if p.allow_no_tiebreaker {
+        cmd.push_str(" --allow-no-tiebreaker");
+    }
+    cmd.push_str(" --yes");
+    cmd
+}
+
+/// Set once `run_setup` starts changing this host (the config write), so a
+/// failure after it is reported as a part-way setup with the way to resume.
+static HOST_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the setup run in this process changed this host before failing.
+pub(crate) fn host_changed() -> bool {
+    HOST_CHANGED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The error `twinstor setup` reports: a failure after setup started changing
+/// this host gets a `next:` line that says how to resume or undo it, unless
+/// it already carries its own guidance.
+pub(crate) fn part_way_failure(err: anyhow::Error, host_changed: bool) -> anyhow::Error {
+    if !host_changed || err.downcast_ref::<crate::render::CliError>().is_some() {
+        return err;
+    }
+    crate::render::CliError::new(
+        "setup stopped part-way on this host",
+        "fix the problem above, then run `twinstor setup` again (it offers to run setup again \
+         from the start), or `twinstor uninstall` to undo what it did",
+    )
+    .caused_by(err)
+    .into()
 }
 
 pub async fn run_setup(params: SetupParams) -> Result<()> {
+    // The wizard ran the requirement checks before its first question.
+    if !params.from_wizard {
+        crate::preflight::run(false).await?;
+    }
     let local_name = hostname::get()
         .context("hostname")?
         .to_string_lossy()
@@ -101,6 +194,36 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
         detect_default_gateway().await.is_some(),
         params.allow_no_tiebreaker,
     )?;
+    // The first node's handoff, present when this is the second node. Read
+    // before anything is written: a wrong CHAP password must stop here, not
+    // at the SR creation after this host's disk is wiped.
+    let inherited = inherited_shared_setup().await;
+    if let Some(inh) = &inherited {
+        second_node_chap_gate(
+            params.chap_password.as_deref(),
+            inh.chap_check.as_deref(),
+            &peer_name,
+        )?;
+        if let Some(refusal) =
+            topology_mismatch(inh.arbitrated, inh.direct_ip, params.direct_ip, &peer_name)
+        {
+            return Err(refusal.into());
+        }
+    }
+    // An accidental re-run on a working pair must stop before any file is
+    // rewritten or DRBD taken down, so the live-SR guard runs first.
+    let pair = live_pair_state().await;
+    if let Some(refusal) = rerun_refusal(
+        rerun_guard(
+            pair.sr_exists,
+            params.full_sync,
+            pair.local_uptodate,
+            pair.peer_uptodate,
+        ),
+        &peer_name,
+    ) {
+        return Err(refusal.into());
+    }
     let local_ip = match params.local_ip {
         Some(ip) => ip,
         None => detect_local_ip(params.peer_ip).await?,
@@ -138,6 +261,25 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
             if !dev.exists() {
                 bail!("{} does not exist", dev.display());
             }
+            // The same checks as the wizard's disk list, except for the
+            // device this host already uses (a re-run or a rebuild, which
+            // DRBD holds).
+            let current = crate::config::Config::load(Path::new(CONFIG_PATH))
+                .ok()
+                .and_then(|c| std::fs::canonicalize(c.storage.backing_device).ok());
+            let same_as_current = current.is_some() && current == std::fs::canonicalize(&dev).ok();
+            if !params.from_wizard
+                && !params.force_device
+                && !same_as_current
+                && let Some(why) = crate::wizard::backing_device_refusal(&dev)
+            {
+                return Err(crate::render::CliError::new(
+                    format!("{} is not a device setup can erase: {why}", dev.display()),
+                    "run `twinstor setup` with no arguments to see the disks it offers and why \
+                     others are not; if you are sure, add --force-device",
+                )
+                .into());
+            }
             dev
         }
         None => bail!(
@@ -156,9 +298,14 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
     let iqn = format!("iqn.2025-01.com.xcp-ng:{res}");
 
     let chap_user = "twinstor".to_string();
+    // Rebuilding this host of a live pair keeps the password the SR was
+    // created with: a new one would lock this host out of its own SR.
     let chap_password = match params.chap_password {
         Some(p) => p,
-        None => generate_chap_password()?,
+        None => match pair.sr_exists.then(existing_chap_password).flatten() {
+            Some(p) => p,
+            None => generate_chap_password()?,
+        },
     };
     let initiator_iqns = get_initiator_iqns().await?;
 
@@ -199,6 +346,40 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
     println!("  CHAP password: {chap_password}");
     println!();
 
+    // The destructive step, confirmed before anything is written.
+    match confirmation(
+        params.yes,
+        params.from_wizard,
+        crate::wizard::stdin_is_tty(),
+    ) {
+        Confirmation::Given => {}
+        Confirmation::Ask => {
+            println!(
+                "This erases {} on {local_name}.",
+                crate::wizard::describe_device(&backing)
+            );
+            print!("Type 'yes' to proceed (anything else aborts): ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim() != "yes" {
+                bail!("aborted by user; nothing was changed");
+            }
+        }
+        Confirmation::Refuse => {
+            return Err(crate::render::CliError::new(
+                format!(
+                    "setup would erase {} and has no terminal to confirm it on; nothing was \
+                     changed",
+                    crate::wizard::describe_device(&backing)
+                ),
+                "add --yes to confirm, or run `twinstor setup` from a terminal",
+            )
+            .into());
+        }
+    }
+
     tokio::fs::create_dir_all(CONFIG_DIR)
         .await
         .context("creating config dir")?;
@@ -238,6 +419,8 @@ initiator_iqns = [{iqn_list}]
         backing = backing.display(),
         allow_no_tiebreaker = params.allow_no_tiebreaker
     );
+    // From here on a failure leaves this host part-way set up.
+    HOST_CHANGED.store(true, std::sync::atomic::Ordering::SeqCst);
     // The config contains the CHAP password: created root-only, never readable
     // by others even briefly (an older config keeps its mode, so set it after).
     crate::cli::write_atomic(std::path::Path::new(CONFIG_PATH), config_text.as_bytes())
@@ -333,8 +516,10 @@ initiator_iqns = [{iqn_list}]
         );
         // Show the scope note (storage-path redundancy only) before writing
         // the config, so the operator knows what arbitrated mode does and does
-        // not cover.
-        println!("\n{ARBITRATED_MODE_NOTE}\n");
+        // not cover. The wizard showed it already, right after the choice.
+        if !params.from_wizard {
+            println!("\n{ARBITRATED_MODE_NOTE}\n");
+        }
     }
     // New pool: write explicit sorted-hostname node-ids for both topologies so a
     // fate-shared pool never leaves DRBD to auto-assign ids, which may not follow
@@ -397,7 +582,16 @@ initiator_iqns = [{iqn_list}]
     open_firewall_ports(port).await;
 
     // Re-runnable after an aborted attempt: a previous run may have left the
-    // resource up, and wipefs/create-md need the device closed.
+    // service running and the resource up, and wipefs/create-md need the
+    // device closed. The service goes first: it manages the resource and
+    // would bring it back up behind setup's back.
+    let service_active = cmd_output("systemctl", &["is-active", "twinstor"])
+        .await
+        .is_ok_and(|s| s.trim() == "active");
+    if service_active {
+        println!("stopping the twinstor service left by the previous run...");
+        run_cmd("systemctl", &["stop", "twinstor"]).await?;
+    }
     let res_up = tokio::process::Command::new("drbdadm")
         .args(["status", res])
         .output()
@@ -406,31 +600,16 @@ initiator_iqns = [{iqn_list}]
         .unwrap_or(false);
     if res_up {
         println!("previous DRBD resource is up, taking it down first...");
-        let _ = run_cmd("drbdadm", &["down", res]).await;
-    }
-
-    // Guard the destructive wipe. An existing twinstor SR means this pool holds
-    // real data, and re-running setup would wipe this node's backing device. A
-    // real rejoin or re-init accepts that by passing --full-sync (which then
-    // resyncs a fresh copy from the peer); an accidental re-run must abort with
-    // the data intact.
-    let twinstor_sr_exists = cmd_output(
-        "xe",
-        &["sr-list", "name-label=twinstor", "params=uuid", "--minimal"],
-    )
-    .await
-    .ok()
-    .map(|u| !u.trim().is_empty())
-    .unwrap_or(false);
-    if backing_wipe_blocked(twinstor_sr_exists, params.full_sync) {
-        bail!(
-            "a live twinstor SR already exists, so re-running setup would wipe this \
-             node's backing device ({}) and destroy its copy of the data. If you are \
-             rejoining or re-initialising this node (the peer holds the good copy and \
-             this node will resync a fresh one), re-run with --full-sync to accept the \
-             wipe. If you did not mean to re-run setup, stop now: your data is intact.",
-            backing.display()
-        );
+        if let Err(e) = run_cmd("drbdadm", &["down", res]).await {
+            return Err(crate::render::CliError::new(
+                "could not take this host's DRBD resource down: something still uses it",
+                "if VMs on this host use the TwinStor SR, move them to the other host or \
+                 shut them down, then run `twinstor setup` again; or run `twinstor uninstall` \
+                 to remove what setup did",
+            )
+            .caused_by(e)
+            .into());
+        }
     }
 
     run_cmd("wipefs", &["-a", &backing.display().to_string()]).await?;
@@ -467,6 +646,7 @@ initiator_iqns = [{iqn_list}]
             drbd_port: port,
             chap_user: chap_user.clone(),
             publisher_uuid: local_host_uuid().await.unwrap_or_default(),
+            chap_check: Some(chap_check_value(&chap_password)),
         })
         .await;
     }
@@ -514,9 +694,12 @@ initiator_iqns = [{iqn_list}]
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("SyncTarget"))
             .unwrap_or(false);
         if syncing {
-            println!("peer is syncing real data to this node; following the resync.");
-            println!("this node stays Secondary until UpToDate; the daemon then promotes");
-            println!("it to dual-Primary (it will not serve Inconsistent data).");
+            println!(
+                "This host is receiving its copy from {peer_name} (follow it with: twinstor status)."
+            );
+            println!("Until it completes, this host reaches the data through {peer_name}, and");
+            println!("does not serve from its own disk. DRBD may show this host Primary with an");
+            println!("Inconsistent disk meanwhile: that is expected.");
         } else {
             establish_skip_sync(res).await?;
             println!("promoting (dual-primary)...");
@@ -536,8 +719,14 @@ initiator_iqns = [{iqn_list}]
         println!("\n======================================================================");
         println!("  Action required: now set up the other node ({peer_name}).");
         println!("======================================================================");
-        println!("  This node is configured and is now waiting for {peer_name} to connect.");
-        println!("  Nothing else happens until you set it up.");
+        println!("  This host is configured and is now waiting for {peer_name} to connect.");
+        println!(
+            "  Keep this window open: this host waits up to {} minutes for {peer_name}.",
+            PEER_WAIT_SECS / 60
+        );
+        println!("  If {peer_name} is set up later, it copies the whole disk from this host");
+        println!("  (hours for large disks). Do not press Ctrl-C here. If this window closes");
+        println!("  anyway, run `twinstor setup` here again: it offers to start over.");
         println!();
         println!("  On {peer_name}, simply run:");
         println!();
@@ -555,7 +744,7 @@ initiator_iqns = [{iqn_list}]
         println!("  (use --full-sync to promote this node immediately and sync later instead)");
         println!("======================================================================\n");
 
-        if wait_for_drbd_connected(res, 300).await {
+        if wait_for_drbd_connected(res, PEER_WAIT_SECS).await {
             println!("peer connected.");
             peer_connected = true;
             establish_skip_sync(res).await?;
@@ -563,8 +752,14 @@ initiator_iqns = [{iqn_list}]
             println!("promoting (dual-primary)...");
             run_cmd("drbdadm", &["primary", "--force", res]).await?;
         } else {
-            println!("peer did not connect within 5 minutes.");
-            println!("promoting anyway (full sync will happen when peer joins)...");
+            let size = cmd_output("blockdev", &["--getsize64", &backing.display().to_string()])
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            println!(
+                "{}",
+                peer_wait_timeout_text(&peer_name, PEER_WAIT_SECS, size, link_mbps)
+            );
             run_cmd("drbdadm", &["primary", "--force", res]).await?;
         }
     }
@@ -582,6 +777,7 @@ initiator_iqns = [{iqn_list}]
         create_sr(
             local_ip,
             params.peer_ip,
+            &peer_name,
             &iqn,
             &chap_user,
             &chap_password,
@@ -612,6 +808,101 @@ initiator_iqns = [{iqn_list}]
     }
 
     Ok(())
+}
+
+/// The second node must carry the first node's CHAP password: refuse a
+/// missing one, and one the first node's published check value disproves.
+fn second_node_chap_gate(given: Option<&str>, check: Option<&str>, peer: &str) -> Result<()> {
+    let next = format!(
+        "pass the password {peer} printed with --chap-password <password> (it is also in \
+         /etc/twinstor/twinstor.toml on {peer}, key chap_password), or run `twinstor setup` \
+         with no arguments for the wizard"
+    );
+    let why = format!(
+        "with another password the iSCSI login to {peer} fails at the very end, after this \
+         host's disk is wiped; nothing was changed on this host"
+    );
+    match given {
+        None => Err(crate::render::CliError::new(
+            format!("{peer} is already set up and waiting, and this host needs its CHAP password"),
+            next,
+        )
+        .explain(why)
+        .into()),
+        Some(p) if chap_verdict(p, check) == ChapVerdict::Differs => {
+            Err(crate::render::CliError::new(
+                format!("this is not the CHAP password {peer} printed"),
+                next,
+            )
+            .explain(why)
+            .into())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// The second node must run the first node's topology: a pair where one host
+/// replicates over a direct link and the other over the switch alone is not
+/// a supported configuration. None when they agree.
+fn topology_mismatch(
+    first_arbitrated: bool,
+    first_direct: Option<IpAddr>,
+    given_direct: Option<IpAddr>,
+    peer: &str,
+) -> Option<crate::render::CliError> {
+    let flag = first_direct
+        .map(|d| format!("--direct-ip {d}"))
+        .unwrap_or_else(|| "--direct-ip <its direct-link IP>".into());
+    match (first_arbitrated, given_direct) {
+        (true, None) => Some(
+            crate::render::CliError::new(
+                format!(
+                    "{peer} runs in arbitrated mode (a direct cable between the two hosts), and \
+                     this command sets up fate-shared mode; nothing was changed"
+                ),
+                format!("add {flag} to this command"),
+            )
+            .explain("both hosts of a pair must use the same topology"),
+        ),
+        (false, Some(_)) => Some(
+            crate::render::CliError::new(
+                format!(
+                    "{peer} runs in fate-shared mode (one network), and this command sets up a \
+                     direct link; nothing was changed"
+                ),
+                "drop --direct-ip from this command",
+            )
+            .explain("both hosts of a pair must use the same topology"),
+        ),
+        (true, Some(given)) if first_direct.is_some_and(|f| f != given) => {
+            Some(crate::render::CliError::new(
+                format!(
+                    "--direct-ip {given} is not {peer}'s end of the direct link; nothing was \
+                     changed"
+                ),
+                format!("use {flag}"),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The SR-creation failure when the first node's iSCSI target never accepts
+/// this host's login: almost always a CHAP password that differs from the
+/// first node's, or a first node whose service is not running.
+fn iscsi_login_refused(peer_name: &str, peer_ip: IpAddr) -> crate::render::CliError {
+    crate::render::CliError::new(
+        format!("{peer_name} ({peer_ip}) refused the iSCSI login after {PROBE_ATTEMPTS} attempts"),
+        format!(
+            "check the CHAP password on both hosts (chap_password in \
+             /etc/twinstor/twinstor.toml) and that `systemctl status twinstor` shows it active \
+             on {peer_name}; then run `twinstor setup` here again (it offers to run setup again)"
+        ),
+    )
+    .explain(format!(
+        "most likely the CHAP password given here differs from the one {peer_name} printed, \
+         or the twinstor service is not running on {peer_name}"
+    ))
 }
 
 /// Hostnames matter: drbdadm matches `on <name>` sections against `uname -n`,
@@ -667,6 +958,115 @@ async fn local_xapi_hostname() -> Option<String> {
     .await
     .ok()
     .filter(|n| !n.is_empty())
+}
+
+/// What setup sees of an existing installation, read before it changes
+/// anything.
+pub(crate) struct PairState {
+    /// The pool has a TwinStor SR: the pair holds real data.
+    pub sr_exists: bool,
+    /// This host's DRBD disk is UpToDate (the resource is up here).
+    pub local_uptodate: bool,
+    /// The peer's disk is UpToDate as this host sees it right now.
+    pub peer_uptodate: bool,
+}
+
+pub(crate) async fn twinstor_sr_exists() -> bool {
+    cmd_output(
+        "xe",
+        &["sr-list", "name-label=twinstor", "params=uuid", "--minimal"],
+    )
+    .await
+    .ok()
+    .is_some_and(|u| !u.trim().is_empty())
+}
+
+pub(crate) async fn live_pair_state() -> PairState {
+    let status = tokio::process::Command::new("drbdadm")
+        .args(["status", "twinstor-data"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| crate::drbd::parse_drbdadm_text(&String::from_utf8_lossy(&o.stdout)).ok());
+    use crate::drbd::DiskState::UpToDate;
+    PairState {
+        sr_exists: twinstor_sr_exists().await,
+        local_uptodate: status.as_ref().is_some_and(|s| s.disk == UpToDate),
+        peer_uptodate: status
+            .as_ref()
+            .is_some_and(|s| s.peer_disk == Some(UpToDate)),
+    }
+}
+
+/// The CHAP password of the current configuration, if any.
+fn existing_chap_password() -> Option<String> {
+    crate::config::Config::load(Path::new(CONFIG_PATH))
+        .ok()
+        .and_then(|c| c.iscsi.chap_password)
+}
+
+/// Whether a setup run may go on, given what already exists.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RerunGuard {
+    /// No TwinStor SR yet (a first install, or one that stopped part-way),
+    /// or a deliberate rebuild of this host from a peer that holds the data.
+    Proceed,
+    /// A live SR and no rebuild asked: an accidental re-run.
+    LiveSr,
+    /// A rebuild asked while this host holds the only current copy: wiping
+    /// it would lose the data.
+    OnlyCurrentCopy,
+}
+
+pub(crate) fn rerun_guard(
+    sr_exists: bool,
+    full_sync: bool,
+    local_uptodate: bool,
+    peer_uptodate: bool,
+) -> RerunGuard {
+    if backing_wipe_blocked(sr_exists, full_sync) {
+        RerunGuard::LiveSr
+    } else if sr_exists && local_uptodate && !peer_uptodate {
+        RerunGuard::OnlyCurrentCopy
+    } else {
+        RerunGuard::Proceed
+    }
+}
+
+/// The refusal for a guard that stops setup, with the way out.
+pub(crate) fn rerun_refusal(guard: RerunGuard, peer: &str) -> Option<crate::render::CliError> {
+    match guard {
+        RerunGuard::Proceed => None,
+        RerunGuard::LiveSr => Some(
+            crate::render::CliError::new(
+                "this pool already has a TwinStor SR, so this host's copy is live; nothing was \
+                 changed",
+                format!(
+                    "if the pair works, there is nothing to do (check it with `twinstor status`). \
+                     To rebuild only this host's copy from {peer} (it keeps serving), run \
+                     `twinstor setup` again and accept the rebuild, or pass --full-sync"
+                ),
+            )
+            .explain(
+                "running setup again erases this host's TwinStor disk and copies it back from \
+                 the other host",
+            ),
+        ),
+        RerunGuard::OnlyCurrentCopy => Some(
+            crate::render::CliError::new(
+                format!(
+                    "this host holds the only current copy of the data ({peer}'s copy is not \
+                     UpToDate); nothing was changed"
+                ),
+                format!(
+                    "wait until `twinstor status` shows both copies UpToDate, then rebuild, or \
+                     rebuild {peer} instead (run `twinstor setup` there)"
+                ),
+            )
+            .explain("rebuilding this host would erase the only good copy"),
+        ),
+    }
 }
 
 /// Whether to block the destructive backing-device wipe on a setup re-run.
@@ -1270,6 +1670,7 @@ const PROBE_RETRY_SECS: u64 = 2;
 async fn create_sr(
     local_ip: IpAddr,
     peer_ip: IpAddr,
+    peer_name: &str,
     iqn: &str,
     chap_user: &str,
     chap_password: &str,
@@ -1369,12 +1770,8 @@ async fn create_sr(
             }
         }
 
-        let scsi_id = match scsi_id {
-            Some(id) => id,
-            None => bail!(
-                "could not determine SCSI ID from iSCSI probe after {PROBE_ATTEMPTS} attempts \
-                 (peer target {peer_ip} not answering CHAP discovery)"
-            ),
+        let Some(scsi_id) = scsi_id else {
+            return Err(iscsi_login_refused(peer_name, peer_ip).into());
         };
         println!("  SCSI ID: {scsi_id}");
 
@@ -1466,6 +1863,11 @@ async fn create_sr(
     }
     if redundant {
         println!("  both paths active: storage is redundant");
+    } else if receiving_copy_now().await {
+        println!(
+            "  one path active until this host's copy is complete; the second appears after \
+             the copy"
+        );
     } else {
         println!(
             "  one path active for now; the daemon's path watchdog will add the second shortly"
@@ -1533,6 +1935,15 @@ async fn create_sr(
     println!("you can now create VMs on this SR.");
 
     Ok(())
+}
+
+/// This host's DRBD resource is receiving its copy from the peer right now.
+async fn receiving_copy_now() -> bool {
+    tokio::process::Command::new("drbdadm")
+        .args(["status", "twinstor-data"])
+        .output()
+        .await
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("SyncTarget"))
 }
 
 fn extract_scsi_id(text: &str) -> Option<String> {
@@ -1614,6 +2025,47 @@ async fn open_firewall_ports(drbd_port: u16) {
                 .await;
         }
     }
+}
+
+/// How long the first node waits for the second before it promotes alone.
+/// Long enough to read the second host's prompts, free its disks and paste
+/// the CHAP password; after it, the second host copies the whole disk.
+const PEER_WAIT_SECS: u64 = 30 * 60;
+
+/// A rough duration for copying `bytes` over a `link_mbps` link, for the
+/// operator ("about 1 h 30 min"); DRBD's resync reaches most of the link.
+pub(crate) fn full_copy_estimate(bytes: u64, link_mbps: u32) -> String {
+    let usable_bytes_per_sec = (u64::from(link_mbps) * 1_000_000 / 8) * 8 / 10;
+    let secs = bytes / usable_bytes_per_sec.max(1);
+    let (h, m) = (secs / 3600, (secs % 3600).div_ceil(60));
+    match (h, m) {
+        (0, m) => format!("about {} min", m.max(1)),
+        (h, 0) => format!("about {h} h"),
+        (h, m) => format!("about {h} h {m} min"),
+    }
+}
+
+/// What the first node says when the second did not connect in time.
+fn peer_wait_timeout_text(
+    peer: &str,
+    waited_secs: u64,
+    bytes: Option<u64>,
+    link_mbps: Option<u32>,
+) -> String {
+    let copy = match (bytes, link_mbps) {
+        (Some(b), Some(l)) => format!(
+            " ({} for {} GB at {l} Mb/s)",
+            full_copy_estimate(b, l),
+            b / 1_000_000_000
+        ),
+        _ => " (hours for large disks)".to_string(),
+    };
+    format!(
+        "{peer} did not connect within {} minutes. This host now serves alone; when\n\
+         {peer} is set up, it copies the whole disk from this host{copy}.\n\
+         promoting this host...",
+        waited_secs / 60
+    )
 }
 
 async fn wait_for_peer(peer_ip: IpAddr, drbd_port: u16, timeout_secs: u64) -> bool {
@@ -1779,6 +2231,11 @@ pub struct SharedSetup {
     /// UUID of the host that published this, so a first-node re-run does not
     /// mistake its own handoff for an inherited one.
     pub publisher_uuid: String,
+    /// A short check value of the first node's CHAP password
+    /// (`chap_check_value`), so the second node can tell a wrong paste before
+    /// it wipes anything. None from a first node that predates it: the paste
+    /// is then accepted unchecked, as before.
+    pub chap_check: Option<String>,
 }
 
 impl SharedSetup {
@@ -1794,7 +2251,7 @@ impl SharedSetup {
             .join(",");
         let direct = self.direct_ip.map(|d| d.to_string()).unwrap_or_default();
         format!(
-            "v=1;arbitrated={};peer_ip={};direct_ip={};ping={};full_sync={};drbd_port={};chap_user={};publisher={}",
+            "v=1;arbitrated={};peer_ip={};direct_ip={};ping={};full_sync={};drbd_port={};chap_user={};publisher={};chap_check={}",
             self.arbitrated as u8,
             self.peer_ip,
             direct,
@@ -1803,6 +2260,7 @@ impl SharedSetup {
             self.drbd_port,
             self.chap_user,
             self.publisher_uuid,
+            self.chap_check.as_deref().unwrap_or_default(),
         )
     }
 
@@ -1840,8 +2298,131 @@ impl SharedSetup {
             drbd_port: map.get("drbd_port")?.parse().ok()?,
             chap_user: map.get("chap_user")?.to_string(),
             publisher_uuid: map.get("publisher")?.to_string(),
+            // An added key, so the format stays v=1: an older second node
+            // ignores it, and an older first node simply does not publish it.
+            chap_check: map
+                .get("chap_check")
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_string()),
         })
     }
+}
+
+/// SHA-256 of `data` (FIPS 180-4). Only for the CHAP check value below, which
+/// does not justify a crypto dependency.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in block.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// The check value the first node publishes for its CHAP password: the first
+/// 8 hex digits of SHA-256 over a fixed prefix and the password. Enough to
+/// catch a wrong or truncated paste on the second node, too short to say
+/// anything useful about the password itself.
+pub(crate) fn chap_check_value(password: &str) -> String {
+    sha256(format!("twinstor-chap:{password}").as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// What a CHAP password typed on the second node is worth against the check
+/// value the first node published.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChapVerdict {
+    /// It is the first node's password.
+    Matches,
+    /// It is not: setup would fail at the very end, after the wipe.
+    Differs,
+    /// The first node published no check value (an older version): accepted
+    /// unchecked.
+    Unchecked,
+}
+
+pub(crate) fn chap_verdict(password: &str, published: Option<&str>) -> ChapVerdict {
+    match published {
+        None => ChapVerdict::Unchecked,
+        Some(c) if c.eq_ignore_ascii_case(&chap_check_value(password)) => ChapVerdict::Matches,
+        Some(_) => ChapVerdict::Differs,
+    }
+}
+
+/// A CHAP password as pasted: surrounding blanks and quotes dropped, and the
+/// `CHAP password:` label removed when the whole line was copied from the
+/// first node's banner.
+pub(crate) fn normalize_chap_paste(raw: &str) -> String {
+    let mut s = raw.trim();
+    let label = "chap password";
+    if s.len() >= label.len()
+        && s.is_char_boundary(label.len())
+        && s[..label.len()].eq_ignore_ascii_case(label)
+    {
+        s = s[label.len()..].trim_start().trim_start_matches(':').trim();
+    }
+    s.trim_matches(|c| c == '"' || c == '\'').trim().to_string()
 }
 
 async fn pool_uuid() -> Option<String> {
@@ -1873,6 +2454,24 @@ async fn publish_shared_setup(s: &SharedSetup) {
 /// published by this host (a first-node re-run reading its own handoff). Only a
 /// real second node gets a value back, so the wizard can key inheritance on it.
 pub async fn inherited_shared_setup() -> Option<SharedSetup> {
+    let s = published_shared_setup().await?;
+    if local_host_uuid().await.as_deref() == Some(s.publisher_uuid.as_str()) {
+        return None; // our own handoff: we are the first node re-running
+    }
+    Some(s)
+}
+
+/// Whether this host published the handoff that is in the pool DB now: it
+/// is the first node, and the second has not created the SR yet.
+pub(crate) async fn own_shared_setup_published() -> bool {
+    match (published_shared_setup().await, local_host_uuid().await) {
+        (Some(s), Some(me)) => s.publisher_uuid == me,
+        _ => false,
+    }
+}
+
+/// The handoff in the pool DB, whoever published it.
+async fn published_shared_setup() -> Option<SharedSetup> {
     let pool = pool_uuid().await?;
     let raw = cmd_output(
         "xe",
@@ -1885,11 +2484,7 @@ pub async fn inherited_shared_setup() -> Option<SharedSetup> {
     )
     .await
     .ok()?;
-    let s = SharedSetup::decode(&raw)?;
-    if local_host_uuid().await.as_deref() == Some(s.publisher_uuid.as_str()) {
-        return None; // our own handoff: we are the first node re-running
-    }
-    Some(s)
+    SharedSetup::decode(&raw)
 }
 
 /// Remove the shared-setup handoff key. Called once the cluster is formed (the
@@ -3383,7 +3978,7 @@ mod tests {
         }
     }
     use super::{
-        SharedSetup, drbd_topology, ha_timeout_secs, iqn_is_lio_compatible,
+        SharedSetup, chap_check_value, drbd_topology, ha_timeout_secs, iqn_is_lio_compatible,
         patch_lvm_global_filter, peer_uuid_from_pool, resync_fill_target, resync_min_rate,
         sanitize_iqn,
     };
@@ -3479,6 +4074,7 @@ mod tests {
             drbd_port: 7789,
             chap_user: "twinstor".to_string(),
             publisher_uuid: "5e5e0004-0000-4000-8000-000000000004".to_string(),
+            chap_check: Some(chap_check_value("s3cret")),
         };
         assert_eq!(SharedSetup::decode(&s.encode()), Some(s));
     }
@@ -3494,6 +4090,7 @@ mod tests {
             drbd_port: 7790,
             chap_user: "twinstor".to_string(),
             publisher_uuid: "abc".to_string(),
+            chap_check: None,
         };
         assert_eq!(SharedSetup::decode(&s.encode()), Some(s));
     }
@@ -3923,5 +4520,241 @@ resource twinstor-data {
         let p = parse_res_file(v0, "twinstor-2", "twinstor-1");
         assert_eq!(p.local_backing.as_deref(), Some("/dev/disk/by-id/nvme-Z"));
         assert_eq!(p.drbd_dev.as_deref(), Some("/dev/drbd0"));
+    }
+}
+
+#[cfg(test)]
+mod setup_flow_tests {
+    use super::*;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn sha256_matches_the_standard_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Two blocks: the padding spills into a second one.
+        assert_eq!(
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn chap_check_is_short_stable_and_discriminating() {
+        let c = chap_check_value("Abcdef0123456789");
+        assert_eq!(c.len(), 8);
+        assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(c, chap_check_value("Abcdef0123456789"));
+        assert_ne!(c, chap_check_value("Abcdef012345678"), "a truncated paste");
+        assert_ne!(c, chap_check_value("abcdef0123456789"), "a case slip");
+    }
+
+    #[test]
+    fn chap_verdict_checks_only_when_a_value_was_published() {
+        let check = chap_check_value("right");
+        assert_eq!(chap_verdict("right", Some(&check)), ChapVerdict::Matches);
+        assert_eq!(
+            chap_verdict("right", Some(&check.to_uppercase())),
+            ChapVerdict::Matches
+        );
+        assert_eq!(chap_verdict("wrong", Some(&check)), ChapVerdict::Differs);
+        // A first node that predates the check value: accepted unchecked.
+        assert_eq!(chap_verdict("anything", None), ChapVerdict::Unchecked);
+    }
+
+    #[test]
+    fn pasted_chap_lines_are_cleaned() {
+        assert_eq!(normalize_chap_paste("  Xy12  "), "Xy12");
+        assert_eq!(normalize_chap_paste("CHAP password:  Xy12"), "Xy12");
+        assert_eq!(normalize_chap_paste("chap password: \"Xy12\""), "Xy12");
+        assert_eq!(normalize_chap_paste("'Xy12'"), "Xy12");
+        assert_eq!(normalize_chap_paste(""), "");
+        assert_eq!(normalize_chap_paste("CHAP password:"), "");
+        // A password that merely starts like the label is kept whole.
+        assert_eq!(normalize_chap_paste("chapXy12"), "chapXy12");
+    }
+
+    #[test]
+    fn second_node_refuses_a_missing_or_disproved_password() {
+        let check = chap_check_value("right");
+        let err = second_node_chap_gate(None, Some(&check), "host-a").unwrap_err();
+        let g = err
+            .downcast_ref::<crate::render::CliError>()
+            .expect("guidance");
+        assert!(g.to_string().contains("host-a"), "{g}");
+        let err = second_node_chap_gate(Some("wrong"), Some(&check), "host-a")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not the CHAP password host-a printed"),
+            "{err}"
+        );
+        assert!(second_node_chap_gate(Some("right"), Some(&check), "host-a").is_ok());
+        // No check value published (an older first node): only the empty
+        // password is refused.
+        assert!(second_node_chap_gate(Some("x"), None, "host-a").is_ok());
+        assert!(second_node_chap_gate(None, None, "host-a").is_err());
+    }
+
+    #[test]
+    fn handoff_without_a_check_value_still_decodes() {
+        // As a first node before the check value existed published it.
+        let old = "v=1;arbitrated=0;peer_ip=192.0.2.20;direct_ip=;ping=;full_sync=0;\
+                   drbd_port=7789;chap_user=twinstor;publisher=abc";
+        let s = SharedSetup::decode(old).expect("decodes");
+        assert_eq!(s.chap_check, None);
+    }
+
+    #[test]
+    fn iscsi_refusal_names_chap_and_the_service() {
+        let e = iscsi_login_refused("host-a", "192.0.2.11".parse().unwrap());
+        let text = format!("{e} {e:?}");
+        assert!(text.contains("refused the iSCSI login"), "{text}");
+        assert!(text.contains("CHAP password"), "{text}");
+        assert!(text.contains("systemctl status twinstor"), "{text}");
+    }
+
+    #[test]
+    fn rerun_guard_protects_a_live_pair() {
+        // Fresh install, or one that stopped before the SR existed.
+        assert_eq!(rerun_guard(false, false, false, false), RerunGuard::Proceed);
+        assert_eq!(rerun_guard(false, false, true, true), RerunGuard::Proceed);
+        // A live SR and no rebuild asked: an accidental re-run.
+        assert_eq!(rerun_guard(true, false, true, true), RerunGuard::LiveSr);
+        // A rebuild from a peer that holds the data.
+        assert_eq!(rerun_guard(true, true, true, true), RerunGuard::Proceed);
+        // A rebuild of the host that holds the only current copy.
+        assert_eq!(
+            rerun_guard(true, true, true, false),
+            RerunGuard::OnlyCurrentCopy
+        );
+        // This host's copy is not current (down, or still syncing): the
+        // rebuild is what it needs.
+        assert_eq!(rerun_guard(true, true, false, false), RerunGuard::Proceed);
+    }
+
+    #[test]
+    fn rerun_refusals_say_nothing_changed_and_the_way_out() {
+        assert!(rerun_refusal(RerunGuard::Proceed, "host-a").is_none());
+        let live = rerun_refusal(RerunGuard::LiveSr, "host-a").expect("refused");
+        let text = format!("{live} {live:?}");
+        assert!(text.contains("nothing was changed"), "{text}");
+        assert!(text.contains("--full-sync"), "{text}");
+        assert!(text.contains("twinstor status"), "{text}");
+        let only = rerun_refusal(RerunGuard::OnlyCurrentCopy, "host-a").expect("refused");
+        let text = format!("{only} {only:?}");
+        assert!(text.contains("only current copy"), "{text}");
+        assert!(text.contains("host-a"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_after_the_first_change_says_how_to_resume() {
+        let e = part_way_failure(anyhow::anyhow!("wipefs failed"), true);
+        let g = e
+            .downcast_ref::<crate::render::CliError>()
+            .expect("guidance attached");
+        let text = format!("{g:?}");
+        assert!(text.contains("twinstor setup"), "{text}");
+        assert!(text.contains("twinstor uninstall"), "{text}");
+        assert!(e.chain().any(|c| c.to_string() == "wipefs failed"));
+        // Before any change, the error stays as it is.
+        let e = part_way_failure(anyhow::anyhow!("bad flag"), false);
+        assert!(e.downcast_ref::<crate::render::CliError>().is_none());
+        // An error with its own guidance keeps it.
+        let own: anyhow::Error = crate::render::CliError::new("refused", "do this").into();
+        let e = part_way_failure(own, true);
+        assert_eq!(e.to_string(), "refused");
+    }
+
+    #[test]
+    fn full_copy_estimates_read_naturally() {
+        // 500 GB at 1 Gb/s: about 83 min at 80 % of the link.
+        assert_eq!(
+            full_copy_estimate(500_000_000_000, 1000),
+            "about 1 h 24 min"
+        );
+        assert_eq!(full_copy_estimate(1_000_000_000, 10_000), "about 1 min");
+        assert_eq!(full_copy_estimate(3_600_000_000_000, 10_000), "about 1 h");
+        // An unknown speed reported as 0 does not divide by zero.
+        assert!(full_copy_estimate(1, 0).starts_with("about"));
+    }
+
+    #[test]
+    fn the_wait_timeout_says_what_happens_next() {
+        let t = peer_wait_timeout_text("host-b", PEER_WAIT_SECS, Some(500_000_000_000), Some(1000));
+        assert!(t.contains("within 30 minutes"), "{t}");
+        assert!(t.contains("serves alone"), "{t}");
+        assert!(t.contains("500 GB at 1000 Mb/s"), "{t}");
+        let t = peer_wait_timeout_text("host-b", PEER_WAIT_SECS, None, Some(1000));
+        assert!(t.contains("hours for large disks"), "{t}");
+    }
+
+    #[test]
+    fn the_second_host_must_follow_the_first_hosts_topology() {
+        let d: IpAddr = "10.99.99.1".parse().unwrap();
+        let other: IpAddr = "10.99.99.5".parse().unwrap();
+        let e = topology_mismatch(true, Some(d), None, "host-a").expect("refused");
+        assert!(format!("{e:?}").contains("--direct-ip 10.99.99.1"), "{e:?}");
+        assert!(topology_mismatch(false, None, Some(d), "host-a").is_some());
+        assert!(topology_mismatch(true, Some(d), Some(other), "host-a").is_some());
+        assert!(topology_mismatch(true, Some(d), Some(d), "host-a").is_none());
+        assert!(topology_mismatch(false, None, None, "host-a").is_none());
+        // A first node that published no direct-link address: any is taken.
+        assert!(topology_mismatch(true, None, Some(other), "host-a").is_none());
+    }
+
+    #[test]
+    fn the_flag_path_confirms_before_erasing() {
+        assert_eq!(confirmation(true, false, false), Confirmation::Given);
+        assert_eq!(confirmation(false, true, false), Confirmation::Given);
+        assert_eq!(confirmation(false, false, true), Confirmation::Ask);
+        assert_eq!(confirmation(false, false, false), Confirmation::Refuse);
+    }
+
+    fn params(direct: Option<&str>, chap: Option<&str>) -> SetupParams {
+        SetupParams {
+            peer_ip: "192.0.2.12".parse().unwrap(),
+            backing_device: Some("/dev/disk/by-id/wwn-0x5000".into()),
+            local_ip: None,
+            drbd_port: None,
+            full_sync: false,
+            chap_password: chap.map(String::from),
+            ping_targets: vec!["192.0.2.250".parse().unwrap()],
+            direct_ip: direct.map(|d| d.parse().unwrap()),
+            allow_no_tiebreaker: false,
+            from_wizard: true,
+            yes: true,
+            force_device: false,
+        }
+    }
+
+    #[test]
+    fn the_equivalent_command_repeats_every_choice() {
+        assert_eq!(
+            equivalent_command(&params(Some("10.99.99.2"), None)),
+            "twinstor setup --peer-ip 192.0.2.12 --backing-device /dev/disk/by-id/wwn-0x5000 \
+             --direct-ip 10.99.99.2 --ping-target 192.0.2.250 --yes"
+        );
+        let mut p = params(None, Some("Xy12"));
+        p.full_sync = true;
+        p.drbd_port = Some(7790);
+        p.allow_no_tiebreaker = true;
+        assert_eq!(
+            equivalent_command(&p),
+            "twinstor setup --peer-ip 192.0.2.12 --backing-device /dev/disk/by-id/wwn-0x5000 \
+             --ping-target 192.0.2.250 --drbd-port 7790 --full-sync --chap-password Xy12 \
+             --allow-no-tiebreaker --yes"
+        );
     }
 }

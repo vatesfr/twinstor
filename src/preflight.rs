@@ -120,25 +120,39 @@ async fn host_name(uuid: &str) -> String {
 }
 
 /// Run the checks and print the checklist. Errors only on what makes setup
-/// impossible (no pool of two); warnings ask before going on.
-pub(crate) async fn run() -> Result<()> {
+/// impossible (no pool of two); warnings ask before going on when
+/// `interactive`, and are only printed on the non-interactive path (the
+/// operator who scripted the command decides from the output).
+pub(crate) async fn run(interactive: bool) -> Result<()> {
     println!(
         "Checking the requirements (https://docs.vates.tech/tech-preview/twinstor/installation/#requirements):"
     );
 
-    // 1. A pool of exactly two hosts.
-    let Some(list) = xe(&["host-list", "--minimal"]).await else {
-        bail!(
-            "XAPI does not answer on this host, so the pool cannot be read. Restart the \
-             toolstack (xe-toolstack-restart), wait a minute, and run setup again."
-        );
+    // 1. A pool of exactly two hosts. When this host is alone, the wizard
+    // offers to run the join itself, then checks again.
+    let hosts = loop {
+        let Some(list) = xe(&["host-list", "--minimal"]).await else {
+            bail!(
+                "XAPI does not answer on this host, so the pool cannot be read. Restart the \
+                 toolstack (xe-toolstack-restart), wait a minute, and run setup again."
+            );
+        };
+        let hosts: Vec<String> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(String::from)
+            .collect();
+        if interactive && pool_verdict(hosts.len()) == PoolVerdict::Alone {
+            println!(
+                "  [FAIL] this host is alone in its pool; TwinStor pairs two hosts of one pool."
+            );
+            if crate::pool_join::offer().await? {
+                continue;
+            }
+        }
+        break hosts;
     };
-    let hosts: Vec<String> = list
-        .split(',')
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .map(String::from)
-        .collect();
     match pool_verdict(hosts.len()) {
         PoolVerdict::Pair => {
             let (a, b) = (host_name(&hosts[0]).await, host_name(&hosts[1]).await);
@@ -229,7 +243,9 @@ pub(crate) async fn run() -> Result<()> {
     println!("  [info] set \"Restore on AC power loss\" to Power On in both hosts' BIOS, so the");
     println!("         pool comes back by itself after a power cut (not checkable from here).");
 
-    if warned && !crate::wizard::ask_yes_no("\nContinue the setup anyway?", false)? {
+    if warned && !interactive {
+        println!("  (non-interactive: going on despite the warnings above)");
+    } else if warned && !crate::wizard::ask_yes_no("\nContinue the setup anyway?", false)? {
         bail!("setup stopped at the requirements check; fix the warnings above and run it again");
     }
     println!();

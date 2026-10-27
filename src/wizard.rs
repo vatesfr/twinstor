@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -33,17 +33,23 @@ fn print_banner() {
 }
 
 /// Ask a question; empty input returns the default (when there is one).
-fn ask(question: &str, default: Option<&str>) -> Result<String> {
+pub(crate) fn ask(question: &str, default: Option<&str>) -> Result<String> {
     match default {
         Some(d) if !d.is_empty() => print!("{question} [{d}]: "),
         _ => print!("{question}: "),
     }
     std::io::stdout().flush()?;
     let mut line = String::new();
-    std::io::stdin()
+    let read = std::io::stdin()
         .lock()
         .read_line(&mut line)
         .context("reading input")?;
+    // End of input (Ctrl-D, a closed pipe): stop instead of looping on a
+    // question that has no default.
+    if read == 0 {
+        println!();
+        bail!("input closed; nothing more was changed");
+    }
     let line = line.trim().to_string();
     if line.is_empty() {
         Ok(default.unwrap_or("").to_string())
@@ -837,6 +843,132 @@ fn candidate_disks() -> Vec<CandidateDisk> {
     out
 }
 
+/// What setup knows about a device given with `--backing-device`, to tell
+/// why the wizard would not offer it.
+#[derive(Debug, Default)]
+struct DeviceFacts {
+    /// The wizard's list offers it.
+    offered: bool,
+    /// Mounted, or used as swap.
+    busy: bool,
+    /// A local SR sits on it (its name, or its uuid).
+    sr: Option<String>,
+    lvm_pv: bool,
+    /// Something is stacked on it (DRBD, multipath, md, device-mapper).
+    holders: bool,
+    /// A partition of the system disk or of a dormant XCP-ng install disk
+    /// that is not labelled for TwinStor.
+    on_os_disk: bool,
+    /// A whole disk that carries a partition table.
+    has_partitions: bool,
+}
+
+/// Why setup refuses a device the wizard would not offer, or None when the
+/// wizard would offer it. Free of I/O so it can be unit-tested.
+fn device_refusal(f: &DeviceFacts) -> Option<String> {
+    if f.offered {
+        return None;
+    }
+    Some(if f.busy {
+        "it is mounted or used as swap".to_string()
+    } else if let Some(sr) = &f.sr {
+        format!("it holds the local SR \"{sr}\"")
+    } else if f.lvm_pv {
+        "it is an LVM physical volume (an SR or a volume group uses it)".to_string()
+    } else if f.holders {
+        "something is stacked on it (DRBD, multipath, md RAID or LVM)".to_string()
+    } else if f.on_os_disk {
+        "it is on the system disk (there, only a partition labelled for TwinStor is used)"
+            .to_string()
+    } else if f.has_partitions {
+        "it has partitions: give one of them, or clear the partition table first (wipefs -a)"
+            .to_string()
+    } else {
+        "it is not a free local disk or partition (too small, or not a local block device)"
+            .to_string()
+    })
+}
+
+/// The `/sys/class/block` directory of a canonical `/dev/<name>` path.
+fn sys_block(canon: &Path) -> Option<PathBuf> {
+    let name = canon.file_name()?.to_string_lossy().to_string();
+    Some(PathBuf::from(format!("/sys/class/block/{name}")))
+}
+
+/// Why `dev` is not a device the wizard would offer as the backing device,
+/// or None when it is. A device that cannot be resolved is left to setup's
+/// own existence check.
+pub(crate) fn backing_device_refusal(dev: &Path) -> Option<String> {
+    let canon = std::fs::canonicalize(dev).ok()?;
+    let offered = candidate_disks()
+        .iter()
+        .any(|d| std::fs::canonicalize(format!("/dev/{}", d.kernel)).is_ok_and(|c| c == canon));
+    let sys = sys_block(&canon)?;
+    let is_partition = sys.join("partition").exists();
+    let has_children = |p: &Path| {
+        std::fs::read_dir(p)
+            .map(|d| d.flatten().any(|c| c.path().join("partition").exists()))
+            .unwrap_or(false)
+    };
+    // The whole disk a partition belongs to: its parent directory in sysfs.
+    let parent = if is_partition {
+        std::fs::canonicalize(&sys).ok().and_then(|p| {
+            p.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+        })
+    } else {
+        None
+    };
+    let os_disks = xcp_os_disks();
+    let system = system_disk();
+    let facts = DeviceFacts {
+        offered,
+        busy: busy_sources().contains(&canon),
+        sr: local_sr_blockers()
+            .into_iter()
+            .find(|b| std::fs::canonicalize(&b.dev).is_ok_and(|c| c == canon))
+            .map(|b| b.name.unwrap_or(b.uuid)),
+        lvm_pv: lvm_pv_paths().contains(&canon),
+        holders: std::fs::read_dir(sys.join("holders"))
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false),
+        on_os_disk: parent
+            .as_ref()
+            .is_some_and(|p| os_disks.contains(p) || system.as_ref() == Some(p)),
+        has_partitions: !is_partition && has_children(&sys),
+    };
+    device_refusal(&facts)
+}
+
+/// "/dev/sdb, 1920 GB, PERC H755N" for the confirmation prompt.
+pub(crate) fn describe_device(dev: &Path) -> String {
+    let Ok(canon) = std::fs::canonicalize(dev) else {
+        return dev.display().to_string();
+    };
+    let mut parts = vec![canon.display().to_string()];
+    if let Some(sys) = sys_block(&canon) {
+        if let Some(gb) = std::fs::read_to_string(sys.join("size"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|sectors| sectors * 512 / 1_000_000_000)
+        {
+            parts.push(format!("{gb} GB"));
+        }
+        let model_dir = if sys.join("partition").exists() {
+            sys.join("../device")
+        } else {
+            sys.join("device")
+        };
+        if let Ok(m) = std::fs::read_to_string(model_dir.join("model"))
+            && !m.trim().is_empty()
+        {
+            parts.push(m.trim().to_string());
+        }
+    }
+    parts.join(", ")
+}
+
 /// Parse `parted -m <dev> unit B print free` machine output into the
 /// unallocated ("free") regions as (start, end, size) byte triples, largest
 /// first. Each machine line is `num:start:end:size:fs:name:flags;`; a free
@@ -945,6 +1077,53 @@ async fn two_host_pool() -> Option<(String, String)> {
     match (this_uuid, peer_uuid) {
         (Some(t), Some(p)) if others == 1 => Some((t, p)),
         _ => None,
+    }
+}
+
+/// The other host's hostname, for messages ("paste the password <name>
+/// printed"); None when the pool cannot be read.
+async fn peer_host_name() -> Option<String> {
+    let (_, peer) = two_host_pool().await?;
+    cmd_output(
+        "xe",
+        &[
+            "host-param-get",
+            &format!("uuid={peer}"),
+            "param-name=hostname",
+        ],
+    )
+    .await
+    .ok()
+    .map(|n| n.trim().to_string())
+    .filter(|n| !n.is_empty())
+}
+
+/// Ask for the CHAP password on the second node until the paste is plausible:
+/// never empty (Enter would generate a new password that the first node's
+/// target refuses at the very end), and equal to the first node's when it
+/// published a check value.
+fn ask_second_node_chap(peer: &str, check: Option<&str>) -> Result<String> {
+    use crate::setup::{ChapVerdict, chap_verdict, normalize_chap_paste};
+    loop {
+        let raw = ask(
+            &format!("CHAP password (paste the one {peer} printed)"),
+            None,
+        )?;
+        let pw = normalize_chap_paste(&raw);
+        if pw.is_empty() {
+            println!(
+                "  Paste the CHAP password that {peer} printed (it is required on this host)."
+            );
+            continue;
+        }
+        if chap_verdict(&pw, check) == ChapVerdict::Differs {
+            println!(
+                "  This is not the password {peer} printed. Paste it again (it is also in\n\
+                 \x20 /etc/twinstor/twinstor.toml on {peer}, key chap_password)."
+            );
+            continue;
+        }
+        return Ok(pw);
     }
 }
 
@@ -1089,53 +1268,56 @@ fn is_point_to_point(netmask: &str) -> bool {
     matches!(netmask, "255.255.255.252" | "255.255.255.254")
 }
 
-/// One line per non-management NIC of this host: device, link, IP. Shown
-/// when no direct link is found, so a back-to-back cable without a link (a
-/// DAC whose port is down, a cable in the wrong port) is visible at once.
-async fn nic_link_lines() -> Vec<String> {
-    let Some((this_uuid, _peer)) = two_host_pool().await else {
-        return vec![];
-    };
-    let pifs = cmd_output(
-        "xe",
-        &["pif-list", &format!("host-uuid={this_uuid}"), "--minimal"],
-    )
-    .await
-    .unwrap_or_default();
-    let mut out = Vec::new();
-    for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let p = pif_params(pif).await;
-        if let Some(l) = nic_link_line(&p) {
-            out.push(l);
-        }
-    }
-    out.sort();
-    out
+/// A NIC of this host as a candidate end of a new direct link.
+#[derive(Debug, Clone, PartialEq)]
+struct NicChoice {
+    device: String,
+    speed_mbps: Option<u32>,
+    /// Why it cannot be the direct link; None when it can.
+    exclusion: Option<String>,
 }
 
-fn nic_link_line(p: &std::collections::HashMap<String, String>) -> Option<String> {
-    let device = p.get("device").filter(|d| !d.is_empty())?;
-    if p.get("management").is_some_and(|m| m == "true")
-        || p.get("physical").is_some_and(|m| m == "false")
-    {
-        return None;
-    }
-    let link = if p.get("carrier").is_some_and(|c| c == "true") {
-        "link up"
+/// Why a NIC cannot be offered as an end of a new direct link, from its
+/// `xe pif-param-list` fields and the number of VM interfaces on its pool
+/// network. On XCP-ng a NIC that carries only VM traffic also has a link and
+/// no IP, so "link up, no IP" alone is no evidence of a cable to the peer.
+fn direct_link_exclusion(
+    p: &std::collections::HashMap<String, String>,
+    vifs: usize,
+) -> Option<String> {
+    let set = |k: &str| {
+        p.get(k)
+            .is_some_and(|v| !v.is_empty() && v != "<not in database>")
+    };
+    if let Some(why) = pif_unusable(p) {
+        Some(why.to_string())
+    } else if set("IP") {
+        Some(format!("it already has the address {}", p["IP"]))
+    } else if p.get("carrier").is_none_or(|c| c != "true") {
+        Some("no link (no cable, or the port at the other end is down)".into())
+    } else if set("VLAN-slave-of") {
+        Some("it carries VLAN networks".into())
+    } else if vifs > 0 {
+        Some(format!(
+            "its network carries VM traffic ({vifs} virtual interface(s))"
+        ))
     } else {
-        "no link"
-    };
-    let ip = p
-        .get("IP")
-        .filter(|i| !i.is_empty())
-        .map(|i| format!(", IP {i}"))
-        .unwrap_or_else(|| ", no IP".into());
-    Some(format!("{device}: {link}{ip}"))
+        None
+    }
 }
 
-/// This host's NICs that have a cable/carrier but no IP and aren't the
-/// management interface: candidates for an as-yet-unconfigured direct link.
-async fn carrier_nics_without_ip() -> Vec<String> {
+/// The link speed the kernel reports for `device`, in Mb/s.
+fn nic_speed_mbps(device: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{device}/speed"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|s| *s > 0)
+        .and_then(|s| u32::try_from(s).ok())
+}
+
+/// This host's physical NICs other than the management one, each with the
+/// reason it cannot be a new direct link, if any. Sorted by device.
+async fn direct_link_nics() -> Vec<NicChoice> {
     let Some((this_uuid, _peer)) = two_host_pool().await else {
         return vec![];
     };
@@ -1149,16 +1331,45 @@ async fn carrier_nics_without_ip() -> Vec<String> {
     for pif in pifs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let p = pif_params(pif).await;
         let device = p.get("device").cloned().unwrap_or_default();
-        let has_ip = p.get("IP").map(|s| !s.is_empty()).unwrap_or(false);
-        let carrier = p.get("carrier").map(|s| s == "true").unwrap_or(false);
-        if device.is_empty() || has_ip || !carrier || pif_unusable(&p).is_some() {
+        if device.is_empty()
+            || p.get("management").is_some_and(|m| m == "true")
+            || p.get("physical").is_none_or(|m| m != "true")
+        {
             continue;
         }
-        out.push(device);
+        let vifs = match p.get("network-uuid").filter(|n| !n.is_empty()) {
+            Some(net) => cmd_output(
+                "xe",
+                &["vif-list", &format!("network-uuid={net}"), "--minimal"],
+            )
+            .await
+            .unwrap_or_default()
+            .split(',')
+            .filter(|v| !v.trim().is_empty())
+            .count(),
+            None => 0,
+        };
+        out.push(NicChoice {
+            speed_mbps: nic_speed_mbps(&device),
+            exclusion: direct_link_exclusion(&p, vifs),
+            device,
+        });
     }
-    out.sort();
-    out.dedup();
+    out.sort_by(|a, b| a.device.cmp(&b.device));
+    out.dedup_by(|a, b| a.device == b.device);
     out
+}
+
+/// One line of the NIC list: device, speed, and why it is not offered.
+fn nic_choice_line(n: &NicChoice) -> String {
+    let speed = n
+        .speed_mbps
+        .map(|s| format!("{s} Mb/s"))
+        .unwrap_or_else(|| "speed unknown".into());
+    match &n.exclusion {
+        None => format!("{:<8} {speed}", n.device),
+        Some(why) => format!("{:<8} {speed}, not offered: {why}", n.device),
+    }
 }
 
 /// What resolving a direct link for arbitrated mode produced.
@@ -1166,21 +1377,25 @@ async fn carrier_nics_without_ip() -> Vec<String> {
 enum DirectLinkOutcome {
     /// A second shared network is already usable; carries the peer's IP on it.
     Ready(IpAddr),
-    /// A cabled-but-unconfigured NIC looks like the intended direct link.
-    NeedsConfig { device: String },
+    /// Unconfigured NICs that could be the direct link; the operator picks.
+    NeedsConfig { devices: Vec<String> },
     /// Nothing suitable found.
     None,
 }
 
-/// A ready peer IP wins; otherwise a cabled NIC to configure; otherwise
-/// nothing. Free of I/O so it can be unit-tested.
-fn decide_direct_link(ready_peer_ips: &[IpAddr], carrier_no_ip: &[String]) -> DirectLinkOutcome {
+/// A ready peer IP wins; otherwise the NICs that could take a new link (never
+/// a guess among them); otherwise nothing. Free of I/O so it can be
+/// unit-tested.
+fn decide_direct_link(ready_peer_ips: &[IpAddr], nics: &[NicChoice]) -> DirectLinkOutcome {
+    let devices: Vec<String> = nics
+        .iter()
+        .filter(|n| n.exclusion.is_none())
+        .map(|n| n.device.clone())
+        .collect();
     if let Some(ip) = ready_peer_ips.first() {
         DirectLinkOutcome::Ready(*ip)
-    } else if let Some(dev) = carrier_no_ip.first() {
-        DirectLinkOutcome::NeedsConfig {
-            device: dev.clone(),
-        }
+    } else if !devices.is_empty() {
+        DirectLinkOutcome::NeedsConfig { devices }
     } else {
         DirectLinkOutcome::None
     }
@@ -1487,15 +1702,30 @@ async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bo
         println!("  the peer's {peer_dev} already has {peer_dl}.");
     }
     // Both ends apply their address asynchronously.
+    let mut answered = false;
     for _ in 0..20 {
         if host_ipv4_addrs().await.contains(&local_dl) && ping_once(&peer_dl.to_string()).await {
-            return Ok(());
+            answered = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // A ping also answers through a switch. The bridge's forwarding table
+    // tells a cable (only the peer behind the port) from a switch port
+    // (other devices too); when it cannot be read, the link is taken as is.
+    let foreign = if answered {
+        foreign_macs_on_link(device, &peer_pif)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if answered && foreign.is_empty() {
+        return Ok(());
+    }
     // A wrong pairing (pool networks pair NICs by device name, so the cable
-    // may sit on another NIC of the peer): undo what this run set, so a later
-    // run does not take it for a working link.
+    // may sit on another NIC of the peer), or a switch port: undo what this
+    // run set, so a later run does not take it for a working link.
     let mut undone = Vec::new();
     if action == PeerEnd::Configure && clear_link_end(&peer_pif).await.is_ok() {
         undone.push(format!("the peer's {peer_dev}"));
@@ -1511,10 +1741,66 @@ async fn bring_up_direct_link(device: &str, local_dl: Ipv4Addr, local_is_set: bo
             undone.join(" and ")
         )
     };
+    if !foreign.is_empty() {
+        bail!(
+            "{device} sees {} other device(s) besides the peer: this looks like a switch port, \
+             not a cable between the two hosts.{undone} Pick the NIC that is cabled straight to \
+             the other host. If {device} really is, configure the link by hand:\n{}",
+            foreign.len(),
+            direct_link_instructions(device)
+        );
+    }
     bail!(
         "{peer_dl} does not answer over {device}: the cable may sit on another NIC of the \
          peer than {peer_dev}.{undone} Check the cabling, or {manual}"
     )
+}
+
+/// MACs the bridge learned on `port` other than `allowed`, from
+/// `ovs-appctl fdb/show <bridge>` (`port VLAN MAC age` rows).
+fn foreign_macs(fdb: &str, port: &str, allowed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in fdb.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 3
+            && f[0] == port
+            && !allowed.iter().any(|a| a.eq_ignore_ascii_case(f[2]))
+            && !out.iter().any(|m| m.eq_ignore_ascii_case(f[2]))
+        {
+            out.push(f[2].to_string());
+        }
+    }
+    out
+}
+
+/// The devices other than the peer that this host's bridge has seen behind
+/// `device`; None when the bridge cannot be read (a Linux-bridge network
+/// backend, or the tools fail), so no check is possible.
+async fn foreign_macs_on_link(device: &str, peer_pif: &str) -> Option<Vec<String>> {
+    let local_pif = pif_uuid_for_device(device).await?;
+    let net = pif_params(&local_pif).await.get("network-uuid").cloned()?;
+    let bridge = cmd_output(
+        "xe",
+        &[
+            "network-param-get",
+            &format!("uuid={net}"),
+            "param-name=bridge",
+        ],
+    )
+    .await
+    .ok()?;
+    let port = cmd_output("ovs-vsctl", &["get", "Interface", device, "ofport"])
+        .await
+        .ok()?;
+    let fdb = cmd_output("ovs-appctl", &["fdb/show", bridge.trim()])
+        .await
+        .ok()?;
+    let peer_mac = pif_params(peer_pif)
+        .await
+        .get("MAC")
+        .cloned()
+        .unwrap_or_default();
+    Some(foreign_macs(&fdb, port.trim(), &[peer_mac]))
 }
 
 /// A direct link this wizard configured on this host (tagged
@@ -1570,10 +1856,14 @@ fn default_local_dl(peer_ip: Option<Ipv4Addr>, peer_mask: Option<&str>) -> Ipv4A
 }
 
 /// Resolve the direct link for arbitrated mode interactively. Returns the
-/// peer's direct-link IP to use, or `None` to fall back to fate-shared.
+/// peer's direct-link IP to use, or `None` to fall back to fate-shared, which
+/// is offered only when `allow_fate_shared` (the first host choosing its
+/// topology; the second host must follow the first).
 async fn resolve_direct_link(
     nets: &[PeerNetwork],
     replication_peer_ip: IpAddr,
+    peer: &str,
+    allow_fate_shared: bool,
 ) -> Result<Option<IpAddr>> {
     // A shared network whose peer endpoint is not the replication peer is a
     // candidate direct link. Matching on the peer IP (not the network name) is
@@ -1590,26 +1880,42 @@ async fn resolve_direct_link(
     {
         let peer_dl = p2p_peer(local_dl).expect("checked by half_configured_link");
         println!(
-            "\n{device} has {local_dl}/30 here (set by an earlier setup), but the peer's end\n\
+            "\n{device} has {local_dl}/30 here (set by an earlier setup), but {peer}'s end\n\
              of that link has no address yet."
         );
         bring_up_direct_link(&device, local_dl, true).await?;
         return Ok(Some(IpAddr::V4(peer_dl)));
     }
     // Only probe NICs if there's no ready network to offer.
-    let carrier = if ready.is_empty() {
-        carrier_nics_without_ip().await
+    let nics = if ready.is_empty() {
+        direct_link_nics().await
     } else {
         vec![]
     };
+    let none_choice = if allow_fate_shared {
+        "none of these: use fate-shared (one network) instead"
+    } else {
+        "none of these: stop setup here"
+    };
+    let decline = || -> Result<Option<IpAddr>> {
+        if allow_fate_shared {
+            println!("  using fate-shared mode.");
+            Ok(None)
+        } else {
+            bail!(
+                "{peer} runs in arbitrated mode, so this host needs its end of the direct link: \
+                 check the cable between the two hosts, then run setup again"
+            )
+        }
+    };
 
-    match decide_direct_link(&ready_ips, &carrier) {
+    match decide_direct_link(&ready_ips, &nics) {
         DirectLinkOutcome::Ready(_) => {
             // The operator must confirm which network is the direct link: a
             // switched second path is not a valid direct link (it shares fate
             // with the first), so we can't auto-pick even when there's one.
-            println!("Which network is the back-to-back direct link (a host-to-host");
-            println!("cable, not a switched network)?");
+            println!("Which network is the direct link (a cable between the two hosts, with no");
+            println!("switch on it)?");
             for (i, n) in ready.iter().enumerate() {
                 let hint = if n.point_to_point {
                     "  (looks point-to-point)"
@@ -1625,101 +1931,243 @@ async fn resolve_direct_link(
                     hint
                 );
             }
-            println!("  0) none of these / use fate-shared instead");
+            println!("  0) {none_choice}");
+            // A default only when the answer is not a guess: one network,
+            // addressed as a point-to-point link.
+            let default = (ready.len() == 1 && ready[0].point_to_point).then_some("1");
             let chosen = loop {
-                match ask("Choice", Some("1"))?.parse::<usize>() {
-                    Ok(0) => {
-                        println!("  using fate-shared mode.");
-                        return Ok(None);
-                    }
+                match ask("Choice", default)?.parse::<usize>() {
+                    Ok(0) => return decline(),
                     Ok(k) if k >= 1 && k <= ready.len() => break ready[k - 1],
                     _ => println!("  pick a number from the list"),
                 }
             };
             Ok(Some(chosen.peer_ip))
         }
-        DirectLinkOutcome::NeedsConfig { device } => {
-            println!("\nFound a cabled NIC with no IP: {device} (a likely direct link).");
-            if ask_yes_no(&format!("Configure {device} as the direct link now?"), true)? {
-                println!(
-                    "This host takes one end of a point-to-point /30 and the peer the other;\n\
-                     setup configures both. Pick another /30 if 10.99.99.0/30 is in use."
-                );
-                // The peer's end may already hold its half of a /30 (the
-                // manual command, an earlier run): offer the other half.
-                let peer_now = match peer_pif_on_same_network(&device).await {
-                    Some(pp) => pif_params(&pp).await,
-                    None => Default::default(),
-                };
-                let default_dl = default_local_dl(
-                    peer_now.get("IP").and_then(|s| s.parse().ok()),
-                    peer_now.get("netmask").map(String::as_str),
-                )
-                .to_string();
-                let local_dl = loop {
-                    let Ok(ip) =
-                        ask("This host's direct-link IP", Some(&default_dl))?.parse::<Ipv4Addr>()
-                    else {
-                        println!("  not a valid IPv4 address");
-                        continue;
-                    };
-                    if p2p_peer(ip).is_none() {
-                        println!("  {ip} is not a usable /30 host address (use e.g. .1 or .2)");
-                        continue;
-                    }
-                    if let Some(c) = p2p_collision(&host_ipv4_addrs().await, ip) {
-                        println!(
-                            "  the /30 around {ip} is already in use on this host ({c}); pick another /30."
-                        );
-                        continue;
-                    }
-                    break ip;
-                };
-                let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
-                bring_up_direct_link(&device, local_dl, false).await?;
-                Ok(Some(IpAddr::V4(peer_dl)))
-            } else {
-                println!("\n{}", direct_link_instructions(&device));
-                if ask_yes_no("Continue in fate-shared mode for now instead?", true)? {
-                    Ok(None)
-                } else {
-                    bail!(
-                        "configure the direct link, then re-run setup and choose arbitrated mode"
-                    );
-                }
+        DirectLinkOutcome::NeedsConfig { devices } => {
+            println!("\nWhich NIC is cabled directly to {peer} (a cable between the two hosts,");
+            println!("no switch)? NICs with VM traffic, an address or no link are not offered.");
+            for (i, d) in devices.iter().enumerate() {
+                let n = nics.iter().find(|n| &n.device == d).expect("listed above");
+                println!("  {}) {}", i + 1, nic_choice_line(n));
             }
+            println!("  0) {none_choice}");
+            for n in nics.iter().filter(|n| n.exclusion.is_some()) {
+                println!("     {}", nic_choice_line(n));
+            }
+            let device = loop {
+                match ask("Choice", None)?.parse::<usize>() {
+                    Ok(0) => return decline(),
+                    Ok(k) if k >= 1 && k <= devices.len() => break devices[k - 1].clone(),
+                    _ => println!("  pick a number from the list"),
+                }
+            };
+            println!(
+                "This host takes one end of a point-to-point /30 and {peer} the other;\n\
+                 setup configures both. Pick another /30 if 10.99.99.0/30 is in use."
+            );
+            // The peer's end may already hold its half of a /30 (the
+            // manual command, an earlier run): offer the other half.
+            let peer_now = match peer_pif_on_same_network(&device).await {
+                Some(pp) => pif_params(&pp).await,
+                None => Default::default(),
+            };
+            let default_dl = default_local_dl(
+                peer_now.get("IP").and_then(|s| s.parse().ok()),
+                peer_now.get("netmask").map(String::as_str),
+            )
+            .to_string();
+            let local_dl = loop {
+                let Ok(ip) =
+                    ask("This host's direct-link IP", Some(&default_dl))?.parse::<Ipv4Addr>()
+                else {
+                    println!("  not a valid IPv4 address");
+                    continue;
+                };
+                if p2p_peer(ip).is_none() {
+                    println!("  {ip} is not a usable /30 host address (use e.g. .1 or .2)");
+                    continue;
+                }
+                if let Some(c) = p2p_collision(&host_ipv4_addrs().await, ip) {
+                    println!(
+                        "  the /30 around {ip} is already in use on this host ({c}); pick another /30."
+                    );
+                    continue;
+                }
+                break ip;
+            };
+            let peer_dl = p2p_peer(local_dl).expect("validated in the loop above");
+            bring_up_direct_link(&device, local_dl, false).await?;
+            Ok(Some(IpAddr::V4(peer_dl)))
         }
         DirectLinkOutcome::None => {
-            println!("\nNo second network or spare cabled NIC found for a direct link.");
-            let nics = nic_link_lines().await;
+            println!("\nNo NIC of this host can take a direct link.");
             if !nics.is_empty() {
                 println!("This host's other NICs:");
-                for l in &nics {
-                    println!("  {l}");
+                for n in &nics {
+                    println!("  {}", nic_choice_line(n));
                 }
-                println!(
-                    "A direct-link NIC must show a link (cable plugged in, the other host powered\n\
-                     on, the port up on both ends) and have no IP yet."
-                );
             }
-            if ask_yes_no(
-                "Arbitrated mode needs a dedicated back-to-back link. Continue in fate-shared mode instead?",
-                true,
-            )? {
+            println!(
+                "A direct-link NIC is cabled straight to {peer} (link up on both ends), has no\n\
+                 IP yet, and carries no VM network."
+            );
+            if allow_fate_shared
+                && ask_yes_no("Use fate-shared mode (one network) instead?", false)?
+            {
                 Ok(None)
             } else {
-                bail!("connect the direct link, then re-run setup and choose arbitrated mode")
+                bail!(
+                    "connect the direct link (a cable between the two hosts), then run setup \
+                     again and choose arbitrated mode"
+                )
             }
         }
     }
 }
 
-/// Show the current installation: persisted settings plus a quick live view.
-async fn show_current_install() {
-    println!("TwinStor is already installed on this node.\n");
-    if let Ok(cfg) =
-        crate::config::Config::load(std::path::Path::new("/etc/twinstor/twinstor.toml"))
-    {
+/// How the second node takes up the first node's direct link.
+#[derive(Debug, PartialEq, Eq)]
+enum InheritedLink {
+    /// The first node's end answers: use it.
+    Use(IpAddr),
+    /// This host has no address on that link yet (a first node that only
+    /// configured its own end): configure this end, never fate-shared.
+    ConfigureHere,
+    /// This host has its end, and the first node's does not answer.
+    NoAnswer(IpAddr),
+}
+
+fn inherited_link_action(
+    first_end: Option<IpAddr>,
+    answers: bool,
+    has_local_end: bool,
+) -> InheritedLink {
+    match first_end {
+        Some(ip) if answers => InheritedLink::Use(ip),
+        Some(ip) if has_local_end => InheritedLink::NoAnswer(ip),
+        _ => InheritedLink::ConfigureHere,
+    }
+}
+
+/// The second node in arbitrated mode: follow the first node's direct link
+/// (it configured both ends) instead of choosing again, and never fall back
+/// to fate-shared, which would leave the two hosts on different topologies.
+async fn follow_inherited_direct_link(
+    nets: &[PeerNetwork],
+    peer_ip: IpAddr,
+    peer: &str,
+    first_end: Option<IpAddr>,
+) -> Result<IpAddr> {
+    let mut answers = false;
+    let mut has_local_end = false;
+    if let Some(ip) = first_end {
+        println!("Direct link: {peer}'s end is {ip} (set up by {peer}); checking it answers...");
+        for _ in 0..5 {
+            if ping_once(&ip.to_string()).await {
+                answers = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        has_local_end = match ip {
+            IpAddr::V4(v4) => p2p_collision(&host_ipv4_addrs().await, v4).is_some(),
+            IpAddr::V6(_) => true,
+        };
+    }
+    match inherited_link_action(first_end, answers, has_local_end) {
+        InheritedLink::Use(ip) => {
+            println!("  it answers.");
+            Ok(ip)
+        }
+        InheritedLink::NoAnswer(ip) => bail!(
+            "the direct link to {ip} ({peer}'s end) does not answer from this host: check the \
+             cable between the two hosts (both ports show a link), then run setup again"
+        ),
+        InheritedLink::ConfigureHere => {
+            println!("This host has no address on the direct link yet; set up its end now.");
+            match resolve_direct_link(nets, peer_ip, peer, false).await? {
+                Some(ip) if first_end.is_none_or(|f| f == ip) => Ok(ip),
+                Some(ip) => bail!(
+                    "the link set up here reaches {ip}, but {peer}'s end of the direct link is \
+                     {}: pick the NIC cabled to that end, then run setup again",
+                    first_end.map(|f| f.to_string()).unwrap_or_default()
+                ),
+                None => bail!("{peer} runs in arbitrated mode; this host needs the direct link"),
+            }
+        }
+    }
+}
+
+/// What an existing configuration on this host stands for.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallState {
+    /// The pool has the TwinStor SR: a working (or degraded) pair.
+    Live,
+    /// This host finished its part and waits for the other host: it
+    /// published the handoff, and its service runs.
+    WaitingForPeer,
+    /// A setup that stopped part-way: a config, but no SR and no host
+    /// waiting for its peer.
+    Unfinished,
+}
+
+fn install_state(sr_exists: bool, own_handoff: bool, daemon_active: bool) -> InstallState {
+    if sr_exists {
+        InstallState::Live
+    } else if own_handoff && daemon_active {
+        InstallState::WaitingForPeer
+    } else {
+        InstallState::Unfinished
+    }
+}
+
+/// The menu for an existing configuration: its lines and the default
+/// choice. Resuming is the default only where it is what the user wants.
+fn install_menu(state: &InstallState, peer: &str) -> (Vec<String>, &'static str) {
+    match state {
+        InstallState::Live => (
+            vec![
+                "  q) quit: leave everything as it is".into(),
+                format!("  r) rebuild this host's copy from {peer} (erases this host's TwinStor disk)"),
+                "  u) uninstall: remove TwinStor from this host".into(),
+            ],
+            "q",
+        ),
+        InstallState::WaitingForPeer => (
+            vec![
+                format!("  q) quit: leave this host waiting, and run `twinstor setup` on {peer}"),
+                "  r) start setup again on this host (erases this host's TwinStor disk)".into(),
+                "  u) uninstall: remove what setup did on this host".into(),
+            ],
+            "q",
+        ),
+        InstallState::Unfinished => (
+            vec![
+                "  r) run setup again from the start (recommended; erases this host's TwinStor disk)"
+                    .into(),
+                "  u) remove what the previous setup did on this host (uninstall)".into(),
+                "  q) quit: leave everything as it is".into(),
+            ],
+            "r",
+        ),
+    }
+}
+
+/// Show the current installation: persisted settings plus a quick live view,
+/// and what it means.
+async fn show_current_install(state: &InstallState, peer: &str) {
+    match state {
+        InstallState::Live => println!("TwinStor is installed on this host.\n"),
+        InstallState::WaitingForPeer => {
+            println!("TwinStor is set up on this host and waits for {peer}.\n")
+        }
+        InstallState::Unfinished => println!(
+            "A previous setup on this host did not finish (there is no TwinStor SR yet).\n"
+        ),
+    }
+    let cfg = crate::config::Config::load(Path::new("/etc/twinstor/twinstor.toml")).ok();
+    if let Some(cfg) = &cfg {
         println!(
             "  node:    {} (peer: {} @ {})",
             cfg.node.name, cfg.node.peer, cfg.network.peer_address
@@ -1754,6 +2202,109 @@ async fn show_current_install() {
         println!("  SR:      {}", sr.trim());
     }
     println!();
+    if *state == InstallState::WaitingForPeer
+        && let Some(pw) = cfg.and_then(|c| c.iscsi.chap_password)
+    {
+        println!("On {peer}, run `twinstor setup` and paste this CHAP password when asked:");
+        println!("\n      CHAP password:  {pw}\n");
+    }
+}
+
+/// The setup that rebuilds this host of a working pair with its current
+/// settings (same peer, topology, disk, password and tiebreakers), from the
+/// config and the files setup wrote. Free of I/O so it can be unit-tested.
+fn rebuild_params(
+    cfg: &crate::config::Config,
+    direct_peer: Option<&str>,
+    ping_targets: Option<&str>,
+) -> SetupParams {
+    let direct_ip = direct_peer.and_then(|t| {
+        crate::setup::parse_ping_targets(t)
+            .first()
+            .and_then(|l| l.parse().ok())
+    });
+    let ping_targets = ping_targets
+        .map(crate::setup::parse_ping_targets)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    SetupParams {
+        peer_ip: cfg.network.peer_address,
+        backing_device: Some(cfg.storage.backing_device.clone()),
+        local_ip: None,
+        drbd_port: Some(cfg.network.drbd_port),
+        full_sync: true,
+        chap_password: cfg.iscsi.chap_password.clone(),
+        ping_targets,
+        direct_ip,
+        allow_no_tiebreaker: cfg.network.allow_no_tiebreaker,
+        from_wizard: true,
+        yes: true,
+        force_device: false,
+    }
+}
+
+/// The tiebreaker line of the summary, from what was actually chosen.
+fn ping_summary(targets: &[IpAddr], no_tiebreaker: bool) -> String {
+    let extra = targets
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (no_tiebreaker, extra.is_empty()) {
+        (true, true) => "none (no tiebreaker accepted)".to_string(),
+        (_, true) => "the default gateway".to_string(),
+        (_, false) => format!("the default gateway, and {extra}"),
+    }
+}
+
+/// The topology question, in the docs' terms: a stacked or MLAG switch pair
+/// is one network (fate-shared); arbitrated is for replication on its own
+/// network, and needs a direct cable.
+const TOPOLOGY_QUESTION: &str = "\
+How are the two hosts and the gateway wired?
+  1) fate-shared: one network carries everything (one switch, or a stacked or
+     MLAG switch pair). A host that loses the other also loses the gateway,
+     so it knows it is the one cut off.                          [most setups]
+  2) arbitrated: replication has its own network, separate from the gateway
+     (storage switches or a storage VLAN). This needs a cable plugged
+     directly between the two hosts.
+If unsure, choose 1. Details:
+https://docs.vates.tech/tech-preview/twinstor/installation/#pick-your-topology
+";
+
+/// Show what a rebuild of this host does and ask for the typed confirmation.
+fn confirm_rebuild(peer: &str) -> Result<Option<SetupParams>> {
+    let cfg = crate::config::Config::load(std::path::Path::new("/etc/twinstor/twinstor.toml"))
+        .context("reading this host's TwinStor configuration")?;
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    let params = rebuild_params(
+        &cfg,
+        read(crate::setup::DIRECT_PEER_PATH).as_deref(),
+        read(crate::setup::PING_TARGETS_PATH).as_deref(),
+    );
+    println!("\nRebuild of this host, with its current settings:");
+    println!("  peer:    {peer} ({})", params.peer_ip);
+    match params.direct_ip {
+        Some(d) => println!("  mode:    arbitrated (direct link to {d})"),
+        None => println!("  mode:    fate-shared (one network)"),
+    }
+    println!(
+        "  device:  {} (ALL DATA ON IT WILL BE ERASED, then copied back from {peer})",
+        params
+            .backing_device
+            .as_deref()
+            .unwrap_or(Path::new("?"))
+            .display()
+    );
+    println!("  the copy takes a while on large disks; follow it with: twinstor status");
+    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
+    if confirm != "yes" {
+        bail!("aborted by user; nothing was changed");
+    }
+    println!();
+    Ok(Some(params))
 }
 
 /// Run the interactive wizard. Returns `Some(params)` when a (re)install
@@ -1761,13 +2312,24 @@ async fn show_current_install() {
 /// shown, uninstall performed, or the user quit).
 pub async fn run() -> Result<Option<SetupParams>> {
     if std::path::Path::new("/etc/twinstor/twinstor.toml").exists() {
-        show_current_install().await;
-        println!("  q) quit: leave everything as it is");
-        println!("  u) uninstall: remove TwinStor from this node");
-        println!(
-            "  r) reconfigure: uninstall is not run; setup re-runs and wipes the backing device"
+        let pair = crate::setup::live_pair_state().await;
+        let daemon_active = cmd_output("systemctl", &["is-active", "twinstor"])
+            .await
+            .is_ok_and(|s| s.trim() == "active");
+        let state = install_state(
+            pair.sr_exists,
+            crate::setup::own_shared_setup_published().await,
+            daemon_active,
         );
-        let choice = ask("Choice", Some("q"))?;
+        let peer = peer_host_name()
+            .await
+            .unwrap_or_else(|| "the other host".to_string());
+        show_current_install(&state, &peer).await;
+        let (lines, default) = install_menu(&state, &peer);
+        for l in &lines {
+            println!("{l}");
+        }
+        let choice = ask("Choice", Some(default))?;
         match choice.to_lowercase().as_str() {
             "u" => {
                 let keep = ask_yes_no("Keep the backing data (skip deleting the volume)?", false)?;
@@ -1778,7 +2340,25 @@ pub async fn run() -> Result<Option<SetupParams>> {
             }
             "r" => {
                 println!();
-                // fall through into the normal wizard below
+                // A working pair is checked now, not after every question:
+                // setup would refuse it at the end anyway.
+                if pair.sr_exists {
+                    println!("This pool already has a TwinStor SR, so this host's copy is live.");
+                    println!(
+                        "Setup can rebuild only this host: it erases this host's TwinStor disk"
+                    );
+                    println!("and copies it back from {peer}, which keeps serving meanwhile.");
+                    use crate::setup::{rerun_guard, rerun_refusal};
+                    let guard = rerun_guard(true, true, pair.local_uptodate, pair.peer_uptodate);
+                    if let Some(refusal) = rerun_refusal(guard, &peer) {
+                        return Err(refusal.into());
+                    }
+                    if !ask_yes_no(&format!("Rebuild this host's copy from {peer}?"), false)? {
+                        println!("nothing changed.");
+                        return Ok(None);
+                    }
+                    return confirm_rebuild(&peer);
+                }
             }
             _ => {
                 println!("nothing changed.");
@@ -1789,7 +2369,16 @@ pub async fn run() -> Result<Option<SetupParams>> {
 
     print_banner();
     println!("TwinStor interactive setup. Press Enter to accept defaults.\n");
-    crate::preflight::run().await?;
+    crate::preflight::run(true).await?;
+    let peer_label = peer_host_name()
+        .await
+        .unwrap_or_else(|| "the other host".to_string());
+    println!(
+        "This wizard runs on both hosts: here, then on {peer_label}. It erases one disk on\n\
+         each host and creates a shared SR \"twinstor\", whose data DRBD (the Linux disk\n\
+         replication) keeps identical on both hosts. Nothing is changed until you\n\
+         confirm; Ctrl-C quits.\n"
+    );
 
     // 1. The other node and the network that carries replication + iSCSI.
     // TwinStor mirrors storage between the two hosts, so it needs the address of
@@ -1823,7 +2412,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
             (inh.peer_ip, None)
         }
     } else if nets.len() >= 2 {
-        println!("Which network should carry DRBD replication and iSCSI?");
+        println!("Which network should carry the replication (every write is copied to the other");
+        println!("host over it) and the storage traffic (iSCSI)?");
         for (i, n) in nets.iter().enumerate() {
             println!(
                 "  {}) {:<20} {:<9}  local {:<15} peer {}{}",
@@ -1876,38 +2466,42 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // password. An inherited handoff is the strong signal; fall back to a live
     // DRBD-port probe when there is none (e.g. the key was already cleared).
     let peer_already_up = inherited.is_some() || peer_drbd_listening(peer_ip).await;
+    let peer_name = peer_label;
     if peer_already_up {
-        println!("The other node is already running TwinStor and waiting for this one.");
-        println!("This node joins it as the second node and creates the shared SR.");
+        println!("{peer_name} already runs TwinStor and is waiting for this host.");
+        println!("This host joins it as the second host and creates the shared SR.");
         if inherited.is_some() {
             println!("Shared settings are inherited from it; you only choose this host's disk");
-            println!("and paste node A's CHAP password below.");
+            println!("and paste the CHAP password {peer_name} printed.");
         } else {
-            println!("Have node A's CHAP password ready to paste when asked below.");
+            println!("Have the CHAP password {peer_name} printed ready to paste when asked below.");
         }
         println!();
     }
 
     // 1b. Topology mode. Inherited from the first node when this is the second
-    // node (it must match), otherwise asked: fate-shared (single path) is the
-    // default; arbitrated (direct link) suits a redundant/multi-switch network.
+    // node (it must match), otherwise asked: fate-shared (one network, which
+    // includes a stacked or MLAG switch pair) is the default; arbitrated is for
+    // replication on a network separate from the gateway, plus a direct cable.
     let direct_ip: Option<IpAddr> = if let Some(inh) = &inherited {
         if inh.arbitrated {
-            println!("Inherited topology: arbitrated (direct link); configure this node's end.");
-            println!("\n{ARBITRATED_MODE_NOTE}\n");
-            resolve_direct_link(&nets, peer_ip).await?
+            println!(
+                "Topology: arbitrated, chosen on {peer_name}: replication uses a direct cable\n\
+                 between the two hosts, with the switched network as a fallback."
+            );
+            Some(follow_inherited_direct_link(&nets, peer_ip, &peer_name, inh.direct_ip).await?)
         } else {
-            println!("Inherited topology: fate-shared (single path).");
+            println!(
+                "Topology: fate-shared, chosen on {peer_name}: one network carries everything."
+            );
             None
         }
     } else {
-        println!("Topology mode:");
-        println!("  1) fate-shared   single replication path over the network above (default)");
-        println!("  2) arbitrated    add a back-to-back direct link (for redundant networks)");
+        print!("{TOPOLOGY_QUESTION}");
         let mode = ask("Choice", Some("1"))?.trim().to_lowercase();
         if matches!(mode.as_str(), "2" | "a" | "arbitrated") {
             println!("\n{ARBITRATED_MODE_NOTE}\n");
-            resolve_direct_link(&nets, peer_ip).await?
+            resolve_direct_link(&nets, peer_ip, &peer_name, true).await?
         } else {
             None
         }
@@ -2058,19 +2652,26 @@ pub async fn run() -> Result<Option<SetupParams>> {
     let full_sync = match &inherited {
         Some(inh) => inh.full_sync,
         None => ask_yes_no(
-            "\nForce a full initial sync (only needed if the devices hold pre-existing data)",
+            "\nCopy this host's whole disk to the other host, instead of starting from two\n\
+             empty disks? Only when the disks hold data to keep; for fresh disks answer no",
             false,
         )?,
     };
-    // When the peer is already up this is the second node: pasting node A's
-    // password is required, not optional, so point straight at that.
-    let chap_prompt = if peer_already_up {
-        "CHAP password (paste the one shown on node A)"
+    // When the peer is already up this is the second node: the first node's
+    // password is required, and checked against the value it published.
+    let chap_password = if peer_already_up {
+        Some(ask_second_node_chap(
+            &peer_name,
+            inherited.as_ref().and_then(|i| i.chap_check.as_deref()),
+        )?)
     } else {
-        "CHAP password (Enter to auto-generate on the first node; paste node A's on the second)"
+        let chap = ask(
+            &format!("CHAP password (Enter to generate one; you will paste it on {peer_name})"),
+            Some(""),
+        )?;
+        let chap = crate::setup::normalize_chap_paste(&chap);
+        if chap.is_empty() { None } else { Some(chap) }
     };
-    let chap = ask(chap_prompt, Some(""))?;
-    let chap_password = if chap.is_empty() { None } else { Some(chap) };
     let mut allow_no_tiebreaker = false;
     let ping_targets: Vec<IpAddr> = if let Some(inh) = &inherited {
         // Cluster-shared choice made on the first node. If it accepted a
@@ -2090,19 +2691,35 @@ pub async fn run() -> Result<Option<SetupParams>> {
         let gateway = crate::setup::detect_default_gateway().await;
         match &gateway {
             Some(gw) => println!(
-                "\nThe fence-peer tiebreaker always pings this node's default gateway ({gw})."
+                "\nIf the two hosts lose sight of each other, each pings the gateway ({gw}) to\n\
+                 decide which one keeps running (the tiebreaker). You can add other always-on\n\
+                 addresses on this network (a switch, a second router). Do not enter the\n\
+                 other host's addresses."
             ),
             None => println!(
-                "\nWARNING: no default gateway detected. The fence-peer handler will have\n\
-                 nothing to probe unless you add a local target below, and would then\n\
-                 freeze this node's storage on any replication interruption, including\n\
-                 the peer host simply dying (a 1-node failure becomes a full outage)."
+                "\nWARNING: no default gateway detected. If the two hosts lose sight of each\n\
+                 other, each pings an always-on address to decide which one keeps running\n\
+                 (the tiebreaker). With none, this host freezes its storage on any\n\
+                 replication interruption, including the other host simply dying (a\n\
+                 1-host failure becomes a full outage). Do not enter the other host's\n\
+                 addresses."
             ),
         }
+        // Addresses that prove nothing about this host's reach: the other
+        // host's (it may be the one cut off), the direct link's, and this
+        // host's own.
+        let mut not_targets = host_ipv4_addrs()
+            .await
+            .into_iter()
+            .map(IpAddr::V4)
+            .collect::<Vec<_>>();
+        not_targets.push(peer_ip);
+        not_targets.extend(direct_ip);
+        not_targets.extend(nets.iter().map(|n| n.peer_ip));
         let mut targets = Vec::new();
         loop {
             let prompt = if gateway.is_some() {
-                "Extra always-on local IPs to also probe, space-separated (optional)"
+                "Other always-on addresses, separated by spaces (Enter to skip)"
             } else {
                 "Always-on local IPs to probe, space-separated (required here; or type \
                  'no-tiebreaker' to accept freeze-on-disconnect)"
@@ -2118,7 +2735,11 @@ pub async fn run() -> Result<Option<SetupParams>> {
                 break;
             }
             for t in ping_raw.split_whitespace() {
-                match t.parse() {
+                match t.parse::<IpAddr>() {
+                    Ok(ip) if not_targets.contains(&ip) => println!(
+                        "  ignoring {ip}: it belongs to one of the two hosts or the direct link, \
+                         so it cannot tell which host is cut off"
+                    ),
                     Ok(ip) => targets.push(ip),
                     Err(_) => println!("  ignoring invalid IP: {t}"),
                 }
@@ -2138,8 +2759,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
     println!("\nSummary:");
     println!("  peer:    {peer_ip}");
     match direct_ip {
-        Some(d) => println!("  mode:    arbitrated (direct link via peer {d})"),
-        None => println!("  mode:    fate-shared (single path)"),
+        Some(d) => println!("  mode:    arbitrated (direct link to {d})"),
+        None => println!("  mode:    fate-shared (one network)"),
     }
     println!("  device:  {} (will be wiped)", backing_device.display());
     println!(
@@ -2159,20 +2780,10 @@ pub async fn run() -> Result<Option<SetupParams>> {
         }
     );
     println!(
-        "  ping:    default gateway always{}",
-        if ping_targets.is_empty() {
-            String::new()
-        } else {
-            format!(" + {ping_targets:?}")
-        }
+        "  ping:    {}",
+        ping_summary(&ping_targets, allow_no_tiebreaker)
     );
-    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
-    if confirm != "yes" {
-        bail!("aborted by user");
-    }
-    println!();
-
-    Ok(Some(SetupParams {
+    let params = SetupParams {
         peer_ip,
         backing_device: Some(backing_device),
         local_ip,
@@ -2182,7 +2793,19 @@ pub async fn run() -> Result<Option<SetupParams>> {
         ping_targets,
         direct_ip,
         allow_no_tiebreaker,
-    }))
+        from_wizard: true,
+        yes: true,
+        force_device: false,
+    };
+    println!("\nSame setup without questions (for scripts, or to run it yourself):");
+    println!("  {}", crate::setup::equivalent_command(&params));
+    let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
+    if confirm != "yes" {
+        bail!("aborted by user");
+    }
+    println!();
+
+    Ok(Some(params))
 }
 
 #[cfg(test)]
@@ -2191,6 +2814,203 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn sample_config() -> crate::config::Config {
+        toml::from_str(
+            r#"
+[node]
+name = "host-b"
+peer = "host-a"
+[network]
+peer_address = "192.0.2.11"
+drbd_port = 7790
+[storage]
+drbd_resource = "data"
+backing_device = "/dev/disk/by-id/wwn-0x5000"
+drbd_device = "/dev/drbd0"
+[iscsi]
+target_iqn = "iqn.2025-01.com.xcp-ng:twinstor-data"
+lun_serial = "twinstor-data"
+chap_user = "twinstor"
+chap_password = "Kept0123456789ab"
+initiator_iqns = ["iqn.a"]
+"#,
+        )
+        .expect("sample config parses")
+    }
+
+    #[test]
+    fn an_existing_config_is_read_as_live_waiting_or_unfinished() {
+        assert_eq!(install_state(true, false, true), InstallState::Live);
+        assert_eq!(install_state(true, true, false), InstallState::Live);
+        // The first host after its part: handoff published, service up.
+        assert_eq!(
+            install_state(false, true, true),
+            InstallState::WaitingForPeer
+        );
+        // The first host whose window was closed during the wait: no service.
+        assert_eq!(install_state(false, true, false), InstallState::Unfinished);
+        // The second host after a failed SR creation (its service started).
+        assert_eq!(install_state(false, false, true), InstallState::Unfinished);
+        assert_eq!(install_state(false, false, false), InstallState::Unfinished);
+    }
+
+    #[test]
+    fn the_menu_defaults_to_resuming_only_an_unfinished_setup() {
+        let (lines, d) = install_menu(&InstallState::Unfinished, "host-a");
+        assert_eq!(d, "r");
+        assert!(lines[0].contains("run setup again"), "{lines:?}");
+        let (lines, d) = install_menu(&InstallState::Live, "host-a");
+        assert_eq!(d, "q");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("rebuild this host's copy from host-a"))
+        );
+        let (lines, d) = install_menu(&InstallState::WaitingForPeer, "host-a");
+        assert_eq!(d, "q");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`twinstor setup` on host-a"))
+        );
+        // Every menu offers the three choices.
+        for st in [
+            InstallState::Live,
+            InstallState::WaitingForPeer,
+            InstallState::Unfinished,
+        ] {
+            let (lines, _) = install_menu(&st, "p");
+            for key in ["q)", "r)", "u)"] {
+                assert!(
+                    lines.iter().any(|l| l.trim_start().starts_with(key)),
+                    "{st:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_second_host_follows_the_first_hosts_direct_link() {
+        let first = Some(ip("10.99.99.1"));
+        assert_eq!(
+            inherited_link_action(first, true, true),
+            InheritedLink::Use(ip("10.99.99.1"))
+        );
+        // The first host configured both ends, but the cable is wrong.
+        assert_eq!(
+            inherited_link_action(first, false, true),
+            InheritedLink::NoAnswer(ip("10.99.99.1"))
+        );
+        // A first host that configured only its own end.
+        assert_eq!(
+            inherited_link_action(first, false, false),
+            InheritedLink::ConfigureHere
+        );
+        // A first host that published no address: set up this end, never
+        // fall back to fate-shared.
+        assert_eq!(
+            inherited_link_action(None, false, false),
+            InheritedLink::ConfigureHere
+        );
+    }
+
+    #[test]
+    fn the_summary_shows_the_tiebreakers_actually_chosen() {
+        assert_eq!(ping_summary(&[], false), "the default gateway");
+        assert_eq!(ping_summary(&[], true), "none (no tiebreaker accepted)");
+        assert_eq!(
+            ping_summary(&[ip("192.0.2.250"), ip("192.0.2.251")], false),
+            "the default gateway, and 192.0.2.250, 192.0.2.251"
+        );
+    }
+
+    #[test]
+    fn the_topology_question_matches_the_docs() {
+        // A stacked or MLAG pair is one network: fate-shared, the default.
+        assert!(TOPOLOGY_QUESTION.contains("MLAG"));
+        assert!(!TOPOLOGY_QUESTION.contains("redundant networks"));
+        assert!(TOPOLOGY_QUESTION.contains("#pick-your-topology"));
+        assert!(TOPOLOGY_QUESTION.lines().all(|l| l.len() <= 80));
+    }
+
+    #[test]
+    fn a_device_the_wizard_would_not_offer_is_refused_with_the_reason() {
+        let offered = DeviceFacts {
+            offered: true,
+            ..Default::default()
+        };
+        assert_eq!(device_refusal(&offered), None);
+        let why = |f: DeviceFacts| device_refusal(&f).expect("refused");
+        assert!(
+            why(DeviceFacts {
+                busy: true,
+                ..Default::default()
+            })
+            .contains("mounted")
+        );
+        assert!(
+            why(DeviceFacts {
+                sr: Some("Local storage".into()),
+                lvm_pv: true,
+                ..Default::default()
+            })
+            .contains("\"Local storage\"")
+        );
+        assert!(
+            why(DeviceFacts {
+                lvm_pv: true,
+                ..Default::default()
+            })
+            .contains("LVM")
+        );
+        assert!(
+            why(DeviceFacts {
+                holders: true,
+                ..Default::default()
+            })
+            .contains("stacked")
+        );
+        assert!(
+            why(DeviceFacts {
+                on_os_disk: true,
+                ..Default::default()
+            })
+            .contains("system disk")
+        );
+        assert!(
+            why(DeviceFacts {
+                has_partitions: true,
+                ..Default::default()
+            })
+            .contains("wipefs -a")
+        );
+        assert!(why(DeviceFacts::default()).contains("not a free local disk"));
+    }
+
+    #[test]
+    fn rebuild_keeps_every_current_setting() {
+        let cfg = sample_config();
+        let p = rebuild_params(
+            &cfg,
+            Some("# peer direct-link IP (arbitrated mode)\n10.99.99.1\n"),
+            Some("# comment\n\n192.0.2.250\n192.0.2.251 # switch\n"),
+        );
+        assert_eq!(p.peer_ip, ip("192.0.2.11"));
+        assert_eq!(p.drbd_port, Some(7790));
+        assert_eq!(
+            p.backing_device.as_deref(),
+            Some(Path::new("/dev/disk/by-id/wwn-0x5000"))
+        );
+        assert_eq!(p.chap_password.as_deref(), Some("Kept0123456789ab"));
+        assert_eq!(p.direct_ip, Some(ip("10.99.99.1")));
+        assert_eq!(p.ping_targets, vec![ip("192.0.2.250"), ip("192.0.2.251")]);
+        assert!(p.full_sync, "a rebuild copies the whole disk back");
+        // Fate-shared, no extra targets.
+        let p = rebuild_params(&cfg, None, Some("# Example:\n#   192.0.2.2\n"));
+        assert_eq!(p.direct_ip, None);
+        assert!(p.ping_targets.is_empty());
     }
 
     #[test]
@@ -2211,34 +3031,92 @@ mod tests {
         assert_eq!(g[1].2, vec!["/dev/nvme0n1p3"]);
     }
 
+    fn pif(kv: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn nic_link_lines_show_link_and_ip() {
-        let m = |kv: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
-            kv.iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
+    fn only_a_free_cabled_nic_can_take_a_new_direct_link() {
+        let free = [
+            ("device", "eth4"),
+            ("physical", "true"),
+            ("VLAN", "-1"),
+            ("carrier", "true"),
+            ("IP", ""),
+            ("VLAN-slave-of", ""),
+            ("bond-slave-of", "<not in database>"),
+        ];
+        assert_eq!(direct_link_exclusion(&pif(&free), 0), None);
+        let with = |k: &'static str, v: &'static str| {
+            let mut p = pif(&free);
+            p.insert(k.to_string(), v.to_string());
+            p
+        };
+        // A NIC that only carries VM traffic: link up and no IP as well.
+        assert!(
+            direct_link_exclusion(&pif(&free), 2)
+                .unwrap()
+                .contains("VM traffic")
+        );
+        assert!(
+            direct_link_exclusion(&with("carrier", "false"), 0)
+                .unwrap()
+                .contains("no link")
+        );
+        assert!(
+            direct_link_exclusion(&with("IP", "192.0.2.5"), 0)
+                .unwrap()
+                .contains("192.0.2.5")
+        );
+        assert!(
+            direct_link_exclusion(&with("VLAN-slave-of", "OpaqueRef:1"), 0)
+                .unwrap()
+                .contains("VLAN")
+        );
+        assert!(
+            direct_link_exclusion(&with("bond-slave-of", "OpaqueRef:2"), 0)
+                .unwrap()
+                .contains("bond")
+        );
+        assert!(direct_link_exclusion(&with("management", "true"), 0).is_some());
+    }
+
+    #[test]
+    fn nic_lines_show_speed_and_reason() {
+        let n = NicChoice {
+            device: "eth4".into(),
+            speed_mbps: Some(25000),
+            exclusion: None,
+        };
+        assert_eq!(nic_choice_line(&n).trim_end(), "eth4     25000 Mb/s");
+        let n = NicChoice {
+            device: "eth1".into(),
+            speed_mbps: None,
+            exclusion: Some("no link".into()),
         };
         assert_eq!(
-            nic_link_line(&m(&[
-                ("device", "eth3"),
-                ("carrier", "false"),
-                ("IP", ""),
-                ("physical", "true")
-            ]))
-            .as_deref(),
-            Some("eth3: no link, no IP")
+            nic_choice_line(&n),
+            "eth1     speed unknown, not offered: no link"
         );
+    }
+
+    #[test]
+    fn only_the_peer_may_sit_behind_a_direct_link_port() {
+        let fdb = " port  VLAN  MAC                Age\n\
+                   \x20   1     0  aa:bb:cc:00:00:01    3\n\
+                   \x20   2     0  aa:bb:cc:00:00:02    1\n\
+                   \x20   2     0  aa:bb:cc:00:00:03   12\n\
+                   LOCAL     0  aa:bb:cc:00:00:09    0\n";
+        // Port 1 sees only the peer (case does not matter).
+        assert!(foreign_macs(fdb, "1", &["AA:BB:CC:00:00:01".into()]).is_empty());
+        // Port 2 sees two devices besides the peer: a switch port.
         assert_eq!(
-            nic_link_line(&m(&[
-                ("device", "eth1"),
-                ("carrier", "true"),
-                ("IP", "10.0.0.2")
-            ]))
-            .as_deref(),
-            Some("eth1: link up, IP 10.0.0.2")
+            foreign_macs(fdb, "2", &["aa:bb:cc:00:00:01".into()]),
+            vec!["aa:bb:cc:00:00:02", "aa:bb:cc:00:00:03"]
         );
-        assert!(nic_link_line(&m(&[("device", "eth0"), ("management", "true")])).is_none());
-        assert!(nic_link_line(&m(&[("device", "bond0"), ("physical", "false")])).is_none());
+        assert!(foreign_macs("", "1", &[]).is_empty());
     }
 
     #[test]
@@ -2313,19 +3191,34 @@ mod tests {
         assert!(parse_free_regions(out).is_empty());
     }
 
+    fn nic(device: &str, exclusion: Option<&str>) -> NicChoice {
+        NicChoice {
+            device: device.into(),
+            speed_mbps: None,
+            exclusion: exclusion.map(String::from),
+        }
+    }
+
     #[test]
     fn ready_network_wins_over_unconfigured_nic() {
-        let out = decide_direct_link(&[ip("198.51.100.2")], &["eth0".to_string()]);
+        let out = decide_direct_link(&[ip("198.51.100.2")], &[nic("eth0", None)]);
         assert_eq!(out, DirectLinkOutcome::Ready(ip("198.51.100.2")));
     }
 
     #[test]
-    fn cabled_nic_suggested_when_no_ready_network() {
-        let out = decide_direct_link(&[], &["eth0".to_string(), "eth3".to_string()]);
+    fn every_free_nic_is_offered_and_none_is_picked() {
+        let out = decide_direct_link(
+            &[],
+            &[
+                nic("eth1", Some("its network carries VM traffic")),
+                nic("eth3", None),
+                nic("eth4", None),
+            ],
+        );
         assert_eq!(
             out,
             DirectLinkOutcome::NeedsConfig {
-                device: "eth0".to_string()
+                devices: vec!["eth3".to_string(), "eth4".to_string()]
             }
         );
     }
@@ -2333,6 +3226,11 @@ mod tests {
     #[test]
     fn nothing_found_yields_none() {
         assert_eq!(decide_direct_link(&[], &[]), DirectLinkOutcome::None);
+        // Only excluded NICs: nothing to offer either.
+        assert_eq!(
+            decide_direct_link(&[], &[nic("eth1", Some("no link"))]),
+            DirectLinkOutcome::None
+        );
     }
 
     #[test]
