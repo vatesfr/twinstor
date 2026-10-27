@@ -3038,7 +3038,7 @@ mod tests {
                         "#!/bin/sh\nS={st}\necho \"$*\" >> $S/drbdadm.calls\ncase \"$1\" in\n\
                      role) [ -f $S/role_fails ] && exit 1; cat $S/role ;;\n\
                      status) [ -f $S/status_fails ] && exit 1; echo \"$2 role:$(cat $S/role) suspended:$(cat $S/susp)\" ;;\n\
-                     cstate) echo StandAlone ;;\n\
+                     cstate) cat $S/cstate 2>/dev/null || echo StandAlone ;;\n\
                      get-gi) cat $S/gi 2>/dev/null ;;\n\
                      dstate) cat $S/dstate 2>/dev/null || echo UpToDate/UpToDate ;;\n\
                      suspend-io) [ -f $S/suspend_rc ] && exit $(cat $S/suspend_rc); echo user,fencing > $S/susp; [ -f $S/suspend_hangs ] && sleep 30 ;;\n\
@@ -3967,6 +3967,40 @@ mod tests {
         rig.flag(daemon.pid());
         assert_eq!(rig.run(60), 4, "{}", rig.log());
         assert!(rig.log().contains("stayed silent for 6s"), "{}", rig.log());
+    }
+
+    #[test]
+    fn fence_peer_survive_while_connected_again_lifts_the_freeze_itself() {
+        // DRBD applies a survive verdict only at its next state change, which
+        // can be the link dropping again: lifted here while Connected.
+        if !fence_rig_usable() {
+            return;
+        }
+        let rig = FenceRig::new("connlift");
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        rig.set("cstate", "Connected");
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert!(
+            drbdadm_calls(&rig).contains("resume-io"),
+            "{}",
+            drbdadm_calls(&rig)
+        );
+        assert!(
+            rig.log().contains("the freeze is lifted now"),
+            "{}",
+            rig.log()
+        );
+        // Not connected: DRBD's own handling, unchanged.
+        let rig = FenceRig::new("connliftno");
+        let daemon = rig.fake_process("daemon");
+        rig.flag(daemon.pid());
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert!(
+            !drbdadm_calls(&rig).contains("resume-io"),
+            "{}",
+            drbdadm_calls(&rig)
+        );
     }
 
     #[test]

@@ -114,7 +114,34 @@ superseded_survive() {
         END { exit !found }'
 }
 
+# A survive verdict given while the pair is Connected again (a flap defused,
+# a reconnect during the tiebreak): DRBD keeps its fencing freeze and applies
+# this verdict only at its next state change, which can be the link dropping
+# again: the writes held since the first disconnect then complete onto this
+# copy alone, acknowledged, and a later resolution can discard them (a
+# fate-shared test pool under 40% packet loss lost writes that way). Lift the
+# freeze here while still Connected, so they replicate; the next disconnect
+# then freezes afresh.
+resume_if_connected() {
+    local pid
+    case "$(timeout 5 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)" in
+        Connected|Sync*) ;;
+        *) return 0 ;;
+    esac
+    io_suspended || return 0
+    timeout 10 drbdadm resume-io "$RESOURCE" >/dev/null 2>&1 9>&- &
+    pid=$!
+    for _ in $(seq 1 20); do
+        sleep 0.5
+        io_suspended || { rm -f "$ENTRY_FREEZE" 2>/dev/null; log "connected again: the freeze is lifted now, so the held writes replicate"; return 0; }
+        kill -0 "$pid" 2>/dev/null || break
+    done
+    io_suspended && log "WARNING: connected again but the freeze could not be lifted here (drbdadm resume-io); DRBD lifts it at its next state change"
+    return 0
+}
+
 verdict() {
+    [ "$2" = 4 ] && [ "$LOCAL_ROLE" = "Primary" ] && resume_if_connected
     if [ "$2" = 4 ] && [ "$1" != keep_win ] && superseded_survive; then
         log "the connection came back and dropped again while this run decided: its $1 verdict is stale, the run for the newer disconnect decides -> stay frozen (exit 1, no yield marker)"
         set -- superseded_survive 1
