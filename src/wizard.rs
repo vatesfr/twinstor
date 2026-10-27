@@ -2113,8 +2113,38 @@ fn rebuild_params(
         ping_targets,
         direct_ip,
         allow_no_tiebreaker: cfg.network.allow_no_tiebreaker,
+        from_wizard: true,
     }
 }
+
+/// The tiebreaker line of the summary, from what was actually chosen.
+fn ping_summary(targets: &[IpAddr], no_tiebreaker: bool) -> String {
+    let extra = targets
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (no_tiebreaker, extra.is_empty()) {
+        (true, true) => "none (no tiebreaker accepted)".to_string(),
+        (_, true) => "the default gateway".to_string(),
+        (_, false) => format!("the default gateway, and {extra}"),
+    }
+}
+
+/// The topology question, in the docs' terms: a stacked or MLAG switch pair
+/// is one network (fate-shared); arbitrated is for replication on its own
+/// network, and needs a direct cable.
+const TOPOLOGY_QUESTION: &str = "\
+How are the two hosts and the gateway wired?
+  1) fate-shared: one network carries everything (one switch, or a stacked or
+     MLAG switch pair). A host that loses the other also loses the gateway,
+     so it knows it is the one cut off.                          [most setups]
+  2) arbitrated: replication has its own network, separate from the gateway
+     (storage switches or a storage VLAN). This needs a cable plugged
+     directly between the two hosts.
+If unsure, choose 1. Details:
+https://docs.vates.tech/tech-preview/twinstor/installation/#pick-your-topology
+";
 
 /// Show what a rebuild of this host does and ask for the typed confirmation.
 fn confirm_rebuild(peer: &str) -> Result<Option<SetupParams>> {
@@ -2212,6 +2242,15 @@ pub async fn run() -> Result<Option<SetupParams>> {
     print_banner();
     println!("TwinStor interactive setup. Press Enter to accept defaults.\n");
     crate::preflight::run().await?;
+    let peer_label = peer_host_name()
+        .await
+        .unwrap_or_else(|| "the other host".to_string());
+    println!(
+        "This wizard runs on both hosts: here, then on {peer_label}. It erases one disk on\n\
+         each host and creates a shared SR \"twinstor\", whose data DRBD (the Linux disk\n\
+         replication) keeps identical on both hosts. Nothing is changed until you\n\
+         confirm; Ctrl-C quits.\n"
+    );
 
     // 1. The other node and the network that carries replication + iSCSI.
     // TwinStor mirrors storage between the two hosts, so it needs the address of
@@ -2245,7 +2284,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
             (inh.peer_ip, None)
         }
     } else if nets.len() >= 2 {
-        println!("Which network should carry DRBD replication and iSCSI?");
+        println!("Which network should carry the replication (every write is copied to the other");
+        println!("host over it) and the storage traffic (iSCSI)?");
         for (i, n) in nets.iter().enumerate() {
             println!(
                 "  {}) {:<20} {:<9}  local {:<15} peer {}{}",
@@ -2298,9 +2338,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
     // password. An inherited handoff is the strong signal; fall back to a live
     // DRBD-port probe when there is none (e.g. the key was already cleared).
     let peer_already_up = inherited.is_some() || peer_drbd_listening(peer_ip).await;
-    let peer_name = peer_host_name()
-        .await
-        .unwrap_or_else(|| "the other host".to_string());
+    let peer_name = peer_label;
     if peer_already_up {
         println!("{peer_name} already runs TwinStor and is waiting for this host.");
         println!("This host joins it as the second host and creates the shared SR.");
@@ -2314,8 +2352,9 @@ pub async fn run() -> Result<Option<SetupParams>> {
     }
 
     // 1b. Topology mode. Inherited from the first node when this is the second
-    // node (it must match), otherwise asked: fate-shared (single path) is the
-    // default; arbitrated (direct link) suits a redundant/multi-switch network.
+    // node (it must match), otherwise asked: fate-shared (one network, which
+    // includes a stacked or MLAG switch pair) is the default; arbitrated is for
+    // replication on a network separate from the gateway, plus a direct cable.
     let direct_ip: Option<IpAddr> = if let Some(inh) = &inherited {
         if inh.arbitrated {
             println!(
@@ -2324,13 +2363,13 @@ pub async fn run() -> Result<Option<SetupParams>> {
             );
             Some(follow_inherited_direct_link(&nets, peer_ip, &peer_name, inh.direct_ip).await?)
         } else {
-            println!("Inherited topology: fate-shared (single path).");
+            println!(
+                "Topology: fate-shared, chosen on {peer_name}: one network carries everything."
+            );
             None
         }
     } else {
-        println!("Topology mode:");
-        println!("  1) fate-shared   single replication path over the network above (default)");
-        println!("  2) arbitrated    add a back-to-back direct link (for redundant networks)");
+        print!("{TOPOLOGY_QUESTION}");
         let mode = ask("Choice", Some("1"))?.trim().to_lowercase();
         if matches!(mode.as_str(), "2" | "a" | "arbitrated") {
             println!("\n{ARBITRATED_MODE_NOTE}\n");
@@ -2485,7 +2524,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
     let full_sync = match &inherited {
         Some(inh) => inh.full_sync,
         None => ask_yes_no(
-            "\nForce a full initial sync (only needed if the devices hold pre-existing data)",
+            "\nCopy this host's whole disk to the other host, instead of starting from two\n\
+             empty disks? Only when the disks hold data to keep; for fresh disks answer no",
             false,
         )?,
     };
@@ -2523,19 +2563,35 @@ pub async fn run() -> Result<Option<SetupParams>> {
         let gateway = crate::setup::detect_default_gateway().await;
         match &gateway {
             Some(gw) => println!(
-                "\nThe fence-peer tiebreaker always pings this node's default gateway ({gw})."
+                "\nIf the two hosts lose sight of each other, each pings the gateway ({gw}) to\n\
+                 decide which one keeps running (the tiebreaker). You can add other always-on\n\
+                 addresses on this network (a switch, a second router). Do not enter the\n\
+                 other host's addresses."
             ),
             None => println!(
-                "\nWARNING: no default gateway detected. The fence-peer handler will have\n\
-                 nothing to probe unless you add a local target below, and would then\n\
-                 freeze this node's storage on any replication interruption, including\n\
-                 the peer host simply dying (a 1-node failure becomes a full outage)."
+                "\nWARNING: no default gateway detected. If the two hosts lose sight of each\n\
+                 other, each pings an always-on address to decide which one keeps running\n\
+                 (the tiebreaker). With none, this host freezes its storage on any\n\
+                 replication interruption, including the other host simply dying (a\n\
+                 1-host failure becomes a full outage). Do not enter the other host's\n\
+                 addresses."
             ),
         }
+        // Addresses that prove nothing about this host's reach: the other
+        // host's (it may be the one cut off), the direct link's, and this
+        // host's own.
+        let mut not_targets = host_ipv4_addrs()
+            .await
+            .into_iter()
+            .map(IpAddr::V4)
+            .collect::<Vec<_>>();
+        not_targets.push(peer_ip);
+        not_targets.extend(direct_ip);
+        not_targets.extend(nets.iter().map(|n| n.peer_ip));
         let mut targets = Vec::new();
         loop {
             let prompt = if gateway.is_some() {
-                "Extra always-on local IPs to also probe, space-separated (optional)"
+                "Other always-on addresses, separated by spaces (Enter to skip)"
             } else {
                 "Always-on local IPs to probe, space-separated (required here; or type \
                  'no-tiebreaker' to accept freeze-on-disconnect)"
@@ -2551,7 +2607,11 @@ pub async fn run() -> Result<Option<SetupParams>> {
                 break;
             }
             for t in ping_raw.split_whitespace() {
-                match t.parse() {
+                match t.parse::<IpAddr>() {
+                    Ok(ip) if not_targets.contains(&ip) => println!(
+                        "  ignoring {ip}: it belongs to one of the two hosts or the direct link, \
+                         so it cannot tell which host is cut off"
+                    ),
                     Ok(ip) => targets.push(ip),
                     Err(_) => println!("  ignoring invalid IP: {t}"),
                 }
@@ -2571,8 +2631,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
     println!("\nSummary:");
     println!("  peer:    {peer_ip}");
     match direct_ip {
-        Some(d) => println!("  mode:    arbitrated (direct link via peer {d})"),
-        None => println!("  mode:    fate-shared (single path)"),
+        Some(d) => println!("  mode:    arbitrated (direct link to {d})"),
+        None => println!("  mode:    fate-shared (one network)"),
     }
     println!("  device:  {} (will be wiped)", backing_device.display());
     println!(
@@ -2592,12 +2652,8 @@ pub async fn run() -> Result<Option<SetupParams>> {
         }
     );
     println!(
-        "  ping:    default gateway always{}",
-        if ping_targets.is_empty() {
-            String::new()
-        } else {
-            format!(" + {ping_targets:?}")
-        }
+        "  ping:    {}",
+        ping_summary(&ping_targets, allow_no_tiebreaker)
     );
     let confirm = ask("\nType 'yes' to proceed (anything else aborts)", None)?;
     if confirm != "yes" {
@@ -2615,6 +2671,7 @@ pub async fn run() -> Result<Option<SetupParams>> {
         ping_targets,
         direct_ip,
         allow_no_tiebreaker,
+        from_wizard: true,
     }))
 }
 
@@ -2724,6 +2781,25 @@ initiator_iqns = ["iqn.a"]
             inherited_link_action(None, false, false),
             InheritedLink::ConfigureHere
         );
+    }
+
+    #[test]
+    fn the_summary_shows_the_tiebreakers_actually_chosen() {
+        assert_eq!(ping_summary(&[], false), "the default gateway");
+        assert_eq!(ping_summary(&[], true), "none (no tiebreaker accepted)");
+        assert_eq!(
+            ping_summary(&[ip("192.0.2.250"), ip("192.0.2.251")], false),
+            "the default gateway, and 192.0.2.250, 192.0.2.251"
+        );
+    }
+
+    #[test]
+    fn the_topology_question_matches_the_docs() {
+        // A stacked or MLAG pair is one network: fate-shared, the default.
+        assert!(TOPOLOGY_QUESTION.contains("MLAG"));
+        assert!(!TOPOLOGY_QUESTION.contains("redundant networks"));
+        assert!(TOPOLOGY_QUESTION.contains("#pick-your-topology"));
+        assert!(TOPOLOGY_QUESTION.lines().all(|l| l.len() <= 80));
     }
 
     #[test]

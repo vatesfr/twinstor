@@ -44,18 +44,18 @@ const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 /// interactive wizard and the non-interactive CLI path so the operator makes
 /// this choice with the known scope in front of them.
 pub const ARBITRATED_MODE_NOTE: &str = "\
-Note: arbitrated (direct-link) mode replicates over the back-to-back cable,
-with the switched network as a fallback path, so a switch failure does not
-split DRBD. If the whole switch dies, each host reads over the cable that its
-peer lost the gateway too; after 15 s both disarm local XHA fencing and keep
-their VMs running (unreachable by clients until the switch returns), then
-re-arm HA. A router outage seen by both hosts holds the same way, HA disarmed
-until the gateway returns. A host that loses only its own switch link is
-stood down after a confirmation window, so its VMs restart on the other host;
-a host that loses only its gateway while the peer still answers over the
-gateway (management) network is not stood down. That check applies only when
-the peer address is on that network. The direct link protects the storage
-path, not the guest network. How to choose the mode:
+Note: in arbitrated mode, replication runs over the direct cable, with the
+switched network as a fallback path, so a switch failure does not split the
+two copies. If the whole switch dies, each host still sees the other over the
+cable and learns that it lost the gateway too; after 15 s both pause the
+automatic HA reboot (fencing) and keep their VMs running (unreachable by
+clients until the switch returns), then turn it back on. A router outage seen
+by both hosts is handled the same way. A host that loses only its own switch
+link is stopped after a confirmation window, so its VMs restart on the other
+host; a host that loses only its gateway while the other host still answers
+over the management network is not stopped. That check applies only when the
+other host's address is on that network. The direct link protects the storage
+path, not the VMs' network. How to choose the mode:
 https://docs.vates.tech/tech-preview/twinstor/installation/";
 
 pub struct SetupParams {
@@ -80,6 +80,10 @@ pub struct SetupParams {
     /// death, freezes this node's storage until the peer returns. Only for
     /// sites that knowingly accept freeze-on-disconnect semantics.
     pub allow_no_tiebreaker: bool,
+    /// Set by the interactive wizard, which already showed the
+    /// arbitrated-mode note and asked for the confirmation; the flag path
+    /// shows and asks them itself.
+    pub from_wizard: bool,
 }
 
 /// Set once `run_setup` starts changing this host (the config write), so a
@@ -395,8 +399,10 @@ initiator_iqns = [{iqn_list}]
         );
         // Show the scope note (storage-path redundancy only) before writing
         // the config, so the operator knows what arbitrated mode does and does
-        // not cover.
-        println!("\n{ARBITRATED_MODE_NOTE}\n");
+        // not cover. The wizard showed it already, right after the choice.
+        if !params.from_wizard {
+            println!("\n{ARBITRATED_MODE_NOTE}\n");
+        }
     }
     // New pool: write explicit sorted-hostname node-ids for both topologies so a
     // fate-shared pool never leaves DRBD to auto-assign ids, which may not follow
@@ -571,9 +577,12 @@ initiator_iqns = [{iqn_list}]
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("SyncTarget"))
             .unwrap_or(false);
         if syncing {
-            println!("peer is syncing real data to this node; following the resync.");
-            println!("this node stays Secondary until UpToDate; the daemon then promotes");
-            println!("it to dual-Primary (it will not serve Inconsistent data).");
+            println!(
+                "This host is receiving its copy from {peer_name} (follow it with: twinstor status)."
+            );
+            println!("Until it completes, this host reaches the data through {peer_name}, and");
+            println!("does not serve from its own disk. DRBD may show this host Primary with an");
+            println!("Inconsistent disk meanwhile: that is expected.");
         } else {
             establish_skip_sync(res).await?;
             println!("promoting (dual-primary)...");
@@ -1737,6 +1746,11 @@ async fn create_sr(
     }
     if redundant {
         println!("  both paths active: storage is redundant");
+    } else if receiving_copy_now().await {
+        println!(
+            "  one path active until this host's copy is complete; the second appears after \
+             the copy"
+        );
     } else {
         println!(
             "  one path active for now; the daemon's path watchdog will add the second shortly"
@@ -1804,6 +1818,15 @@ async fn create_sr(
     println!("you can now create VMs on this SR.");
 
     Ok(())
+}
+
+/// This host's DRBD resource is receiving its copy from the peer right now.
+async fn receiving_copy_now() -> bool {
+    tokio::process::Command::new("drbdadm")
+        .args(["status", "twinstor-data"])
+        .output()
+        .await
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("SyncTarget"))
 }
 
 fn extract_scsi_id(text: &str) -> Option<String> {

@@ -356,6 +356,7 @@ impl Cli {
                         ping_targets: ping_target,
                         direct_ip,
                         allow_no_tiebreaker,
+                        from_wizard: false,
                     },
                     None => {
                         let other_args_given = backing_device.is_some()
@@ -1749,11 +1750,15 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
     // markers, and the top-line verdict, so a value can never read green in
     // one place and red in another.
     let syncing = sync.is_some();
+    // This host receiving its copy (the second host right after setup, or a
+    // rebuild) is expected, not an outage: it reads degraded, not critical.
+    let receiving = drbd_status.as_ref().is_some_and(receiving_copy);
     let sev_local_disk = |d: crate::drbd::DiskState| -> Sev {
         use crate::drbd::DiskState::*;
         match d {
             UpToDate => Sev::Good,
             Consistent | Outdated | Unknown => Sev::Warn,
+            Inconsistent if receiving => Sev::Warn,
             Inconsistent | Diskless => Sev::Bad,
         }
     };
@@ -1797,10 +1802,16 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
     };
     let readiness_sev = match &readiness {
         crate::readiness::Readiness::Ready => Sev::Good,
+        crate::readiness::Readiness::NotReady { .. } if receiving => Sev::Warn,
         crate::readiness::Readiness::NotReady { .. } => Sev::Bad,
         _ => Sev::Warn,
     };
-    let iscsi_sev = iscsi_sev(iscsi_active);
+    // The local target stays closed until this host's copy is complete.
+    let iscsi_sev = if receiving {
+        iscsi_sev(iscsi_active).min(Sev::Warn)
+    } else {
+        iscsi_sev(iscsi_active)
+    };
     let worst_cache = cache
         .iter()
         .map(|(_, s)| cache_sev(s))
@@ -1837,8 +1848,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
     // "not exported": it degrades the verdict but does not make it critical.
     let critical = !daemon_active
         || drbd_status.is_none()
-        || !readiness.can_serve()
-        || iscsi_active == Some(false);
+        || (!receiving && (!readiness.can_serve() || iscsi_active == Some(false)));
     let degraded = drbd_sev > Sev::Good
         || readiness_sev > Sev::Good
         || iscsi_active.is_none()
@@ -1865,7 +1875,9 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         };
         (Sev::Bad, "critical", reason)
     } else if degraded {
-        let reason = if let Some((pct, _)) = &sync {
+        let reason = if receiving {
+            receiving_reason(sync.as_ref())
+        } else if let Some((pct, _)) = &sync {
             format!("resyncing (peer catching up, {pct:.1}%)")
         } else if readiness_sev > Sev::Good {
             readiness.reason().to_string()
@@ -2485,6 +2497,34 @@ async fn is_iscsi_active(iqn: &str) -> Option<bool> {
 /// Rendering of the tri-state iSCSI probe, shared by the JSON, plain and
 /// human outputs so unknown cannot read as a confirmed answer in one mode and
 /// as unknown in another.
+/// This host is receiving its copy from an UpToDate peer over a live
+/// connection: the expected state while the second host's initial copy (or
+/// a rebuild) runs. It does not serve from its own disk meanwhile, and VMs
+/// on it reach the data through the peer.
+fn receiving_copy(s: &crate::drbd::DrbdStatus) -> bool {
+    use crate::drbd::{ConnectionState, DiskState, Replication};
+    s.disk == DiskState::Inconsistent
+        && s.connection == ConnectionState::Connected
+        && s.peer_disk == Some(DiskState::UpToDate)
+        && s.replication == Some(Replication::SyncTarget)
+}
+
+fn receiving_reason(sync: Option<&(f64, String)>) -> String {
+    match sync {
+        Some((pct, eta)) if eta != "unknown" => format!(
+            "receiving this host's copy from the peer ({pct:.1}%, ETA {eta}); the data is \
+             reached through the peer meanwhile"
+        ),
+        Some((pct, _)) => format!(
+            "receiving this host's copy from the peer ({pct:.1}%); the data is reached through \
+             the peer meanwhile"
+        ),
+        None => "receiving this host's copy from the peer; the data is reached through the \
+                 peer meanwhile"
+            .to_string(),
+    }
+}
+
 fn iscsi_sev(active: Option<bool>) -> crate::render::Sev {
     use crate::render::Sev;
     match active {
@@ -3490,6 +3530,39 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
 
 #[cfg(test)]
 mod tests {
+    use super::{receiving_copy, receiving_reason};
+
+    fn drbd(text: &str) -> crate::drbd::DrbdStatus {
+        crate::drbd::parse_drbdadm_text(text).expect("parses")
+    }
+
+    #[test]
+    fn the_initial_copy_on_the_second_host_is_recognised() {
+        let receiving = drbd(
+            "twinstor-data role:Primary\n  disk:Inconsistent\n  host-a role:Primary\n    \
+             replication:SyncTarget peer-disk:UpToDate done:37.20\n",
+        );
+        assert!(receiving_copy(&receiving));
+        // The sync source (the first host) is not receiving.
+        let source = drbd(
+            "twinstor-data role:Primary\n  disk:UpToDate\n  host-b role:Primary\n    \
+             replication:SyncSource peer-disk:Inconsistent done:37.20\n",
+        );
+        assert!(!receiving_copy(&source));
+        // Inconsistent with no peer to copy from is a real problem.
+        let alone = drbd("twinstor-data role:Secondary\n  disk:Inconsistent\n");
+        assert!(!receiving_copy(&alone));
+    }
+
+    #[test]
+    fn the_initial_copy_reason_reads_as_expected_progress() {
+        let r = receiving_reason(Some(&(37.2, "1:12:00".to_string())));
+        assert!(r.contains("37.2%"), "{r}");
+        assert!(r.contains("ETA 1:12:00"), "{r}");
+        assert!(r.contains("through the peer"), "{r}");
+        assert!(!receiving_reason(Some(&(5.0, "unknown".to_string()))).contains("ETA"));
+        assert!(receiving_reason(None).starts_with("receiving"));
+    }
     #[test]
     fn discard_and_resync_treats_an_unclear_daemon_state_as_running() {
         use super::daemon_may_be_running;
