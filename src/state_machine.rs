@@ -4935,6 +4935,9 @@ const ISCSI_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The split-brain loser's extra wait past `ISCSI_STOP_TIMEOUT` before it
 /// self-fences: it serves nobody, so a slow teardown costs only time.
 const LOSER_TEARDOWN_EXTRA: Duration = Duration::from_secs(60);
+/// The arbitrated loser's wait between closing its portal to new logins and
+/// tearing the target down: past LIO's 15 s login timeout.
+const LOSER_LOGIN_DRAIN: Duration = Duration::from_secs(20);
 
 /// What holds an iSCSI teardown: the targetcli and LIO kernel threads with
 /// their state and wait channel, and the kernel stack of those in
@@ -23692,6 +23695,22 @@ impl StateMachine {
                 }
             }
         }
+        // (2b) Arbitrated: refuse new logins to this host's portal and wait out
+        // LIO's login timeout before the teardown removes the portal. The
+        // removal waits in the kernel for the portal thread, and a login the
+        // peer's side abandoned (its path to this portal cut by a mutual-freeze
+        // keep) held it past any bound (`block_portal_logins`).
+        let portal_port = self.config.iscsi.portal_port;
+        let blocked =
+            self.arbitrated && !cfg!(test) && crate::iscsi::block_portal_logins(portal_port).await;
+        if blocked {
+            info!(
+                heal_event = "loser_portal_block",
+                "split-brain: this host's iSCSI portal refuses new logins; waiting out any \
+                   login in progress before the teardown"
+            );
+            tokio::time::sleep(LOSER_LOGIN_DRAIN).await;
+        }
         // (3) Time-bound the teardown; if it wedges unkillable, self-fence.
         // This copy serves nobody and its guests are stopped, so a slow
         // teardown (LIO waiting out a login negotiation, 15 s each) gets more
@@ -23713,6 +23732,12 @@ impl StateMachine {
                 }
             }
         };
+        if blocked && !crate::iscsi::unblock_portal_logins(portal_port).await {
+            warn!(
+                "split-brain: could not lift the block on this host's iSCSI portal; the next \
+                   target start retries"
+            );
+        }
         match stopped {
             Some(Ok(())) => {}
             Some(Err(e)) => {

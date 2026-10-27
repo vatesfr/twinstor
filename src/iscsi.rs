@@ -120,6 +120,11 @@ impl IscsiControl for IscsiController {
         let port = config.iscsi.portal_port;
         let serial = &config.iscsi.lun_serial;
         info!(iqn = %iqn, device = %device.display(), serial = %serial, "starting iSCSI target");
+        // A loser's teardown block left behind (a crash between its block and
+        // its unblock) would keep every initiator out of this target.
+        if !cfg!(test) && !unblock_portal_logins(port).await {
+            warn!("could not remove a leftover block on this host's iSCSI portal");
+        }
 
         // Check if iSCSI is already configured and serving
         let chap_expected = config.iscsi.chap_user.is_some()
@@ -557,6 +562,62 @@ pub async fn remove_peer_portal_reset(peer_ip: &str, port: u16) -> bool {
         let _ = iptables_input_reset("-D", peer_ip, port).await;
     }
     iptables_input_reset("-C", peer_ip, port).await == Some(false)
+}
+
+/// This host's own portal closed to new iSCSI logins (any initiator): the
+/// split-brain loser sets it before tearing its target down. Removing a
+/// network portal waits in the kernel (`iscsit_reset_np_thread`) for the
+/// portal thread, and one busy with a login negotiation that will never
+/// complete (an initiator whose side was cut) held a loser's teardown until
+/// it self-fenced. With new logins refused and the login timeout waited out,
+/// no login is in progress when the portal goes. Removed after the teardown
+/// and by every `start()`.
+fn portal_block_rule(port: u16) -> Vec<String> {
+    format!(
+        "-p tcp -m tcp --dport {port} -m comment --comment twinstor-loser-portal-block \
+         -j REJECT --reject-with tcp-reset"
+    )
+    .split_whitespace()
+    .map(str::to_string)
+    .collect()
+}
+
+async fn iptables_portal_block(op: &str, port: u16) -> Option<bool> {
+    let mut args: Vec<String> = vec!["-w".into(), "3".into(), op.into(), "INPUT".into()];
+    if op == "-I" {
+        args.push("1".into());
+    }
+    args.extend(portal_block_rule(port));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("iptables")
+            .args(&args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.code() == Some(0) => Some(true),
+        Ok(Ok(o)) if o.status.code() == Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Refuse new logins to this host's portal. `false` on failure.
+pub async fn block_portal_logins(port: u16) -> bool {
+    iptables_portal_block("-C", port).await == Some(true)
+        || iptables_portal_block("-I", port).await == Some(true)
+}
+
+/// Accept logins to this host's portal again. `false` if a block stays.
+pub async fn unblock_portal_logins(port: u16) -> bool {
+    for _ in 0..8 {
+        if iptables_portal_block("-C", port).await == Some(false) {
+            return true;
+        }
+        let _ = iptables_portal_block("-D", port).await;
+    }
+    iptables_portal_block("-C", port).await == Some(false)
 }
 
 /// The SCSI disks (`sdc`) attached through the session(s) to `portal`, from
