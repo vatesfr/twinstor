@@ -7211,6 +7211,11 @@ pub struct StateMachine {
     arb_mutual_since: Option<(std::time::Instant, u64, f64)>,
     arb_mutual_read_at: Option<std::time::Instant>,
     arb_mutual_query: Option<tokio::task::JoinHandle<crate::peer_signal::PeerClaim>>,
+    /// The keeper's mutual-freeze decision in progress (`arb_keep_step`): the
+    /// intent record (tmpfs, holds the peer's generation; the fence-peer
+    /// handler reads it as `keep_win`), and when the link was last taken down.
+    arb_keep_path: String,
+    arb_keep_retry_at: Option<std::time::Instant>,
     // Arbitrated yield: since when the decided-behind step has waited for
     // this host's XAPI (`ARB_YIELD_XAPI_WAIT`).
     arb_yield_xapi_wait_since: Option<std::time::Instant>,
@@ -7514,6 +7519,12 @@ impl StateMachine {
             arb_mutual_since: None,
             arb_mutual_read_at: None,
             arb_mutual_query: None,
+            arb_keep_path: test_private_path(
+                "arb-keep",
+                std::env::var("TWINSTOR_ARB_KEEP_MARKER")
+                    .unwrap_or_else(|_| "/run/twinstor/arb-mutual-keep".to_string()),
+            ),
+            arb_keep_retry_at: None,
             arb_yield_hold_alerted: false,
             arb_yield_xapi_wait_since: None,
             frozen_domains: None,
@@ -9013,6 +9024,12 @@ impl StateMachine {
         // DRBD's split-brain handler drops a marker for case B. We act on the
         // marker, and otherwise attempt only a non-destructive reconnect.
         if status.connection == crate::drbd::ConnectionState::StandAlone {
+            // A mutual-freeze keep in progress owns the link until this copy
+            // resumed (`arb_keep_step`): a reconnect before that puts it back
+            // in the cycle it just left.
+            if std::path::Path::new(&self.arb_keep_path).exists() && status.suspended_user {
+                return;
+            }
             if self.standalone_since.is_none() {
                 self.standalone_since = Some(std::time::Instant::now());
             }
@@ -11588,7 +11605,11 @@ impl StateMachine {
     /// freezes I/O at the disconnect, so its failover is safe; a Secondary
     /// has nothing local the peer lacks.
     async fn peer_portal_allowed(&self) -> bool {
-        if self.arbitrated || cfg!(test) {
+        // Arbitrated mode freezes I/O at the disconnect, so a failover there
+        // carries no gap; except after a mutual-freeze keep (`arb_keep_path`),
+        // where the peer lifts its own suspend to step down while its target
+        // may still hold this host's writes.
+        if cfg!(test) || (self.arbitrated && !std::path::Path::new(&self.arb_keep_path).exists()) {
             return true;
         }
         match self.drbd.status().await {
@@ -11965,9 +11986,9 @@ impl StateMachine {
                 rule_installed = installed,
                 portal = %portal,
                 devices = ?devs,
-                "fate-shared: this Primary is disconnected from the peer, so its guests must not \
-                 reach the peer's copy; fencing the path through the peer's iSCSI portal until \
-                 the pair is Connected again"
+                "this Primary is disconnected from the peer, so its guests must not reach the \
+                 peer's copy; fencing the path through the peer's iSCSI portal until the pair is \
+                 Connected again"
             );
             self.peer_portal_fenced = true;
         }
@@ -11987,7 +12008,7 @@ impl StateMachine {
         }
         let peer_ip = self.config.network.peer_address.to_string();
         let port = self.config.iscsi.portal_port;
-        if !std::path::Path::new(&self.peer_portal_marker).exists() || self.arbitrated {
+        if !std::path::Path::new(&self.peer_portal_marker).exists() {
             // No fence to lift; a rule left without its marker (a /run wipe,
             // a saved firewall, a killed handler) is swept all the same.
             self.peer_portal_restore_due = None;
@@ -21132,9 +21153,19 @@ impl StateMachine {
     ///   `arbitrated_yield_step` steps it down.
     async fn arb_mutual_freeze_tick(&mut self) {
         use crate::peer_signal::{ForkClaim, PeerClaim};
+        if !self.arbitrated {
+            self.arb_mutual_reset();
+            return;
+        }
+        // A decision taken (the keep intent stands): finish it, one step per
+        // pass, whatever the connection reads now.
+        if let Some(Some(u)) = read_fork_record(&self.arb_keep_path) {
+            self.arb_keep_step(u).await;
+            return;
+        }
         // Cheap checks first: the files, then DRBD, then the peer (read off
         // the tick, so a cut never stalls it).
-        if !self.arbitrated || !std::path::Path::new(&self.yield_path).exists() {
+        if !std::path::Path::new(&self.yield_path).exists() {
             self.arb_mutual_reset();
             return;
         }
@@ -21151,24 +21182,32 @@ impl StateMachine {
         let local_current = self.drbd.local_current_uuid().await;
         if let PeerClaim::Claim(ForkClaim::Won(u)) = claim
             && local_current.is_some_and(|c| same_gen(u, c))
-            && !self.yield_latched()
         {
-            warn!(heal_event = "arb_mutual_freeze_lost",
-                  peer_won_over = %format!("{u:016X}"), incident = ?self.incident_id,
-                  "arbitrated: the peer took the win for this node's generation and serves;                    latching the loser verdict (this copy resyncs from the peer once the link                    is back, and never promotes alone, after a reboot included)");
-            write_fork_record(&self.latch_path, local_current);
+            if !matches!(read_fork_record(&self.latch_path), Some(Some(l)) if same_gen(l, u)) {
+                warn!(heal_event = "arb_mutual_freeze_lost",
+                      peer_won_over = %format!("{u:016X}"), incident = ?self.incident_id,
+                      "arbitrated: the peer took the win for this node's generation; latching the \
+                       loser verdict (this copy resyncs from the peer, and never promotes alone, \
+                       after a reboot included)");
+                write_fork_record(&self.latch_path, local_current);
+            }
             // StandAlone, the latched yield is decided (`arbitrated_yield_step`):
             // this node stops its guests and resyncs from the peer, without
             // waiting for a handshake verdict that the conflicting pending
-            // writes keep aborting.
-            let _ = self.drbd.disconnect().await;
+            // writes keep aborting. Repeated on every read until it holds.
+            if status.connection != ConnectionState::StandAlone {
+                let _ = self.drbd.disconnect().await;
+            }
             return;
         }
         let read = MutualFreezeRead {
             keeper: self.config.node.name < self.config.node.peer,
             primary: status.role == Role::Primary,
             up_to_date: status.disk == DiskState::UpToDate,
-            connecting: status.connection == ConnectionState::Connecting,
+            // Any state between the attempts (DRBD's transient ones included),
+            // but not a handshake verdict (StandAlone) nor a held link.
+            connecting: status.connection != ConnectionState::Connected
+                && status.connection != ConnectionState::StandAlone,
             suspended_user: status.suspended_user,
             yielded: true,
             with_guests: std::path::Path::new(&self.yield_guests_path).exists(),
@@ -21232,57 +21271,93 @@ impl StateMachine {
                settle; this node takes the win for this split and resumes its guests. The \
                peer's copy is behind from now on: its guests are stopped and restarted and it \
                resyncs from this node");
-        write_fork_record(&self.win_path, Some(peer_gen));
-        // Leave the reconnect cycle before resuming: every reconnect aborts on
-        // the two frozen copies' pending writes and runs the fence-peer handler
-        // again, which would freeze this copy again. StandAlone, this copy's
-        // pending writes complete here alone and it starts a new generation,
-        // so every later handshake reads the peer's copy as behind and never
-        // exchanges the conflicting writes.
-        if !self.mutual_standalone().await {
-            warn!(heal_event = "arb_mutual_freeze_standalone_failed", incident = ?self.incident_id,
-                  "arbitrated: could not take the replication link down (or a fence-peer \
-                   decision still runs); retrying before resuming");
+        // The keep intent first: from here on the fence-peer handler keeps this
+        // node serving (`keep_win`), and the path through the peer's portal is
+        // not allowed until the pair is Connected again.
+        write_fork_record(&self.arb_keep_path, Some(peer_gen));
+        // Then cut this host's path to the peer's portal: frozen this long,
+        // the guests' multipath may hold writes on that path, and the peer,
+        // stepping down, lifts its own suspend before its target goes; a write
+        // it completed there would be acknowledged onto the copy it discards.
+        // Cut, those writes fail back to multipath and land on the local path.
+        self.fence_peer_portal().await;
+        if !cfg!(test)
+            && crate::iscsi::peer_portal_rule_state(
+                &self.config.network.peer_address.to_string(),
+                self.config.iscsi.portal_port,
+            )
+            .await
+                != Some(true)
+        {
+            warn!(heal_event = "arb_mutual_freeze_fence_failed", incident = ?self.incident_id,
+                  "arbitrated: could not cut the path through the peer's portal; the win is not \
+                   published yet, retrying");
+            let _ = std::fs::remove_file(&self.arb_keep_path);
             return;
         }
+        // Only now the win the peer acts on, and out of the reconnect cycle.
+        write_fork_record(&self.win_path, Some(peer_gen));
+        let _ = self.drbd.disconnect().await;
+        self.arb_mutual_since = None;
+        self.arb_keep_retry_at = Some(std::time::Instant::now());
+        self.arb_keep_step(peer_gen).await;
+    }
+
+    /// The keeper's decision, one step per pass until done: StandAlone (out
+    /// of the reconnect cycle, whose every handshake aborts on the two frozen
+    /// copies' pending writes), no fence-peer decision running, a new data
+    /// generation (every later handshake then reads the peer's copy as behind
+    /// and never exchanges the conflicting writes), the yield files gone (a
+    /// fence-peer run that gets its lock afterwards reads the keep intent),
+    /// then the resume.
+    async fn arb_keep_step(&mut self, peer_gen: u64) {
+        let Ok(s) = self.drbd.status().await else {
+            return;
+        };
+        if !s.suspended_user {
+            return;
+        }
+        if s.connection != ConnectionState::StandAlone {
+            if self
+                .arb_keep_retry_at
+                .is_none_or(|t| t.elapsed() >= ARB_MUTUAL_READ_EVERY)
+            {
+                self.arb_keep_retry_at = Some(std::time::Instant::now());
+                let _ = self.drbd.disconnect().await;
+            }
+            return;
+        }
+        if fence_handler_running().await {
+            return;
+        }
+        let current = self.drbd.local_current_uuid().await;
+        if current.is_none_or(|c| same_gen(c, peer_gen))
+            && let Err(e) = self.drbd.new_current_uuid().await
+        {
+            warn!(heal_event = "arb_mutual_freeze_new_gen_failed", error = %e,
+                  incident = ?self.incident_id,
+                  "arbitrated: could not start a new data generation; retrying");
+            return;
+        }
+        for p in [&self.yield_path, &self.latch_path, &self.yield_guests_path] {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
         if let Err(e) = self.drbd.resume_io().await {
-            // Still frozen with the win recorded: the next read retries, and a
-            // reconnect releases it as for any kept yield
-            // (`release_winner_freeze`).
             warn!(heal_event = "arb_mutual_freeze_resume_failed", error = %e,
                   incident = ?self.incident_id,
                   "arbitrated: resuming this copy's I/O failed; retrying");
             return;
         }
-        // This copy serves: its yield is over.
-        for p in [&self.yield_path, &self.latch_path, &self.yield_guests_path] {
-            let _ = std::fs::remove_file(p);
-        }
-        let _ = std::fs::remove_file(relatch_pending_path(&self.latch_path));
-        self.arb_mutual_reset();
+        info!(heal_event = "arb_mutual_freeze_resumed", incident = ?self.incident_id,
+              "arbitrated: this copy serves again, StandAlone on a new data generation; the \
+               peer steps down and resyncs from it");
         let _ = xapi::send_xapi_alert(
             "TwinStor: both nodes froze their storage I/O during a network split and neither \
              could decide alone. This node resumed serving its guests. The peer's guests were \
              frozen; they are restarted and the peer resyncs from this node.",
         )
         .await;
-    }
-
-    /// Take the replication link down for the keeper's resume: StandAlone,
-    /// and no fence-peer decision still running (one started by the
-    /// disconnect keeps this node's yield while its marker and suspend stand,
-    /// and must be over before the resume). Bounded at 10 s.
-    async fn mutual_standalone(&self) -> bool {
-        let _ = self.drbd.disconnect().await;
-        for _ in 0..20 {
-            let standalone = matches!(self.drbd.status().await,
-                                      Ok(s) if s.connection == ConnectionState::StandAlone);
-            if standalone && !fence_handler_running().await {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        false
     }
 
     fn arb_mutual_reset(&mut self) {
@@ -21528,6 +21603,8 @@ impl StateMachine {
         let _ = std::fs::remove_file(&self.offer_path);
         let _ = std::fs::remove_file(&self.win_path);
         let _ = std::fs::remove_file(&self.yield_guests_path);
+        let _ = std::fs::remove_file(&self.arb_keep_path);
+        self.arb_keep_retry_at = None;
         self.clear_give_way();
         let _ = std::fs::remove_file(&self.split_guests_path);
         self.freeze_wait_since = None;
@@ -37832,7 +37909,7 @@ poll_interval_ms = 10
     }
 
     fn mutual_cleanup(sm: &StateMachine) {
-        for p in [&sm.yield_guests_path, &sm.win_path] {
+        for p in [&sm.yield_guests_path, &sm.win_path, &sm.arb_keep_path] {
             let _ = std::fs::remove_file(p);
         }
         arb_yield_cleanup(sm);
@@ -37877,19 +37954,34 @@ poll_interval_ms = 10
         sm.arb_mutual_freeze_tick().await;
         assert!(!drbd.calls().contains(&"resume_io"));
 
-        // A newer drop and no refusal: the win, StandAlone, then the resume.
+        // A newer drop and no refusal: the intent and the win, StandAlone, a
+        // new data generation, then the resume (which leaves the copy
+        // serving, StandAlone).
+        let mut serving = drbd.status.lock().unwrap().clone();
+        serving.suspended_user = false;
+        serving.connection = ConnectionState::StandAlone;
+        *drbd.status_after_resume.lock().unwrap() = Some(serving);
         sm.test_refusals = Some(0);
         sm.arb_mutual_read_at = None;
         sm.arb_mutual_freeze_tick().await;
         let calls = drbd.calls();
         let at = |c: &str| calls.iter().position(|x| *x == c);
         assert!(
-            at("disconnect").is_some() && at("disconnect") < at("resume_io"),
-            "the link goes down before the resume: {calls:?}"
+            at("disconnect").is_some()
+                && at("disconnect") < at("new_current_uuid")
+                && at("new_current_uuid") < at("resume_io"),
+            "StandAlone, new generation, then the resume: {calls:?}"
         );
+        assert_eq!(read_fork_record(&sm.arb_keep_path), Some(Some(g)));
         assert_eq!(read_fork_record(&sm.win_path), Some(Some(g)));
         assert!(!std::path::Path::new(&sm.yield_path).exists());
         assert!(!std::path::Path::new(&sm.yield_guests_path).exists());
+        // Resumed: later passes do nothing more.
+        sm.arb_mutual_freeze_tick().await;
+        assert_eq!(
+            drbd.calls().iter().filter(|c| **c == "resume_io").count(),
+            1
+        );
         mutual_cleanup(&sm);
     }
 
@@ -37906,8 +37998,18 @@ poll_interval_ms = 10
         mutual_backdate(&mut sm, g, 100.0);
         sm.arb_mutual_freeze_tick().await;
         assert!(drbd.calls().contains(&"disconnect"));
+        // A later pass (past the pacing) takes the link down again, and still
+        // never resumes on a live link.
+        sm.arb_keep_retry_at = None;
+        sm.arb_mutual_freeze_tick().await;
+        assert_eq!(
+            drbd.calls().iter().filter(|c| **c == "disconnect").count(),
+            2,
+            "{:?}",
+            drbd.calls()
+        );
         assert!(
-            !drbd.calls().contains(&"resume_io"),
+            !drbd.calls().contains(&"resume_io") && !drbd.calls().contains(&"new_current_uuid"),
             "still frozen: {:?}",
             drbd.calls()
         );
@@ -37915,6 +38017,10 @@ poll_interval_ms = 10
             std::path::Path::new(&sm.yield_path).exists(),
             "the yield stands"
         );
+        // Once StandAlone, the step completes.
+        drbd.status.lock().unwrap().connection = ConnectionState::StandAlone;
+        sm.arb_mutual_freeze_tick().await;
+        assert!(drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
         mutual_cleanup(&sm);
     }
 
@@ -38012,6 +38118,21 @@ poll_interval_ms = 10
             "StandAlone, the latched yield is decided: {:?}",
             drbd.calls()
         );
+        // The disconnect did not take: the next read sends it again; once
+        // StandAlone, no more.
+        drbd.status.lock().unwrap().connection = ConnectionState::Connecting;
+        sm.arb_mutual_read_at = None;
+        sm.arb_mutual_freeze_tick().await;
+        drbd.status.lock().unwrap().connection = ConnectionState::StandAlone;
+        sm.arb_mutual_read_at = None;
+        sm.arb_mutual_freeze_tick().await;
+        assert_eq!(
+            drbd.calls().iter().filter(|c| **c == "disconnect").count(),
+            2,
+            "{:?}",
+            drbd.calls()
+        );
+        drbd.status.lock().unwrap().connection = ConnectionState::Connecting;
         // A win over another generation is not this copy's verdict.
         let _ = std::fs::remove_file(&sm.latch_path);
         sm.test_peer_claim = PeerClaim::Claim(ForkClaim::Won(g + 2));

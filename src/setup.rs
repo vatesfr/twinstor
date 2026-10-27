@@ -2610,60 +2610,53 @@ mod tests {
     }
 
     #[test]
-    fn fence_peer_a_standing_win_keeps_serving() {
+    fn fence_peer_arbitrated_keep_intent_keeps_serving() {
         if !fence_rig_usable() {
             return;
         }
-        let rig = FenceRig::new("keepwin");
-        let win = rig.root.join("state/win-claim");
-        std::fs::write(&win, "06B424565A635FA7\n").unwrap();
-        let run = |rig: &FenceRig| {
-            rig.command(5)
-                .env("TWINSTOR_WIN_CLAIM_MARKER", &win)
-                .status()
-                .unwrap()
-                .code()
-                .unwrap()
-        };
-        // Gateway down, serving, with the win of this split: the record
-        // names this node's bitmap generation (bit 0 aside). Keep serving.
+        // Arbitrated, gateway down, peer reachable: without a keep intent the
+        // node yields. With the daemon's mutual-freeze keep intent bound to
+        // this node's generation it keeps serving, before any yield rule (a
+        // run that waited on the lock while the daemon resumed must not freeze
+        // the keeper again), and only while the intent names this node's
+        // current or bitmap generation.
+        let rig = FenceRig::new("keepintent");
+        std::fs::write(rig.root.join("etc/direct-peer"), "127.0.0.253\n").unwrap();
+        let intent = rig.root.join("run/arb-mutual-keep");
         rig.set("ping_rc", "1");
-        rig.set("susp", "none");
-        rig.set(
-            "gi",
-            "38DD10FC3F5DEEFF:06B424565A635FA7:264E6B831F610398:0:1:1:1:1:0:0:0:1:0:1:0:1",
-        );
-        assert_eq!(run(&rig), 4, "{}", rig.log());
-        assert!(rig.log().contains("keep_win"), "{}", rig.log());
-        assert!(!rig.marker().exists(), "no yield recorded");
-        // Frozen (a win recorded while frozen keeps its own rules): no keep_win.
         rig.set("susp", "user");
-        assert_eq!(run(&rig), 1, "{}", rig.log());
-        assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
-        // A standing yield wins over the record.
-        assert!(rig.marker().exists());
-        rig.set("susp", "none");
-        let _ = run(&rig);
-        assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
-        // A record from an earlier episode (the bitmap generation moved on,
-        // or the pair is in sync): the gateway decides as before.
-        let _ = std::fs::remove_file(rig.marker());
+        std::fs::write(rig.marker(), "yielded\n").unwrap();
+        // Bound to the current generation (before the keeper's new generation).
+        std::fs::write(&intent, "711F99C562B81B52\n").unwrap();
         rig.set(
             "gi",
-            "38DD10FC3F5DEEFF:0000000000000000:06B424565A635FA6:0:1:1:1:1:0:0:0:1:0:1:0:1",
+            "711F99C562B81B53:0000000000000000:264E6B831F610398:0:1:1:1:1:0:0:0:1:0:1:0:1",
         );
-        assert_eq!(run(&rig), 1, "{}", rig.log());
-        let _ = std::fs::remove_file(rig.marker());
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert!(rig.log().contains("keep_win"), "{}", rig.log());
+        // Bound to the bitmap generation (after it).
         rig.set(
             "gi",
-            "38DD10FC3F5DEEFF:1111111111111110:06B424565A635FA6:0:1:1:1:1:0:0:0:1:0:1:0:1",
+            "06B424565A635FA7:711F99C562B81B53:264E6B831F610398:0:1:1:1:1:0:0:0:1:0:1:0:1",
         );
-        assert_eq!(run(&rig), 1, "{}", rig.log());
-        // No record: the gateway decides as before.
-        let _ = std::fs::remove_file(rig.marker());
-        std::fs::remove_file(&win).unwrap();
-        assert_eq!(run(&rig), 1, "{}", rig.log());
-        assert_eq!(rig.log().matches("keep_win").count(), 1, "{}", rig.log());
+        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        assert_eq!(rig.log().matches("keep_win").count(), 2, "{}", rig.log());
+        // An intent from an earlier episode (the pair resynced since): the
+        // yield in force stands.
+        rig.set(
+            "gi",
+            "38DD10FC3F5DEEFF:0000000000000000:06B424565A635FA6:711F99C562B81B52:1:1:1:1:0:0:0:1:0:1:0:1",
+        );
+        assert_eq!(rig.run(5), 1, "{}", rig.log());
+        assert_eq!(rig.log().matches("keep_win").count(), 2, "{}", rig.log());
+        // Fate-shared (no direct link): never.
+        std::fs::remove_file(rig.root.join("etc/direct-peer")).unwrap();
+        rig.set(
+            "gi",
+            "711F99C562B81B53:0000000000000000:264E6B831F610398:0:1:1:1:1:0:0:0:1:0:1:0:1",
+        );
+        let _ = rig.run(5);
+        assert_eq!(rig.log().matches("keep_win").count(), 2, "{}", rig.log());
     }
 
     #[test]
