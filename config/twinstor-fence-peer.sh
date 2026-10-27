@@ -140,7 +140,30 @@ resume_if_connected() {
     return 0
 }
 
+# Freeze mode: a survive verdict given while the pair is Connected again is
+# not handed to DRBD as "peer fenced" (exit 4). DRBD keeps that answer and
+# applies it at its next state change: when that is the link dropping again,
+# it lifts the fresh freeze at once ("susp-io( fencing -> no )
+# [after-fencing]") and the writes in flight complete onto this copy alone,
+# acknowledged (a test pool under 30% packet loss lost writes that way, after
+# every other gap was closed). The freeze is lifted here instead
+# (`resume_if_connected`), and the run reports no fencing done (exit 1), so the
+# next disconnect freezes and runs this handler afresh.
+connected_now() {
+    case "$(timeout 5 drbdadm cstate "$RESOURCE" 2>/dev/null | head -1)" in
+        Connected|Sync*) return 0 ;;
+    esac
+    return 1
+}
+
 verdict() {
+    if [ "$2" = 4 ] && [ "$FREEZE" = 1 ] && [ "$LOCAL_ROLE" = "Primary" ] && connected_now; then
+        resume_if_connected
+        if ! io_suspended; then
+            log "verdict=$1 given while Connected again: freeze lifted here; no fencing reported to DRBD (exit 1), so the next disconnect freezes afresh"
+            set -- "${1}_connected" 1
+        fi
+    fi
     [ "$2" = 4 ] && [ "$LOCAL_ROLE" = "Primary" ] && resume_if_connected
     if [ "$2" = 4 ] && [ "$1" != keep_win ] && superseded_survive; then
         log "the connection came back and dropped again while this run decided: its $1 verdict is stale, the run for the newer disconnect decides -> stay frozen (exit 1, no yield marker)"

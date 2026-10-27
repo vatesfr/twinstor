@@ -4087,7 +4087,10 @@ mod tests {
         let daemon = rig.fake_process("daemon");
         rig.flag(daemon.pid());
         rig.set("cstate", "Connected");
-        assert_eq!(rig.run(5), 4, "{}", rig.log());
+        // Freeze mode: no fencing reported to DRBD (exit 1), so it keeps no
+        // stale "peer fenced" answer for the next disconnect.
+        assert_eq!(rig.run(5), 1, "{}", rig.log());
+        assert!(rig.log().contains("no fencing reported"), "{}", rig.log());
         assert!(
             drbdadm_calls(&rig).contains("resume-io"),
             "{}",
