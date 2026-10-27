@@ -20244,6 +20244,20 @@ impl StateMachine {
         let since = *self
             .latch_hold_since
             .get_or_insert_with(std::time::Instant::now);
+        // Both nodes latched (a daemon restart lands a mutual yield here,
+        // where the Online checks never run): the copy that holds everything
+        // the peer has takes the win (`mutual_yield_take_win`); bring-up then
+        // promotes it through the readiness gate.
+        if since.elapsed() >= MUTUAL_YIELD_SETTLE
+            && self
+                .log_pace
+                .due("mutual_yield_init_check", Duration::from_secs(10))
+            && self.mutual_yield_take_win(false).await
+        {
+            self.latch_hold_since = None;
+            self.clear_heal_state_if_stage("yield_latch_hold");
+            return false;
+        }
         // Once on entry, then once a minute: it holds on every pass (once a
         // second after a whole-switch outage).
         if first
