@@ -56,8 +56,18 @@ log() {
 # DRBD ignores an older run's exit code, and the newer run decides for it.
 entry_freeze_release() {
     [ -f "$ENTRY_FREEZE" ] || return 0
-    if [ "$(cat "$RUN/fence-peer.newest" 2>/dev/null)" != "$$" ]; then
+    local newest
+    newest=$(cat "$RUN/fence-peer.newest" 2>/dev/null)
+    # A newer run that has already exited lifts nothing any more: this run's
+    # verdict is the last word, so it releases.
+    if [ "$newest" != "$$" ] && [ -n "$newest" ] && kill -0 "$newest" 2>/dev/null; then
         log "a newer fence-peer run decides this disconnect: the entry freeze stays for it"
+        return 0
+    fi
+    # ... unless it yielded: its suspend is the yield's, which only the
+    # daemon lifts.
+    if [ "$newest" != "$$" ] && [ -f "$YIELD_MARKER" ]; then
+        log "a newer fence-peer run yielded: the freeze stays as its yield"
         return 0
     fi
     local pid

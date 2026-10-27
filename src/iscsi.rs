@@ -170,10 +170,35 @@ impl IscsiControl for IscsiController {
             return self.rebuild_lun_in_place(device, serial).await;
         }
 
-        // Check if iSCSI is already configured and serving
         let chap_expected = config.iscsi.chap_user.is_some()
             && config.iscsi.chap_password.is_some()
             && config.iscsi.initiator_iqns.is_some();
+        // A daemon restart forgets a release in place: recognise this host's
+        // own LUN-less target (portal kept, no backstore) and rebuild it in
+        // place too, rather than clearconfig deleting the portal (the delete
+        // LIO can hang on). While the portal is cut, an unreadable listing is
+        // never read as "configured" (that would lift the cut over a target
+        // with no LUN): retried instead.
+        let cut = !cfg!(test) && portal_cut_present(port).await;
+        match self.cli.ls("/iscsi").await {
+            None if cut => {
+                bail!("iSCSI target listing unreadable while this host's portal is cut; retrying")
+            }
+            Some(out)
+                if released_leftover(&out, iqn, chap_expected)
+                    && !self.target_left_over().await =>
+            {
+                info!(
+                    "found this host's target released in place by an earlier daemon run; rebuilding its LUN"
+                );
+                self.portal_spec = Some((iqn.clone(), port));
+                self.released_in_place = true;
+                return self.rebuild_lun_in_place(device, serial).await;
+            }
+            _ => {}
+        }
+
+        // Check if iSCSI is already configured and serving
         if self.is_configured(iqn, chap_expected).await {
             info!("iSCSI target already configured, skipping setup");
             lift_leftover_cut(port).await;
@@ -503,6 +528,19 @@ fn target_is_configured(ls_output: &str, iqn: &str, chap_expected: bool) -> bool
     present
 }
 
+/// Whether `targetcli ls /iscsi` shows this host's target as a loser's
+/// teardown leaves it (`release_device`): the target and its portal present,
+/// no LUN, and (when CHAP is expected) its ACLs still there.
+fn released_leftover(ls_output: &str, iqn: &str, chap_expected: bool) -> bool {
+    let Some(sub) = target_subtree(ls_output, iqn) else {
+        return false;
+    };
+    sub.contains("[LUNs: 0]")
+        && sub.contains("[Portals: ")
+        && !sub.contains("[Portals: 0]")
+        && (!chap_expected || !sub.contains("[ACLs: 0]"))
+}
+
 /// The lines of `targetcli ls` that belong to the node naming `iqn`: that
 /// line and every following line indented deeper. `None` when no line names
 /// it.
@@ -711,6 +749,16 @@ pub async fn ensure_stray_reset_rule(port: u16) {
     if let Err(e) = crate::cmd::run_cmd_quiet("iptables", &insert).await {
         warn!(error = %e, "could not insert the iSCSI stray-segment reset rule");
     }
+}
+
+/// Whether a loser's cut of this host's portal is in place (either form).
+async fn portal_cut_present(port: u16) -> bool {
+    for legacy in [false, true] {
+        if iptables_portal_block("-C", "INPUT", port, legacy).await == Some(true) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cut this host's target off from every initiator; `spare_loopback` leaves
@@ -1186,6 +1234,41 @@ poll_interval_ms = 10
             c.released_in_place,
             "a device not ready yet keeps the in-place rebuild"
         );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("clearconfig") || l.contains("portals"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_daemon_rebuilds_a_released_target_in_place() {
+        let listing = "o- iscsi\n  o- iqn.2026-01.com.xcp-ng:twinstor-data ..... [TPGs: 1]\n    o- tpg1 ..... [gen-acls]\n      o- acls ..... [ACLs: 0]\n      o- luns ..... [LUNs: 0]\n      o- portals ..... [Portals: 1]\n        o- 0.0.0.0:3260 ..... [OK]\n";
+        assert!(released_leftover(listing, IQN, false));
+        assert!(
+            !released_leftover(listing, IQN, true),
+            "CHAP expected, no ACL: full rebuild"
+        );
+        assert!(!released_leftover(
+            &listing.replace("[LUNs: 0]", "[LUNs: 1]"),
+            IQN,
+            false
+        ));
+        let leaked: &'static str = Box::leak(listing.to_string().into_boxed_str());
+        let (mut c, log) = fresh(Some(leaked));
+        let cfg: Config = toml::from_str(&format!(
+            "[node]\nname = \"a\"\npeer = \"b\"\n[network]\nbond = \"bond0\"\n\
+             peer_address = \"10.0.0.2\"\ndrbd_port = 7789\n[storage]\n\
+             drbd_resource = \"data\"\nbacking_device = \"/dev/null\"\n\
+             drbd_device = \"/nonexistent/drbd\"\n[iscsi]\ntarget_iqn = \"{IQN}\"\n\
+             lun_serial = \"twinstor0001\"\n"
+        ))
+        .unwrap();
+        // The device is not a real volume here, so the rebuild holds: what
+        // matters is that the portal was never touched.
+        assert!(c.start(&cfg).await.is_err());
+        assert!(c.released_in_place);
         assert!(
             !log.lock()
                 .unwrap()
