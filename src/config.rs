@@ -202,6 +202,18 @@ pub struct HaConfig {
     /// pool. Set false to pass the raw signal through.
     #[serde(default = "default_true")]
     pub readmission_flap_debounce: bool,
+    /// Whether the pool master starts, once after its boot, the VMs marked
+    /// `other-config:auto_poweron=true` that XCP-ng's own autostart left
+    /// halted. XCP-ng tries them once per host boot, before the pool is
+    /// whole, and HA refuses those starts while it cannot keep its failover
+    /// plan, so after a reboot of both hosts they stay halted. Only VMs that
+    /// stayed halted since the boot are started, once both hosts are enabled,
+    /// live and in the HA liveset, both copies are UpToDate and the SR is
+    /// plugged on both; never a VM HA still protects, one that ran since the
+    /// boot, or one whose disks are marked suspect. Needs the pool's
+    /// `auto_poweron` too, as XCP-ng does. Default on.
+    #[serde(default = "default_true")]
+    pub complete_autostart: bool,
 }
 
 impl Default for HaConfig {
@@ -213,6 +225,7 @@ impl Default for HaConfig {
             self_standdown_isolated_master: true,
             reconcile_stuck_xhad: true,
             readmission_flap_debounce: true,
+            complete_autostart: true,
         }
     }
 }

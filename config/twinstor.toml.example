@@ -60,6 +60,15 @@ initiator_iqns = ["iqn.1993-08.org.debian:01:node-a", "iqn.1993-08.org.debian:01
 # self-fence, so this key is deliberately NOT `self_fence_isolated_master`.
 # self_standdown_isolated_master = true
 
+# Once after the pool master boots, start the VMs marked auto_poweron that
+# XCP-ng's own autostart left halted. XCP-ng tries them once per host boot,
+# before the pool is whole, and HA refuses those starts while it cannot keep
+# its failover plan: after a reboot of both hosts they stay halted. Only VMs
+# halted since the boot are started, once both hosts are up, both copies are
+# UpToDate and the SR is plugged on both; never one HA still protects or one
+# that ran since the boot. Needs the pool's auto_poweron too, as XCP-ng does.
+# complete_autostart = true
+
 [reboot_drain]
 # Host-side reboot-safety backstop (twinstor-reboot-drain.service). During the
 # shutdown transaction it holds THIS host's reboot only when it is the last
