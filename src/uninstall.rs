@@ -291,6 +291,26 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
             }
         }
     }
+    // The backups this install made of its own files: a managed artifact
+    // reconciled after drifting (`<path>.bak-prev`) and the resource file
+    // before a `regenerate-config` (`.res.pre-regen`).
+    let res_file = format!("{DRBD_CONF_DIR}/{res}.res");
+    let backups: Vec<String> = crate::setup::static_artifacts()
+        .iter()
+        .map(|(path, _)| format!("{path}.bak-prev"))
+        .chain([
+            format!("{res_file}.pre-regen"),
+            format!("{res_file}.bak-prev"),
+        ])
+        .collect();
+    for path in &backups {
+        if std::path::Path::new(path).exists() {
+            match std::fs::remove_file(path) {
+                Ok(()) => println!("  removed {path}"),
+                Err(e) => println!("  failed to remove {path}: {e}"),
+            }
+        }
+    }
     // The two markers that keep this copy from serving (a pending manual
     // discard; the memory of a peer seen serving) describe the data, which
     // --keep-data preserves: a reinstall over the same copy must honour them.
