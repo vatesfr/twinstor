@@ -94,6 +94,9 @@ handling of a split where both hosts yield acts only when both run 0.7.3.
   an initiator name LIO refuses while still planning). A local SR left by
   the installer is named when it holds the disks. A failure after setup
   started says what to do next and never leaves the service stopped.
+- `twinstor status` and `twinstor doctor` end quietly when the reader of
+  their output exits early (`twinstor status | grep -q healthy`) instead of
+  panicking on the broken pipe.
 
 ### Changed
 - **`twinstor setup` with flags asks for a typed confirmation** before it
