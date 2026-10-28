@@ -1620,6 +1620,10 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         },
     );
     let arbitrated = !direct_ips.is_empty();
+    // No capacity: XAPI did not answer, or there is no SR yet (between the
+    // two hosts' setup steps). Only a positive answer reads as the latter.
+    let no_sr_yet = capacity.is_none()
+        && crate::xapi::twinstor_sr_absent_confirmed(crate::setup::TARGET_IQN).await;
     let readiness =
         crate::readiness::assess(drbd_status.as_ref(), host_enabled, path_degraded.as_deref());
 
@@ -1831,7 +1835,13 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         .map(|(_, s)| cache_sev(s))
         .max()
         .unwrap_or(Sev::Good);
+    // While one copy is still being built, the copy being built does not
+    // serve, so a single iSCSI path is expected and is not flagged.
+    let single_path_expected = drbd_status
+        .as_ref()
+        .and_then(|s| single_path_expected(s, path_degraded.as_deref()));
     let mp_sev = match path_degraded.as_deref() {
+        _ if single_path_expected.is_some() => Sev::Good,
         // Probe skipped (no local IP toward the peer, fail open) and no map
         // visible: unknown is not "ok".
         None if mpath.is_none() => Sev::Warn,
@@ -1921,7 +1931,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
                 "no partition tiebreaker configured".to_string()
             } else if let Some(r) = path_degraded
                 .as_ref()
-                .filter(|_| !copying || mp_sev == Sev::Bad)
+                .filter(|_| single_path_expected.is_none() && (!copying || mp_sev == Sev::Bad))
             {
                 r.clone()
             } else if !mpath_answered && mp_sev > Sev::Good {
@@ -2340,6 +2350,7 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         st.marker(cap_sev),
         match capacity {
             Some(p) => st.paint(cap_sev, &format!("{p}% used")),
+            None if no_sr_yet => st.paint(Sev::Good, "no TwinStor SR yet (setup creates it)"),
             None => st.paint(Sev::Warn, "unknown (XAPI did not answer)"),
         }
     );
@@ -2347,9 +2358,13 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
     println!();
     match &mpath {
         Some(info) => {
-            let summary = match &path_degraded {
-                None => st.paint(Sev::Good, "ok"),
-                Some(r) => st.paint(mp_sev, &format!("degraded: {r}")),
+            let summary = match (&path_degraded, single_path_expected) {
+                (_, Some(whose)) => st.paint(
+                    Sev::Good,
+                    &format!("1 iSCSI path until {whose} copy is complete (expected)"),
+                ),
+                (None, None) => st.paint(Sev::Good, "ok"),
+                (Some(r), None) => st.paint(mp_sev, &format!("degraded: {r}")),
             };
             println!("{}multipath:   {}", st.marker(mp_sev), summary);
             for line in info.lines() {
@@ -2534,6 +2549,27 @@ async fn is_iscsi_active(iqn: &str) -> Option<bool> {
 /// connection: the expected state while the second host's initial copy (or
 /// a rebuild) runs. It does not serve from its own disk meanwhile, and VMs
 /// on it reach the data through the peer.
+/// Whose copy is still being built when the only multipath degradation is a
+/// single iSCSI path: this host's (it receives its copy) or the peer's (it
+/// catches up). The copy being built does not serve, so its portal's path is
+/// closed on purpose until the copy is complete.
+fn single_path_expected(
+    s: &crate::drbd::DrbdStatus,
+    path_degraded: Option<&str>,
+) -> Option<&'static str> {
+    use crate::drbd::{ConnectionState, DiskState};
+    if !path_degraded?.starts_with("only 1 iSCSI path") {
+        return None;
+    }
+    if receiving_copy(s) {
+        return Some("this host's");
+    }
+    (s.connection == ConnectionState::Connected
+        && s.disk == DiskState::UpToDate
+        && s.peer_disk == Some(DiskState::Inconsistent))
+    .then_some("the peer's")
+}
+
 fn receiving_copy(s: &crate::drbd::DrbdStatus) -> bool {
     use crate::drbd::{ConnectionState, DiskState, Replication};
     s.disk == DiskState::Inconsistent
@@ -3591,7 +3627,9 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
 
 #[cfg(test)]
 mod tests {
-    use super::{critical_now, receiving_copy, receiving_reason, with_receiving};
+    use super::{
+        critical_now, receiving_copy, receiving_reason, single_path_expected, with_receiving,
+    };
 
     #[test]
     fn an_open_target_during_the_initial_copy_is_critical() {
@@ -3642,6 +3680,38 @@ mod tests {
         // Inconsistent with no peer to copy from is a real problem.
         let alone = drbd("twinstor-data role:Secondary\n  disk:Inconsistent\n");
         assert!(!receiving_copy(&alone));
+    }
+
+    #[test]
+    fn a_single_path_is_expected_only_while_a_copy_is_built() {
+        let one = Some("only 1 iSCSI path (local or peer portal session missing)");
+        let receiving = drbd(
+            "twinstor-data role:Primary\n  disk:Inconsistent\n  host-a role:Primary\n    \
+             replication:SyncTarget peer-disk:UpToDate done:37.20\n",
+        );
+        assert_eq!(single_path_expected(&receiving, one), Some("this host's"));
+        let source = drbd(
+            "twinstor-data role:Primary\n  disk:UpToDate\n  host-b role:Primary\n    \
+             replication:SyncSource peer-disk:Inconsistent done:37.20\n",
+        );
+        assert_eq!(single_path_expected(&source, one), Some("the peer's"));
+        // Other degradations still show, and so does a single path on a pair
+        // whose copies are both complete, or whose peer is gone.
+        assert_eq!(
+            single_path_expected(
+                &receiving,
+                Some("no multipath map: storage I/O rides a raw single-path device")
+            ),
+            None
+        );
+        assert_eq!(single_path_expected(&receiving, None), None);
+        let healthy = drbd(
+            "twinstor-data role:Primary\n  disk:UpToDate\n  host-b role:Primary\n    \
+             peer-disk:UpToDate\n",
+        );
+        assert_eq!(single_path_expected(&healthy, one), None);
+        let alone = drbd("twinstor-data role:Primary\n  disk:UpToDate\n");
+        assert_eq!(single_path_expected(&alone, one), None);
     }
 
     #[test]

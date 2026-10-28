@@ -75,7 +75,7 @@ if command -v yum >/dev/null 2>&1; then
   updates="$(timeout 60 yum check-update -q 2>/dev/null)" || rc=$?
   if [ "$rc" -eq 100 ]; then
     if printf '%s\n' "$updates" | grep -qiE '^(kernel|kmod|xen|xcp-ng|microcode)'; then
-      warn "core updates pending (kernel/xen/xcp-ng): patch and reboot before installing"
+      warn "core updates pending (kernel/xen/xcp-ng): apply them (yum update, then reboot) before running setup"
     else
       warn "package updates are available; consider 'yum update' then reboot"
     fi
