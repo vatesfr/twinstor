@@ -178,7 +178,8 @@ pub(crate) fn renamed_note(renamed_to: Option<&str>) -> String {
     }
 }
 
-/// A root-only password file for `xe -pwf`, removed when dropped.
+/// A root-only password file for `xe -pwf`, removed when dropped. xe reads
+/// the user name from its first line and the password from the second.
 struct PasswordFile(std::path::PathBuf);
 
 impl PasswordFile {
@@ -194,7 +195,7 @@ impl PasswordFile {
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("creating {}", path.display()))?;
-        f.write_all(password.as_bytes())?;
+        f.write_all(format!("root\n{password}\n").as_bytes())?;
         Ok(PasswordFile(path))
     }
 }
@@ -325,10 +326,18 @@ pub(crate) async fn offer() -> Result<bool> {
         JoinPlan::Join { rename } => rename,
     };
     let new_name = if rename {
-        println!(
-            "Both hosts are named \"{local_hostname}\". TwinStor needs distinct names, so this \
-             host gets a new one first."
-        );
+        if local_hostname == remote_hostname {
+            println!(
+                "Both hosts are named \"{local_hostname}\". TwinStor needs distinct names, so \
+                 this host gets a new one first."
+            );
+        } else {
+            println!(
+                "Both hosts are called \"{}\" in XCP-ng. TwinStor needs distinct names, so this \
+                 host gets a new one first.",
+                facts.local_label
+            );
+        }
         let default = suggest_name(&local_hostname, &remote_hostname);
         loop {
             let n = crate::wizard::ask("New name for this host", Some(&default))?;
@@ -429,6 +438,16 @@ pub(crate) async fn offer() -> Result<bool> {
             .map(|l| l.split(',').filter(|u| !u.trim().is_empty()).count())
             .unwrap_or(0);
         if n == 2 {
+            // This host's network records are filled in a little after it
+            // is listed; the wizard reads them next to find the other host.
+            // Wait for them, but go on without when the hosts share no
+            // network: the wizard then asks for the address.
+            for _ in 0..12 {
+                if crate::wizard::shares_a_network_with_peer().await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
             println!("  done: this host is in the pool of {addr}.\n");
             return Ok(true);
         }
@@ -497,7 +516,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cret");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "root\ns3cret\n");
         }
         assert!(!path.exists(), "removed when dropped");
     }

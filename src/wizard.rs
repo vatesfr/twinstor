@@ -1143,6 +1143,11 @@ async fn peer_drbd_listening(peer_ip: IpAddr) -> bool {
     )
 }
 
+/// Whether `detect_peer_networks` finds the other host on some network.
+pub(crate) async fn shares_a_network_with_peer() -> bool {
+    !detect_peer_networks().await.is_empty()
+}
+
 /// Networks where both hosts have an IPv4 PIF: the candidates that can carry
 /// replication and iSCSI. Includes VLAN networks (a dedicated storage VLAN over
 /// the same NIC), so the operator can keep DRBD off the management network.
