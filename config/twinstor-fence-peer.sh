@@ -664,13 +664,17 @@ PROBE_PORTS="$DRBD_PORT $PORTAL_PORT"
 # 2 s each made a 10 s window last 17 s, the survivor's I/O frozen all along)
 # and a lossy link gets several chances. Prints which ports answered.
 peer_probe_round() {
-    local p port
+    local p port pids=""
     for p in $PEER_ADDR $DIRECT_PEER; do
         for port in $PROBE_PORTS; do
             ( timeout 1 bash -c "exec 3<>/dev/tcp/$p/$port" 2>/dev/null && echo "$port" ) &
+            pids="$pids $!"
         done
     done
-    wait
+    # Wait for these probes by pid: a bare wait in this command substitution
+    # also waits for the parent's background jobs, which some bash 5.3
+    # releases turn into an endless "not a child of this shell" loop.
+    wait $pids
 }
 peer_listening_within_window() {
     local end answered
