@@ -803,7 +803,7 @@ initiator_iqns = [{iqn_list}]
         println!("  {peer_name} then creates the shared SR and finishes the cluster.");
         println!();
         println!("  (Non-interactive alternative, substituting {peer_name}'s own disk:");
-        println!("      {peer_cmd} --backing-device <disk-on-peer> )");
+        println!("      {peer_cmd} --backing-device <disk-on-peer> --yes )");
         println!("  (use --full-sync to promote this node immediately and sync later instead)");
         println!("======================================================================\n");
 
@@ -866,7 +866,7 @@ initiator_iqns = [{iqn_list}]
         println!("CHAP password (you need it on the peer): {chap_password}\n");
         println!("on the peer node ({peer_name}), run setup with that CHAP password and");
         println!("the peer's own backing device:");
-        println!("  {peer_cmd} --backing-device <disk-on-peer>");
+        println!("  {peer_cmd} --backing-device <disk-on-peer> --yes");
         println!("  (or just run `twinstor setup` on the peer to pick its disk interactively)");
         println!("\nthe second node creates the SR and finishes the cluster.");
     }
