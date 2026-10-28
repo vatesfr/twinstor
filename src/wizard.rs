@@ -2291,10 +2291,22 @@ async fn show_current_install(state: &InstallState, peer: &str) {
             .join(" ");
         println!("  status:  {line}");
     }
-    if let Ok(sr) = cmd_output("xe", &["sr-list", "name-label=twinstor", "--minimal"]).await
-        && !sr.trim().is_empty()
+    // By uuid, then IQN, then name: an SR renamed in Xen Orchestra is still
+    // this installation's.
+    if let Some(sr) = crate::uninstall::resolve_sr_uuid(cfg.as_ref()).await
+        && crate::xapi::sr_uuid_exists(&sr).await
     {
-        println!("  SR:      {}", sr.trim());
+        let name = cmd_output(
+            "xe",
+            &[
+                "sr-param-get",
+                &format!("uuid={sr}"),
+                "param-name=name-label",
+            ],
+        )
+        .await
+        .unwrap_or_default();
+        println!("  SR:      {sr} (\"{}\")", name.trim());
     }
     println!();
     if *state == InstallState::WaitingForPeer

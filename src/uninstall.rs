@@ -530,7 +530,7 @@ async fn clear_backing_device(backing: &str) -> bool {
 /// TwinStor SR exists at all (the other node's uninstall destroyed it), the
 /// recorded uuid is returned and reads as an SR with no VMs. `None` = could
 /// not resolve, which the safety gate treats as fail-closed.
-async fn resolve_sr_uuid(config: Option<&crate::config::Config>) -> Option<String> {
+pub(crate) async fn resolve_sr_uuid(config: Option<&crate::config::Config>) -> Option<String> {
     let recorded = crate::xapi::read_recorded_sr_uuid();
     if let Some(u) = &recorded
         && crate::xapi::sr_uuid_exists(u).await
