@@ -1301,12 +1301,40 @@ struct NicChoice {
     exclusion: Option<String>,
 }
 
+/// What the kernel says about a NIC's link. XAPI's PIF record can be stale
+/// (a NIC gone from the host still reads "carrier: true"), so the kernel's
+/// answer wins whenever it has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelLink {
+    /// No such device in `/sys/class/net`.
+    Absent,
+    Up,
+    Down,
+    /// The device exists but its carrier cannot be read (interface down):
+    /// XAPI's value is used.
+    Unread,
+}
+
+fn kernel_link(device: &str) -> KernelLink {
+    let dir = format!("/sys/class/net/{device}");
+    if !Path::new(&dir).exists() {
+        return KernelLink::Absent;
+    }
+    match std::fs::read_to_string(format!("{dir}/carrier")).map(|c| c.trim().to_string()) {
+        Ok(c) if c == "1" => KernelLink::Up,
+        Ok(c) if c == "0" => KernelLink::Down,
+        _ => KernelLink::Unread,
+    }
+}
+
 /// Why a NIC cannot be offered as an end of a new direct link, from its
-/// `xe pif-param-list` fields and the number of VM interfaces on its pool
-/// network. On XCP-ng a NIC that carries only VM traffic also has a link and
-/// no IP, so "link up, no IP" alone is no evidence of a cable to the peer.
+/// `xe pif-param-list` fields, the kernel's view of its link and the number
+/// of VM interfaces on its pool network. On XCP-ng a NIC that carries only
+/// VM traffic also has a link and no IP, so "link up, no IP" alone is no
+/// evidence of a cable to the peer.
 fn direct_link_exclusion(
     p: &std::collections::HashMap<String, String>,
+    link: KernelLink,
     vifs: usize,
 ) -> Option<String> {
     let set = |k: &str| {
@@ -1317,7 +1345,11 @@ fn direct_link_exclusion(
         Some(why.to_string())
     } else if set("IP") {
         Some(format!("it already has the address {}", p["IP"]))
-    } else if p.get("carrier").is_none_or(|c| c != "true") {
+    } else if link == KernelLink::Absent {
+        Some("this host's kernel has no such device (XAPI's record of it is stale)".into())
+    } else if link == KernelLink::Down
+        || (link == KernelLink::Unread && p.get("carrier").is_none_or(|c| c != "true"))
+    {
         Some("no link (no cable, or the port at the other end is down)".into())
     } else if set("VLAN-slave-of") {
         Some("it carries VLAN networks".into())
@@ -1337,6 +1369,45 @@ fn nic_speed_mbps(device: &str) -> Option<u32> {
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|s| *s > 0)
         .and_then(|s| u32::try_from(s).ok())
+}
+
+/// The interfaces of VMs on a pool network. Templates and snapshots carry no
+/// traffic, so theirs do not count. An unreadable VM counts.
+async fn vm_vifs_on(net: &str) -> usize {
+    let vms = cmd_output(
+        "xe",
+        &[
+            "vif-list",
+            &format!("network-uuid={net}"),
+            "params=vm-uuid",
+            "--minimal",
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    let mut n = 0;
+    for vm in vms.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let flag = |name: &'static str| {
+            let vm = vm.to_string();
+            async move {
+                cmd_output(
+                    "xe",
+                    &[
+                        "vm-param-get",
+                        &format!("uuid={vm}"),
+                        &format!("param-name={name}"),
+                    ],
+                )
+                .await
+                .map(|v| v.trim() == "true")
+                .unwrap_or(false)
+            }
+        };
+        if !flag("is-a-template").await && !flag("is-a-snapshot").await {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// This host's physical NICs other than the management one, each with the
@@ -1362,20 +1433,12 @@ async fn direct_link_nics() -> Vec<NicChoice> {
             continue;
         }
         let vifs = match p.get("network-uuid").filter(|n| !n.is_empty()) {
-            Some(net) => cmd_output(
-                "xe",
-                &["vif-list", &format!("network-uuid={net}"), "--minimal"],
-            )
-            .await
-            .unwrap_or_default()
-            .split(',')
-            .filter(|v| !v.trim().is_empty())
-            .count(),
+            Some(net) => vm_vifs_on(net).await,
             None => 0,
         };
         out.push(NicChoice {
             speed_mbps: nic_speed_mbps(&device),
-            exclusion: direct_link_exclusion(&p, vifs),
+            exclusion: direct_link_exclusion(&p, kernel_link(&device), vifs),
             device,
         });
     }
@@ -3064,7 +3127,10 @@ mod tests {
             ("VLAN-slave-of", ""),
             ("bond-slave-of", "<not in database>"),
         ];
-        assert_eq!(direct_link_exclusion(&pif(&free), 0), None);
+        assert_eq!(
+            direct_link_exclusion(&pif(&free), KernelLink::Unread, 0),
+            None
+        );
         let with = |k: &'static str, v: &'static str| {
             let mut p = pif(&free);
             p.insert(k.to_string(), v.to_string());
@@ -3072,31 +3138,51 @@ mod tests {
         };
         // A NIC that only carries VM traffic: link up and no IP as well.
         assert!(
-            direct_link_exclusion(&pif(&free), 2)
+            direct_link_exclusion(&pif(&free), KernelLink::Unread, 2)
                 .unwrap()
                 .contains("VM traffic")
         );
         assert!(
-            direct_link_exclusion(&with("carrier", "false"), 0)
+            direct_link_exclusion(&with("carrier", "false"), KernelLink::Unread, 0)
                 .unwrap()
                 .contains("no link")
         );
         assert!(
-            direct_link_exclusion(&with("IP", "192.0.2.5"), 0)
+            direct_link_exclusion(&with("IP", "192.0.2.5"), KernelLink::Unread, 0)
                 .unwrap()
                 .contains("192.0.2.5")
         );
         assert!(
-            direct_link_exclusion(&with("VLAN-slave-of", "OpaqueRef:1"), 0)
+            direct_link_exclusion(&with("VLAN-slave-of", "OpaqueRef:1"), KernelLink::Unread, 0)
                 .unwrap()
                 .contains("VLAN")
         );
         assert!(
-            direct_link_exclusion(&with("bond-slave-of", "OpaqueRef:2"), 0)
+            direct_link_exclusion(&with("bond-slave-of", "OpaqueRef:2"), KernelLink::Unread, 0)
                 .unwrap()
                 .contains("bond")
         );
-        assert!(direct_link_exclusion(&with("management", "true"), 0).is_some());
+        assert!(
+            direct_link_exclusion(&with("management", "true"), KernelLink::Unread, 0).is_some()
+        );
+        // The kernel's answer wins over XAPI's carrier: a NIC gone from the
+        // host (seen on a lab host whose XAPI still read carrier true) and a
+        // link the kernel sees down are never offered; a link up is offered
+        // even when XAPI says otherwise.
+        assert!(
+            direct_link_exclusion(&pif(&free), KernelLink::Absent, 0)
+                .unwrap()
+                .contains("no such device")
+        );
+        assert!(
+            direct_link_exclusion(&pif(&free), KernelLink::Down, 0)
+                .unwrap()
+                .contains("no link")
+        );
+        assert_eq!(
+            direct_link_exclusion(&with("carrier", "false"), KernelLink::Up, 0),
+            None
+        );
     }
 
     #[test]
