@@ -663,6 +663,126 @@ pub async fn start_vm_on(uuid: &str, host: &str) -> Result<(), String> {
     }
 }
 
+/// Start a VM by UUID within `secs`. `Err` carries the first line of XAPI's
+/// error text.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn start_vm_reason(uuid: &str, secs: u64) -> Result<(), String> {
+    match crate::cmd::cmd_status_for("xe", &["vm-start", &format!("uuid={uuid}")], secs).await {
+        Ok((true, _, _)) => Ok(()),
+        Ok((false, out, err)) => Err(first_error_line(&err)
+            .or_else(|| first_error_line(&out))
+            .unwrap_or_else(|| "no error text".to_string())),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// Whether the pool carries `other-config:auto_poweron=true`, the flag
+/// XCP-ng's boot-time autostart requires. `None` when XAPI does not answer.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn pool_auto_poweron() -> Option<bool> {
+    let out = crate::cmd::cmd_output_for(
+        "xe",
+        &["pool-list", "other-config:auto_poweron=true", "--minimal"],
+        15,
+    )
+    .await
+    .ok()?;
+    Some(!out.trim().is_empty())
+}
+
+/// Halted VMs marked `other-config:auto_poweron=true` (templates, snapshots
+/// and dom0 excluded): what XCP-ng's boot-time autostart starts.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn halted_auto_poweron_vms() -> Option<Vec<String>> {
+    xe_vm_uuids(&[
+        "vm-list",
+        "is-control-domain=false",
+        "is-a-snapshot=false",
+        "is-a-template=false",
+        "power-state=halted",
+        "other-config:auto_poweron=true",
+    ])
+    .await
+}
+
+/// Hosts in the pool, enabled hosts, and hosts whose metrics read live.
+/// `None` when any read fails.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn pool_host_counts() -> Option<(usize, usize, usize)> {
+    let count = |s: &str| s.split(',').filter(|t| !t.trim().is_empty()).count();
+    let all = crate::cmd::cmd_output_for("xe", &["host-list", "--minimal"], 15)
+        .await
+        .ok()?;
+    let enabled = crate::cmd::cmd_output_for("xe", &["host-list", "enabled=true", "--minimal"], 15)
+        .await
+        .ok()?;
+    let live = crate::cmd::cmd_output_for(
+        "xe",
+        &["host-list", "params=host-metrics-live", "--minimal"],
+        15,
+    )
+    .await
+    .ok()?;
+    let live = live.split(',').filter(|t| t.trim() == "true").count();
+    Some((count(&all), count(&enabled), live))
+}
+
+/// PBDs of an SR, and how many are attached. `None` when XAPI does not
+/// answer.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn sr_pbds_attached(sr_uuid: &str) -> Option<(usize, usize)> {
+    let out = crate::cmd::cmd_output_for(
+        "xe",
+        &[
+            "pbd-list",
+            &format!("sr-uuid={sr_uuid}"),
+            "params=currently-attached",
+            "--minimal",
+        ],
+        15,
+    )
+    .await
+    .ok()?;
+    let all: Vec<&str> = out
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    Some((all.len(), all.iter().filter(|t| **t == "true").count()))
+}
+
+/// What the autostart completion re-reads about a VM right before starting
+/// it. `None` when any read fails.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn autostart_vm_facts(uuid: &str) -> Option<crate::autostart::VmFacts> {
+    let power_state = vm_param(uuid, "power-state", None).await?;
+    let ha_always_run = vm_param(uuid, "ha-always-run", None).await?;
+    let start_time = vm_param(uuid, "start-time", None).await?;
+    let map = xe_minimal(&[
+        "vm-param-get",
+        &format!("uuid={uuid}"),
+        "param-name=other-config",
+    ])
+    .await?;
+    Some(crate::autostart::VmFacts {
+        power_state,
+        ha_always_run,
+        auto_poweron: other_config_value(&map, "auto_poweron").unwrap_or_default(),
+        start_time,
+        disks_suspect: other_config_value(&map, DISKS_SUSPECT_KEY).as_deref() == Some("true"),
+    })
+}
+
+/// One key of an `other-config` map as `xe` prints it (`k1: v1; k2: v2`).
+pub(crate) fn other_config_value(map: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}: ");
+    map.split(';').find_map(|kv| {
+        kv.trim()
+            .strip_prefix(prefix.as_str())
+            .map(|v| v.trim().to_string())
+    })
+}
+
 /// The first non-empty line of an `xe` error output, for logs and alerts.
 fn first_error_line(text: &str) -> Option<String> {
     text.lines()
@@ -2297,6 +2417,24 @@ mod alert_delivery_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn other_config_keys_are_matched_whole() {
+        use super::other_config_value;
+        // As xe printed a pool's map on a test pool, colons inside keys and values.
+        let map = "xo:clientInfo:5051: {\"a\":1}; twinstor-default-ha-timeout-prior: 120:; \
+                   auto_poweron: true; default_ha_timeout: 120";
+        assert_eq!(
+            other_config_value(map, "auto_poweron").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            other_config_value(map, "default_ha_timeout").as_deref(),
+            Some("120")
+        );
+        assert_eq!(other_config_value(map, "poweron"), None);
+        assert_eq!(other_config_value("", "auto_poweron"), None);
+    }
+
     #[test]
     fn a_pending_pool_ha_task_is_found_by_name() {
         use super::pending_ha_task_in;

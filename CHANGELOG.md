@@ -118,6 +118,17 @@ handling of a split where both hosts yield acts only when both run 0.7.3.
   meanwhile; other degraded reasons are listed first.
 
 ### Added
+- **VMs marked auto_poweron start again after a reboot of both hosts.**
+  XCP-ng tries them once per host boot, before the pool is whole, and HA
+  refuses those starts while it cannot keep its failover plan, so they
+  stayed halted. Once after it boots, the pool master now starts the VMs
+  marked `other-config:auto_poweron=true` (with the pool's flag set, as
+  XCP-ng requires) that have stayed halted since the boot, once both hosts
+  are enabled, live and in the HA liveset, both copies are UpToDate and
+  the SR is plugged on both. It never starts a VM HA still protects, one
+  that ran since the boot or one whose disks are marked suspect, and it
+  raises an alert listing what it started. `[ha] complete_autostart =
+  false` turns it off.
 - **The setup wizard checks the requirements first** (two hosts in one
   pool, same updates, every SR plugged) and, on a host alone in its pool,
   offers to join it to the other host's pool. As with any pool join, that
@@ -138,6 +149,9 @@ handling of a split where both hosts yield acts only when both run 0.7.3.
   0.7.2. No configuration change; the install replaces the fence-peer
   handler, and the daemon adds its firewall rule at start.
 - Scripts that run `twinstor setup` with flags need `--yes`.
+- After a reboot of both hosts, the pool master starts the VMs marked
+  auto_poweron that are still halted (see Added). Remove the mark from a VM
+  that must stay off, or set `[ha] complete_autostart = false`.
 
 ### Known limitations
 - **Heavy packet loss between the hosts:** when the replication network

@@ -6974,6 +6974,8 @@ pub struct StateMachine {
     host_disabled_since: Option<std::time::Instant>,
     host_enable_last_attempt: Option<std::time::Instant>,
     host_enable_ticks: u64,
+    /// Autostart completion after a whole-pool reboot (`check_autostart_completion`).
+    autostart: crate::autostart::Watch,
     /// Set as soon as the daemon is asked to stop. The tick loop checks it
     /// between steps and the multi-step operations check it before they
     /// start, so a stop never starts new storage work; work already started
@@ -7749,6 +7751,7 @@ impl StateMachine {
             host_disabled_since: None,
             host_enable_last_attempt: None,
             host_enable_ticks: 0,
+            autostart: crate::autostart::Watch::default(),
             stop_requested: Arc::new(AtomicBool::new(false)),
             host_enable_checked_at: None,
             host_enable_hold_logged: None,
@@ -8571,6 +8574,13 @@ impl StateMachine {
                     self,
                     "check_protected_vms",
                     self.check_protected_vms().await
+                );
+            }
+            if !sb_fresh && !self.xapi_quiet().await {
+                step!(
+                    self,
+                    "check_autostart_completion",
+                    self.check_autostart_completion().await
                 );
             }
             if !sb_fresh && !self.xapi_quiet().await {
@@ -18480,6 +18490,332 @@ impl StateMachine {
                 started, "protected VM starts issued"
             );
         }
+    }
+
+    /// Autostart completion (see `crate::autostart`): once per boot, the
+    /// pool master starts the VMs marked auto_poweron that XCP-ng's own
+    /// autostart left halted, once the pool is whole. Every host reads from
+    /// its first post-boot scan on, so a host that becomes master later knows
+    /// which VMs stayed halted; only the master starts. A minute cadence, on
+    /// other ticks than the protected-VM watchdog so their starts never share
+    /// one tick.
+    async fn check_autostart_completion(&mut self) {
+        use crate::autostart as ac;
+        if cfg!(test) || self.autostart.finished {
+            return;
+        }
+        if self.host_enable_ticks % 60 != 30
+            || self
+                .autostart
+                .last_scan
+                .is_some_and(|t| t.elapsed() < ac::SCAN_EVERY)
+        {
+            return;
+        }
+        self.autostart.last_scan = Some(std::time::Instant::now());
+        if !self.config.ha.complete_autostart {
+            self.autostart.finished = true;
+            return;
+        }
+        let boot_id = current_boot_id();
+        if boot_id.is_empty() {
+            return; // nothing to bind the once-per-boot record to
+        }
+        let record = ac::record_path();
+        if ac::done_this_boot(
+            &std::fs::read_to_string(&record).unwrap_or_default(),
+            &boot_id,
+        ) {
+            self.autostart.finished = true;
+            return;
+        }
+        let Some(uptime) = read_uptime_secs().map(Duration::from_secs) else {
+            return;
+        };
+        let finish = |w: &mut ac::Watch, outcome: &str| {
+            w.finished = true;
+            if let Err(e) = std::fs::write(&record, ac::record_text(&boot_id, outcome)) {
+                warn!(error = %e, path = %record, "autostart completion: could not write its record");
+            }
+            info!(
+                heal_event = "autostart_completion",
+                step = "finished",
+                outcome,
+                "autostart completion done for this boot"
+            );
+        };
+
+        // First read: the VMs halted now are the candidates, if the read
+        // comes early enough in the boot to stand for "left halted by it".
+        let Some(cands) = self.autostart.candidates.as_mut() else {
+            if uptime > ac::FIRST_READ_WINDOW {
+                finish(
+                    &mut self.autostart,
+                    "first read too late in the boot; not applicable",
+                );
+                return;
+            }
+            let Some(pool_flag) = xapi::pool_auto_poweron().await else {
+                return;
+            };
+            if !pool_flag {
+                // XCP-ng's autostart does nothing without the pool flag either.
+                finish(&mut self.autostart, "pool auto_poweron is off");
+                return;
+            }
+            let Some(halted) = xapi::halted_auto_poweron_vms().await else {
+                return;
+            };
+            info!(heal_event = "autostart_completion", step = "first_read", candidates = halted.len(),
+                  uptime_secs = uptime.as_secs(), vms = ?halted,
+                  "VMs marked auto_poweron halted at this boot's first read");
+            if halted.is_empty() {
+                finish(
+                    &mut self.autostart,
+                    "no VM marked auto_poweron was halted at boot",
+                );
+            } else {
+                self.autostart.candidates = Some(halted.into_iter().collect());
+            }
+            return;
+        };
+
+        // A VM seen not halted at any read since is no longer a candidate:
+        // XCP-ng, HA or an operator started it.
+        let Some(halted) = xapi::halted_auto_poweron_vms().await else {
+            return;
+        };
+        let halted: std::collections::BTreeSet<String> = halted.into_iter().collect();
+        for u in cands.iter().filter(|u| !halted.contains(*u)) {
+            info!(heal_event = "autostart_completion", step = "ran", vm = %u,
+                  "a VM halted at boot is running (or no longer marked); not a candidate any more");
+        }
+        cands.retain(|u| halted.contains(u));
+        let left: Vec<String> = cands.iter().cloned().collect();
+        if left.is_empty() {
+            self.autostart.whole_since = None;
+            let outcome = if self.autostart.started.is_empty() && self.autostart.failed.is_empty() {
+                "every VM halted at boot ran"
+            } else {
+                "done"
+            };
+            self.autostart_report().await;
+            finish(&mut self.autostart, outcome);
+            return;
+        }
+        if uptime >= ac::DEADLINE {
+            let why = self
+                .autostart
+                .not_whole
+                .unwrap_or("this host was not the pool master");
+            warn!(heal_event = "autostart_completion", step = "gave_up", vms = ?left, reason = why,
+                  "VMs marked auto_poweron still halted an hour after boot; not started");
+            let mut names = std::collections::HashMap::new();
+            for u in &left {
+                names.insert(
+                    u.clone(),
+                    xapi::vm_name_label(u).await.unwrap_or_else(|| "?".into()),
+                );
+            }
+            if xapi::is_pool_master_resilient().await == Some(true) {
+                let _ = xapi::send_xapi_alert(&ac::give_up_body(&left, why, |u| {
+                    names.get(u).cloned().unwrap_or_default()
+                }))
+                .await;
+            }
+            self.autostart_report().await;
+            finish(
+                &mut self.autostart,
+                "gave up: pool not whole an hour after boot",
+            );
+            return;
+        }
+
+        // Only the master starts, after the grace, on a pool whole long enough.
+        if xapi::is_pool_master_resilient().await != Some(true) {
+            self.autostart.whole_since = None;
+            return;
+        }
+        if uptime < ac::MIN_UPTIME {
+            return;
+        }
+        let facts = self.autostart_pool_facts().await;
+        let now = std::time::Instant::now();
+        match ac::pool_whole(&facts) {
+            Err(why) => {
+                if self.autostart.not_whole != Some(why) {
+                    info!(
+                        heal_event = "autostart_completion",
+                        step = "waiting",
+                        reason = why,
+                        candidates = left.len(),
+                        "autostart completion waits for the pool to be whole"
+                    );
+                }
+                self.autostart.not_whole = Some(why);
+                self.autostart.whole_since = None;
+                return;
+            }
+            Ok(()) => {
+                self.autostart.not_whole = None;
+            }
+        }
+        let since = *self.autostart.whole_since.get_or_insert(now);
+        if now.duration_since(since) < ac::WHOLE_HOLD {
+            return;
+        }
+        // XCP-ng starts nothing without the pool's flag: neither does this.
+        match xapi::pool_auto_poweron().await {
+            Some(true) => {}
+            Some(false) => {
+                for u in &left {
+                    self.autostart.left.push((
+                        u.clone(),
+                        "the pool's auto_poweron was turned off".to_string(),
+                    ));
+                }
+                self.autostart_report().await;
+                finish(
+                    &mut self.autostart,
+                    "pool auto_poweron turned off before the starts",
+                );
+                return;
+            }
+            None => return,
+        }
+        let Some(threshold) =
+            ac::boot_threshold(time::OffsetDateTime::now_utc().unix_timestamp(), uptime)
+        else {
+            return;
+        };
+        let batch = ac::pick_batch(&left, |u| {
+            self.autostart.attempts.get(u).copied().unwrap_or(0)
+        });
+        for u in batch {
+            // Re-read right before the start: an operator may have acted
+            // since the scan.
+            let Some(v) = xapi::autostart_vm_facts(&u).await else {
+                continue; // unreadable: no start, no verdict; next scan
+            };
+            if let Err(why) = ac::start_guard(&v, &threshold) {
+                info!(heal_event = "autostart_completion", step = "left", vm = %u, reason = why,
+                      power_state = %v.power_state, ha_always_run = %v.ha_always_run,
+                      start_time = %v.start_time, "VM left alone by the autostart completion");
+                if let Some(c) = self.autostart.candidates.as_mut() {
+                    c.remove(&u);
+                }
+                if v.power_state == "halted" {
+                    self.autostart.left.push((u.clone(), why.to_string()));
+                }
+                continue;
+            }
+            let tries = self.autostart.attempts.entry(u.clone()).or_insert(0);
+            *tries += 1;
+            let tries = *tries;
+            match xapi::start_vm_reason(&u, ac::START_TIMEOUT_SECS).await {
+                Ok(()) => {
+                    info!(heal_event = "autostart_completion", step = "started", vm = %u, attempt = tries,
+                          "started a VM marked auto_poweron left halted since boot");
+                    self.autostart.started.push(u.clone());
+                    if let Some(c) = self.autostart.candidates.as_mut() {
+                        c.remove(&u);
+                    }
+                }
+                Err(e) => {
+                    // Started by someone else meanwhile (XCP-ng's autostart on
+                    // a late host, or an operator): not a failure.
+                    if xapi::vm_param(&u, "power-state", None).await.as_deref() == Some("running") {
+                        info!(heal_event = "autostart_completion", step = "ran", vm = %u, error = %e,
+                              "the start failed but the VM runs: started elsewhere meanwhile");
+                        if let Some(c) = self.autostart.candidates.as_mut() {
+                            c.remove(&u);
+                        }
+                        continue;
+                    }
+                    warn!(heal_event = "autostart_completion", step = "start_failed", vm = %u,
+                          attempt = tries, error = %e, "could not start a VM marked auto_poweron");
+                    if tries >= ac::MAX_ATTEMPTS {
+                        self.autostart.failed.push((u.clone(), e));
+                        if let Some(c) = self.autostart.candidates.as_mut() {
+                            c.remove(&u);
+                        }
+                    }
+                }
+            }
+        }
+        if self
+            .autostart
+            .candidates
+            .as_ref()
+            .is_some_and(|c| c.is_empty())
+        {
+            self.autostart_report().await;
+            finish(&mut self.autostart, "done");
+        }
+    }
+
+    /// The facts `crate::autostart::pool_whole` decides on, all read from this
+    /// master's own XAPI, xhad and DRBD. An unreadable fact stays at its
+    /// "missing" default.
+    async fn autostart_pool_facts(&self) -> crate::autostart::PoolFacts {
+        let mut f = crate::autostart::PoolFacts::default();
+        if let Some((hosts, enabled, live)) = xapi::pool_host_counts().await {
+            (f.hosts, f.enabled, f.live) = (hosts, enabled, live);
+        }
+        match xapi::is_ha_enabled().await {
+            Some(on) => {
+                f.ha_on = on;
+                if on {
+                    f.local_ha_online = self.xha_host_state().await == XhaHostState::Online;
+                    f.peer_in_liveset = self.peer_in_liveset().await == Some(true);
+                }
+            }
+            // Unreadable HA state: ask for the liveset anyway.
+            None => f.ha_on = true,
+        }
+        if let Ok(st) = self.drbd.status().await {
+            f.drbd_connected = st.connection == ConnectionState::Connected;
+            f.local_uptodate = st.disk == DiskState::UpToDate;
+            f.peer_uptodate = st.peer_disk == Some(DiskState::UpToDate);
+        }
+        if let Some(sr) = xapi::twinstor_sr_uuid().await
+            && let Some((pbds, attached)) = xapi::sr_pbds_attached(&sr).await
+        {
+            (f.pbds, f.pbds_attached) = (pbds, attached);
+        }
+        f
+    }
+
+    /// The end-of-completion alert, when anything was started or failed.
+    async fn autostart_report(&mut self) {
+        let w = &self.autostart;
+        if w.started.is_empty() && w.failed.is_empty() {
+            return;
+        }
+        let mut names = std::collections::HashMap::new();
+        for u in w
+            .started
+            .iter()
+            .chain(w.failed.iter().map(|(u, _)| u))
+            .chain(w.left.iter().map(|(u, _)| u))
+        {
+            names.insert(
+                u.clone(),
+                xapi::vm_name_label(u).await.unwrap_or_else(|| "?".into()),
+            );
+        }
+        warn!(
+            heal_event = "autostart_completion",
+            step = "report",
+            started = w.started.len(),
+            failed = w.failed.len(),
+            left = w.left.len(),
+            "autostart completion: VMs marked auto_poweron started after the pool reboot"
+        );
+        let body = crate::autostart::alert_body(&w.started, &w.failed, &w.left, |u| {
+            names.get(u).cloned().unwrap_or_default()
+        });
+        let _ = xapi::send_xapi_alert(&body).await;
     }
 
     /// Forget what the protected-VM watchdog learned (this host is not the

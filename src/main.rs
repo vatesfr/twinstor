@@ -1,4 +1,5 @@
 mod advertise;
+mod autostart;
 mod cli;
 mod cmd;
 mod config;
