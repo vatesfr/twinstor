@@ -361,6 +361,10 @@ pub(crate) async fn offer() -> Result<bool> {
         "  - join this host to the pool of {addr} (\"{remote_hostname}\"): xe pool-join \
          master-address={addr} master-username=root master-password=********"
     );
+    println!(
+        "  - this host's root password becomes the one of {addr}, as for any host joining a \
+         pool"
+    );
     println!("This host's toolstack restarts during the join; it takes a minute or two.");
     let confirm = crate::wizard::ask("Type 'join' to proceed (anything else aborts)", None)?;
     if confirm != "join" {
@@ -438,12 +442,22 @@ pub(crate) async fn offer() -> Result<bool> {
             .map(|l| l.split(',').filter(|u| !u.trim().is_empty()).count())
             .unwrap_or(0);
         if n == 2 {
-            // This host's network records are filled in a little after it
-            // is listed; the wizard reads them next to find the other host.
-            // Wait for them, but go on without when the hosts share no
-            // network: the wizard then asks for the address.
+            // This host's network records are filled in and its SRs plugged
+            // a little after it is listed; the wizard reads both next (to
+            // find the other host, and in the SR check). Wait for them, but
+            // go on without: hosts that share no network get asked for the
+            // address, and an SR that stays unplugged is reported.
             for _ in 0..12 {
-                if crate::wizard::shares_a_network_with_peer().await {
+                let unplugged = local_xe(&[
+                    "pbd-list",
+                    &format!("host-uuid={local_uuid}"),
+                    "currently-attached=false",
+                    "--minimal",
+                ])
+                .await
+                .unwrap_or_else(|| "unknown".into());
+                if unplugged.trim().is_empty() && crate::wizard::shares_a_network_with_peer().await
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
