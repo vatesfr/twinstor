@@ -97,6 +97,22 @@ fn main() -> std::process::ExitCode {
         unsafe { std::env::set_var("NO_COLOR", "1") };
     }
 
+    // The read-only reports end quietly when their reader goes away, as Unix
+    // tools do (`twinstor status | grep -q healthy`): Rust ignores SIGPIPE, so
+    // the next print would panic on the broken pipe. Only these commands: the
+    // daemon and the commands that change the host must see a write error,
+    // never be killed by a signal.
+    if std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-') && !a.starts_with('/'))
+        .is_some_and(|c| c == "status" || c == "doctor")
+    {
+        // SAFETY: no other thread exists yet; SIG_DFL is a valid disposition.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     // Bare `twinstor` gets a short command map instead of clap's usage error.
     if std::env::args_os().len() < 2 {
         cli::print_overview();
