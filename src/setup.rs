@@ -358,7 +358,7 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
             None => generate_chap_password()?,
         },
     };
-    let initiator_iqns = get_initiator_iqns().await?;
+    let initiators = plan_initiator_iqns().await?;
 
     // The command we tell the operator to run on the peer. It carries the
     // flags that must match across the two nodes (CHAP password; a mismatched
@@ -430,6 +430,9 @@ pub async fn run_setup(params: SetupParams) -> Result<()> {
             .into());
         }
     }
+
+    apply_initiator_fixes(&initiators).await?;
+    let initiator_iqns = initiators.iqns;
 
     tokio::fs::create_dir_all(CONFIG_DIR)
         .await
@@ -2650,7 +2653,42 @@ async fn ensure_local_initiator(iqn: &str) -> Result<()> {
     Ok(())
 }
 
-async fn get_initiator_iqns() -> Result<Vec<String>> {
+/// The pool's initiator IQNs as the LIO ACL will list them, and the changes
+/// that takes. Planning only reads: `apply_initiator_fixes` makes the
+/// changes, after the operator confirmed the setup.
+struct InitiatorPlan {
+    iqns: Vec<String>,
+    /// (host uuid, LIO-valid IQN) to write to XAPI.
+    xapi_fixes: Vec<(String, String)>,
+    /// This host's IQN, which its OS initiator name must match.
+    local: Option<String>,
+}
+
+async fn apply_initiator_fixes(plan: &InitiatorPlan) -> Result<()> {
+    for (uuid, iqn) in &plan.xapi_fixes {
+        // Pool-wide XAPI update (forwards to the master from any node).
+        run_cmd(
+            "xe",
+            &[
+                "host-param-set",
+                &format!("uuid={uuid}"),
+                &format!("other-config:iscsi_iqn={iqn}"),
+            ],
+        )
+        .await
+        .with_context(|| format!("setting iscsi_iqn on host {uuid}"))?;
+        println!("  host {uuid}: iSCSI IQN set to '{iqn}'");
+    }
+    // This host's OS initiator name must match its (possibly sanitized) XAPI
+    // IQN, whether this node rewrote it or the peer did. The peer fixes its own
+    // file when its setup runs.
+    if let Some(iqn) = &plan.local {
+        ensure_local_initiator(iqn).await?;
+    }
+    Ok(())
+}
+
+async fn plan_initiator_iqns() -> Result<InitiatorPlan> {
     let hosts = cmd_output("xe", &["host-list", "--minimal"])
         .await
         .context("listing hosts (is this node in a pool?)")?;
@@ -2685,22 +2723,15 @@ async fn get_initiator_iqns() -> Result<Vec<String>> {
     // an ACL). Skip the rewrite when an iSCSI SR already depends on the current
     // IQN (brownfield guard): in that case fall through to the bail below with
     // manual guidance.
+    let mut xapi_fixes = Vec::new();
     let any_invalid = pairs.iter().any(|(_, iqn)| !iqn_is_lio_compatible(iqn));
     if any_invalid && !pool_has_other_iscsi_sr().await {
         for (uuid, iqn) in pairs.iter_mut() {
             if let Some(fixed) = sanitize_iqn(iqn) {
-                println!("  host {uuid}: iSCSI IQN '{iqn}' invalid for LIO, setting '{fixed}'");
-                // Pool-wide XAPI update (forwards to the master from any node).
-                run_cmd(
-                    "xe",
-                    &[
-                        "host-param-set",
-                        &format!("uuid={uuid}"),
-                        &format!("other-config:iscsi_iqn={fixed}"),
-                    ],
-                )
-                .await
-                .with_context(|| format!("setting iscsi_iqn on host {uuid}"))?;
+                println!(
+                    "  host {uuid}: iSCSI IQN '{iqn}' is invalid for LIO; setup sets '{fixed}'"
+                );
+                xapi_fixes.push((uuid.clone(), fixed.clone()));
                 *iqn = fixed;
             }
         }
@@ -2725,14 +2756,10 @@ async fn get_initiator_iqns() -> Result<Vec<String>> {
         }
     }
 
-    // This host's OS initiator name must match its (possibly sanitized) XAPI
-    // IQN, whether this node rewrote it or the peer did. The peer fixes its own
-    // file when its setup runs.
-    if let Some(local) = &local_uuid
-        && let Some((_, iqn)) = pairs.iter().find(|(u, _)| u == local)
-    {
-        ensure_local_initiator(iqn).await?;
-    }
+    let local = local_uuid
+        .as_ref()
+        .and_then(|l| pairs.iter().find(|(u, _)| u == l))
+        .map(|(_, iqn)| iqn.clone());
 
     let mut iqns: Vec<String> = pairs.into_iter().map(|(_, iqn)| iqn).collect();
     if iqns.is_empty() {
@@ -2754,7 +2781,11 @@ async fn get_initiator_iqns() -> Result<Vec<String>> {
             "no initiator IQNs found (check /etc/iscsi/initiatorname.iscsi and XAPI other-config:iscsi_iqn)"
         );
     }
-    Ok(iqns)
+    Ok(InitiatorPlan {
+        iqns,
+        xapi_fixes,
+        local,
+    })
 }
 
 /// Given this host's UUID and every pool host's UUID, pick the single peer.
