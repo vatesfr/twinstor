@@ -24495,6 +24495,28 @@ impl StateMachine {
             return false;
         }
         let still_yielded = |c: PeerClaim, g: u64| matches!(c, PeerClaim::Claim(ForkClaim::Yielded(u)) if same_gen(u, g));
+        // The peer's copy is Inconsistent (an interrupted resync): it is no
+        // possible winner and holds no write this copy lacks, so this node
+        // takes the win whatever the peer claims (a latched node and an
+        // Inconsistent peer otherwise both held as losers). Read from the
+        // last handshake, bound to this copy as it is now.
+        if let Ok(crate::drbd::LineageRead { pair: Some(h), .. }) = self.drbd.handshake_read().await
+            && h.peer.flags & UUID_FLAG_INCONSISTENT != 0
+            && self
+                .drbd
+                .local_current_uuid()
+                .await
+                .is_some_and(|c| same_gen(h.local.current, c))
+            && matches!(self.drbd.status().await, Ok(s) if s.disk == DiskState::UpToDate)
+        {
+            warn!(heal_event = "mutual_yield_take_win", rule = "peer_inconsistent",
+                  peer_current = %format!("{:016X}", h.peer.current),
+                  "split-brain: this node yielded but the peer's copy is Inconsistent (an \
+                   interrupted resync): this copy is the only complete one; taking the win");
+            return self
+                .mutual_yield_commit(h.peer.current, restart_target)
+                .await;
+        }
         let claim = self.query_peer_claim().await;
         let PeerClaim::Claim(ForkClaim::Yielded(peer_gen)) = claim else {
             self.withdraw_take_intent("the peer no longer claims it yielded");
