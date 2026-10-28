@@ -274,13 +274,15 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
     }
     // The backups this install made of its own files: a managed artifact
     // reconciled after drifting (`<path>.bak-prev`) and the resource file
-    // before a `regenerate-config` (`.res.pre-regen`).
+    // before a `regenerate-config` (`.res.pre-regen`) or a `replace-backing`
+    // (`.res.pre-replace`).
     let res_file = format!("{DRBD_CONF_DIR}/{res}.res");
     let backups: Vec<String> = crate::setup::static_artifacts()
         .iter()
         .map(|(path, _)| format!("{path}.bak-prev"))
         .chain([
             format!("{res_file}.pre-regen"),
+            format!("{res_file}.pre-replace"),
             format!("{res_file}.bak-prev"),
         ])
         .collect();
