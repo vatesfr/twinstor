@@ -729,6 +729,22 @@ fn is_nvme_path_node(name: &str) -> bool {
 /// path node, see `is_nvme_path_node`, which also covers kernels without the
 /// attribute). Never a backing target: the device it is a path to is listed
 /// under its own name.
+/// A disk reached over the network: an iSCSI LUN sits under a `session<N>`
+/// node of its sysfs path. TwinStor's own LUN is one, and so is any array's;
+/// none is a local backing device. Takes the resolved `/sys/block/<name>`.
+fn is_network_disk_path(resolved: &str) -> bool {
+    resolved.split('/').any(|c| {
+        c.strip_prefix("session")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+fn is_network_disk(sys_path: &std::path::Path) -> bool {
+    std::fs::canonicalize(sys_path)
+        .map(|p| is_network_disk_path(&p.to_string_lossy()))
+        .unwrap_or(false)
+}
+
 fn is_hidden_block(name: &str, sys_path: &std::path::Path) -> bool {
     is_nvme_path_node(name)
         || std::fs::read_to_string(sys_path.join("hidden")).is_ok_and(|h| h.trim() == "1")
@@ -800,7 +816,10 @@ fn candidate_disks() -> Vec<CandidateDisk> {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if is_virtual_device(&name) || is_hidden_block(&name, &e.path()) {
+        if is_virtual_device(&name)
+            || is_hidden_block(&name, &e.path())
+            || is_network_disk(&e.path())
+        {
             continue;
         }
         // The running system disk or a dormant XCP-ng install disk: its
@@ -2347,7 +2366,10 @@ pub async fn run() -> Result<Option<SetupParams>> {
                 crate::uninstall::run_uninstall(false, keep, false).await?;
                 return Ok(None);
             }
-            "r" if menu_offers(&lines, "r") => println!(),
+            "r" if menu_offers(&lines, "r") => {
+                println!();
+                crate::uninstall::release_for_rerun().await;
+            }
             _ => {
                 println!("nothing changed.");
                 return Ok(None);
@@ -3117,6 +3139,22 @@ mod tests {
         std::fs::write(dir.join("hidden"), "1\n").unwrap();
         assert!(is_hidden_block("sdz", &dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iscsi_luns_are_not_local_disks() {
+        // The paths seen on a host during setup: its own SATA disk, and the
+        // other host's TwinStor LUN after the iSCSI login.
+        assert!(!is_network_disk_path(
+            "/sys/devices/pci0000:00/0000:00:17.0/ata2/host1/target1:0:0/1:0:0:0/block/sda"
+        ));
+        assert!(is_network_disk_path(
+            "/sys/devices/platform/host2/session4/target2:0:0/2:0:0:0/block/sdb"
+        ));
+        assert!(!is_network_disk_path(
+            "/sys/devices/virtual/block/sessions/x"
+        ));
+        assert!(!is_network_disk_path("/sys/devices/session/block/sdc"));
     }
 
     #[test]

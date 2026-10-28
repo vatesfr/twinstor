@@ -216,31 +216,12 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
 
     // Step 3: stop twinstor daemon
     print_step(3, "stopping twinstor daemon");
-    match run_cmd("systemctl", &["stop", "twinstor"]).await {
-        Ok(()) => println!("  daemon stopped"),
-        Err(_) => println!("  daemon not running"),
-    }
+    stop_daemon().await;
     let _ = run_cmd("systemctl", &["disable", "twinstor"]).await;
 
     // Step 4: stop iSCSI target and DRBD
     print_step(4, "stopping iSCSI target");
-    let _ = run_cmd("targetcli", &["clearconfig confirm=True"]).await;
-    let _ = run_cmd("targetcli", &["saveconfig"]).await;
-    println!("  iSCSI cleared");
-
-    println!("  stopping DRBD resource {res}");
-    let _ = run_cmd("drbdadm", &["secondary", &res]).await;
-    let _ = run_cmd("drbdadm", &["down", &res]).await;
-    println!("  DRBD stopped");
-
-    // Log out of iSCSI sessions to the twinstor target
-    let iqn = config.as_ref().map(|c| c.iscsi.target_iqn.clone());
-    if let Some(iqn) = &iqn {
-        println!("  logging out of iSCSI sessions for {iqn}");
-        // Both fail when there is no session or node record, which is normal.
-        let _ = run_cmd_quiet("iscsiadm", &["-m", "node", "-T", iqn, "--logout"]).await;
-        let _ = run_cmd_quiet("iscsiadm", &["-m", "node", "-T", iqn, "-o", "delete"]).await;
-    }
+    stop_target_and_drbd(&res, config.as_ref().map(|c| c.iscsi.target_iqn.as_str())).await;
 
     // Step 5: wipe the backing device
     let mut wiped = false;
@@ -368,6 +349,51 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
     println!("run this command on the peer node as well.");
 
     Ok(())
+}
+
+async fn stop_daemon() {
+    match run_cmd("systemctl", &["stop", "twinstor"]).await {
+        Ok(()) => println!("  daemon stopped"),
+        Err(_) => println!("  daemon not running"),
+    }
+}
+
+/// Clear this host's iSCSI target, take DRBD down, and log out of the
+/// TwinStor target's sessions: afterwards nothing holds the backing device.
+async fn stop_target_and_drbd(res: &str, iqn: Option<&str>) {
+    let _ = run_cmd("targetcli", &["clearconfig confirm=True"]).await;
+    let _ = run_cmd("targetcli", &["saveconfig"]).await;
+    println!("  iSCSI cleared");
+
+    println!("  stopping DRBD resource {res}");
+    let _ = run_cmd("drbdadm", &["secondary", res]).await;
+    let _ = run_cmd("drbdadm", &["down", res]).await;
+    println!("  DRBD stopped");
+
+    if let Some(iqn) = iqn {
+        println!("  logging out of iSCSI sessions for {iqn}");
+        // Both fail when there is no session or node record, which is normal.
+        let _ = run_cmd_quiet("iscsiadm", &["-m", "node", "-T", iqn, "--logout"]).await;
+        let _ = run_cmd_quiet("iscsiadm", &["-m", "node", "-T", iqn, "-o", "delete"]).await;
+    }
+}
+
+/// Before the wizard runs setup again on a host whose setup stopped before
+/// the SR existed: stop what that setup started here (daemon, iSCSI target,
+/// DRBD, iSCSI sessions), so its backing device is free to be chosen again.
+/// The configuration, the other host's published settings and the pool's
+/// settings stay: setup writes this host's again, and the other host still
+/// waits with its own.
+pub(crate) async fn release_for_rerun() {
+    let config = crate::config::Config::load(std::path::Path::new(CONFIG_PATH)).ok();
+    let res = config
+        .as_ref()
+        .map(|c| format!("twinstor-{}", c.storage.drbd_resource))
+        .unwrap_or_else(|| "twinstor-data".to_string());
+    println!("Stopping what the previous setup started on this host:");
+    stop_daemon().await;
+    stop_target_and_drbd(&res, config.as_ref().map(|c| c.iscsi.target_iqn.as_str())).await;
+    println!();
 }
 
 fn print_step(n: u32, msg: &str) {
