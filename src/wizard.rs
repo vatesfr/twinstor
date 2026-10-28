@@ -2380,6 +2380,18 @@ pub async fn run() -> Result<Option<SetupParams>> {
             }
             "r" if menu_offers(&lines, "r") => {
                 println!();
+                // The menu read "no SR" from lookups that also read a failed
+                // or slow XAPI as "none". Stopping this host's target and DRBD
+                // is only safe when XAPI positively says no SR exists.
+                if !crate::xapi::twinstor_sr_absent_confirmed(crate::setup::TARGET_IQN).await {
+                    return Err(crate::render::CliError::new(
+                        "XAPI did not confirm that the pool has no TwinStor SR, so setup did \
+                         not stop anything on this host; nothing was changed"
+                            .to_string(),
+                        "check that `xe sr-list` answers on this host, then run setup again",
+                    )
+                    .into());
+                }
                 crate::uninstall::release_for_rerun().await;
             }
             _ => {

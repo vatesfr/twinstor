@@ -279,6 +279,27 @@ pub async fn record_sr_uuid(target_iqn: &str) -> Option<String> {
 
 /// Whether an SR with this UUID exists. `twinstor sr set` uses it to validate an
 /// operator-supplied UUID before recording it.
+/// Whether XAPI positively answers that the pool has no TwinStor SR: each
+/// lookup (recorded uuid, target IQN, default name) answered and found none.
+/// A lookup that fails or times out is no answer, so this reads false: the
+/// lookups behind `sr_uuid_exists` and friends read a failure as "none".
+pub async fn twinstor_sr_absent_confirmed(target_iqn: &str) -> bool {
+    if let Some(u) = read_recorded_sr_uuid() {
+        match xe_minimal(&["sr-list", &format!("uuid={u}"), "params=uuid"]).await {
+            Some(s) if s.is_empty() => {}
+            _ => return false,
+        }
+    }
+    match xe_raw(&["pbd-list", "params=sr-uuid,device-config"]).await {
+        Some(out) if parse_sr_uuid_for_iqn(&out, target_iqn).is_none() => {}
+        _ => return false,
+    }
+    matches!(
+        xe_minimal(&["sr-list", "name-label=twinstor", "params=uuid"]).await,
+        Some(s) if s.is_empty()
+    )
+}
+
 pub async fn sr_uuid_exists(uuid: &str) -> bool {
     xe_minimal(&["sr-list", &format!("uuid={uuid}"), "params=uuid"])
         .await
@@ -2364,7 +2385,10 @@ mod tests {
         assert_eq!(default_ha_timeout_restore(Some(":"), Some("")), DropRecord);
     }
 
-    use super::{ALERT_GATE_MAX, ALERT_GATE_MIN, AlertGate, parse_sr_uuid_for_iqn};
+    use super::{
+        ALERT_GATE_MAX, ALERT_GATE_MIN, AlertGate, parse_sr_uuid_for_iqn,
+        twinstor_sr_absent_confirmed,
+    };
     use super::{
         first_error_line, first_token, fs_freeze_in_other_config, parse_maintenance,
         parse_pool_role,
@@ -2467,6 +2491,12 @@ device-config (MRO): target: 198.51.100.2; targetIQN: iqn.2025-01.tech.vates:twi
 sr-uuid ( RO)       : 22222222-2222-2222-2222-222222222222
 device-config (MRO): target: 10.0.0.50; targetIQN: iqn.2000-01.com.synology:backup.Target-1; SCSIid: 36001405def; port: 3260
 ";
+
+    #[tokio::test]
+    async fn sr_absence_is_never_confirmed_without_an_answer() {
+        // No xe here: every lookup fails, which must not read as "no SR".
+        assert!(!twinstor_sr_absent_confirmed("iqn.2025-01.com.xcp-ng:twinstor-data").await);
+    }
 
     #[test]
     fn parse_sr_uuid_for_iqn_matches_twinstor_among_two() {
