@@ -2843,8 +2843,11 @@ async fn rebuild_res_text(
     };
 
     let link = crate::setup::detect_link_speed_mbps(peer_ip).await;
-    let fill = crate::setup::resync_fill_target(link);
-    let min_rate = crate::setup::resync_min_rate(link, direct_pair.is_some());
+    let direct_link = match direct_pair {
+        Some((_, peer_direct)) => crate::setup::detect_link_speed_mbps(peer_direct).await,
+        None => None,
+    };
+    let (fill, min_rate) = crate::setup::resync_sizing(link, direct_pair.is_some(), direct_link);
     let fencing = if direct_pair.is_some() {
         "resource-and-stonith"
     } else {

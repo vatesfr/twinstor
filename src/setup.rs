@@ -546,20 +546,24 @@ initiator_iqns = [{iqn_list}]
     // fill/bandwidth of added latency), so it is scaled to the link. The
     // controller's c-min-rate yield to application I/O applies either way.
     let link_mbps = detect_link_speed_mbps(params.peer_ip).await;
-    let fill_target = resync_fill_target(link_mbps);
-    let min_rate = resync_min_rate(link_mbps, direct.is_some());
-    let sync_mode = if direct.is_some() {
-        "arbitrated"
-    } else {
-        "fate-shared"
+    let direct_mbps = match params.direct_ip {
+        Some(peer_direct) => detect_link_speed_mbps(peer_direct).await,
+        None => None,
     };
-    match link_mbps {
-        Some(m) => println!(
-            "  link:    {m} Mbps ({sync_mode}) -> resync c-fill-target {fill_target}, c-min-rate {min_rate}"
-        ),
-        None => println!(
-            "  link:    speed unknown ({sync_mode}) -> resync c-fill-target {fill_target}, c-min-rate {min_rate}"
-        ),
+    let (fill_target, min_rate) = resync_sizing(link_mbps, direct.is_some(), direct_mbps);
+    let speed = |m: Option<u32>| m.map_or("speed unknown".to_string(), |m| format!("{m} Mbps"));
+    if direct.is_some() {
+        println!(
+            "  link:    direct cable {}, switched {} (arbitrated) -> resync c-fill-target \
+             {fill_target}, c-min-rate {min_rate}",
+            speed(direct_mbps),
+            speed(link_mbps)
+        );
+    } else {
+        println!(
+            "  link:    {} (fate-shared) -> resync c-fill-target {fill_target}, c-min-rate {min_rate}",
+            speed(link_mbps)
+        );
     }
 
     // Topology: a single switched path (fate-shared) or two active-backup
@@ -1332,11 +1336,37 @@ pub(crate) fn resync_fill_target(link_mbps: Option<u32>) -> &'static str {
 /// cause a fence). Capped at c-max-rate (800M; a floor above the ceiling is
 /// invalid) and floored at 10 MB/s. An unknown link is treated as 1 GbE.
 pub(crate) fn resync_min_rate(link_mbps: Option<u32>, arbitrated: bool) -> String {
+    format!("{}M", min_rate_mbytes(link_mbps, arbitrated))
+}
+
+fn min_rate_mbytes(link_mbps: Option<u32>, dedicated: bool) -> u32 {
     let mbps = link_mbps.unwrap_or(1000); // unknown: assume 1 GbE
     let link_mbytes = mbps / 8; // Mb/s to MB/s
-    let pct = if arbitrated { 80 } else { 50 }; // dedicated vs shared link
-    let rate = (link_mbytes.saturating_mul(pct) / 100).clamp(10, 800); // floor 10, cap c-max-rate
-    format!("{rate}M")
+    let pct = if dedicated { 80 } else { 50 }; // dedicated vs shared link
+    (link_mbytes.saturating_mul(pct) / 100).clamp(10, 800) // floor 10, cap c-max-rate
+}
+
+/// The resync controller values for the `.res`: `(c-fill-target, c-min-rate)`.
+/// Fate-shared: both from the one switched link (`direct_mbps` is `None`).
+/// Arbitrated: the resync rides the direct cable, so the fill target is sized
+/// from it (the switched link's speed when the cable's is unknown). The floor
+/// must hold on whichever path DRBD uses: with the cable down the resync rides
+/// the switched link beside the XHA heartbeat, iSCSI and VM traffic, so it is
+/// the lower of 80% of the cable and half of the switched link.
+pub(crate) fn resync_sizing(
+    switched_mbps: Option<u32>,
+    arbitrated: bool,
+    direct_mbps: Option<u32>,
+) -> (&'static str, String) {
+    if !arbitrated {
+        return (
+            resync_fill_target(switched_mbps),
+            resync_min_rate(switched_mbps, false),
+        );
+    }
+    let cable = direct_mbps.or(switched_mbps);
+    let floor = min_rate_mbytes(cable, true).min(min_rate_mbytes(switched_mbps, false));
+    (resync_fill_target(cable), format!("{floor}M"))
 }
 
 /// Preflight the direct link before making it the default replication path.
@@ -1606,7 +1636,7 @@ resource {res} {{
         # DRBD's 250k default is the resync-vs-application-I/O floor and collapses
         # the resync under app I/O (down to ~6 MB/s during a rolling
         # update), leaving the pool single-copy far too long and nearly capping the
-        # reboot-drain hold. Raised, topology-scaled (see resync_min_rate()),
+        # reboot-drain hold. Raised, topology-scaled (see resync_sizing()),
         # so the resync keeps making real progress under
         # load and the single-copy window / drain hold stay bounded.
         c-fill-target {fill_target};
@@ -4216,7 +4246,7 @@ mod tests {
     use super::{
         SharedSetup, chap_check_value, drbd_topology, ha_timeout_secs, iqn_is_lio_compatible,
         patch_lvm_global_filter, peer_uuid_from_pool, resync_fill_target, resync_min_rate,
-        sanitize_iqn,
+        resync_sizing, sanitize_iqn,
     };
     use super::{tiebreaker_gate, validate_local_name_matches_xapi, validate_node_names};
 
@@ -4571,6 +4601,38 @@ mod tests {
         // The comment is untouched, the active line is patched.
         assert!(out.contains("# global_filter = [ \"a|.*|\" ]"));
         assert!(out.contains("global_filter = [ \"r|nvme-X_1|\", \"r|^/dev/drbd.*|\" ]"));
+    }
+
+    #[test]
+    fn arbitrated_resync_is_sized_from_the_cable_with_a_floor_safe_on_both_paths() {
+        // Fate-shared: unchanged, from the one switched link.
+        assert_eq!(
+            resync_sizing(Some(10_000), false, None),
+            ("10M", "625M".to_string())
+        );
+        // A 10 GbE cable beside a 1 GbE switched network: the fill target
+        // follows the cable; the floor stays at half the switched link, the
+        // path the resync rides when the cable is down.
+        assert_eq!(
+            resync_sizing(Some(1000), true, Some(10_000)),
+            ("10M", "62M".to_string())
+        );
+        // Both fast: the cable's 80% is capped at c-max-rate, half the
+        // switched link is lower.
+        assert_eq!(
+            resync_sizing(Some(10_000), true, Some(100_000)),
+            ("10M", "625M".to_string())
+        );
+        // A cable slower than the switched network: the cable's 80% decides.
+        assert_eq!(
+            resync_sizing(Some(10_000), true, Some(1000)),
+            ("1M", "100M".to_string())
+        );
+        // Unknown cable speed: the switched link's speed stands in for it.
+        assert_eq!(
+            resync_sizing(Some(1000), true, None),
+            ("1M", "62M".to_string())
+        );
     }
 
     #[test]
