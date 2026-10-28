@@ -7,6 +7,164 @@ TwinStor is in the 0.x tech-preview series: treat every release as
 potentially behaviour-changing and read the notes before upgrading a live
 pool.
 
+## [0.7.3] - 2026-10-28
+
+A fix release for 0.7.2, from fault campaigns on both test pools (heavy
+packet loss, both hosts yielding at once, disk failures, router outages)
+and a fresh-install run of the setup wizard. Upgrade both hosts: the new
+handling of a split where both hosts yield acts only when both run 0.7.3.
+
+### Fixed
+- **Heavy packet loss no longer makes two writers in most cases.** A
+  replication link that keeps dropping packets without staying down made
+  both hosts read the other as gone and accept writes, and the resolution
+  then discarded one side's acknowledged writes. The fence-peer handler now:
+  watches the peer for a few seconds before it survives (arbitrated
+  non-keeper: DRBD port and iSCSI portal for 10 s; fate-shared freeze mode:
+  the DRBD port for 6 s); freezes I/O at entry when DRBD dropped its
+  fencing suspend during a flap; keeps the freeze when a newer disconnect
+  overtook its verdict; lifts the freeze itself, and reports no fencing,
+  when the pair is connected again before it answers, and stays until the
+  link has held for 20 s. Some loss remains possible, see Known
+  limitations.
+- **When both hosts yield, one of them takes over.** Arbitrated: when both
+  hosts froze with guests and every reconnect aborts, the keeper resumes on
+  its copy once the peer attests it is frozen at the same generation, takes
+  the replication link down until its pending writes complete, and the
+  other host stops its guests and resyncs. Fate-shared: a host whose copy
+  holds everything the other's has takes the win, also after a daemon
+  restart or a refused discard; when neither copy holds the other's, the
+  keeper takes it after 90 s, in two published steps so that never both
+  do; a host whose peer's copy is Inconsistent takes it at once. A host
+  that took the win keeps serving through the next fence-peer run. The
+  freeze budgets are staggered so the two hosts no longer step down
+  together.
+- **The losing host of a split-brain cuts its own iSCSI target before it
+  lifts its frozen I/O,** in both modes, so a write still queued there is
+  never acknowledged from the copy that is discarded. Its teardown now
+  releases only the backstore behind that cut and rebuilds the LUN in place
+  at the next start: deleting the portal could hang in the kernel after a
+  timed-out login, and the host then rebooted itself.
+- **An iSCSI portal is no longer unreachable for about 15 minutes after a
+  frozen login.** The stock firewall answered the portal's retransmits with
+  ICMP, so its socket lingered and LIO accepted no login meanwhile. The
+  daemon now keeps a rule that answers such segments with a TCP reset.
+- **A disk failure on the pool master no longer makes the slave take the
+  mastership.** The slave read the master's Diskless state as stale and
+  ran its emergency master transition, which could run a VM on both hosts
+  at once. In fate-shared mode a Diskless host also keeps its path through
+  the peer's portal during a link drop, and it stops its own target only
+  after the peer has been gone for 10 s, logging its own session out
+  first.
+- **Arbitrated mode: releasing a whole-switch hold no longer reboots the
+  host.** The release restarted XHA while DRBD I/O was suspended, and the
+  XHA watchdog reset the host about 105 s later. A host with no guest now
+  waits for I/O and for its HA statefile, repairing the statefile link if
+  needed, and alerts after 5 minutes; a host running guests re-arms at once
+  as before.
+- **Arbitrated mode: losing only the gateway no longer stands a host down
+  when the peer still answers on the gateway network.** The isolated-slave
+  and isolated-master stand-downs first ping the peer's address when it is
+  on the gateway network. A router outage seen by both hosts still holds
+  as a whole-switch outage.
+- **The stuck-Primary recovery never tears down storage or reboots a host
+  that runs guests.** It held frozen copies on repeated aborted reconnects
+  alone; it now also needs DRBD's own refusal and no guest, and otherwise
+  holds and alerts.
+- **Pool HA is armed again after a reboot that disabled it.** A master
+  rebooted (or whose toolstack restarted) after an emergency HA disarm came
+  back with pool HA off and left its stopped guests halted.
+- **Write cache on hardware RAID volumes and SAS disks.** The cache check
+  only spoke ATA, so these read as unknown and the pair as degraded. RAID
+  volumes are now left to their controller, and other SCSI disks are read
+  and set through the kernel.
+- **`twinstor uninstall` leaves no state behind** after a wipe: it empties
+  `/var/lib/twinstor` and `/run/twinstor`, and removes the backup copies
+  setup and upgrades make of their files. Without a wipe the state stays.
+- **Setup never wipes a live pair.** A re-run on a pair whose SR was
+  renamed read as an unfinished install, and a rebuild could promote an
+  empty disk; a live pair is now detected by the recorded SR uuid, the
+  target IQN, the name or DRBD, and is never offered a re-run. The checks
+  run before setup writes anything.
+- **The setup wizard never offers an NVMe multipath path node or a disk
+  reached over iSCSI** as the backing device: both looked like empty
+  disks (the first was a boot disk on one server, the second the other
+  host's TwinStor volume after an interrupted setup).
+- Setup changes nothing on the host before its confirmation (it corrected
+  an initiator name LIO refuses while still planning). A local SR left by
+  the installer is named when it holds the disks. A failure after setup
+  started says what to do next and never leaves the service stopped.
+
+### Changed
+- **`twinstor setup` with flags asks for a typed confirmation** before it
+  erases the backing device, and without a terminal refuses unless `--yes`
+  is given. Add `--yes` to scripted setups.
+- `twinstor setup` with flags runs the wizard's requirement checks (a pool
+  of exactly two hosts stops it; other findings are warnings) and refuses a
+  backing device the wizard would not offer, with the reason;
+  `--force-device` overrides that. The device a host already uses is
+  exempt.
+- On the second host, setup refuses a missing or wrong `--chap-password`
+  and a topology that differs from the first host's, before changing
+  anything.
+- The first host waits up to 30 minutes for the second one (it was 5)
+  before it promotes alone.
+- `install.sh` refuses XCP-ng versions other than 8.3 (overridable with
+  `TWINSTOR_SKIP_PREFLIGHT=1`), gives up the update check after a minute
+  without network, and stops with the list of missing packages when yum did
+  not install them all.
+- `twinstor status` on a host receiving its first copy reads degraded with
+  the copy's progress instead of critical, unless its own target is open
+  meanwhile; other degraded reasons are listed first.
+
+### Added
+- **The setup wizard checks the requirements first** (two hosts in one
+  pool, same updates, every SR plugged) and, on a host alone in its pool,
+  offers to join it to the other host's pool. As with any pool join, that
+  host's root password becomes the other host's.
+- In arbitrated mode the wizard lists the NICs with their speed, offers
+  only those fit for a direct cable, configures both ends, and refuses a
+  link with a switch behind it (read from the bridge's forwarding table).
+  The second host follows the first host's topology.
+- The wizard can destroy an empty local SR that holds the disks (typed
+  confirmation; an SR with virtual disks is never touched), checks the
+  pasted CHAP password before anything is erased, recognises a setup that
+  stopped part-way and offers to run it again, and prints the equivalent
+  `twinstor setup` command before its confirmation.
+
+### Upgrading
+- Upgrade the two hosts back to back with `twinstor upgrade-apply`. While
+  one host still runs 0.7.2, a split where both hosts yield ends as on
+  0.7.2. No configuration change; the install replaces the fence-peer
+  handler, and the daemon adds its firewall rule at start.
+- Scripts that run `twinstor setup` with flags need `--yes`.
+
+### Known limitations
+- **Heavy packet loss between the hosts:** when the replication network
+  keeps dropping a large share of its packets (30% or more, for minutes)
+  without cutting the hosts apart, both hosts can still accept writes for a
+  moment, and the last few writes of the host that loses are discarded; a
+  VM that ran on it may need a filesystem check. An alert names the VMs
+  concerned. In arbitrated mode this needs both the direct cable and the
+  switched network to drop packets at once. DRBD applies a fence-peer
+  answer at its next state change, which a link that flaps every second
+  can turn against the freeze.
+- When such loss makes both hosts yield while each runs VMs, neither takes
+  over by itself, because each copy may hold writes the other lacks: the
+  pool stops serving until an operator picks the copy to keep. An alert on
+  each host gives the steps.
+- Arbitrated mode: if the direct link's address or NIC disappears (not a
+  cable pull), DRBD does not use the switched path either; the host that
+  does not keep serving stays frozen until the address is back.
+- Arbitrated mode: a switch isolation of the pool master that outlasts the
+  XHA timeout can reboot both hosts. Fate-shared mode: a cut longer than
+  about 60 s can end with XHA rebooting either host.
+- The wizard's switch-port check cannot tell a dedicated switch with nothing
+  else on it from a cable, and needs the Open vSwitch backend (the
+  default). During the wizard's pool join the master's password is visible
+  in the joining host's process list (`xe pool-join` takes it only on its
+  command line).
+
 ## [0.7.2] - 2026-10-25
 
 Follow-up release to 0.7.1: the pool default HA timeout, quieter and safer
