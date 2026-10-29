@@ -1,6 +1,6 @@
 [package]
 name = "twinstor"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 description = "Replicated shared storage for two-host XCP-ng pools (DRBD 9, LIO iSCSI, multipath)"
 license = "GPL-2.0-or-later"
