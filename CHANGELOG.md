@@ -7,6 +7,41 @@ TwinStor is in the 0.x tech-preview series: treat every release as
 potentially behaviour-changing and read the notes before upgrading a live
 pool.
 
+## [0.7.4] - 2026-10-29
+
+A small fix release for 0.7.3. Upgrade both hosts.
+
+### Fixed
+- Arbitrated mode: setup sizes the resync from the direct cable, which
+  carries it, instead of the switched network.
+- `twinstor status` while a copy is being built shows the single iSCSI path
+  as expected instead of degraded, and shows "no TwinStor SR yet" between
+  the two hosts' setup steps instead of "XAPI did not answer". The
+  install.sh warning about pending XCP-ng updates now says to apply them
+  before running setup.
+- The fence-peer handler no longer relies on a behaviour of `wait` that
+  some bash 5.3 releases changed (XCP-ng's bash is not affected).
+
+### Upgrading
+- Upgrade the two hosts back to back with `twinstor upgrade-apply`. No
+  configuration change. Existing arbitrated pools keep their resync
+  settings until `twinstor regenerate-config`.
+
+### Known limitations
+- **Heavy packet loss between the hosts:** when the replication network
+  keeps dropping a large share of its packets (20% or more, for minutes)
+  without cutting the hosts apart, both hosts can still accept writes for a
+  moment, and the last few writes of the host that loses are discarded; a
+  VM that ran on it may need a filesystem check. An alert names the VMs
+  concerned. In arbitrated mode this needs both the direct cable and the
+  switched network to drop packets at once. (0.7.3 put the threshold at
+  30%; further tests lost a few writes at 20%.)
+- On a fate-shared pool, such a link can also leave both hosts stepped
+  down, with nothing serving the SR until an operator picks the copy to
+  keep; no acknowledged write is lost in that case. A link that keeps
+  dropping packets is a hardware fault to fix (cable, optic, switch port).
+- The other limitations of 0.7.3 are unchanged.
+
 ## [0.7.3] - 2026-10-28
 
 A fix release for 0.7.2, from fault campaigns on both test pools (heavy
