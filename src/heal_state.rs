@@ -54,7 +54,6 @@ pub fn state_path(default: &str) -> String {
     default.to_string()
 }
 
-
 /// A parsed snapshot for display. Numeric fields default to 0 when absent so
 /// the renderer never needs to distinguish "old file" from "no counter".
 pub struct HealState {

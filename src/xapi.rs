@@ -1722,7 +1722,10 @@ pub async fn is_ha_enabled() -> Option<bool> {
         _ => None,
     };
     if let Some(on) = v {
-        LAST_POOL_HA.store(pool_ha_cache_pack(on, cache_secs()), std::sync::atomic::Ordering::Relaxed);
+        LAST_POOL_HA.store(
+            pool_ha_cache_pack(on, cache_secs()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     v
 }
@@ -1741,7 +1744,10 @@ pub const POOL_HA_CACHE_MAX_AGE_SECS: u64 = 300;
 /// Seconds on a monotonic clock since the first use, plus one (0: never).
 fn cache_secs() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    BASE.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
+        + 1
 }
 
 fn pool_ha_cache_pack(on: bool, at: u64) -> u64 {
@@ -1765,7 +1771,10 @@ fn pool_ha_cache_value(packed: u64, now: u64) -> Option<bool> {
 /// The last pool HA state read by this daemon in the last few minutes,
 /// `None` if never read or too old.
 pub fn last_known_pool_ha() -> Option<bool> {
-    pool_ha_cache_value(LAST_POOL_HA.load(std::sync::atomic::Ordering::Relaxed), cache_secs())
+    pool_ha_cache_value(
+        LAST_POOL_HA.load(std::sync::atomic::Ordering::Relaxed),
+        cache_secs(),
+    )
 }
 
 /// The name of a pool HA enable or disable task XAPI still holds pending
@@ -1795,7 +1804,12 @@ pub fn parse_xapi_time(s: &str) -> Option<u64> {
     let month = time::Month::try_from(num(4, 6)? as u8).ok()?;
     let date = time::Date::from_calendar_date(num(0, 4)? as i32, month, num(6, 8)? as u8).ok()?;
     let t = time::Time::from_hms(num(9, 11)? as u8, num(12, 14)? as u8, num(15, 17)? as u8).ok()?;
-    u64::try_from(time::PrimitiveDateTime::new(date, t).assume_utc().unix_timestamp()).ok()
+    u64::try_from(
+        time::PrimitiveDateTime::new(date, t)
+            .assume_utc()
+            .unix_timestamp(),
+    )
+    .ok()
 }
 
 /// The pending pool HA tasks in `xe task-list params=uuid,name-label,created`
@@ -2199,8 +2213,12 @@ impl PendingAlerts {
             let (n, _, b, _) = self.items.remove(0);
             warn!(alert = %n, body = %log_body(&b), "held-back XAPI alert dropped undelivered (held set full)");
         }
-        self.items
-            .push((name.to_string(), key.to_string(), body.to_string(), Held { at, park }));
+        self.items.push((
+            name.to_string(),
+            key.to_string(),
+            body.to_string(),
+            Held { at, park },
+        ));
     }
 
     /// The message `(name, key)` reached XAPI: drop its held version.
@@ -2299,12 +2317,11 @@ pub fn expire_held_alerts() {
     }
 }
 
-static PENDING_ALERTS: std::sync::Mutex<PendingAlerts> =
-    std::sync::Mutex::new(PendingAlerts {
-        items: Vec::new(),
-        in_flight: Vec::new(),
-        withdrawn: Vec::new(),
-    });
+static PENDING_ALERTS: std::sync::Mutex<PendingAlerts> = std::sync::Mutex::new(PendingAlerts {
+    items: Vec::new(),
+    in_flight: Vec::new(),
+    withdrawn: Vec::new(),
+});
 
 /// Withdraw a held-back alert `(name, key)` (`key` as passed to the keyed
 /// send) that no longer holds, so it is never delivered late. Whether a held
@@ -2430,8 +2447,16 @@ fn hold_ha_advice(name: &str, key: &str, body: &str, view: crate::arbitration::P
 
 /// [`hold_ha_advice`] for an advice a flush took: back in the queue for the
 /// park, unless withdrawn meanwhile or a newer version is queued.
-fn hold_ha_advice_requeue(name: &str, key: &str, body: &str, view: crate::arbitration::PartitionView) {
-    let fresh = PENDING_ALERTS.lock().map(|p| !p.flush_skip(name, key)).unwrap_or(false);
+fn hold_ha_advice_requeue(
+    name: &str,
+    key: &str,
+    body: &str,
+    view: crate::arbitration::PartitionView,
+) {
+    let fresh = PENDING_ALERTS
+        .lock()
+        .map(|p| !p.flush_skip(name, key))
+        .unwrap_or(false);
     if fresh {
         hold_ha_advice(name, key, body, view);
     }
@@ -2529,15 +2554,16 @@ async fn send_alert_as(name: &str, key: &str, body: &str, queue: bool) -> bool {
     // while a host is parked, otherwise prefixed with when it is safe.
     let advice = key.starts_with(crate::arbitration::HA_DISABLE_ADVICE_KEY);
     let view = crate::arbitration::current();
-    let routed = match crate::arbitration::route_alert(crate::arbitration::advice_held(), advice, body) {
-        crate::arbitration::AlertRoute::Send(b) => b,
-        crate::arbitration::AlertRoute::Hold => {
-            if queue {
-                hold_ha_advice(name, key, body, view);
+    let routed =
+        match crate::arbitration::route_alert(crate::arbitration::advice_held(), advice, body) {
+            crate::arbitration::AlertRoute::Send(b) => b,
+            crate::arbitration::AlertRoute::Hold => {
+                if queue {
+                    hold_ha_advice(name, key, body, view);
+                }
+                return false;
             }
-            return false;
-        }
-    };
+        };
     let body = routed.as_str();
     let undelivered = |name: &str, key: &str, body: &str, why: &str| {
         if queue {
@@ -2610,40 +2636,41 @@ async fn send_alert_as(name: &str, key: &str, body: &str, queue: bool) -> bool {
 /// Deliver one alert a flush took from the queue.
 async fn flush_one(host_uuid: &str, n: &str, k: &str, b: &str, h: Held) {
     {
-                    // The age limit again at delivery: nothing older goes out.
-                    if stale_held(n, b, &h, std::time::Instant::now()) {
-                        return;
-                    }
-                    // Withdrawn after it was taken, or a newer version queued.
-                    if PENDING_ALERTS.lock().map(|p| p.flush_skip(n, k)).unwrap_or(false) {
-                        return;
-                    }
-                    // Advice routed again at delivery: still held while a
-                    // host is parked.
-                    let view = crate::arbitration::current();
-                    let advice = k.starts_with(crate::arbitration::HA_DISABLE_ADVICE_KEY);
-                    let routed = match crate::arbitration::route_alert(
-                        crate::arbitration::advice_held(),
-                        advice,
-                        b,
-                    ) {
-                        crate::arbitration::AlertRoute::Send(b) => b,
-                        crate::arbitration::AlertRoute::Hold => {
-                            hold_ha_advice_requeue(n, k, b, view);
-                            return;
-                        }
-                    };
-                    match message_create(host_uuid, n, &routed).await {
-                        Ok(()) => {
-                            info!(alert = %n, body = %log_body(&routed), "held-back XAPI alert delivered")
-                        }
-                        Err(e) => {
-                            undelivered_log(n, k, &routed, &e);
-                            if let Ok(mut p) = PENDING_ALERTS.lock() {
-                                p.flush_requeue(n, k, b, h);
-                            }
-                        }
-                    }
+        // The age limit again at delivery: nothing older goes out.
+        if stale_held(n, b, &h, std::time::Instant::now()) {
+            return;
+        }
+        // Withdrawn after it was taken, or a newer version queued.
+        if PENDING_ALERTS
+            .lock()
+            .map(|p| p.flush_skip(n, k))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // Advice routed again at delivery: still held while a
+        // host is parked.
+        let view = crate::arbitration::current();
+        let advice = k.starts_with(crate::arbitration::HA_DISABLE_ADVICE_KEY);
+        let routed =
+            match crate::arbitration::route_alert(crate::arbitration::advice_held(), advice, b) {
+                crate::arbitration::AlertRoute::Send(b) => b,
+                crate::arbitration::AlertRoute::Hold => {
+                    hold_ha_advice_requeue(n, k, b, view);
+                    return;
+                }
+            };
+        match message_create(host_uuid, n, &routed).await {
+            Ok(()) => {
+                info!(alert = %n, body = %log_body(&routed), "held-back XAPI alert delivered")
+            }
+            Err(e) => {
+                undelivered_log(n, k, &routed, &e);
+                if let Ok(mut p) = PENDING_ALERTS.lock() {
+                    p.flush_requeue(n, k, b, h);
+                }
+            }
+        }
     }
 }
 
@@ -2724,7 +2751,13 @@ mod alert_delivery_tests {
     fn a_held_alert_too_old_is_dropped_unless_raised_again() {
         let t0 = std::time::Instant::now();
         let mut p = PendingAlerts::default();
-        p.push_at("twinstor_degraded", "old", "serving without redundancy", false, t0);
+        p.push_at(
+            "twinstor_degraded",
+            "old",
+            "serving without redundancy",
+            false,
+            t0,
+        );
         p.push_at("twinstor_degraded", "raised", "x", false, t0);
         p.push_at("twinstor_degraded", "park", "advice", true, t0);
         let later = t0 + super::PENDING_ALERT_MAX_AGE;
@@ -2741,7 +2774,10 @@ mod alert_delivery_tests {
     #[test]
     fn a_flush_respects_withdrawals_and_newer_versions() {
         let t0 = std::time::Instant::now();
-        let held = super::Held { at: t0, park: false };
+        let held = super::Held {
+            at: t0,
+            park: false,
+        };
         let mut p = PendingAlerts::default();
         p.push_at("d", "isolated", "old", false, t0);
         p.push_at("d", "hold", "old hold", false, t0);
@@ -2749,7 +2785,10 @@ mod alert_delivery_tests {
         let taken = p.take_at("sending", "k", 8, t0);
         assert_eq!(taken.len(), 3);
         // Withdrawn after it was taken: dropped at send time.
-        assert!(p.delivered("d", "isolated"), "an in-flight entry counts as withdrawn");
+        assert!(
+            p.delivered("d", "isolated"),
+            "an in-flight entry counts as withdrawn"
+        );
         assert!(p.flush_skip("d", "isolated"));
         p.flush_requeue("d", "isolated", "old", held);
         assert!(p.items.is_empty(), "a withdrawn entry is not put back");
@@ -2758,11 +2797,21 @@ mod alert_delivery_tests {
         p.push_at("d", "hold", "new hold", false, t0);
         assert!(p.flush_skip("d", "hold"));
         p.flush_requeue("d", "hold", "old hold", held);
-        assert_eq!(p.items.iter().find(|(_, k, _, _)| k == "hold").map(|i| i.2.as_str()), Some("new hold"));
+        assert_eq!(
+            p.items
+                .iter()
+                .find(|(_, k, _, _)| k == "hold")
+                .map(|i| i.2.as_str()),
+            Some("new hold")
+        );
         // Neither: a failed send puts it back with its age.
         assert!(!p.flush_skip("d", "other"));
         p.flush_requeue("d", "other", "x", held);
-        assert!(p.items.iter().any(|(_, k, _, h)| k == "other" && h.at == t0));
+        assert!(
+            p.items
+                .iter()
+                .any(|(_, k, _, h)| k == "other" && h.at == t0)
+        );
         for k in ["isolated", "hold", "other"] {
             p.flush_end("d", k);
         }
@@ -2776,8 +2825,18 @@ mod alert_delivery_tests {
     #[test]
     fn a_withdrawal_names_the_held_body() {
         let mut p = PendingAlerts::default();
-        p.push_at("d", "run 'xe x heartbeat-sr-uuids=<twinstor SR uuid>'", "run 'xe x heartbeat-sr-uuids=00000000-aaaa'", false, std::time::Instant::now());
-        assert_eq!(p.held_body("d", "run 'xe x heartbeat-sr-uuids=<twinstor SR uuid>'").as_deref(), Some("run 'xe x heartbeat-sr-uuids=00000000-aaaa'"));
+        p.push_at(
+            "d",
+            "run 'xe x heartbeat-sr-uuids=<twinstor SR uuid>'",
+            "run 'xe x heartbeat-sr-uuids=00000000-aaaa'",
+            false,
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            p.held_body("d", "run 'xe x heartbeat-sr-uuids=<twinstor SR uuid>'")
+                .as_deref(),
+            Some("run 'xe x heartbeat-sr-uuids=00000000-aaaa'")
+        );
         assert_eq!(p.held_body("d", "other"), Option::None);
     }
 
@@ -2796,8 +2855,16 @@ mod alert_delivery_tests {
         let keys: Vec<&str> = p.items.iter().map(|(_, k, _, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["b"], "the parked host's advice is kept");
         // At delivery: a taken alert past the limit is not delivered.
-        let h = super::Held { at: t0, park: false };
-        assert!(super::stale_held("x", "y", &h, t0 + super::PENDING_ALERT_MAX_AGE));
+        let h = super::Held {
+            at: t0,
+            park: false,
+        };
+        assert!(super::stale_held(
+            "x",
+            "y",
+            &h,
+            t0 + super::PENDING_ALERT_MAX_AGE
+        ));
         assert!(!super::stale_held("x", "y", &h, t0));
     }
 
@@ -2807,7 +2874,10 @@ mod alert_delivery_tests {
     #[test]
     fn a_held_alert_is_withdrawn_when_its_condition_clears() {
         let key = "test-only: serving without redundancy";
-        super::PENDING_ALERTS.lock().unwrap().push("twinstor_degraded", key, key);
+        super::PENDING_ALERTS
+            .lock()
+            .unwrap()
+            .push("twinstor_degraded", key, key);
         assert!(super::alert_is_held("twinstor_degraded", key));
         assert!(super::drop_held_alert("twinstor_degraded", key));
         assert!(!super::alert_is_held("twinstor_degraded", key));
@@ -2995,14 +3065,21 @@ mod alert_delivery_tests {
         let held = p.take("x", "", 32);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held.iter().any(|(_, _, b, _)| b == "host-enable failed"));
-        assert!(held.iter().any(|(_, _, b, _)| b == "Holding for 20 minutes."));
+        assert!(
+            held.iter()
+                .any(|(_, _, b, _)| b == "Holding for 20 minutes.")
+        );
     }
 
     #[test]
     fn held_back_alerts_are_kept_by_name_and_key_and_handed_out_later() {
         let mut p = PendingAlerts::default();
         let e = |n: &str, b: &str| (n.to_string(), b.to_string(), b.to_string());
-        let strip = |v: Vec<(String, String, String, super::Held)>| v.into_iter().map(|(n, k, b, _)| (n, k, b)).collect::<Vec<_>>();
+        let strip = |v: Vec<(String, String, String, super::Held)>| {
+            v.into_iter()
+                .map(|(n, k, b, _)| (n, k, b))
+                .collect::<Vec<_>>()
+        };
         p.push("a", "one", "one");
         p.push("b", "two", "two");
         p.push("a", "three", "three");
@@ -3959,9 +4036,18 @@ mod pool_ha_cache_tests {
         let t = 1_000;
         let off = pool_ha_cache_pack(false, t);
         assert_eq!(pool_ha_cache_value(off, t + 60), Some(false));
-        assert_eq!(pool_ha_cache_value(off, t + POOL_HA_CACHE_MAX_AGE_SECS), Some(false));
-        assert_eq!(pool_ha_cache_value(off, t + POOL_HA_CACHE_MAX_AGE_SECS + 1), None);
-        assert_eq!(pool_ha_cache_value(pool_ha_cache_pack(true, t), t + 1), Some(true));
+        assert_eq!(
+            pool_ha_cache_value(off, t + POOL_HA_CACHE_MAX_AGE_SECS),
+            Some(false)
+        );
+        assert_eq!(
+            pool_ha_cache_value(off, t + POOL_HA_CACHE_MAX_AGE_SECS + 1),
+            None
+        );
+        assert_eq!(
+            pool_ha_cache_value(pool_ha_cache_pack(true, t), t + 1),
+            Some(true)
+        );
         assert_eq!(pool_ha_cache_value(0, t), None);
     }
 }
@@ -3979,9 +4065,15 @@ mod peer_role_tests {
     #[test]
     fn local_xapi_role_script_uses_the_local_socket() {
         let s = local_xapi_role_script();
-        assert!(!s.contains("print('MASTER')"), "a local login says nothing about the role");
+        assert!(
+            !s.contains("print('MASTER')"),
+            "a local login says nothing about the role"
+        );
         assert!(s.contains("OTHER:LOGIN_OK"));
-        assert_eq!(parse_peer_xapi_role(Some("OTHER:LOGIN_OK\n")), PeerXapiRole::Unknown);
+        assert_eq!(
+            parse_peer_xapi_role(Some("OTHER:LOGIN_OK\n")),
+            PeerXapiRole::Unknown
+        );
         for code in [
             "xapi_local()",
             "HOST_IS_SLAVE",
@@ -4010,7 +4102,10 @@ mod peer_role_tests {
             ("peer", peer_xapi_role_script("192.0.2.1")),
         ] {
             let mut child = Command::new("python3")
-                .args(["-c", "import sys; compile(sys.stdin.read(), 'probe', 'exec')"])
+                .args([
+                    "-c",
+                    "import sys; compile(sys.stdin.read(), 'probe', 'exec')",
+                ])
                 .stdin(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -4044,16 +4139,28 @@ mod peer_role_tests {
         );
         // Wedged: pool HA on, host locally disarmed, and its xapi restarted
         // since (before that restart it still answers as slave or master).
-        assert_eq!(parse_peer_xapi_role(Some("ARMED_MISMATCH\n")), ArmedMismatch);
+        assert_eq!(
+            parse_peer_xapi_role(Some("ARMED_MISMATCH\n")),
+            ArmedMismatch
+        );
         // Released from the startup loop, master not yet connected.
         assert_eq!(
             parse_peer_xapi_role(Some("OTHER:HA_HEARTBEAT_DAEMON_STARTUP_FAILED\n")),
             Unknown
         );
         // Parked in the startup loop, or xapi stopped: TCP reset after TLS.
-        assert_eq!(parse_peer_xapi_role(Some("RESET:ConnectionResetError\n")), Unknown);
-        assert_eq!(parse_peer_xapi_role(Some("RESET:RemoteDisconnected\n")), Unknown);
-        assert_eq!(parse_peer_xapi_role(Some("RESET:ConnectionRefusedError\n")), Unknown);
+        assert_eq!(
+            parse_peer_xapi_role(Some("RESET:ConnectionResetError\n")),
+            Unknown
+        );
+        assert_eq!(
+            parse_peer_xapi_role(Some("RESET:RemoteDisconnected\n")),
+            Unknown
+        );
+        assert_eq!(
+            parse_peer_xapi_role(Some("RESET:ConnectionRefusedError\n")),
+            Unknown
+        );
         // Across the cut: no TCP connection.
         assert_eq!(parse_peer_xapi_role(Some("UNREACHABLE\n")), Unreachable);
         // The command itself failed or hung: something held the port.
@@ -4096,7 +4203,10 @@ mod ha_advice_tests {
         let delivered = super::send_xapi_alert_advising_ha_disable(body).await;
         set_current(PartitionView::None);
         assert!(!delivered, "not delivered while parked");
-        assert!(super::alert_is_held("twinstor_degraded", &super::ha_advice_key(body)));
+        assert!(super::alert_is_held(
+            "twinstor_degraded",
+            &super::ha_advice_key(body)
+        ));
         let _ = super::drop_held_alert("twinstor_degraded", &super::ha_advice_key(body));
     }
 }

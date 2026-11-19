@@ -3241,7 +3241,8 @@ mod tests {
             assert!(!is_nvme_path_node(name), "{name}");
         }
         // The kernel's hidden flag excludes too, whatever the name.
-        let dir = crate::heal_state::test_tmp_dir().join(format!("twinstor-hidden-{}", std::process::id()));
+        let dir = crate::heal_state::test_tmp_dir()
+            .join(format!("twinstor-hidden-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!is_hidden_block("sdz", &dir), "no attribute: not hidden");
         std::fs::write(dir.join("hidden"), "0\n").unwrap();

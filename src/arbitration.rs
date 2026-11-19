@@ -360,7 +360,11 @@ pub struct ParkMemory {
 
 impl ParkMemory {
     pub fn remembered() -> Self {
-        Self { confirmed: true, disarmed_evaluations: 0, online_evaluations: 0 }
+        Self {
+            confirmed: true,
+            disarmed_evaluations: 0,
+            online_evaluations: 0,
+        }
     }
 
     pub fn confirmed(&self) -> bool {
@@ -447,9 +451,7 @@ impl ViewHysteresis {
     /// shown view's premise has just ended. The next real view still holds
     /// its evaluations.
     pub fn update_with(&mut self, view: PartitionView, i: &ViewInputs) -> PartitionView {
-        if view != self.shown
-            && (view == PartitionView::Settling || contradicted(self.shown, i))
-        {
+        if view != self.shown && (view == PartitionView::Settling || contradicted(self.shown, i)) {
             self.shown = PartitionView::Settling;
             self.candidate = view;
             self.count = u8::from(view != PartitionView::Settling);
@@ -484,7 +486,8 @@ impl ViewHysteresis {
 /// The PeerDisarmed view's text, its reset budget taken from the budget's
 /// own constants.
 static PEER_DISARMED_VERDICT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let (count, window, spacing, after_futile) = crate::state_machine::peer_emergency_budget_rules();
+    let (count, window, spacing, after_futile) =
+        crate::state_machine::peer_emergency_budget_rules();
     format!(
         "The peer's XAPI answers that it is locally disarmed under the armed pool: HA does not \
          protect the peer, and a reboot or toolstack restart of it can leave it in XAPI's HA \
@@ -696,7 +699,11 @@ static ADVICE_HOLD: AtomicBool = AtomicBool::new(false);
 /// it as a second master.
 pub fn holds_ha_disable_advice(i: &ViewInputs) -> bool {
     i.park_confirmed
-        || classify_partition(&ViewInputs { last_probe_answered: false, ..*i }).parked()
+        || classify_partition(&ViewInputs {
+            last_probe_answered: false,
+            ..*i
+        })
+        .parked()
 }
 
 /// Publish the input-based hold (the view task, every evaluation).
@@ -712,8 +719,7 @@ pub fn advice_held() -> bool {
 }
 
 /// The prefix put on advice to disable HA when no host is parked.
-pub const HA_DISABLE_ADVICE_PREFIX: &str =
-    "Only when both hosts' management networks are up: ";
+pub const HA_DISABLE_ADVICE_PREFIX: &str = "Only when both hosts' management networks are up: ";
 
 /// Identity-key prefix marking an alert that advises an HA disable
 /// (`pool-ha-disable` or `host-emergency-ha-disable`): only alerts sent
@@ -820,13 +826,25 @@ mod tests {
         // Healthy pool.
         assert_eq!(classify_partition(&base()), None);
         // ClientIsolated: own clients unreachable, P false, peer alive.
-        let i = ViewInputs { own_clients: Some(false), p: false, settled: false, ..base() };
+        let i = ViewInputs {
+            own_clients: Some(false),
+            p: false,
+            settled: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&i), ClientIsolated);
         // PeerClientIsolated: own clients reachable, P false, peer alive.
-        let i = ViewInputs { p: false, settled: false, ..base() };
+        let i = ViewInputs {
+            p: false,
+            settled: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&i), PeerClientIsolated);
         // GatewayOutage: own clients unreachable, P true.
-        let i = ViewInputs { own_clients: Some(false), ..base() };
+        let i = ViewInputs {
+            own_clients: Some(false),
+            ..base()
+        };
         assert_eq!(classify_partition(&i), GatewayOutage);
         // Parked (a failed join seen), own clients silent: this host is cut.
         let parked = ViewInputs {
@@ -837,10 +855,22 @@ mod tests {
             own_clients: Some(false),
             ..base()
         };
-        assert_eq!(classify_partition(&ViewInputs { conf_master: true, ..parked }), ParkedExMaster);
+        assert_eq!(
+            classify_partition(&ViewInputs {
+                conf_master: true,
+                ..parked
+            }),
+            ParkedExMaster
+        );
         assert_eq!(classify_partition(&parked), ParkedMember);
         // ParkedDark: the same with the peer unreachable everywhere.
-        assert_eq!(classify_partition(&ViewInputs { peer_alive: false, ..parked }), ParkedDark);
+        assert_eq!(
+            classify_partition(&ViewInputs {
+                peer_alive: false,
+                ..parked
+            }),
+            ParkedDark
+        );
         // PeerParked: master lock held here, peer not live, peer alive, P false.
         let i = ViewInputs {
             p: false,
@@ -851,15 +881,30 @@ mod tests {
         };
         assert_eq!(classify_partition(&i), PeerParked);
         // Rejoining: P back for less than the settle, this host not answering.
-        let i = ViewInputs { settled: false, xhad_online: false, ..base() };
+        let i = ViewInputs {
+            settled: false,
+            xhad_online: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&i), Rejoining);
-        let i = ViewInputs { settled: false, local_xapi_answers: false, ..base() };
+        let i = ViewInputs {
+            settled: false,
+            local_xapi_answers: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&i), Rejoining);
         // PeerRejoining: P back for less than the settle, peer not yet live.
-        let i = ViewInputs { settled: false, peer_live_in_liveset: Some(false), ..base() };
+        let i = ViewInputs {
+            settled: false,
+            peer_live_in_liveset: Some(false),
+            ..base()
+        };
         assert_eq!(classify_partition(&i), PeerRejoining);
         // Settled and normal: nothing.
-        let i = ViewInputs { settled: false, ..base() };
+        let i = ViewInputs {
+            settled: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&i), None);
         // PeerGone: peer unreachable everywhere, own clients reachable.
         let gone = ViewInputs {
@@ -872,21 +917,42 @@ mod tests {
         };
         assert_eq!(classify_partition(&gone), PeerGone);
         // Blind: the same with this host's own clients silent too.
-        assert_eq!(classify_partition(&ViewInputs { own_clients: Some(false), ..gone }), Blind);
+        assert_eq!(
+            classify_partition(&ViewInputs {
+                own_clients: Some(false),
+                ..gone
+            }),
+            Blind
+        );
         // SecondMaster: the local xapi answers as master, the own liveset
         // names the peer master (a stand-down release, or a partial heal).
-        let i = ViewInputs { local_xapi_master: Some(true), liveset_names_peer_master: true,
-                             conf_master: true, local_armed: Some(false), ..base() };
+        let i = ViewInputs {
+            local_xapi_master: Some(true),
+            liveset_names_peer_master: true,
+            conf_master: true,
+            local_armed: Some(false),
+            ..base()
+        };
         assert_eq!(classify_partition(&i), SecondMaster);
         // DisarmedMember: in the liveset, locally disarmed, pool HA on (a
         // whole-switch release).
-        let i = ViewInputs { local_armed: Some(false), ..base() };
+        let i = ViewInputs {
+            local_armed: Some(false),
+            ..base()
+        };
         assert_eq!(classify_partition(&i), DisarmedMember);
         // Pool HA off: not a disarmed member.
-        let i = ViewInputs { local_armed: Some(false), pool_ha: Some(false), ..base() };
+        let i = ViewInputs {
+            local_armed: Some(false),
+            pool_ha: Some(false),
+            ..base()
+        };
         assert_eq!(classify_partition(&i), None);
         // An unarmed host never reads parked.
-        let i = ViewInputs { local_armed: Some(false), ..parked };
+        let i = ViewInputs {
+            local_armed: Some(false),
+            ..parked
+        };
         assert_eq!(classify_partition(&i), ClientIsolated);
         assert!(degrades_health("ClientIsolated") && degrades_health("PeerParked"));
         assert!(!degrades_health("none") && !degrades_health(""));
@@ -918,7 +984,13 @@ mod tests {
         assert!(!verdict(IsolatedSurvivor).contains("peer was restarted"));
         assert!(degrades_health(IsolatedSurvivor.name()));
         // Before the lock moved here: still this host's side, never PeerParked.
-        assert_eq!(classify_partition(&ViewInputs { holds_master_lock: false, ..winner }), IsolatedSurvivor);
+        assert_eq!(
+            classify_partition(&ViewInputs {
+                holds_master_lock: false,
+                ..winner
+            }),
+            IsolatedSurvivor
+        );
         for conf_master in [true, false] {
             let fenced = ViewInputs {
                 own_clients: Some(true),
@@ -934,7 +1006,14 @@ mod tests {
                 ..base()
             };
             let v = classify_partition(&fenced);
-            assert_eq!(v, if conf_master { ParkedExMasterPeerCut } else { ParkedMemberPeerCut });
+            assert_eq!(
+                v,
+                if conf_master {
+                    ParkedExMasterPeerCut
+                } else {
+                    ParkedMemberPeerCut
+                }
+            );
             assert!(verdict(v).contains("This host's own network is fine"));
             assert!(verdict(v).contains("host-emergency-ha-disable"));
             assert!(!verdict(v).contains("its own network is still cut off"));
@@ -956,7 +1035,13 @@ mod tests {
         assert_eq!(classify_partition(&i), PeerParkedPending);
         assert!(verdict(PeerParkedPending).contains("expected to"));
         assert!(!verdict(PeerParkedPending).contains("runs the protected VMs"));
-        assert_eq!(classify_partition(&ViewInputs { holds_master_lock: true, ..i }), PeerParked);
+        assert_eq!(
+            classify_partition(&ViewInputs {
+                holds_master_lock: true,
+                ..i
+            }),
+            PeerParked
+        );
     }
 
     /// After a daemon start P is false until its probes have run: a healthy
@@ -967,7 +1052,12 @@ mod tests {
     #[test]
     fn no_view_while_p_warms_up_and_no_park_without_a_failed_join() {
         use PartitionView::*;
-        let start = ViewInputs { p_window_full: false, p: false, settled: false, ..base() };
+        let start = ViewInputs {
+            p_window_full: false,
+            p: false,
+            settled: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&start), None);
         let rebooted = ViewInputs {
             p: false,
@@ -979,12 +1069,22 @@ mod tests {
         assert_ne!(classify_partition(&rebooted), ParkedMember);
         assert_ne!(classify_partition(&rebooted), ParkedMemberPeerCut);
         assert_eq!(classify_partition(&rebooted), Joining);
-        assert_eq!(classify_partition(&ViewInputs { own_clients: Some(false), ..rebooted }), Joining);
+        assert_eq!(
+            classify_partition(&ViewInputs {
+                own_clients: Some(false),
+                ..rebooted
+            }),
+            Joining
+        );
         assert!(!verdict(Joining).contains("restarted"));
         assert!(!verdict(Joining).contains("side cut off"));
         assert!(Joining.parked());
         // Not armed (pool HA off): the cut views as before.
-        let unarmed = ViewInputs { local_armed: Some(false), pool_ha: Some(false), ..rebooted };
+        let unarmed = ViewInputs {
+            local_armed: Some(false),
+            pool_ha: Some(false),
+            ..rebooted
+        };
         assert_eq!(classify_partition(&unarmed), PeerClientIsolated);
     }
 
@@ -994,7 +1094,12 @@ mod tests {
     #[test]
     fn after_a_revert_both_hosts_settle_without_naming_a_cut_side() {
         use PartitionView::*;
-        let reverted = ViewInputs { p: false, settled: false, last_probe_answered: true, ..base() };
+        let reverted = ViewInputs {
+            p: false,
+            settled: false,
+            last_probe_answered: true,
+            ..base()
+        };
         // The formerly cut survivor (master lock, peer out of its liveset)
         // and the parked or fenced healthy host.
         let cut_survivor = ViewInputs {
@@ -1002,21 +1107,37 @@ mod tests {
             holds_master_lock: true,
             ..reverted
         };
-        let parked = ViewInputs { xhad_online: false, park_confirmed: true, ..reverted };
+        let parked = ViewInputs {
+            xhad_online: false,
+            park_confirmed: true,
+            ..reverted
+        };
         for (i, before) in [
             (reverted, PeerClientIsolated),
             (cut_survivor, IsolatedSurvivor),
             (parked, ParkedExMasterPeerCut),
         ] {
             assert_eq!(classify_partition(&i), Settling);
-            let mut h = ViewHysteresis { shown: before, candidate: before, count: 0 };
+            let mut h = ViewHysteresis {
+                shown: before,
+                candidate: before,
+                count: 0,
+            };
             assert_eq!(h.update_with(classify_partition(&i), &i), Settling);
         }
         assert!(!verdict(Settling).contains("cut off"));
         // P matured, settle running: the rejoin views (their texts do not say
         // the network left), then nothing; each holds its evaluations.
-        let mut h = ViewHysteresis { shown: Settling, candidate: Settling, count: 0 };
-        let rejoin = ViewInputs { settled: false, xhad_online: false, ..base() };
+        let mut h = ViewHysteresis {
+            shown: Settling,
+            candidate: Settling,
+            count: 0,
+        };
+        let rejoin = ViewInputs {
+            settled: false,
+            xhad_online: false,
+            ..base()
+        };
         assert_eq!(classify_partition(&rejoin), Rejoining);
         assert!(!verdict(Rejoining).contains("network is back"));
         assert!(!verdict(PeerRejoining).contains("network is back"));
@@ -1033,34 +1154,75 @@ mod tests {
     fn peer_gone_and_blind_end_when_the_peer_answers_again() {
         use PartitionView::*;
         let mut h = ViewHysteresis::default();
-        let gone = ViewInputs { p: false, settled: false, peer_alive: false, ..base() };
+        let gone = ViewInputs {
+            p: false,
+            settled: false,
+            peer_alive: false,
+            ..base()
+        };
         for _ in 0..VIEW_HOLD_EVALUATIONS {
             h.update_with(classify_partition(&gone), &gone);
         }
         assert_eq!(h.update_with(classify_partition(&gone), &gone), PeerGone);
         // Back on replication, its management address not answering yet.
-        let booting = ViewInputs { peer_alive: true, ..gone };
+        let booting = ViewInputs {
+            peer_alive: true,
+            ..gone
+        };
         assert_eq!(classify_partition(&booting), PeerClientIsolated);
-        assert_eq!(h.update_with(classify_partition(&booting), &booting), Settling);
+        assert_eq!(
+            h.update_with(classify_partition(&booting), &booting),
+            Settling
+        );
         // Its address answers (refused or XAPI up) while P re-matures.
-        let answering = ViewInputs { last_probe_answered: true, ..booting };
-        assert_eq!(h.update_with(classify_partition(&answering), &answering), Settling);
+        let answering = ViewInputs {
+            last_probe_answered: true,
+            ..booting
+        };
+        assert_eq!(
+            h.update_with(classify_partition(&answering), &answering),
+            Settling
+        );
         // P matured: nothing to say once that has held.
         let healed = base();
         for _ in 0..VIEW_HOLD_EVALUATIONS - 1 {
-            assert_eq!(h.update_with(classify_partition(&healed), &healed), Settling);
+            assert_eq!(
+                h.update_with(classify_partition(&healed), &healed),
+                Settling
+            );
         }
         assert_eq!(h.update_with(classify_partition(&healed), &healed), None);
         // Blind, cut host whose fenced peer is back on replication.
-        let blind = ViewInputs { own_clients: Some(false), ..gone };
-        let mut h = ViewHysteresis { shown: Blind, candidate: Blind, count: 0 };
-        let back = ViewInputs { peer_alive: true, ..blind };
+        let blind = ViewInputs {
+            own_clients: Some(false),
+            ..gone
+        };
+        let mut h = ViewHysteresis {
+            shown: Blind,
+            candidate: Blind,
+            count: 0,
+        };
+        let back = ViewInputs {
+            peer_alive: true,
+            ..blind
+        };
         assert_eq!(classify_partition(&back), ClientIsolated);
         assert_eq!(h.update_with(classify_partition(&back), &back), Settling);
         // A parked host whose peer went dark, then came back.
-        let mut h = ViewHysteresis { shown: ParkedDark, candidate: ParkedDark, count: 0 };
-        let parked = ViewInputs { xhad_online: false, park_confirmed: true, ..back };
-        assert_eq!(h.update_with(classify_partition(&parked), &parked), Settling);
+        let mut h = ViewHysteresis {
+            shown: ParkedDark,
+            candidate: ParkedDark,
+            count: 0,
+        };
+        let parked = ViewInputs {
+            xhad_online: false,
+            park_confirmed: true,
+            ..back
+        };
+        assert_eq!(
+            h.update_with(classify_partition(&parked), &parked),
+            Settling
+        );
     }
 
     /// Once a failed join was seen, the park holds through XAPI's join cycle
@@ -1099,7 +1261,10 @@ mod tests {
         for _ in 0..VIEW_HOLD_EVALUATIONS - 1 {
             assert!(m.observe(false, true, false, Some(true)));
         }
-        assert!(!m.observe(false, true, false, Some(true)), "joined for good");
+        assert!(
+            !m.observe(false, true, false, Some(true)),
+            "joined for good"
+        );
         assert!(!m.confirmed());
         // The view keeps the park while armed reads unreadable.
         use PartitionView::*;
@@ -1125,9 +1290,16 @@ mod tests {
         use PartitionView::*;
         let advice = "on the master run 'xe pool-ha-disable'";
         for (confirmed, shown_before) in [(true, ParkedMemberPeerCut), (false, Joining)] {
-            let mut memory =
-                if confirmed { ParkMemory::remembered() } else { ParkMemory::default() };
-            let mut h = ViewHysteresis { shown: shown_before, candidate: shown_before, count: 0 };
+            let mut memory = if confirmed {
+                ParkMemory::remembered()
+            } else {
+                ParkMemory::default()
+            };
+            let mut h = ViewHysteresis {
+                shown: shown_before,
+                candidate: shown_before,
+                count: 0,
+            };
             let mut settling_shown = 0;
             for n in 0..30 {
                 let answered = n % 2 == 0;
@@ -1183,11 +1355,18 @@ mod tests {
         assert!(!verdict(DisarmedMember).contains("is in the HA liveset"));
         // Without that answer (pool HA off, xhad stopped): nothing.
         assert_eq!(
-            classify_partition(&ViewInputs { own_xapi_armed_mismatch: false, ..wedged }),
+            classify_partition(&ViewInputs {
+                own_xapi_armed_mismatch: false,
+                ..wedged
+            }),
             None
         );
         // The master: healthy otherwise, the peer answers as disarmed.
-        let master = ViewInputs { peer_disarmed: true, conf_master: true, ..base() };
+        let master = ViewInputs {
+            peer_disarmed: true,
+            conf_master: true,
+            ..base()
+        };
         assert_eq!(classify_partition(&master), PeerDisarmed);
         assert!(degrades_health(PeerDisarmed.name()));
         // Neither text promises an HA cycle without its conditions.
@@ -1196,7 +1375,11 @@ mod tests {
         }
         assert!(!PeerDisarmed.parked());
         // Only while P holds (the answer is read over the management address).
-        let cut = ViewInputs { p: false, settled: false, ..master };
+        let cut = ViewInputs {
+            p: false,
+            settled: false,
+            ..master
+        };
         assert_ne!(classify_partition(&cut), PeerDisarmed);
     }
 
@@ -1234,7 +1417,10 @@ mod tests {
         assert!(!verdict(PeerStoodDown).contains("restarted by XHA and"));
         // A fenced peer that rebooted and reconnected as Secondary (parked):
         // the link dropped since it left, so it is not shown as stood down.
-        let fenced = ViewInputs { peer_left_on_held_link: false, ..survivor };
+        let fenced = ViewInputs {
+            peer_left_on_held_link: false,
+            ..survivor
+        };
         assert_eq!(classify_partition(&fenced), PeerParked);
         assert!(verdict(PeerParked).contains("restarted by XHA"));
         // Whole-switch hold, both hosts: own clients silent, P false, peer
@@ -1250,7 +1436,13 @@ mod tests {
         };
         assert_eq!(classify_partition(&hold), WholeSwitchHold);
         assert!(!verdict(WholeSwitchHold).contains("host order"));
-        assert_ne!(classify_partition(&ViewInputs { whole_switch_hold: false, ..hold }), WholeSwitchHold);
+        assert_ne!(
+            classify_partition(&ViewInputs {
+                whole_switch_hold: false,
+                ..hold
+            }),
+            WholeSwitchHold
+        );
     }
 
     #[test]
@@ -1311,11 +1503,29 @@ mod tests {
     fn every_view_has_a_verdict_and_parked_views_suppress_ha_disable_advice() {
         use PartitionView::*;
         for v in [
-            ClientIsolated, PeerClientIsolated, GatewayOutage, ParkedExMaster, ParkedMember,
-            ParkedDark, PeerParked, Rejoining, PeerRejoining, PeerGone, SecondMaster,
-            DisarmedMember, ParkedExMasterPeerCut, ParkedMemberPeerCut, IsolatedSurvivor,
-            PeerParkedPending, Blind, WholeSwitchHold, StoodDown, PeerStoodDown, Settling,
-            Joining, PeerDisarmed,
+            ClientIsolated,
+            PeerClientIsolated,
+            GatewayOutage,
+            ParkedExMaster,
+            ParkedMember,
+            ParkedDark,
+            PeerParked,
+            Rejoining,
+            PeerRejoining,
+            PeerGone,
+            SecondMaster,
+            DisarmedMember,
+            ParkedExMasterPeerCut,
+            ParkedMemberPeerCut,
+            IsolatedSurvivor,
+            PeerParkedPending,
+            Blind,
+            WholeSwitchHold,
+            StoodDown,
+            PeerStoodDown,
+            Settling,
+            Joining,
+            PeerDisarmed,
         ] {
             assert!(!verdict(v).is_empty(), "{v:?}");
             assert_eq!(PartitionView::from_u8(v as u8), v);
@@ -1327,33 +1537,75 @@ mod tests {
         // hold: a parked member, a parked ex-master, a parked host whose peer
         // is dark, the survivor holding the lock for a parked peer, a host
         // joining before its first failed join.
-        let cut = ViewInputs { p: false, settled: false, ..base() };
-        let parked = ViewInputs { xhad_online: false, park_confirmed: true, ..cut };
+        let cut = ViewInputs {
+            p: false,
+            settled: false,
+            ..base()
+        };
+        let parked = ViewInputs {
+            xhad_online: false,
+            park_confirmed: true,
+            ..cut
+        };
         let shapes = [
             (parked, ParkedMemberPeerCut),
-            (ViewInputs { conf_master: true, own_clients: Some(false), ..parked }, ParkedExMaster),
-            (ViewInputs { peer_alive: false, ..parked }, ParkedDark),
             (
-                ViewInputs { peer_live_in_liveset: Some(false), holds_master_lock: true, ..cut },
+                ViewInputs {
+                    conf_master: true,
+                    own_clients: Some(false),
+                    ..parked
+                },
+                ParkedExMaster,
+            ),
+            (
+                ViewInputs {
+                    peer_alive: false,
+                    ..parked
+                },
+                ParkedDark,
+            ),
+            (
+                ViewInputs {
+                    peer_live_in_liveset: Some(false),
+                    holds_master_lock: true,
+                    ..cut
+                },
                 PeerParked,
             ),
-            (ViewInputs { xhad_online: false, ..cut }, Joining),
+            (
+                ViewInputs {
+                    xhad_online: false,
+                    ..cut
+                },
+                Joining,
+            ),
         ];
         for (i, expect) in shapes {
             assert_eq!(classify_partition(&i), expect);
             let held = holds_ha_disable_advice(&i);
-            assert_eq!(route_alert(held, true, advice), AlertRoute::Hold, "{expect:?}");
+            assert_eq!(
+                route_alert(held, true, advice),
+                AlertRoute::Hold,
+                "{expect:?}"
+            );
             // Not marked as advice: unchanged, whatever its text says.
-            assert_eq!(route_alert(held, false, advice), AlertRoute::Send(advice.to_string()));
+            assert_eq!(
+                route_alert(held, false, advice),
+                AlertRoute::Send(advice.to_string())
+            );
         }
         // Healthy, or a cut with no host held out of the pool: sent, prefixed
         // with when the advice is safe, and idempotent.
         for i in [base(), cut] {
-            let AlertRoute::Send(out) = route_alert(holds_ha_disable_advice(&i), true, advice) else {
+            let AlertRoute::Send(out) = route_alert(holds_ha_disable_advice(&i), true, advice)
+            else {
                 panic!("nothing held: sent");
             };
             assert!(out.starts_with(HA_DISABLE_ADVICE_PREFIX));
-            assert_eq!(route_alert(false, true, &out), AlertRoute::Send(out.clone()));
+            assert_eq!(
+                route_alert(false, true, &out),
+                AlertRoute::Send(out.clone())
+            );
         }
     }
 

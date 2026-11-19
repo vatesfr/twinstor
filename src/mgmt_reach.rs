@@ -132,7 +132,6 @@ impl ReachState {
         if self.p() && self.p_true_since.is_none() {
             self.p_true_since = Some(now);
         }
-
     }
 
     /// The predicate P: at least 4 of the last 6 probes answered and the last
@@ -227,7 +226,9 @@ pub enum Gate {
     /// answering reliably.
     NotReachable,
     /// P holds but the settle has this much left.
-    Settling { remaining: Duration },
+    Settling {
+        remaining: Duration,
+    },
 }
 
 /// The gate an HA action checks at the moment it fires. An action that finds
@@ -455,7 +456,9 @@ pub fn status_text(view: &PView, address: Option<&str>, k: u32, now_unix: u64) -
         view.p,
         view.answered,
         view.probes,
-        view.true_for.map(|d| d.as_secs().to_string()).unwrap_or_default(),
+        view.true_for
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default(),
         SETTLE.as_secs(),
         k,
         address.unwrap_or(""),
@@ -486,7 +489,9 @@ pub fn parse_status(text: &str) -> Option<StatusSnapshot> {
         probes: get("probes")?.parse().ok()?,
         settled_secs: get("settled_secs").and_then(|s| s.parse().ok()),
         address: get("address").filter(|s| !s.is_empty()).map(str::to_string),
-        updated_unix: get("updated_unix").and_then(|s| s.parse().ok()).unwrap_or(0),
+        updated_unix: get("updated_unix")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -570,7 +575,8 @@ pub fn spawn_prober(state: Shared, peer_hostname: String, arbitrated: bool) {
                 }
                 last_warn = disagree;
             }
-            let candidates = distinct_candidates(pc.as_deref(), cache.as_deref(), ha_peers.as_deref());
+            let candidates =
+                distinct_candidates(pc.as_deref(), cache.as_deref(), ha_peers.as_deref());
             // Probe: the current address while P holds; every candidate,
             // freshest first until one answers, while it does not.
             let mut answers = vec![false; candidates.len()];
@@ -586,17 +592,21 @@ pub fn spawn_prober(state: Shared, peer_hostname: String, arbitrated: bool) {
                     }
                 }
             }
-            let (addr, answered) = if p_now && current.as_ref().is_some_and(|c| !candidates.contains(c)) {
-                // The address P was built on is no longer named by any source.
-                pick_address(false, None, &candidates, &answers)
-            } else {
-                pick_address(p_now, current.as_deref(), &candidates, &answers)
-            };
+            let (addr, answered) =
+                if p_now && current.as_ref().is_some_and(|c| !candidates.contains(c)) {
+                    // The address P was built on is no longer named by any source.
+                    pick_address(false, None, &candidates, &answers)
+                } else {
+                    pick_address(p_now, current.as_deref(), &candidates, &answers)
+                };
             if addr != current && current.is_some() {
-                tracing::warn!(heal_event = "mgmt_address_switch",
-                               from = current.as_deref().unwrap_or(""),
-                               to = addr.as_deref().unwrap_or(""), answered,
-                               "peer management address switched to the source that answers");
+                tracing::warn!(
+                    heal_event = "mgmt_address_switch",
+                    from = current.as_deref().unwrap_or(""),
+                    to = addr.as_deref().unwrap_or(""),
+                    answered,
+                    "peer management address switched to the source that answers"
+                );
             }
             let k = std::fs::read_to_string(XHAD_CONF)
                 .ok()
@@ -632,7 +642,10 @@ pub fn spawn_prober(state: Shared, peer_hostname: String, arbitrated: bool) {
             if let Some(dir) = std::path::Path::new(STATUS_PATH.as_str()).parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(STATUS_PATH.as_str(), status_text(&view, addr.as_deref(), k, now_unix));
+            let _ = std::fs::write(
+                STATUS_PATH.as_str(),
+                status_text(&view, addr.as_deref(), k, now_unix),
+            );
             round = round.wrapping_add(1);
             tokio::time::sleep(PROBE_EVERY).await;
         }
@@ -673,10 +686,16 @@ mod tests {
 
     #[test]
     fn refused_counts_as_an_answer() {
-        assert!(refused_counts_as_answer(std::io::ErrorKind::ConnectionRefused));
+        assert!(refused_counts_as_answer(
+            std::io::ErrorKind::ConnectionRefused
+        ));
         assert!(!refused_counts_as_answer(std::io::ErrorKind::TimedOut));
-        assert!(!refused_counts_as_answer(std::io::ErrorKind::HostUnreachable));
-        assert!(!refused_counts_as_answer(std::io::ErrorKind::NetworkUnreachable));
+        assert!(!refused_counts_as_answer(
+            std::io::ErrorKind::HostUnreachable
+        ));
+        assert!(!refused_counts_as_answer(
+            std::io::ErrorKind::NetworkUnreachable
+        ));
     }
 
     #[test]
@@ -686,7 +705,11 @@ mod tests {
         let start = feed(&mut st, t0, &[true, true, true, true]);
         assert_eq!(st.p_true_since, Some(start));
         // Single losses, and even five in a row, keep the clock.
-        feed(&mut st, start, &[false, true, true, false, false, false, false, false, true]);
+        feed(
+            &mut st,
+            start,
+            &[false, true, true, false, false, false, false, false, true],
+        );
         assert_eq!(st.p_true_since, Some(start));
         // Six in a row reset it.
         let end = feed(&mut st, start, &[false; 6]);
@@ -719,7 +742,9 @@ mod tests {
         let (mut p_true, mut resets, mut settled_ticks) = (0, 0, 0);
         let mut had_since = false;
         for _ in 0..3600 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let lost = (x >> 33) % 100 < loss_pct;
             now += PROBE_EVERY;
             st.record(!lost, now);
@@ -742,11 +767,20 @@ mod tests {
         let (p5, resets5, settled5) = loss_replay(5, 7);
         assert!(p5 > 3300, "P true most of the time at 5 % loss: {p5}");
         assert_eq!(resets5, 0, "no settle reset at 5 % loss");
-        assert!(settled5 > 3300, "settled most of the time at 5 % loss: {settled5}");
+        assert!(
+            settled5 > 3300,
+            "settled most of the time at 5 % loss: {settled5}"
+        );
         let (p20, resets20, settled20) = loss_replay(20, 11);
         assert!(p20 > 2500, "P true most of the time at 20 % loss: {p20}");
-        assert!(resets20 <= 1, "the settle almost never resets at 20 % loss: {resets20}");
-        assert!(settled20 > 2500, "settled most of the time at 20 % loss: {settled20}");
+        assert!(
+            resets20 <= 1,
+            "the settle almost never resets at 20 % loss: {resets20}"
+        );
+        assert!(
+            settled20 > 2500,
+            "settled most of the time at 20 % loss: {settled20}"
+        );
     }
 
     #[test]
@@ -772,7 +806,10 @@ mod tests {
         v.p = false;
         assert_eq!(gate(&v, Trigger::Positive), Gate::NotReachable);
         assert_eq!(gate(&v, Trigger::Absence), Gate::NotReachable);
-        assert_eq!(gate(&PView::default(), Trigger::Positive), Gate::NotReachable);
+        assert_eq!(
+            gate(&PView::default(), Trigger::Positive),
+            Gate::NotReachable
+        );
     }
 
     #[test]
@@ -838,7 +875,10 @@ mod tests {
     fn a_stale_cached_address_gives_way_to_a_source_that_answers() {
         let c = distinct_candidates(Some(" "), Some("10.0.0.9"), Some("10.0.0.2"));
         assert_eq!(c, vec!["10.0.0.9".to_string(), "10.0.0.2".to_string()]);
-        assert_eq!(distinct_candidates(Some("a"), Some("a"), None), vec!["a".to_string()]);
+        assert_eq!(
+            distinct_candidates(Some("a"), Some("a"), None),
+            vec!["a".to_string()]
+        );
         // P false: the cache (freshest) does not answer, ha_peers does.
         assert_eq!(
             pick_address(false, Some("10.0.0.9"), &c, &[false, true]),
@@ -885,12 +925,18 @@ mod tests {
         );
         // A row edited to drop the peer: only this host left.
         let edited = r#"<row key="ha_peers" value="(('22222222-2222-4222-8222-222222222222' '198.51.100.49'))"/>"#;
-        assert_eq!(ha_peers_address(edited, "22222222-2222-4222-8222-222222222222"), None);
+        assert_eq!(
+            ha_peers_address(edited, "22222222-2222-4222-8222-222222222222"),
+            None
+        );
         assert_eq!(
             ha_peers_names(edited, "11111111-1111-4111-8111-111111111111"),
             Some(false)
         );
-        assert_eq!(ha_peers_names(db, "11111111-1111-4111-8111-111111111111"), Some(true));
+        assert_eq!(
+            ha_peers_names(db, "11111111-1111-4111-8111-111111111111"),
+            Some(true)
+        );
         assert_eq!(ha_peers_address("<localdb/>", "x"), None);
         let escaped = r#"<row key="ha_peers" value="((&apos;a&apos; &apos;10.0.0.1&apos;) (&apos;b&apos; &apos;10.0.0.2&apos;))"/>"#;
         assert_eq!(ha_peers_address(escaped, "a").as_deref(), Some("10.0.0.2"));

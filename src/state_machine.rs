@@ -64,8 +64,9 @@ fn operator_discard_gate(s: &DrbdStatus) -> OperatorDiscard {
 /// DRBD current generation and is void once that generation changes (a
 /// resync, an operator force).
 fn peer_served_marker() -> String {
-    std::env::var("TWINSTOR_PEER_SERVED_MARKER")
-        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/boot-gate-peer-served"))
+    std::env::var("TWINSTOR_PEER_SERVED_MARKER").unwrap_or_else(|_| {
+        crate::heal_state::state_path("/var/lib/twinstor/boot-gate-peer-served")
+    })
 }
 
 /// Write a small state file durably: temp file, fsync, rename, fsync the
@@ -210,8 +211,9 @@ fn relatch_pending_path(latch: &str) -> String {
 /// the peer never keeps its copy of the same fork, even after a reboot.
 /// Removed at every episode end.
 pub(crate) fn win_claim_marker() -> String {
-    std::env::var("TWINSTOR_WIN_CLAIM_MARKER")
-        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/split-brain-win-claim"))
+    std::env::var("TWINSTOR_WIN_CLAIM_MARKER").unwrap_or_else(|_| {
+        crate::heal_state::state_path("/var/lib/twinstor/split-brain-win-claim")
+    })
 }
 
 /// Fate-shared freeze mode opt-out. Freeze mode is on by default on a
@@ -677,7 +679,8 @@ async fn fence_handler_running() -> bool {
     }
     let lock = format!(
         "{}/fence-peer.lock",
-        std::env::var("TWINSTOR_RUN_DIR").unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor"))
+        std::env::var("TWINSTOR_RUN_DIR")
+            .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor"))
     );
     if !std::path::Path::new(&lock).exists() {
         return false;
@@ -931,8 +934,9 @@ const STANDDOWN_REJOIN_STABLE: Duration = Duration::from_secs(45);
 /// node is still isolated, bring-up stays parked (Secondary, no iSCSI, no
 /// promote) so a reboot can never let VMs run here. Cleared only when the
 /// client network returns with the peer reachable on replication.
-static ISOLATED_STANDDOWN_MARKER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/isolated-standdown"));
+static ISOLATED_STANDDOWN_MARKER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::heal_state::state_path("/var/lib/twinstor/isolated-standdown")
+});
 /// Masterless-pool watchdog timings. `pool.conf == slave:<own address>` means
 /// this node is a slave of itself: a rejoining master that XHA did not
 /// propose as master gets demoted by xapi to a slave of its own database's
@@ -1731,7 +1735,8 @@ fn parse_liveset_masters(xml: &str) -> Option<LivesetMasters> {
 /// host not holding it, while the local xapi answers as master.
 fn second_master_evidence_a(liveset: Option<LivesetMasters>, local_xapi_master: bool) -> bool {
     local_xapi_master
-        && liveset.is_some_and(|l| l.local_online && l.peer_live && l.peer_master && !l.local_master)
+        && liveset
+            .is_some_and(|l| l.local_online && l.peer_live && l.peer_master && !l.local_master)
 }
 
 /// Two reads at least this far apart must show evidence (a) before a demote.
@@ -2782,9 +2787,7 @@ fn spawn_partition_view(
     tokio::spawn(async move {
         use crate::drbd::DrbdControl;
         let drbd = crate::drbd::DrbdController::new(&config);
-        use crate::arbitration::{
-            PartitionView, ViewHysteresis, ViewInputs, classify_partition,
-        };
+        use crate::arbitration::{PartitionView, ViewHysteresis, ViewInputs, classify_partition};
         let mut last = PartitionView::None;
         let mut shown = ViewHysteresis::default();
         // A park is confirmed only by a failed HA join in xha.log, read from
@@ -2832,8 +2835,9 @@ fn spawn_partition_view(
                     _ => (false, None, false, false),
                 };
             let join_failed = if !xhad_online && !pv.p {
-                let off = *park_offset
-                    .get_or_insert_with(|| std::fs::metadata(XHA_LOG).map(|m| m.len()).unwrap_or(0));
+                let off = *park_offset.get_or_insert_with(|| {
+                    std::fs::metadata(XHA_LOG).map(|m| m.len()).unwrap_or(0)
+                });
                 let (join_failed, _, next) = scan_park_signals(XHA_LOG, off);
                 park_offset = Some(next);
                 join_failed
@@ -2856,7 +2860,8 @@ fn spawn_partition_view(
             if own_login_probe_wanted(local_armed, xhad_online, xapi::last_known_pool_ha())
                 && std::path::Path::new(XHAD_CONF).exists()
             {
-                if own_role_read_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+                if own_role_read_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+                {
                     own_role_read_at = Some(now);
                     own_xapi_armed_mismatch =
                         xapi::local_xapi_role().await == xapi::PeerXapiRole::ArmedMismatch;
@@ -2935,7 +2940,9 @@ fn spawn_partition_view(
             let evaluated = classify_partition(&inputs);
             // The advice hold is published from the inputs, before the view:
             // a parked host shown as Settling still holds it.
-            crate::arbitration::set_advice_hold(crate::arbitration::holds_ha_disable_advice(&inputs));
+            crate::arbitration::set_advice_hold(crate::arbitration::holds_ha_disable_advice(
+                &inputs,
+            ));
             let view = shown.update_with(evaluated, &inputs);
             crate::arbitration::set_current(view);
             let text = view_text(view, crate::heal_state::unix_now());
@@ -3239,7 +3246,11 @@ fn mark_disarm_record_cycled(path: &str) {
     if record.lines().any(|l| l.trim() == "cycled=1") {
         return;
     }
-    let sep = if record.ends_with('\n') || record.is_empty() { "" } else { "\n" };
+    let sep = if record.ends_with('\n') || record.is_empty() {
+        ""
+    } else {
+        "\n"
+    };
     let _ = std::fs::write(path, format!("{record}{sep}cycled=1\n"));
 }
 
@@ -3298,9 +3309,8 @@ fn peer_not_recruited_alert(what: &str, master: &str, peer: &str, t: u32) -> Str
 /// sentinel): what its next reboot does, and the re-alignment, on the named
 /// master, with the configured timeout.
 fn armed_mismatch_alert(i_am_master: bool, me: &str, peer: &str, t: u32) -> String {
-    let enable = format!(
-        "'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"
-    );
+    let enable =
+        format!("'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'");
     if i_am_master {
         format!(
             "TwinStor: this host ({me}, the pool master) is locally HA-disarmed while pool HA \
@@ -3329,7 +3339,9 @@ enum ReviveCause {
 
 fn revive_cause(local_armed: Option<bool>, pool_ha: Option<bool>, own_record: bool) -> ReviveCause {
     if local_armed == Some(false) && pool_ha != Some(false) {
-        ReviveCause::LocallyDisarmed { by_twinstor: own_record }
+        ReviveCause::LocallyDisarmed {
+            by_twinstor: own_record,
+        }
     } else {
         ReviveCause::BootRace
     }
@@ -3338,8 +3350,18 @@ fn revive_cause(local_armed: Option<bool>, pool_ha: Option<bool>, own_record: bo
 /// The revive's alert on a host locally disarmed under the armed pool: only
 /// what is known, and the pool-level cycle that re-arms it, on the named
 /// master.
-fn revived_disarmed_alert(me: &str, master: &str, by_twinstor: bool, t: u32, pool_off: bool) -> String {
-    let who = if by_twinstor { "" } else { " (TwinStor did not disarm it)" };
+fn revived_disarmed_alert(
+    me: &str,
+    master: &str,
+    by_twinstor: bool,
+    t: u32,
+    pool_off: bool,
+) -> String {
+    let who = if by_twinstor {
+        ""
+    } else {
+        " (TwinStor did not disarm it)"
+    };
     if pool_off {
         // Pool HA was turned off meanwhile: no "armed pool" claim, nothing
         // to cycle.
@@ -3986,11 +4008,19 @@ fn obligation_parse(text: &str) -> Option<ObligationFile> {
         }
     }
     let state = match state.as_deref() {
-        Some("pending") => ObligationState::Pending { until: until.unwrap_or(0) },
+        Some("pending") => ObligationState::Pending {
+            until: until.unwrap_or(0),
+        },
         Some("enabled") => ObligationState::Enabled,
         _ => ObligationState::Owed,
     };
-    Some(ObligationFile { sr, timeout, attempt, state, owner })
+    Some(ObligationFile {
+        sr,
+        timeout,
+        attempt,
+        state,
+        owner,
+    })
 }
 
 fn obligation_render(f: &ObligationFile) -> String {
@@ -3999,7 +4029,9 @@ fn obligation_render(f: &ObligationFile) -> String {
         line.push_str(&format!(" {a}"));
     }
     match f.state {
-        ObligationState::Pending { until } => line.push_str(&format!(" state=pending until={until}")),
+        ObligationState::Pending { until } => {
+            line.push_str(&format!(" state=pending until={until}"))
+        }
         ObligationState::Owed => line.push_str(" state=owed"),
         ObligationState::Enabled => line.push_str(" state=enabled"),
     }
@@ -4029,15 +4061,39 @@ fn ha_obligation_write(sr: &str, timeout: u64, state: ObligationState) {
 fn ha_obligation_write_at(p: &str, sr: &str, timeout: u64, state: ObligationState) {
     let _w = obligation_writer();
     let attempt = ha_obligation_file_at(p).and_then(|f| f.attempt);
-    ha_obligation_store(p, &ObligationFile { sr: sr.to_string(), timeout, attempt, state, owner: None });
+    ha_obligation_store(
+        p,
+        &ObligationFile {
+            sr: sr.to_string(),
+            timeout,
+            attempt,
+            state,
+            owner: None,
+        },
+    );
 }
 
 /// `ha_obligation_write_at` naming the routine that writes it (`by=`).
-fn ha_obligation_write_owned_at(p: &str, sr: &str, timeout: u64, state: ObligationState, owner: &str) {
+fn ha_obligation_write_owned_at(
+    p: &str,
+    sr: &str,
+    timeout: u64,
+    state: ObligationState,
+    owner: &str,
+) {
     let _w = obligation_writer();
     let attempt = ha_obligation_file_at(p).and_then(|f| f.attempt);
     let owner = Some(owner.to_string());
-    ha_obligation_store(p, &ObligationFile { sr: sr.to_string(), timeout, attempt, state, owner });
+    ha_obligation_store(
+        p,
+        &ObligationFile {
+            sr: sr.to_string(),
+            timeout,
+            attempt,
+            state,
+            owner,
+        },
+    );
 }
 
 /// Move a standing obligation to `state` (nothing when none stands).
@@ -4298,7 +4354,12 @@ impl RejoinWatch {
     /// One sample as master: the outcome for this sample, decided on the
     /// memory from before it; the sample is folded in afterwards.
     #[cfg(test)]
-    fn observe(&mut self, peer_live: Option<bool>, ha: Option<bool>, record_present: bool) -> RejoinHaOff {
+    fn observe(
+        &mut self,
+        peer_live: Option<bool>,
+        ha: Option<bool>,
+        record_present: bool,
+    ) -> RejoinHaOff {
         self.observe_at(peer_live, ha, record_present, 0)
     }
 
@@ -4391,9 +4452,7 @@ enum MasterlessRetryStep {
 }
 
 fn masterless_retry_step(f: MasterlessRetryFacts) -> MasterlessRetryStep {
-    if f.pool_ha == Some(true)
-        || matches!(f.obligation, None | Some(ObligationState::Enabled))
-    {
+    if f.pool_ha == Some(true) || matches!(f.obligation, None | Some(ObligationState::Enabled)) {
         return MasterlessRetryStep::Done;
     }
     if f.peer_back {
@@ -4419,7 +4478,9 @@ fn masterless_retry_step(f: MasterlessRetryFacts) -> MasterlessRetryStep {
 fn masterless_obligation(pool_ha: Option<bool>, now_unix: u64) -> Option<ObligationState> {
     match pool_ha {
         Some(false) => Some(ObligationState::Owed),
-        None => Some(ObligationState::Pending { until: now_unix + OBLIGATION_PENDING_FOR }),
+        None => Some(ObligationState::Pending {
+            until: now_unix + OBLIGATION_PENDING_FOR,
+        }),
         Some(true) => None,
     }
 }
@@ -4781,9 +4842,7 @@ impl LogPace {
     /// [`LogPace::mark`] only once delivered, so an undelivered one is
     /// raised again on the next pass rather than a pacing interval later.
     fn is_due(&self, key: &'static str, every: Duration) -> bool {
-        self.0
-            .get(key)
-            .is_none_or(|t| t.elapsed() >= every)
+        self.0.get(key).is_none_or(|t| t.elapsed() >= every)
     }
 
     fn mark(&mut self, key: &'static str) {
@@ -5171,8 +5230,7 @@ fn protected_vm_can_serve(
     xhad_online: bool,
     own_lock: bool,
 ) -> bool {
-    local_serveable
-        && ((peer_nonserving && incident_open) || (ha_on && xhad_online && own_lock))
+    local_serveable && ((peer_nonserving && incident_open) || (ha_on && xhad_online && own_lock))
 }
 
 /// Which "ghost" protected VMs are safe to reconcile (`vm-reset-powerstate` to
@@ -5390,7 +5448,11 @@ enum FutileWhy {
     /// A waiting phase (whether the disable took, pool HA back on, no HA
     /// task pending) reached `PEER_EMERGENCY_HA_WAIT` from the cycle's
     /// return; the last successful reads, for a text that says only them.
-    Waited { last_ha: Option<bool>, task_since: u64, task_read_failed: bool },
+    Waited {
+        last_ha: Option<bool>,
+        task_since: u64,
+        task_read_failed: bool,
+    },
 }
 
 /// The budget's verdict on a reset, from the evidence that triggered it
@@ -5464,7 +5526,11 @@ impl ResetVerdict {
     }
 
     fn at(phase: VerdictPhase, now: std::time::Instant, returned: u64) -> Self {
-        Self { phase, returned, ..Self::new(now) }
+        Self {
+            phase,
+            returned,
+            ..Self::new(now)
+        }
     }
 }
 
@@ -5490,10 +5556,23 @@ fn reset_verdict_step(
             if v.normal_in_row >= 1 {
                 return (None, Some(false));
             }
-            return (Some(ResetVerdict { normal_in_row: 1, ..v }), None);
+            return (
+                Some(ResetVerdict {
+                    normal_in_row: 1,
+                    ..v
+                }),
+                None,
+            );
         }
     }
-    let v = if probed { ResetVerdict { normal_in_row: 0, ..v } } else { v };
+    let v = if probed {
+        ResetVerdict {
+            normal_in_row: 0,
+            ..v
+        }
+    } else {
+        v
+    };
     if now.saturating_duration_since(v.since) >= PEER_EMERGENCY_CONFIRM_AFTER {
         return (None, Some(true));
     }
@@ -5554,15 +5633,21 @@ fn peer_emergency_budget_read(path: &str, boot_id: &str) -> PeerEmergencyBudget 
             .split(',')
             .filter_map(|v| v.trim().parse().ok())
             .collect(),
-        alerted_until: get("alerted_until").and_then(|v| v.parse().ok()).unwrap_or(0),
+        alerted_until: get("alerted_until")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         futile: get("futile").and_then(|v| v.parse().ok()).unwrap_or(0),
         pending: get("pending").and_then(|v| v.parse().ok()).unwrap_or(0),
         freed_at: get("freed_at").and_then(|v| v.parse().ok()).unwrap_or(0),
         freed_reset: get("freed_reset").and_then(|v| v.parse().ok()).unwrap_or(0),
         verdict_at: get("verdict_at").and_then(|v| v.parse().ok()).unwrap_or(0),
         pending_phase: get("pending_phase").unwrap_or("").to_string(),
-        pending_since: get("pending_since").and_then(|v| v.parse().ok()).unwrap_or(0),
-        disarm_alerted: get("disarm_alerted").and_then(|v| v.parse().ok()).unwrap_or(0),
+        pending_since: get("pending_since")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        disarm_alerted: get("disarm_alerted")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     }
 }
 
@@ -5624,8 +5709,7 @@ impl BudgetHold {
 /// the last reset too recent; the latest end wins. Resets older than the
 /// window no longer count.
 fn peer_emergency_budget_hold(b: &PeerEmergencyBudget, now_unix: u64) -> Option<BudgetHold> {
-    let futile = (b.futile != 0
-        && now_unix.saturating_sub(b.futile) < PEER_EMERGENCY_AFTER_FUTILE)
+    let futile = (b.futile != 0 && now_unix.saturating_sub(b.futile) < PEER_EMERGENCY_AFTER_FUTILE)
         .then(|| BudgetHold {
             rule: BudgetRule::AfterFutile,
             why: format!(
@@ -5734,7 +5818,9 @@ fn local_utc_offset_now() -> Option<i32> {
     if r.is_null() {
         return None;
     }
-    i32::try_from(tm.tm_gmtoff).ok().filter(|o| o.abs() <= 14 * 3600)
+    i32::try_from(tm.tm_gmtoff)
+        .ok()
+        .filter(|o| o.abs() <= 14 * 3600)
 }
 
 /// How far `unix` is from `now`, in minutes: "in 58 min", "3 min ago",
@@ -5759,12 +5845,18 @@ fn operator_time(unix: u64) -> String {
 /// A time for an operator in a status text, read when shown: with how far
 /// it is from now (`02:54 +01:00, in 58 min`).
 fn operator_time_rel(unix: u64) -> String {
-    format!("{}, {}", local_hm(unix), relative_minutes(unix, unix_now_secs()))
+    format!(
+        "{}, {}",
+        local_hm(unix),
+        relative_minutes(unix, unix_now_secs())
+    )
 }
 
 /// The PeerDisarmed view's addition while TwinStor's reset is on hold.
 fn peer_emergency_hold_note(now_unix: u64) -> Option<String> {
-    let g = PEER_EMERGENCY_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let g = PEER_EMERGENCY_HOLD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     hold_note(g.as_ref(), now_unix)
 }
 
@@ -5789,10 +5881,14 @@ fn futile_reset_alert(
     peer: &str,
     t: u32,
 ) -> String {
-    let enable = format!(
-        "'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"
-    );
-    if let FutileWhy::Waited { last_ha, task_since, task_read_failed } = why {
+    let enable =
+        format!("'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'");
+    if let FutileWhy::Waited {
+        last_ha,
+        task_since,
+        task_read_failed,
+    } = why
+    {
         // Only what was read, and the command only where it applies.
         let (read, advice) = match (last_ha, task_since) {
             (Some(false), _) => (
@@ -5805,7 +5901,10 @@ fn futile_reset_alert(
             ),
             (Some(true), 0) => ("pool HA reads on".to_string(), String::new()),
             (Some(true), since) => (
-                format!("pool HA reads on, but an HA operation has been pending since {}", operator_time(since)),
+                format!(
+                    "pool HA reads on, but an HA operation has been pending since {}",
+                    operator_time(since)
+                ),
                 format!(" Check it on the pool master {master}: 'xe task-list status=pending'."),
             ),
             (None, _) => ("pool HA could not be read".to_string(), String::new()),
@@ -6013,8 +6112,7 @@ fn armed_mismatch_confirm(
         }
         Unknown | Unreachable => {}
     }
-    if s
-        .last
+    if s.last
         .is_some_and(|l| now.saturating_duration_since(l) > PEER_EMERGENCY_CONFIRM_WINDOW)
     {
         s = MismatchSightings::default();
@@ -7661,8 +7759,9 @@ const SUSPENDED_PRIMARY_DEMOTE_AFTER: u32 = 3;
 /// the same state comes right back after a reboot, the cause is one a reboot
 /// cannot fix, and the daemon must degrade to alert-and-hold instead of a
 /// reboot loop. Kept outside /run so it survives the reboot.
-static STUCK_PRIMARY_FENCE_STAMP: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/stuck-primary-fence-at"));
+static STUCK_PRIMARY_FENCE_STAMP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::heal_state::state_path("/var/lib/twinstor/stuck-primary-fence-at")
+});
 
 /// Tries at withdrawing a discard offer whose state cannot be read, per
 /// disconnect (see `steered_connect`).
@@ -7670,8 +7769,9 @@ const OFFER_UNKNOWN_TRIES: u32 = 3;
 
 /// Why the daemon last forced a reboot (written just before it): logged and
 /// renamed `.seen` by the next daemon start.
-static FORCED_REBOOT_BREADCRUMB: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/last-forced-reboot"));
+static FORCED_REBOOT_BREADCRUMB: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::heal_state::state_path("/var/lib/twinstor/last-forced-reboot")
+});
 
 /// One durable state file, for the startup dump: `-` when absent, else its
 /// first line (bounded).
@@ -8019,13 +8119,19 @@ fn ha_step_gates(
     if let Some(t) = trigger {
         match crate::mgmt_reach::gate(pv, t) {
             crate::mgmt_reach::Gate::Pass => {}
-            g => return Some(format!("the peer's management address gate is closed ({g:?})")),
+            g => {
+                return Some(format!(
+                    "the peer's management address gate is closed ({g:?})"
+                ));
+            }
         }
     }
     if let Some(m) = expect_master
         && master_now != Some(m)
     {
-        return Some("this host's pool role is no longer the one the operation started with".into());
+        return Some(
+            "this host's pool role is no longer the one the operation started with".into(),
+        );
     }
     if crate::mgmt_reach::startup_loop_locked(local_armed, xhad_online, pv.p) {
         return Some("XAPI holds this host in its HA startup loop".into());
@@ -8039,7 +8145,9 @@ fn ha_step_gates(
 #[async_trait::async_trait]
 impl HaOps for LiveHaOps {
     async fn disable(&self) -> HaCmd {
-        ha_cmd_of(crate::cmd::run_cmd_for("xe", &["pool-ha-disable"], HA_CMD_TIMEOUT.as_secs()).await)
+        ha_cmd_of(
+            crate::cmd::run_cmd_for("xe", &["pool-ha-disable"], HA_CMD_TIMEOUT.as_secs()).await,
+        )
     }
     async fn enable(&self, sr: &str, timeout: u64) -> HaCmd {
         let sr_arg = format!("heartbeat-sr-uuids={sr}");
@@ -8139,8 +8247,10 @@ async fn xhad_online_now() -> bool {
 /// Since when (`mono_secs`, 0: not) some routine has been stopped at its
 /// start by a pending pool HA task; the HA watchdog reports it once it has
 /// lasted `OWN_TASK_STALE_AFTER`.
-static ROUTINE_TASK_HOLD: std::sync::Mutex<TaskHold> =
-    std::sync::Mutex::new(TaskHold { since: 0, task: String::new() });
+static ROUTINE_TASK_HOLD: std::sync::Mutex<TaskHold> = std::sync::Mutex::new(TaskHold {
+    since: 0,
+    task: String::new(),
+});
 
 /// Which pending pool HA task holds the routines, and since when
 /// (`mono_secs`; 0: none). A different task starts the clock afresh; none
@@ -8238,7 +8348,10 @@ async fn pool_ha_cycle_start(ops: &dyn HaOps, who: &'static str) -> CycleStart {
             routine_task_hold_observe(&t);
             CycleStart::Stop(format!(
                 "a pool HA operation is already pending in XAPI ({}); not issuing another",
-                t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ")
+                t.iter()
+                    .map(|x| x.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
         }
         Some(t) => {
@@ -8309,11 +8422,17 @@ async fn pool_ha_disable_step(ops: &dyn HaOps) -> DisableStep {
                 ha_refusal_hint(&e)
             )),
             Some(true) => DisableStep::Failed(
-                format!("pool-ha-disable refused ({}: {e}); pool HA still reads on", ha_refusal_hint(&e)),
+                format!(
+                    "pool-ha-disable refused ({}: {e}); pool HA still reads on",
+                    ha_refusal_hint(&e)
+                ),
                 false,
             ),
             None => DisableStep::Failed(
-                format!("pool-ha-disable refused ({}: {e}); pool HA unreadable", ha_refusal_hint(&e)),
+                format!(
+                    "pool-ha-disable refused ({}: {e}); pool HA unreadable",
+                    ha_refusal_hint(&e)
+                ),
                 true,
             ),
         },
@@ -8343,8 +8462,10 @@ async fn pool_ha_off_not_by_us(
     wrote_obligation: bool,
     body: &str,
 ) {
-    warn!(heal_event = "ha_off_not_by_twinstor", who, note,
-          "pool HA is off and not by TwinStor's own disable; not re-enabling it");
+    warn!(
+        heal_event = "ha_off_not_by_twinstor",
+        who, note, "pool HA is off and not by TwinStor's own disable; not re-enabling it"
+    );
     if wrote_obligation {
         ops.clear_obligation();
     }
@@ -8367,16 +8488,26 @@ fn enable_still_owed(ops: &dyn HaOps, who: &'static str, step: &'static str) -> 
         Some(ObligationState::Pending { .. }) => "the re-arm obligation is still pending",
         Some(ObligationState::Enabled) => "the re-arm obligation is already enabled",
     };
-    warn!(heal_event = "ha_action_withheld", action = who, step, reason = why,
-          "{who}: {step} withheld: {why}; no enable is issued");
+    warn!(
+        heal_event = "ha_action_withheld",
+        action = who,
+        step,
+        reason = why,
+        "{who}: {step} withheld: {why}; no enable is issued"
+    );
     false
 }
 
 /// Log a step a re-read fire-time gate withheld.
 fn log_cycle_withheld(who: &'static str, step: &'static str, why: &str) {
-    warn!(heal_event = "ha_action_withheld", action = who, step, reason = why,
-          "{who}: {step} withheld at its firing: {why}; the re-arm obligation enables pool HA \
-           later under its own gates");
+    warn!(
+        heal_event = "ha_action_withheld",
+        action = who,
+        step,
+        reason = why,
+        "{who}: {step} withheld at its firing: {why}; the re-arm obligation enables pool HA \
+           later under its own gates"
+    );
     if !cfg!(test) {
         crate::arbitration::write_status(
             crate::arbitration::WITHHELD_PATH.as_str(),
@@ -8418,29 +8549,38 @@ async fn obligation_step(ops: &dyn HaOps, ha: Option<bool>, settled: bool) -> Ob
     match obligation_verdict(state, ha, ops.now_unix(), settled) {
         ObligationVerdict::Keep => ObligationStep::Proceed,
         ObligationVerdict::Wait => {
-            info!(heal_event = "ha_rearm_hold", reason = "disable_pending",
-                  "a pool HA disable TwinStor issued has not been seen to land yet; no re-arm \
-                   and no clear until it does or its window passes");
+            info!(
+                heal_event = "ha_rearm_hold",
+                reason = "disable_pending",
+                "a pool HA disable TwinStor issued has not been seen to land yet; no re-arm \
+                   and no clear until it does or its window passes"
+            );
             ObligationStep::Stop
         }
         ObligationVerdict::BecomeOwed => {
             ops.set_obligation_state(ObligationState::Owed);
-            info!(heal_event = "ha_rearm_owed",
-                  "TwinStor's own pool HA disable has landed; a re-arm is owed");
+            info!(
+                heal_event = "ha_rearm_owed",
+                "TwinStor's own pool HA disable has landed; a re-arm is owed"
+            );
             ObligationStep::Proceed
         }
         ObligationVerdict::BecomeEnabled => {
             ops.set_obligation_state(ObligationState::Enabled);
-            info!(heal_event = "ha_rearm_enabled_seen",
-                  "pool HA reads on again after TwinStor's disable; any later HA-off is not \
-                   TwinStor's");
+            info!(
+                heal_event = "ha_rearm_enabled_seen",
+                "pool HA reads on again after TwinStor's disable; any later HA-off is not \
+                   TwinStor's"
+            );
             ObligationStep::Proceed
         }
         ObligationVerdict::Expired => {
             ops.clear_obligation();
-            info!(heal_event = "ha_rearm_expired",
-                  "TwinStor's pool HA disable never took (its window passed with pool HA on); \
-                   nothing is owed");
+            info!(
+                heal_event = "ha_rearm_expired",
+                "TwinStor's pool HA disable never took (its window passed with pool HA on); \
+                   nothing is owed"
+            );
             ObligationStep::Stop
         }
         ObligationVerdict::NotOurs => {
@@ -8493,7 +8633,9 @@ async fn pool_ha_cycle(ops: &dyn HaOps, sr: &str, timeout: u32, who: &'static st
     ops.write_obligation(
         sr,
         timeout.into(),
-        ObligationState::Pending { until: ops.now_unix() + OBLIGATION_PENDING_FOR },
+        ObligationState::Pending {
+            until: ops.now_unix() + OBLIGATION_PENDING_FOR,
+        },
         &format!("{who}:{}", ops.now_unix()),
     );
     ops.touch_attempt();
@@ -8503,7 +8645,10 @@ async fn pool_ha_cycle(ops: &dyn HaOps, sr: &str, timeout: u32, who: &'static st
             ops.set_obligation_state(ObligationState::Owed);
             out.disabled = true;
             out.disable_note = step.to_string();
-            info!(heal_event = "pool_ha_cycle", who, step, "pool HA cycle: pool HA is off");
+            info!(
+                heal_event = "pool_ha_cycle",
+                who, step, "pool HA cycle: pool HA is off"
+            );
         }
         DisableStep::RefusedButOff(note) => {
             pool_ha_off_not_by_us(ops, who, &note, true, &ha_off_disable_refused()).await;
@@ -8527,9 +8672,13 @@ async fn pool_ha_cycle(ops: &dyn HaOps, sr: &str, timeout: u32, who: &'static st
     // pause. Still pending at the bound: no enable; the re-arm obligation
     // retries it once XAPI is done.
     if !wait_no_pending_ha_task(ops, HA_CMD_TIMEOUT).await {
-        info!(heal_event = "pool_ha_cycle", who, step = "enable_deferred",
-              "pool HA cycle: a pool HA task is still pending in XAPI; the enable is left to \
-               the re-arm obligation");
+        info!(
+            heal_event = "pool_ha_cycle",
+            who,
+            step = "enable_deferred",
+            "pool HA cycle: a pool HA task is still pending in XAPI; the enable is left to \
+               the re-arm obligation"
+        );
         return out;
     }
     // A returning peer's readmission can leave the heartbeat SR's PBD
@@ -8551,8 +8700,14 @@ async fn pool_ha_cycle(ops: &dyn HaOps, sr: &str, timeout: u32, who: &'static st
         // From here any later HA-off is not TwinStor's.
         ops.set_obligation_state(ObligationState::Enabled);
     }
-    info!(heal_event = "pool_ha_cycle", who, step = "enable", enabled = out.enabled,
-          "pool HA cycle: pool-ha-enable {}", if out.enabled { "returned" } else { "failed" });
+    info!(
+        heal_event = "pool_ha_cycle",
+        who,
+        step = "enable",
+        enabled = out.enabled,
+        "pool HA cycle: pool-ha-enable {}",
+        if out.enabled { "returned" } else { "failed" }
+    );
     out
 }
 
@@ -9188,7 +9343,10 @@ static TIEBREAKER_ANSWERED_MONO: AtomicU64 = AtomicU64::new(0);
 /// can mean "never"): unaffected by wall-clock steps.
 fn mono_secs() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    BASE.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
+        + 1
 }
 
 /// Record one view probe of the tiebreaker set (`None`: no target).
@@ -9249,9 +9407,20 @@ fn tiebreaker_observe(
     }
     if probes > 0 && answered.saturating_mul(2) > probes {
         // Mostly answering until recently: the failing window starts here.
-        return (true, Some(TiebreakerOutage { since: now, answered: 0, probes: 0 }));
+        return (
+            true,
+            Some(TiebreakerOutage {
+                since: now,
+                answered: 0,
+                probes: 0,
+            }),
+        );
     }
-    let mut o = outage.unwrap_or(TiebreakerOutage { since: window_start, answered: 0, probes: 0 });
+    let mut o = outage.unwrap_or(TiebreakerOutage {
+        since: window_start,
+        answered: 0,
+        probes: 0,
+    });
     o.answered += answered;
     o.probes += probes;
     (false, Some(o))
@@ -9782,31 +9951,45 @@ fn readmission_scope(
     action: ReadmissionAction,
     scope: ReadmissionScope,
 ) -> (ReadmissionAction, Option<&'static str>) {
-    let ReadmissionScope { pool_ha, startup_loop, cut_from_master, pool_ha_off_seen } = scope;
-    if !matches!(action, ReadmissionAction::Revive | ReadmissionAction::AlertManual) {
+    let ReadmissionScope {
+        pool_ha,
+        startup_loop,
+        cut_from_master,
+        pool_ha_off_seen,
+    } = scope;
+    if !matches!(
+        action,
+        ReadmissionAction::Revive | ReadmissionAction::AlertManual
+    ) {
         return (action, None);
     }
     if startup_loop {
         return (
             ReadmissionAction::Wait,
-            Some("XAPI holds this host in its HA startup loop (armed, not in the liveset, the \
-                  peer's management address silent)"),
+            Some(
+                "XAPI holds this host in its HA startup loop (armed, not in the liveset, the \
+                  peer's management address silent)",
+            ),
         );
     }
     if cut_from_master {
         return (
             ReadmissionAction::Wait,
-            Some("this slave is cut off from the pool master's management address while the \
+            Some(
+                "this slave is cut off from the pool master's management address while the \
                   peer is alive on replication: the runbook's commands run on the master, and \
-                  this host's HA daemon cannot join until the management network is back"),
+                  this host's HA daemon cannot join until the management network is back",
+            ),
         );
     }
     if pool_ha_off_seen {
         return (
             ReadmissionAction::Wait,
-            Some("this host's HA daemon last exited with 'Invalid pool state (1906)', which it \
+            Some(
+                "this host's HA daemon last exited with 'Invalid pool state (1906)', which it \
                   logs when pool HA is disabled, and nothing restarted it: pool HA is off as far \
-                  as this host can tell"),
+                  as this host can tell",
+            ),
         );
     }
     if pool_ha == Some(false) {
@@ -9844,7 +10027,10 @@ fn readmission_plan(
     ha: &crate::config::HaConfig,
     scope: ReadmissionScope,
 ) -> (ReadmissionAction, Option<&'static str>) {
-    readmission_scope(readmission_keys(decision, ha.readmission_assist, ha.rejoin_assist), scope)
+    readmission_scope(
+        readmission_keys(decision, ha.readmission_assist, ha.rejoin_assist),
+        scope,
+    )
 }
 
 /// A whole-switch verdict holds: the tick's hold, or the fast guard's
@@ -11332,8 +11518,9 @@ impl StateMachine {
             arb_mutual_query: None,
             arb_keep_path: test_private_path(
                 "arb-keep",
-                std::env::var("TWINSTOR_ARB_KEEP_MARKER")
-                    .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/arb-mutual-keep")),
+                std::env::var("TWINSTOR_ARB_KEEP_MARKER").unwrap_or_else(|_| {
+                    crate::heal_state::state_path("/run/twinstor/arb-mutual-keep")
+                }),
             ),
             arb_keep_retry_at: None,
             own_target_cut_at: None,
@@ -11341,15 +11528,17 @@ impl StateMachine {
             mutual_intent: None,
             take_intent_path: test_private_path(
                 "take-intent",
-                std::env::var("TWINSTOR_TAKE_INTENT_MARKER")
-                    .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/mutual-take-intent")),
+                std::env::var("TWINSTOR_TAKE_INTENT_MARKER").unwrap_or_else(|_| {
+                    crate::heal_state::state_path("/run/twinstor/mutual-take-intent")
+                }),
             ),
             // Durable: a reboot of this node during the episode must not forget
             // that the peer froze with guests (cleared at the episode end).
             peer_guests_path: test_private_path(
                 "peer-guests",
-                std::env::var("TWINSTOR_PEER_GUESTS_MARKER")
-                    .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/peer-had-guests")),
+                std::env::var("TWINSTOR_PEER_GUESTS_MARKER").unwrap_or_else(|_| {
+                    crate::heal_state::state_path("/var/lib/twinstor/peer-had-guests")
+                }),
             ),
             claim_publish: std::sync::Arc::new(std::sync::Mutex::new(())),
             arb_yield_hold_alerted: false,
@@ -12257,7 +12446,11 @@ impl StateMachine {
             // Runs in every (non-parked) state: HA being disarmed is a pool fact.
             if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "check_ha_armed", self.check_ha_armed().await);
-                step!(self, "masterless_rearm_retry", self.drive_masterless_rearm_retry().await);
+                step!(
+                    self,
+                    "masterless_rearm_retry",
+                    self.drive_masterless_rearm_retry().await
+                );
             }
 
             // Repeated split-brain episodes mean one flapping link; escalate instead of
@@ -12404,7 +12597,11 @@ impl StateMachine {
                 );
             }
             if !sb_fresh && !self.xapi_quiet().await {
-                step!(self, "check_second_master", self.check_second_master().await);
+                step!(
+                    self,
+                    "check_second_master",
+                    self.check_second_master().await
+                );
                 step!(
                     self,
                     "check_recorded_disarm_rearm",
@@ -13933,8 +14130,7 @@ impl StateMachine {
                 // ALERT_RETRY_EVERY cadence, gated in the decision fn) is what
                 // gets the alert to the operator once the election settles.
                 self.redundancy_alert_attempt_at = Some(now);
-                if xapi::send_xapi_alert(REDUNDANCY_LOST_ALERT).await
-                {
+                if xapi::send_xapi_alert(REDUNDANCY_LOST_ALERT).await {
                     self.redundancy_alert_at = Some(now);
                 }
             }
@@ -14577,10 +14773,7 @@ impl StateMachine {
             if let Some((_, is_master)) = cached {
                 is_master
             } else {
-                let is_master = matches!(
-                    self.peer_role_probe().await,
-                    xapi::PeerXapiRole::Master
-                );
+                let is_master = matches!(self.peer_role_probe().await, xapi::PeerXapiRole::Master);
                 self.peer_master_probe = Some((now, is_master));
                 is_master
             }
@@ -14651,8 +14844,13 @@ impl StateMachine {
                 xapi_pid_bounded().await
             };
             let pv = self.p_view();
-            self.slave_xapi_stuck
-                .observe(xapi_live_readable, &pid, pv.p, pv.true_for.is_some(), now)
+            self.slave_xapi_stuck.observe(
+                xapi_live_readable,
+                &pid,
+                pv.p,
+                pv.true_for.is_some(),
+                now,
+            )
         } else {
             self.slave_xapi_stuck = Default::default();
             false
@@ -19167,7 +19365,8 @@ impl StateMachine {
         // the staleness counts from then.
         let unix_now = unix_now_secs();
         let p = self.p_view().p;
-        let Some(p_back_at) = peer_daemon_p_clock(&mut self.peer_daemon_p_back_at, p, unix_now) else {
+        let Some(p_back_at) = peer_daemon_p_clock(&mut self.peer_daemon_p_back_at, p, unix_now)
+        else {
             return;
         };
 
@@ -19203,7 +19402,9 @@ impl StateMachine {
         if !due {
             return;
         }
-        let stale_min = reference.map(|s| unix_now.saturating_sub(s) / 60).unwrap_or(0);
+        let stale_min = reference
+            .map(|s| unix_now.saturating_sub(s) / 60)
+            .unwrap_or(0);
         warn!(
             peer = %self.config.node.peer,
             stale_min,
@@ -19291,7 +19492,11 @@ impl StateMachine {
             targets.is_empty(),
             self.config.network.allow_no_tiebreaker,
             any_reachable,
-            if restart_streak { 0 } else { self.tiebreaker_bad_streak },
+            if restart_streak {
+                0
+            } else {
+                self.tiebreaker_bad_streak
+            },
         );
         self.tiebreaker_bad_streak = streak;
         if any_reachable {
@@ -19494,10 +19699,14 @@ impl StateMachine {
         // The dance's pool HA cycle runs off the tick: nothing else here acts
         // (pool HA reads off and xhad is down meanwhile, by design) until it
         // has returned and its outcome is read.
-        if readmission_cycle_holds(self.readmission_cycle_pending, self.ha_reset_inflight.load(Ordering::SeqCst)) {
+        if readmission_cycle_holds(
+            self.readmission_cycle_pending,
+            self.ha_reset_inflight.load(Ordering::SeqCst),
+        ) {
             return;
         }
-        self.dance_disarm_watch_pass(crate::heal_state::unix_now()).await;
+        self.dance_disarm_watch_pass(crate::heal_state::unix_now())
+            .await;
         if self.readmission_cycle_pending {
             self.readmission_cycle_pending = false;
             let r = self.take_ha_cycle_result("readmission_dance");
@@ -19634,7 +19843,9 @@ impl StateMachine {
         // the release).
         if self.whole_switch_held
             || self.whole_switch_guard.load(Ordering::Relaxed)
-            || self.whole_switch_guard_ever_disarmed.load(Ordering::Relaxed)
+            || self
+                .whole_switch_guard_ever_disarmed
+                .load(Ordering::Relaxed)
         {
             self.readmission_suspect_since = None;
             return;
@@ -19672,28 +19883,34 @@ impl StateMachine {
         let peer_reachable = self.peer_replication_reachable().await;
 
         let action = readmission_decision(
-                true,
-                host_state,
-                self.readmission_signals,
-                storage_healthy,
-                peer_reachable,
-                self.readmission_suspect_since,
-                self.readmission_last_dance,
-                self.readmission_last_revive,
-                now,
-            );
+            true,
+            host_state,
+            self.readmission_signals,
+            storage_healthy,
+            peer_reachable,
+            self.readmission_suspect_since,
+            self.readmission_last_dance,
+            self.readmission_last_revive,
+            now,
+        );
         // Not Online here, so the startup loop is armed and P false.
         let p = self.p_view().p;
         let startup_loop = crate::mgmt_reach::startup_loop_locked(xapi::local_ha_armed(), false, p);
         let scope = ReadmissionScope {
             pool_ha,
             startup_loop,
-            cut_from_master: readmission_cut_from_master(p, peer_reachable, xapi::local_pool_role()),
+            cut_from_master: readmission_cut_from_master(
+                p,
+                peer_reachable,
+                xapi::local_pool_role(),
+            ),
             pool_ha_off_seen: self.readmission_signals.pool_ha_off_seen(),
         };
         let (action, held) = readmission_plan(action, &self.config.ha, scope);
         if let Some(why) = held
-            && self.log_pace.due("readmission_scope_held", Duration::from_secs(600))
+            && self
+                .log_pace
+                .due("readmission_scope_held", Duration::from_secs(600))
         {
             info!(
                 heal_event = "ha_readmission_held",
@@ -19786,7 +20003,9 @@ impl StateMachine {
                          statefile-race signature); restarting it locally"
                     ),
                     ReviveCause::LocallyDisarmed { by_twinstor } => warn!(
-                        heal_event = "ha_readmission_revive", locally_disarmed = true, by_twinstor,
+                        heal_event = "ha_readmission_revive",
+                        locally_disarmed = true,
+                        by_twinstor,
                         "the HA daemon is not running on this host, which is locally disarmed \
                          under the armed pool, and nothing restarts it: restarting it so the \
                          host is back in the liveset; it stays locally disarmed until pool HA \
@@ -19857,7 +20076,9 @@ impl StateMachine {
                 "readmission_dance_phase1",
                 crate::mgmt_reach::Trigger::Absence,
             ) {
-                Some("the peer's management address does not answer, or has not answered long enough")
+                Some(
+                    "the peer's management address does not answer, or has not answered long enough",
+                )
             } else if self.startup_loop_locked("readmission_dance_phase1").await {
                 Some("XAPI holds this host in its HA startup loop")
             } else {
@@ -19878,17 +20099,19 @@ impl StateMachine {
             // host decides for itself, with no word from the peer.
             let pool_ha = self.h_pool_ha().await;
             let tasks = self.h_pending_ha_tasks().await;
-            match dance_phase1_check(
-                pool_ha,
-                tasks.as_deref(),
-                t.saturating_sub(now_unix),
-                lead,
-            ) {
+            match dance_phase1_check(pool_ha, tasks.as_deref(), t.saturating_sub(now_unix), lead) {
                 DancePhase1::Go => {}
                 DancePhase1::Hold(why) => {
-                    if self.log_pace.due("dance_phase1_held", Duration::from_secs(60)) {
-                        info!(heal_event = "ha_readmission_dance_held", phase = 1, reason = why,
-                              "re-admission dance phase 1 waits: {why}; checked again next pass");
+                    if self
+                        .log_pace
+                        .due("dance_phase1_held", Duration::from_secs(60))
+                    {
+                        info!(
+                            heal_event = "ha_readmission_dance_held",
+                            phase = 1,
+                            reason = why,
+                            "re-admission dance phase 1 waits: {why}; checked again next pass"
+                        );
                     }
                     return;
                 }
@@ -19947,7 +20170,8 @@ impl StateMachine {
             return;
         }
         let Some(sr) = xapi::twinstor_sr_uuid().await else {
-            self.dance_phase2_stopped("the heartbeat SR uuid cannot be resolved").await;
+            self.dance_phase2_stopped("the heartbeat SR uuid cannot be resolved")
+                .await;
             return;
         };
         let arbitrated = std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists();
@@ -19969,16 +20193,21 @@ impl StateMachine {
         ) {
             self.readmission_cycle_pending = true;
         } else {
-            self.dance_phase2_stopped("another pool HA operation is in flight").await;
+            self.dance_phase2_stopped("another pool HA operation is in flight")
+                .await;
         }
     }
 
     /// Phase 2 did not cycle pool HA after phase 1 disarmed this host: one
     /// alert, at once, saying so (no retry, no coordination with the peer).
     async fn dance_phase2_stopped(&mut self, why: &str) {
-        warn!(heal_event = "ha_readmission_dance_cancelled", phase = 2, reason = why,
-              "re-admission dance phase 2 did not cycle pool HA: {why}; this host stays locally \
-               disarmed under the armed pool; alerting");
+        warn!(
+            heal_event = "ha_readmission_dance_cancelled",
+            phase = 2,
+            reason = why,
+            "re-admission dance phase 2 did not cycle pool HA: {why}; this host stays locally \
+               disarmed under the armed pool; alerting"
+        );
         if !self.readmission_disabled_done {
             return;
         }
@@ -20009,9 +20238,11 @@ impl StateMachine {
             (Some(true), _) | (_, Some(false)) => self.dance_disarm_watch = None,
             (Some(false), Some(true)) => {
                 self.dance_disarm_watch = None;
-                warn!(heal_event = "ha_readmission_dance_not_rearmed",
-                      "this host is still locally disarmed under the armed pool after the \
-                       re-admission dance; alerting");
+                warn!(
+                    heal_event = "ha_readmission_dance_not_rearmed",
+                    "this host is still locally disarmed under the armed pool after the \
+                       re-admission dance; alerting"
+                );
                 let what = format!(
                     "no pool HA cycle re-armed it within {} minutes of the dance's sync point",
                     DANCE_REARM_WAIT / 60
@@ -20022,8 +20253,12 @@ impl StateMachine {
                 } else {
                     &self.config.node.peer
                 };
-                let body =
-                    dance_disarmed_alert(&self.config.node.name, master, &what, self.ha_timeout_now());
+                let body = dance_disarmed_alert(
+                    &self.config.node.name,
+                    master,
+                    &what,
+                    self.ha_timeout_now(),
+                );
                 let _ = self.h_alert_advice(&body).await;
             }
             _ => {}
@@ -21291,7 +21526,10 @@ impl StateMachine {
             match self.local_xapi_master_cached(now).await {
                 Some(m) => m,
                 None => {
-                    if self.log_pace.due("isolated_master_xapi_silent", Duration::from_secs(600)) {
+                    if self
+                        .log_pace
+                        .due("isolated_master_xapi_silent", Duration::from_secs(600))
+                    {
                         info!(
                             heal_event = "isolated_master_check_held",
                             "pool.conf says master but the local xapi does not answer as \
@@ -21604,9 +21842,15 @@ impl StateMachine {
             IsolationAction::Alert => {
                 if let Some(why) = isolated_master_alert_held(self.p_view().p) {
                     // Not alerted: the next pass decides again.
-                    if self.log_pace.due("isolated_master_alert_held", Duration::from_secs(600)) {
-                        info!(heal_event = "isolated_master_alert_held", reason = why,
-                              "no isolated-master alert: {why}");
+                    if self
+                        .log_pace
+                        .due("isolated_master_alert_held", Duration::from_secs(600))
+                    {
+                        info!(
+                            heal_event = "isolated_master_alert_held",
+                            reason = why,
+                            "no isolated-master alert: {why}"
+                        );
                     }
                     return;
                 }
@@ -21631,13 +21875,17 @@ impl StateMachine {
                 match isolated_master_claim(
                     membership_now,
                     self.xha_reach.quiet_for(self.isolated_master_since, now),
-                    self.isolated_master_since.map(|t| now.saturating_duration_since(t)),
+                    self.isolated_master_since
+                        .map(|t| now.saturating_duration_since(t)),
                     xha_decision_window(t_hb),
                 ) {
                     IsolatedMasterClaim::XhaDeciding => {
                         // Not alerted: the next pass decides again.
                         self.isolated_master_alerted_at = None;
-                        if self.log_pace.due("isolated_master_xha_deciding", Duration::from_secs(300)) {
+                        if self
+                            .log_pace
+                            .due("isolated_master_xha_deciding", Duration::from_secs(300))
+                        {
                             info!(
                                 heal_event = "isolated_master_wait_xha",
                                 "the pool master's management address is silent and it is still \
@@ -22259,11 +22507,10 @@ impl StateMachine {
                 .h_slave_master_addr()
                 .map(|a| addr_is_local(&a))
                 .unwrap_or(false),
-            MasterlessFlavor::MutualSlave | MasterlessFlavor::DemotedSurvivor => {
-                self.h_slave_master_addr()
-                    .map(|a| a == self.config.network.peer_address.to_string())
-                    .unwrap_or(false)
-            }
+            MasterlessFlavor::MutualSlave | MasterlessFlavor::DemotedSurvivor => self
+                .h_slave_master_addr()
+                .map(|a| a == self.config.network.peer_address.to_string())
+                .unwrap_or(false),
         };
         if !still {
             info!("masterless recovery: pool.conf recovered on its own; standing down");
@@ -23743,7 +23990,11 @@ impl StateMachine {
         // A first-sighting alert sent off the tick: mark its hold alerted
         // once it was delivered (never rolling back a newer hold's mark);
         // not sent, the next sighting tries again.
-        let outcome = self.peer_disarm_alert_result.lock().ok().and_then(|mut r| r.take());
+        let outcome = self
+            .peer_disarm_alert_result
+            .lock()
+            .ok()
+            .and_then(|mut r| r.take());
         match outcome {
             Some(FirstAlertOutcome::Delivered(Some(until))) => {
                 let mut b = self.pe_budget();
@@ -23791,7 +24042,8 @@ impl StateMachine {
                 let resume = match phase {
                     Some(_)
                         if b.pending_since != 0
-                            && now_unix.saturating_sub(b.pending_since) >= PEER_EMERGENCY_HA_WAIT =>
+                            && now_unix.saturating_sub(b.pending_since)
+                                >= PEER_EMERGENCY_HA_WAIT =>
                     {
                         None
                     }
@@ -23802,14 +24054,23 @@ impl StateMachine {
                     _ => None,
                 };
                 let Some((phase, returned)) = resume else {
-                    self.peer_emergency_futile(b.pending, FutileWhy::Unknown).await;
+                    self.peer_emergency_futile(b.pending, FutileWhy::Unknown)
+                        .await;
                     return;
                 };
                 // A probe interrupted resumes from the wait for pool HA.
-                let phase = if phase == VerdictPhase::Probing { VerdictPhase::AwaitingHa } else { phase };
-                info!(scenario = "peer_emergency", heal_event = "peer_emergency_verdict_resumed",
-                      reset_age_secs = age, phase = phase.key(),
-                      "resuming the verdict on a pool HA reset issued {age}s ago");
+                let phase = if phase == VerdictPhase::Probing {
+                    VerdictPhase::AwaitingHa
+                } else {
+                    phase
+                };
+                info!(
+                    scenario = "peer_emergency",
+                    heal_event = "peer_emergency_verdict_resumed",
+                    reset_age_secs = age,
+                    phase = phase.key(),
+                    "resuming the verdict on a pool HA reset issued {age}s ago"
+                );
                 self.peer_emergency_resolve_at = Some(now);
                 self.pe_verdict_set(ResetVerdict::at(phase, now, returned));
                 return;
@@ -23820,7 +24081,8 @@ impl StateMachine {
             // delay it.
             if let Some(v) = self.peer_emergency_verdict
                 && v.phase != VerdictPhase::Probing
-                && crate::heal_state::unix_now().saturating_sub(v.returned) >= PEER_EMERGENCY_HA_WAIT
+                && crate::heal_state::unix_now().saturating_sub(v.returned)
+                    >= PEER_EMERGENCY_HA_WAIT
             {
                 let reset = self.pe_budget().pending;
                 let why = FutileWhy::Waited {
@@ -23901,7 +24163,11 @@ impl StateMachine {
             let v = match self.peer_emergency_verdict {
                 Some(v) => v,
                 None => {
-                    let v = ResetVerdict::at(VerdictPhase::AwaitingHa, now, crate::heal_state::unix_now());
+                    let v = ResetVerdict::at(
+                        VerdictPhase::AwaitingHa,
+                        now,
+                        crate::heal_state::unix_now(),
+                    );
                     self.pe_verdict_set(v);
                     v
                 }
@@ -23925,22 +24191,35 @@ impl StateMachine {
                 let ours = record_is_resets(ops.obligation_owner().as_deref(), reset);
                 match (ops.obligation_state(), ours) {
                     (Some(ObligationState::Owed | ObligationState::Enabled), true) => {
-                        info!(scenario = "peer_emergency", heal_event = "peer_emergency_disable_took",
-                              "the timed-out pool HA disable took (its re-arm record became owed or \
-                               enabled); the verdict goes on");
-                        self.pe_verdict_set(ResetVerdict::at(VerdictPhase::AwaitingHa, now, v.returned));
+                        info!(
+                            scenario = "peer_emergency",
+                            heal_event = "peer_emergency_disable_took",
+                            "the timed-out pool HA disable took (its re-arm record became owed or \
+                               enabled); the verdict goes on"
+                        );
+                        self.pe_verdict_set(ResetVerdict::at(
+                            VerdictPhase::AwaitingHa,
+                            now,
+                            v.returned,
+                        ));
                     }
                     (Some(ObligationState::Pending { .. }), true) => {
                         if !v.seen_own_pending {
-                            self.peer_emergency_verdict = Some(ResetVerdict { seen_own_pending: true, ..v });
+                            self.peer_emergency_verdict = Some(ResetVerdict {
+                                seen_own_pending: true,
+                                ..v
+                            });
                         }
                     }
                     // Ended while seen pending in this run (fulfilled and
                     // cleared would have shown owed or enabled first).
                     (None, _) if v.seen_own_pending => {
-                        info!(scenario = "peer_emergency", heal_event = "peer_emergency_disable_did_not_take",
-                              "the timed-out pool HA disable did not take (its re-arm record ended \
-                               while still pending): no verdict on this reset, which stays spent");
+                        info!(
+                            scenario = "peer_emergency",
+                            heal_event = "peer_emergency_disable_did_not_take",
+                            "the timed-out pool HA disable did not take (its re-arm record ended \
+                               while still pending): no verdict on this reset, which stays spent"
+                        );
                         self.peer_emergency_resolve_at = None;
                         self.peer_emergency_verdict = None;
                         self.peer_emergency_budget_clear_pending();
@@ -23960,7 +24239,11 @@ impl StateMachine {
                 if pool_ha == Some(true) {
                     match self.h_pending_ha_tasks().await {
                         Some(t) if t.is_empty() => {
-                            self.pe_verdict_set(ResetVerdict::at(VerdictPhase::Probing, now, v.returned));
+                            self.pe_verdict_set(ResetVerdict::at(
+                                VerdictPhase::Probing,
+                                now,
+                                v.returned,
+                            ));
                         }
                         Some(t) if v.task_since == 0 => {
                             let first = t.iter().filter_map(|x| x.created_unix).min();
@@ -24004,10 +24287,13 @@ impl StateMachine {
                 )
                 && self.h_pool_ha().await == Some(false)
             {
-                warn!(scenario = "peer_emergency", heal_event = "peer_emergency_verdict_interrupted",
-                      "pool HA was turned off while the verdict on TwinStor's reset was probing the \
+                warn!(
+                    scenario = "peer_emergency",
+                    heal_event = "peer_emergency_verdict_interrupted",
+                    "pool HA was turned off while the verdict on TwinStor's reset was probing the \
                        peer, and not by TwinStor: no verdict on this reset (no hold beyond the \
-                       usual spacing, no alert)");
+                       usual spacing, no alert)"
+                );
                 self.peer_emergency_resolve_at = None;
                 self.peer_emergency_verdict = None;
                 self.peer_emergency_budget_clear_pending();
@@ -24058,7 +24344,8 @@ impl StateMachine {
                 && crate::heal_state::unix_now().saturating_sub(b.freed_at)
                     < PEER_EMERGENCY_RELAPSE_WITHIN
             {
-                self.peer_emergency_futile(b.freed_reset, FutileWhy::Relapsed).await;
+                self.peer_emergency_futile(b.freed_reset, FutileWhy::Relapsed)
+                    .await;
             }
         }
         if armed_mismatch_confirmed && !p.matured() {
@@ -24259,7 +24546,9 @@ impl StateMachine {
             self.h_forget_held_advice(&key);
         }
         if !cfg!(test) {
-            *PEER_EMERGENCY_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = hold.clone();
+            *PEER_EMERGENCY_HOLD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = hold.clone();
         }
         self.peer_emergency_hold = hold;
     }
@@ -24280,7 +24569,9 @@ impl StateMachine {
     fn pe_budget(&self) -> PeerEmergencyBudget {
         match &self.pe_budget_unwritten {
             Some(b) => b.clone(),
-            None => peer_emergency_budget_read(&self.peer_emergency_budget_path, &current_boot_id()),
+            None => {
+                peer_emergency_budget_read(&self.peer_emergency_budget_path, &current_boot_id())
+            }
         }
     }
 
@@ -24298,7 +24589,8 @@ impl StateMachine {
     /// Spend a reset before it runs: only on a write that lands (fail
     /// closed), with nothing left unwritten from before.
     fn pe_budget_spend(&mut self, b: &PeerEmergencyBudget) -> bool {
-        let ok = peer_emergency_budget_write(&self.peer_emergency_budget_path, &current_boot_id(), b);
+        let ok =
+            peer_emergency_budget_write(&self.peer_emergency_budget_path, &current_boot_id(), b);
         if ok {
             self.pe_budget_unwritten = None;
         }
@@ -24332,7 +24624,10 @@ impl StateMachine {
             return;
         }
         let refused = if refused {
-            format!(" A confirmed reset for the peer host {} was refused for it.", self.config.node.peer)
+            format!(
+                " A confirmed reset for the peer host {} was refused for it.",
+                self.config.node.peer
+            )
         } else {
             String::new()
         };
@@ -24383,10 +24678,17 @@ impl StateMachine {
     async fn peer_disarm_first_alert(&mut self) {
         if let Some(why) = self.peer_disarm_explained() {
             // Not latched: a later sighting is looked at again.
-            if self.log_pace.due("peer_disarmed_explained", Duration::from_secs(600)) {
-                info!(scenario = "peer_emergency", heal_event = "peer_disarmed_seen", reason = why,
-                      "the peer reports itself locally disarmed under the armed pool; no alert \
-                       for now: {why}");
+            if self
+                .log_pace
+                .due("peer_disarmed_explained", Duration::from_secs(600))
+            {
+                info!(
+                    scenario = "peer_emergency",
+                    heal_event = "peer_disarmed_seen",
+                    reason = why,
+                    "the peer reports itself locally disarmed under the armed pool; no alert \
+                       for now: {why}"
+                );
             }
             return;
         }
@@ -24436,16 +24738,23 @@ impl StateMachine {
         tokio::spawn(async move {
             let vms = xapi::running_vms_on(&peer).await;
             if vms == Some(0) {
-                info!(scenario = "peer_emergency", heal_event = "peer_disarmed_seen", vms = 0,
-                      "the peer reports itself locally disarmed under the armed pool and runs no VM \
-                       per the pool database; no alert");
+                info!(
+                    scenario = "peer_emergency",
+                    heal_event = "peer_disarmed_seen",
+                    vms = 0,
+                    "the peer reports itself locally disarmed under the armed pool and runs no VM \
+                       per the pool database; no alert"
+                );
                 return report(FirstAlertOutcome::Kept);
             }
             // Still master, read right before the send: otherwise not this
             // host's alert to send.
             if xapi::is_pool_master_resilient().await != Some(true) {
-                info!(scenario = "peer_emergency", heal_event = "peer_disarmed_seen",
-                      "no longer pool master; the first-sighting alert is not sent");
+                info!(
+                    scenario = "peer_emergency",
+                    heal_event = "peer_disarmed_seen",
+                    "no longer pool master; the first-sighting alert is not sent"
+                );
                 return report(FirstAlertOutcome::Dropped);
             }
             let body = peer_disarm_first_alert_text(&master, &peer, vms, &next, t);
@@ -24479,8 +24788,12 @@ impl StateMachine {
     /// own doing with a repair due, or a wedge another alert speaks for.
     fn peer_disarm_explained(&self) -> Option<&'static str> {
         let b = self.pe_budget();
-        if b.freed_at != 0 && unix_now_secs().saturating_sub(b.freed_at) < PEER_EMERGENCY_RELAPSE_WITHIN {
-            return Some("a reset freed this peer less than 30 minutes ago; a confirmed relapse is alerted");
+        if b.freed_at != 0
+            && unix_now_secs().saturating_sub(b.freed_at) < PEER_EMERGENCY_RELAPSE_WITHIN
+        {
+            return Some(
+                "a reset freed this peer less than 30 minutes ago; a confirmed relapse is alerted",
+            );
         }
         if self.peer_emergency_resolve_at.is_some() || b.pending != 0 {
             return Some("TwinStor's own pool HA reset for this peer is under way");
@@ -24488,19 +24801,26 @@ impl StateMachine {
         if b.futile != 0
             && unix_now_secs().saturating_sub(b.verdict_at) < PEER_EMERGENCY_AFTER_FUTILE
         {
-            return Some("TwinStor's last reset did not free this peer; its alert speaks for the wedge");
+            return Some(
+                "TwinStor's last reset did not free this peer; its alert speaks for the wedge",
+            );
         }
         if self.ha_reset_inflight.load(Ordering::SeqCst) {
             return Some("a TwinStor pool HA cycle is in flight");
         }
         if self.whole_switch_held
             || self.whole_switch_guard.load(Ordering::Relaxed)
-            || self.whole_switch_guard_ever_disarmed.load(Ordering::Relaxed)
+            || self
+                .whole_switch_guard_ever_disarmed
+                .load(Ordering::Relaxed)
         {
             return Some("a whole-switch hold disarmed both hosts and owns their re-arm");
         }
         if self.twinstor_hold_released_at.is_some_and(|t| {
-            t.elapsed() < RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER + READMISSION_SUSPECT_AFTER
+            t.elapsed()
+                < RECORDED_REARM_LIVESET_FOR
+                    + RECORDED_REARM_SLAVE_DEFER
+                    + READMISSION_SUSPECT_AFTER
         }) {
             return Some("a TwinStor hold released recently; its recorded-disarm repair is due");
         }
@@ -24549,7 +24869,10 @@ impl StateMachine {
             self.pe_budget_store(b);
             // Only the texts that advise a pool HA disable are held while a
             // host is parked.
-            let advice = matches!(why, FutileWhy::Still | FutileWhy::NoAnswer | FutileWhy::Relapsed);
+            let advice = matches!(
+                why,
+                FutileWhy::Still | FutileWhy::NoAnswer | FutileWhy::Relapsed
+            );
             // A "freed" for this reset still queued undelivered (a relapse
             // after it) must not go out after this: dropped. A plain alert
             // under the same key replaces it in the queue anyway; an advice
@@ -24776,8 +25099,12 @@ impl StateMachine {
     async fn self_unwedge_clear(&mut self) {
         let result = self.h_emergency_disable_local().await;
         match &result {
-            Ok(()) => info!(scenario = "local_emergency_wedge", heal_event = "self_unwedge_clear",
-                            outcome = "ok", "host-emergency-ha-disable --force returned success"),
+            Ok(()) => info!(
+                scenario = "local_emergency_wedge",
+                heal_event = "self_unwedge_clear",
+                outcome = "ok",
+                "host-emergency-ha-disable --force returned success"
+            ),
             Err(e) => warn!(scenario = "local_emergency_wedge", heal_event = "self_unwedge_clear",
                             outcome = "failed", error = %e, "host-emergency-ha-disable --force failed"),
         }
@@ -24793,7 +25120,11 @@ impl StateMachine {
     async fn h_emergency_disable_local(&mut self) -> Result<(), String> {
         if self.h_record("emergency-disable-local".to_string()) {
             #[cfg(test)]
-            if let Some(e) = self.test_ha.as_ref().and_then(|t| t.emergency_disable_err.clone()) {
+            if let Some(e) = self
+                .test_ha
+                .as_ref()
+                .and_then(|t| t.emergency_disable_err.clone())
+            {
                 return Err(e);
             }
             return Ok(());
@@ -24956,7 +25287,9 @@ impl StateMachine {
         // demoted host would follow nobody. Checked when the demote fires.
         let mut addr_silent = false;
         if action == SecondMasterAction::Demote
-            && !self.h_addr_answers(peer_addr.as_deref().unwrap_or("")).await
+            && !self
+                .h_addr_answers(peer_addr.as_deref().unwrap_or(""))
+                .await
         {
             addr_silent = true;
             action = SecondMasterAction::AlertOnly;
@@ -25053,7 +25386,10 @@ impl StateMachine {
                          address>'."
                     )
                 };
-                if self.log_pace.due("second_master_alert", Duration::from_secs(600)) {
+                if self
+                    .log_pace
+                    .due("second_master_alert", Duration::from_secs(600))
+                {
                     warn!(heal_event = "second_master_alert", running_vms = %vms_text, "{body}");
                 }
                 // Paced from its delivery: sent unqueued and raised again on
@@ -25116,12 +25452,16 @@ impl StateMachine {
                 .whole_switch_guard
                 .load(std::sync::atomic::Ordering::Relaxed);
         // An unreadable task list is unknown: wait, as for a pending one.
-        let task_pending = self.h_pending_ha_tasks().await.is_none_or(|t| !t.is_empty());
+        let task_pending = self
+            .h_pending_ha_tasks()
+            .await
+            .is_none_or(|t| !t.is_empty());
         let decision = recorded_disarm_rearm_decision(
             true,
             pool_ha,
             local_armed,
-            self.recorded_rearm_liveset_since.map(|t| now.duration_since(t)),
+            self.recorded_rearm_liveset_since
+                .map(|t| now.duration_since(t)),
             p.matured(),
             i_am_master,
             &peer_role,
@@ -25145,7 +25485,9 @@ impl StateMachine {
                 if self
                     .log_pace
                     .is_due("recorded_rearm_disabled", DEGRADED_REALERT_AFTER)
-                    && self.h_alert_advice_unqueued(&self.recorded_rearm_manual_now()).await
+                    && self
+                        .h_alert_advice_unqueued(&self.recorded_rearm_manual_now())
+                        .await
                 {
                     self.log_pace.mark("recorded_rearm_disabled");
                 }
@@ -25162,9 +25504,15 @@ impl StateMachine {
         // Another pool HA cycle (or the survivor reset) is running: wait,
         // with the record unused.
         if self.ha_reset_inflight.load(Ordering::SeqCst) {
-            if self.log_pace.due("recorded_rearm_wait", Duration::from_secs(600)) {
-                info!(heal_event = "recorded_rearm_wait", reason = "cycle in flight",
-                      "the recorded-disarm re-arm waits: another pool HA cycle is in flight");
+            if self
+                .log_pace
+                .due("recorded_rearm_wait", Duration::from_secs(600))
+            {
+                info!(
+                    heal_event = "recorded_rearm_wait",
+                    reason = "cycle in flight",
+                    "the recorded-disarm re-arm waits: another pool HA cycle is in flight"
+                );
             }
             return;
         }
@@ -25179,8 +25527,12 @@ impl StateMachine {
              HA cycle (disable, then enable) to re-arm both hosts"
         );
         let Some(sr) = xapi::twinstor_sr_uuid().await else {
-            if self.log_pace.is_due("recorded_rearm_no_sr", DEGRADED_REALERT_AFTER)
-                && self.h_alert_advice_unqueued(&self.recorded_rearm_manual_now()).await
+            if self
+                .log_pace
+                .is_due("recorded_rearm_no_sr", DEGRADED_REALERT_AFTER)
+                && self
+                    .h_alert_advice_unqueued(&self.recorded_rearm_manual_now())
+                    .await
             {
                 self.log_pace.mark("recorded_rearm_no_sr");
             }
@@ -25200,7 +25552,10 @@ impl StateMachine {
             crate::mgmt_reach::Trigger::Positive,
             i_am_master,
         ) {
-            info!(heal_event = "recorded_rearm_started", "pool HA cycle started off the tick");
+            info!(
+                heal_event = "recorded_rearm_started",
+                "pool HA cycle started off the tick"
+            );
         }
     }
 
@@ -25244,20 +25599,26 @@ impl StateMachine {
             warn!(heal_event = "recorded_rearm_failed", disable = %r.disable_note, enabled = r.enabled,
                   "the pool HA cycle disabled pool HA but its enable did not return; the re-arm \
                    obligation retries the enable");
-            let _ = xapi::send_xapi_alert_advising_ha_disable(&self.recorded_rearm_manual_now()).await;
+            let _ =
+                xapi::send_xapi_alert_advising_ha_disable(&self.recorded_rearm_manual_now()).await;
         } else {
             warn!(heal_event = "recorded_rearm_failed", disable = %r.disable_note,
                   "the pool HA cycle's disable was not seen to take ({}); if it may still land \
                    (no answer), the pending re-arm record re-enables pool HA once it does, \
                    otherwise nothing is owed", r.disable_note);
-            let _ = xapi::send_xapi_alert_advising_ha_disable(&self.recorded_rearm_manual_now()).await;
+            let _ =
+                xapi::send_xapi_alert_advising_ha_disable(&self.recorded_rearm_manual_now()).await;
         }
     }
 
     /// `recorded_rearm_manual` for this host, the pool master as pool.conf
     /// names it, and the configured HA timeout.
     fn recorded_rearm_manual_now(&self) -> String {
-        recorded_rearm_manual(&self.config.node.name, &self.pool_master_name(), self.ha_timeout_now())
+        recorded_rearm_manual(
+            &self.config.node.name,
+            &self.pool_master_name(),
+            self.ha_timeout_now(),
+        )
     }
 
     /// The pool master's host name as pool.conf says (this host or the
@@ -25323,7 +25684,10 @@ impl StateMachine {
         }
         let _ = std::fs::write(
             &self.disarm_record_path,
-            format!("boot_id={boot}\nxapi_pid={}\nreason=second_master_demote\n", xapi_pid()),
+            format!(
+                "boot_id={boot}\nxapi_pid={}\nreason=second_master_demote\n",
+                xapi_pid()
+            ),
         );
     }
 
@@ -25621,7 +25985,12 @@ impl StateMachine {
                 // The forwarded enable runs off the tick; its result is read
                 // on a later pass (a failure is only logged from a slave).
                 self.rearm_enable_from_slave = true;
-                self.spawn_rearm_enable(sr, timeout, false, Some(crate::mgmt_reach::Trigger::Positive));
+                self.spawn_rearm_enable(
+                    sr,
+                    timeout,
+                    false,
+                    Some(crate::mgmt_reach::Trigger::Positive),
+                );
             }
             HaRearmAction::Attempt => {
                 // The last enable's failure may call for the toolstack
@@ -25663,7 +26032,12 @@ impl StateMachine {
                 // this obligation hold meanwhile). Its result is read on the
                 // next pass (`rearm_enable_followup`).
                 self.rearm_enable_from_slave = false;
-                self.spawn_rearm_enable(sr, timeout, true, Some(crate::mgmt_reach::Trigger::Positive));
+                self.spawn_rearm_enable(
+                    sr,
+                    timeout,
+                    true,
+                    Some(crate::mgmt_reach::Trigger::Positive),
+                );
             }
         }
         if let Some(r @ RearmEnable::Failed(_)) = last_enable {
@@ -25708,20 +26082,29 @@ impl StateMachine {
                 } else {
                     "the re-arm obligation is gone (cleared, or deleted to keep HA off)"
                 };
-                info!(heal_event = "masterless_rearm_retry_done", issued = facts.issued, reason = why,
-                      "masterless recovery: retry ended: {why}");
+                info!(
+                    heal_event = "masterless_rearm_retry_done",
+                    issued = facts.issued,
+                    reason = why,
+                    "masterless recovery: retry ended: {why}"
+                );
                 self.masterless_retry = None;
             }
             MasterlessRetryStep::HandOver => {
-                info!(heal_event = "masterless_rearm_retry_handover",
-                      "masterless recovery: the peer is back; the normal re-arm path takes over");
+                info!(
+                    heal_event = "masterless_rearm_retry_handover",
+                    "masterless recovery: the peer is back; the normal re-arm path takes over"
+                );
                 self.masterless_retry = None;
             }
             MasterlessRetryStep::GiveUp => {
-                warn!(heal_event = "masterless_rearm_retry_exhausted", issued = facts.issued,
-                      elapsed_secs = facts.elapsed.as_secs(),
-                      "masterless recovery: pool HA enable still not done after its retries; the \
-                       re-arm obligation stays and re-enables pool HA once the peer is back");
+                warn!(
+                    heal_event = "masterless_rearm_retry_exhausted",
+                    issued = facts.issued,
+                    elapsed_secs = facts.elapsed.as_secs(),
+                    "masterless recovery: pool HA enable still not done after its retries; the \
+                       re-arm obligation stays and re-enables pool HA once the peer is back"
+                );
                 self.masterless_retry = None;
             }
             MasterlessRetryStep::Wait => {
@@ -25731,8 +26114,11 @@ impl StateMachine {
             MasterlessRetryStep::Retry => {
                 self.rearm_enable_from_slave = false;
                 if self.spawn_rearm_enable(st.sr.clone(), st.timeout, true, None) {
-                    info!(heal_event = "masterless_rearm_retry", issued_so_far = facts.issued,
-                          "masterless recovery: retrying the pool HA enable");
+                    info!(
+                        heal_event = "masterless_rearm_retry",
+                        issued_so_far = facts.issued,
+                        "masterless recovery: retrying the pool HA enable"
+                    );
                 }
                 st.next_at = now + MASTERLESS_RETRY_EVERY;
                 self.masterless_retry = Some(st);
@@ -25799,7 +26185,11 @@ impl StateMachine {
     /// after it, or never.
     fn take_fresh_rearm_result(&mut self, now: std::time::Instant) -> Option<RearmEnable> {
         self.rearm_pass = self.rearm_pass.wrapping_add(1);
-        let (r, at, spawned) = self.rearm_enable_result.lock().ok().and_then(|mut s| s.take())?;
+        let (r, at, spawned) = self
+            .rearm_enable_result
+            .lock()
+            .ok()
+            .and_then(|mut s| s.take())?;
         let age = now.saturating_duration_since(at);
         if rearm_result_fresh(spawned, self.rearm_pass, age) {
             return Some(r);
@@ -25872,14 +26262,15 @@ impl StateMachine {
                 if self
                     .log_pace
                     .is_due("rearm_ts_unwritable", DEGRADED_REALERT_AFTER)
-                    && self.h_alert_unqueued(&format!(
-                        "TwinStor on {}: pool HA's re-arm keeps failing, and its last-resort \
+                    && self
+                        .h_alert_unqueued(&format!(
+                            "TwinStor on {}: pool HA's re-arm keeps failing, and its last-resort \
                          toolstack restart is unavailable because its restart count cannot be \
                          written ({}); check that /var/lib/twinstor is writable. The re-arm \
                          itself keeps retrying.",
-                        self.config.node.name, self.rearm_ts_path
-                    ))
-                    .await
+                            self.config.node.name, self.rearm_ts_path
+                        ))
+                        .await
                 {
                     self.log_pace.mark("rearm_ts_unwritable");
                 }
@@ -25988,7 +26379,8 @@ impl StateMachine {
             XhadReconcileAction::None => {}
             // Every HA actuator waits for a pool HA cycle in flight; the
             // next pass decides again.
-            XhadReconcileAction::StopLocalXhad if self.ha_cycle_in_flight("reconcile_stuck_xhad") => {}
+            XhadReconcileAction::StopLocalXhad
+                if self.ha_cycle_in_flight("reconcile_stuck_xhad") => {}
             XhadReconcileAction::StopLocalXhad => self.reconcile_xhad_stop(now).await,
         }
     }
@@ -26123,7 +26515,9 @@ impl StateMachine {
         let settling = disarm_record_age(&record, unix_now_secs())
             .is_some_and(|age| age < DISARM_RECORD_SETTLE);
         let hold = self.whole_switch_held
-            || self.whole_switch_guard.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .whole_switch_guard
+                .load(std::sync::atomic::Ordering::Relaxed)
             || settling;
         let restarted = if cfg!(test) {
             false
@@ -26145,9 +26539,9 @@ impl StateMachine {
                     let Some(sr) = xapi::twinstor_sr_uuid().await else {
                         return;
                     };
-                    let timeout = xapi::pool_ha_timeout()
-                        .await
-                        .unwrap_or_else(|| crate::setup::configured_ha_timeout_for(self.arbitrated));
+                    let timeout = xapi::pool_ha_timeout().await.unwrap_or_else(|| {
+                        crate::setup::configured_ha_timeout_for(self.arbitrated)
+                    });
                     warn!(
                         heal_event = "ha_rearm_after_armed_trap",
                         "pool HA is off after xapi restarted on this host while it was locally \
@@ -26195,10 +26589,16 @@ impl StateMachine {
         );
         let record_present = ha_obligation_read().is_some()
             || std::path::Path::new(&ha_local_disarm_path()).exists();
-        match self.rejoin_watch.observe_at(peer_live, ha, record_present, now_unix) {
+        match self
+            .rejoin_watch
+            .observe_at(peer_live, ha, record_present, now_unix)
+        {
             RejoinHaOff::Nothing => {}
             RejoinHaOff::AlreadyReported => {
-                if self.log_pace.due("ha_off_already_reported", Duration::from_secs(3600)) {
+                if self
+                    .log_pace
+                    .due("ha_off_already_reported", Duration::from_secs(3600))
+                {
                     info!(
                         heal_event = "ha_off_still",
                         "pool HA is still off; already reported for this episode (no record says \
@@ -28395,10 +28795,8 @@ impl StateMachine {
                             && may_restart(self.auto_heal_restarts, self.auto_heal_holds)
                             && self.peer_reachable().await
                             && self.rejoin_assist_allows("dual_master_yield")
-                            && self.ha_gate(
-                                "dual_master_yield",
-                                crate::mgmt_reach::Trigger::Absence,
-                            );
+                            && self
+                                .ha_gate("dual_master_yield", crate::mgmt_reach::Trigger::Absence);
                         if yield_now {
                             self.heal_state_update(
                                 "yield_restart",
@@ -28443,7 +28841,10 @@ impl StateMachine {
                             );
                             if !self.sb_wedge_alerted {
                                 self.sb_wedge_alerted =
-                                    xapi::send_ha_wedge_alert_advising_ha_disable(&wedge_alert_body(self.ha_timeout_now())).await;
+                                    xapi::send_ha_wedge_alert_advising_ha_disable(
+                                        &wedge_alert_body(self.ha_timeout_now()),
+                                    )
+                                    .await;
                             }
                             // Last resort past the cap: the restarts are not
                             // demoting and the survivor's escalation has had its
@@ -28489,8 +28890,10 @@ impl StateMachine {
                              keeper); keeping data, not discarding."
                         );
                         if !self.sb_wedge_alerted {
-                            self.sb_wedge_alerted =
-                                xapi::send_ha_wedge_alert_advising_ha_disable(&wedge_alert_body(self.ha_timeout_now())).await;
+                            self.sb_wedge_alerted = xapi::send_ha_wedge_alert_advising_ha_disable(
+                                &wedge_alert_body(self.ha_timeout_now()),
+                            )
+                            .await;
                         }
                         // Best effort: re-admit a peer that auto-demoted to us.
                         if !cfg!(test) {
@@ -28542,10 +28945,8 @@ impl StateMachine {
                         if !cfg!(test)
                             && is_loser == Some(false)
                             && self.sb_keepdata_stuck >= ha_reset_threshold
-                            && self.ha_gate(
-                                "survivor_ha_reset",
-                                crate::mgmt_reach::Trigger::Positive,
-                            )
+                            && self
+                                .ha_gate("survivor_ha_reset", crate::mgmt_reach::Trigger::Positive)
                         {
                             self.heal_state_update(
                                 "survivor_ha_reset",
@@ -28958,7 +29359,10 @@ impl StateMachine {
             if let Some(dir) = std::path::Path::new(STUCK_PRIMARY_FENCE_STAMP.as_str()).parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(STUCK_PRIMARY_FENCE_STAMP.as_str(), unix_now_secs().to_string());
+            let _ = std::fs::write(
+                STUCK_PRIMARY_FENCE_STAMP.as_str(),
+                unix_now_secs().to_string(),
+            );
         }
         // The forced reboot lands a few seconds after the detached spawn; stop
         // the tick loop from starting another teardown in that window (each
@@ -29181,7 +29585,11 @@ impl StateMachine {
         if let Some(o) = &self.test_ha_ops {
             return o.clone();
         }
-        Arc::new(LiveHaOps { mgmt: self.mgmt.clone(), trigger, expect_master })
+        Arc::new(LiveHaOps {
+            mgmt: self.mgmt.clone(),
+            trigger,
+            expect_master,
+        })
     }
 
     /// Under the test seam without scripted operations, an off-tick routine
@@ -29478,7 +29886,10 @@ impl StateMachine {
                     crate::mgmt_reach::FRESH_MAX.as_secs()
                 );
             } else {
-                info!(heal_event = "mgmt_reach_fresh", "the management-reachability prober probes again");
+                info!(
+                    heal_event = "mgmt_reach_fresh",
+                    "the management-reachability prober probes again"
+                );
             }
         }
         v
@@ -29648,7 +30059,10 @@ impl StateMachine {
             return false;
         }
         if !require_peer_dead
-            && !self.ha_gate("masterless_transition", crate::mgmt_reach::Trigger::Positive)
+            && !self.ha_gate(
+                "masterless_transition",
+                crate::mgmt_reach::Trigger::Positive,
+            )
         {
             return false;
         }
@@ -29748,7 +30162,8 @@ impl StateMachine {
         if since == 0 || now.saturating_sub(since) < OWN_TASK_STALE_AFTER {
             return since != 0;
         }
-        self.pending_ha_task_holds(ha_obligation_read().and_then(|o| o.2)).await
+        self.pending_ha_task_holds(ha_obligation_read().and_then(|o| o.2))
+            .await
     }
 
     /// While TwinStor's own pool HA task is seen pending (or a cancel of it
@@ -29769,10 +30184,16 @@ impl StateMachine {
     async fn pending_ha_task_holds(&mut self, attempt_stamp: Option<u64>) -> bool {
         let Some(tasks) = self.h_pending_ha_tasks().await else {
             // Unknown: no clear, no enable; the next pass reads again.
-            if self.log_pace.due("ha_rearm_tasks_unreadable", Duration::from_secs(600)) {
-                info!(heal_event = "ha_rearm_hold", reason = "task_list_unreadable",
-                      "XAPI's pending task list is unreadable; the re-arm holds (no clear, no \
-                       enable) and reads it again on the next pass");
+            if self
+                .log_pace
+                .due("ha_rearm_tasks_unreadable", Duration::from_secs(600))
+            {
+                info!(
+                    heal_event = "ha_rearm_hold",
+                    reason = "task_list_unreadable",
+                    "XAPI's pending task list is unreadable; the re-arm holds (no clear, no \
+                       enable) and reads it again on the next pass"
+                );
             }
             return true;
         };
@@ -29817,12 +30238,18 @@ impl StateMachine {
                 } else {
                     let ops = self.ha_ops(None, None);
                     if let Some(ObligationState::Pending { .. }) = ops.obligation_state() {
-                        ops.set_obligation_state(ObligationState::Pending { until: ops.now_unix() });
+                        ops.set_obligation_state(ObligationState::Pending {
+                            until: ops.now_unix(),
+                        });
                     }
                 }
                 // A task that could not be cancelled is tried again on later
                 // passes; its alert is paced.
-                if !ok && !self.log_pace.due("ha_task_cancel_failed_alert", DEGRADED_REALERT_AFTER) {
+                if !ok
+                    && !self
+                        .log_pace
+                        .due("ha_task_cancel_failed_alert", DEGRADED_REALERT_AFTER)
+                {
                     return true;
                 }
                 let _ = self
@@ -29853,10 +30280,7 @@ impl StateMachine {
                         &[("reason", &reason)],
                     );
                 }
-                if self
-                    .log_pace
-                    .due("ha_task_foreign", DEGRADED_REALERT_AFTER)
-                {
+                if self.log_pace.due("ha_task_foreign", DEGRADED_REALERT_AFTER) {
                     warn!(heal_event = "ha_task_foreign", task = %t.uuid, name = %t.name, "{reason}");
                 }
                 // The alert's pace is marked once delivered.
@@ -30158,7 +30582,10 @@ impl StateMachine {
 
     /// Rewrite the whole-switch hold's heal stage (paced to a minute).
     fn refresh_live_hold_stage(&mut self) {
-        if !self.log_pace.due("whole_switch_hold_refresh", Duration::from_secs(60)) {
+        if !self
+            .log_pace
+            .due("whole_switch_hold_refresh", Duration::from_secs(60))
+        {
             return;
         }
         self.heal_state_update(
@@ -33042,7 +33469,8 @@ async fn survivor_ha_reset_with(
 ) {
     let sr = sr.to_string();
     if announce {
-        ops.wedge_alert(&survivor_reset_announcement(ha_timeout)).await;
+        ops.wedge_alert(&survivor_reset_announcement(ha_timeout))
+            .await;
     }
     // The same start checks as every pool HA cycle (gates, pool HA on, no
     // pool HA task pending: another disable would only queue behind it).
@@ -33054,8 +33482,14 @@ async fn survivor_ha_reset_with(
             return;
         }
         CycleStart::OffNotByUs(note, clear) => {
-            pool_ha_off_not_by_us(ops, "survivor_ha_reset", &note, clear, &ha_off_not_by_twinstor())
-                .await;
+            pool_ha_off_not_by_us(
+                ops,
+                "survivor_ha_reset",
+                &note,
+                clear,
+                &ha_off_not_by_twinstor(),
+            )
+            .await;
             return;
         }
     }
@@ -33070,7 +33504,9 @@ async fn survivor_ha_reset_with(
     ops.write_obligation(
         &sr,
         ha_timeout.into(),
-        ObligationState::Pending { until: ops.now_unix() + OBLIGATION_PENDING_FOR },
+        ObligationState::Pending {
+            until: ops.now_unix() + OBLIGATION_PENDING_FOR,
+        },
         &format!("survivor_ha_reset:{}", ops.now_unix()),
     );
     ops.touch_attempt();
@@ -33082,12 +33518,20 @@ async fn survivor_ha_reset_with(
     match pool_ha_disable_step(ops).await {
         DisableStep::Disabled(step) => {
             ops.set_obligation_state(ObligationState::Owed);
-            info!(heal_event = "survivor_ha_reset", step,
-                  "survivor_ha_reset: pool HA is off; continuing");
+            info!(
+                heal_event = "survivor_ha_reset",
+                step, "survivor_ha_reset: pool HA is off; continuing"
+            );
         }
         DisableStep::RefusedButOff(note) => {
-            pool_ha_off_not_by_us(ops, "survivor_ha_reset", &note, true, &ha_off_disable_refused())
-                .await;
+            pool_ha_off_not_by_us(
+                ops,
+                "survivor_ha_reset",
+                &note,
+                true,
+                &ha_off_disable_refused(),
+            )
+            .await;
             return;
         }
         DisableStep::Failed(note, may_land) => {
@@ -40040,7 +40484,11 @@ poll_interval_ms = 10
             }
         }
         let t0 = 10_000u64;
-        let mut c = Check { streak: 0, outage: None, last: t0 - 600 };
+        let mut c = Check {
+            streak: 0,
+            outage: None,
+            last: t0 - 600,
+        };
         // During the cut: silent.
         assert!(!c.at(t0, 0, 60));
         assert!(!c.at(t0 + 600, 0, 60));
@@ -40058,7 +40506,11 @@ poll_interval_ms = 10
         );
         // A gateway answering about one probe per check: no restart, it
         // alerts at the third check, and the text says how little it answered.
-        let mut c = Check { streak: 0, outage: None, last: t0 - 600 };
+        let mut c = Check {
+            streak: 0,
+            outage: None,
+            last: t0 - 600,
+        };
         assert!(!c.at(t0, 1, 60));
         assert!(!c.at(t0 + 600, 1, 60));
         assert!(c.at(t0 + 1200, 1, 60));
@@ -40076,7 +40528,10 @@ poll_interval_ms = 10
         let (restart, _) = tiebreaker_observe(false, 0, 0, t0, None, t0 + 600);
         assert!(!restart);
         // An answer at the check clears the window.
-        assert_eq!(tiebreaker_observe(true, 0, 60, t0, o, t0 + 600), (false, None));
+        assert_eq!(
+            tiebreaker_observe(true, 0, 60, t0, o, t0 + 600),
+            (false, None)
+        );
     }
 
     /// The local login probe runs only for a host disarmed out of the
@@ -40126,10 +40581,20 @@ poll_interval_ms = 10
         assert_eq!(peer_daemon_p_clock(&mut back, true, 6000), Some(6000));
         assert_eq!(peer_daemon_p_clock(&mut back, true, 6500), Some(6000));
         let reference = peer_daemon_reference(Some(1000), 6000);
-        assert!(!peer_daemon_down(reference, 6000 + 160, Some(true), stale), "a stamp from before the cut");
-        assert!(peer_daemon_down(reference, 6000 + 900, Some(true), stale), "no report 15 min after P came back");
+        assert!(
+            !peer_daemon_down(reference, 6000 + 160, Some(true), stale),
+            "a stamp from before the cut"
+        );
+        assert!(
+            peer_daemon_down(reference, 6000 + 900, Some(true), stale),
+            "no report 15 min after P came back"
+        );
         assert_eq!(peer_daemon_p_clock(&mut back, false, 7000), Option::None);
-        assert_eq!(peer_daemon_p_clock(&mut back, true, 7100), Some(7100), "restarted");
+        assert_eq!(
+            peer_daemon_p_clock(&mut back, true, 7100),
+            Some(7100),
+            "restarted"
+        );
         assert_eq!(peer_daemon_reference(Some(9000), 7100), Some(9000));
         // No stamp at all: the peer may run an older version; never alert.
         assert!(!peer_daemon_down(None, 10_000, Some(true), stale));
@@ -40789,17 +41254,35 @@ poll_interval_ms = 10
         assert_eq!(xha_decision_window(90), Duration::from_secs(330));
         let isolated = |t0_plus: u64| Some(Duration::from_secs(t0_plus - 94));
         // At the alert's maturity (T0+394), still listed 7 s before removal.
-        assert_eq!(isolated_master_claim(Some(true), isolated(377), Option::None, w), XhaDeciding);
-        assert_eq!(isolated_master_claim(Some(true), isolated(394), Option::None, w), XhaDeciding);
+        assert_eq!(
+            isolated_master_claim(Some(true), isolated(377), Option::None, w),
+            XhaDeciding
+        );
+        assert_eq!(
+            isolated_master_claim(Some(true), isolated(394), Option::None, w),
+            XhaDeciding
+        );
         // Removed: no alert at all.
-        assert_eq!(isolated_master_claim(Some(false), isolated(400), Option::None, w), Removed);
+        assert_eq!(
+            isolated_master_claim(Some(false), isolated(400), Option::None, w),
+            Removed
+        );
         // Still listed past the window: the claim stands; it cannot hold
         // forever whatever P does (no P input any more).
-        assert_eq!(isolated_master_claim(Some(true), isolated(94 + 421), Option::None, w), InLiveset);
+        assert_eq!(
+            isolated_master_claim(Some(true), isolated(94 + 421), Option::None, w),
+            InLiveset
+        );
         // No liveset: the no-claim alert at once.
-        assert_eq!(isolated_master_claim(None, isolated(377), Option::None, w), LivesetUnknown);
+        assert_eq!(
+            isolated_master_claim(None, isolated(377), Option::None, w),
+            LivesetUnknown
+        );
         // Listed, but when its inputs last changed is unknown: no claim.
-        assert_eq!(isolated_master_claim(Some(true), Option::None, Option::None, w), LivesetUnknown);
+        assert_eq!(
+            isolated_master_claim(Some(true), Option::None, Option::None, w),
+            LivesetUnknown
+        );
     }
 
     /// Replay of the partial-heal shape where the survivor claimed too early:
@@ -40814,41 +41297,95 @@ poll_interval_ms = 10
     /// deciding then; the removal follows and no alert is raised.
     #[test]
     fn the_in_liveset_claim_waits_for_the_last_change_in_xhas_inputs() {
-        use super::{IsolatedMasterClaim::*, XhaReach, XhaReachClock, isolated_master_claim, xha_decision_window};
+        use super::{
+            IsolatedMasterClaim::*, XhaReach, XhaReachClock, isolated_master_claim,
+            xha_decision_window,
+        };
         let w = xha_decision_window(120);
         let cut = std::time::Instant::now();
         let at = |s: i64| {
-            if s >= 0 { cut + Duration::from_secs(s as u64) } else { cut - Duration::from_secs((-s) as u64) }
+            if s >= 0 {
+                cut + Duration::from_secs(s as u64)
+            } else {
+                cut - Duration::from_secs((-s) as u64)
+            }
         };
         let since = Some(at(-44));
-        let healthy = XhaReach { p: true, peer_alive: true, drbd_connected: true,
-                                 peer_live: Some(true), peer_statefile: Some(true) };
+        let healthy = XhaReach {
+            p: true,
+            peer_alive: true,
+            drbd_connected: true,
+            peer_live: Some(true),
+            peer_statefile: Some(true),
+        };
         let mut c = XhaReachClock::default();
         c.observe(healthy, false, at(-44));
         c.observe(healthy, false, at(5));
-        let cut_off = XhaReach { p: false, ..healthy };
+        let cut_off = XhaReach {
+            p: false,
+            ..healthy
+        };
         c.observe(cut_off, false, at(11));
         // An unreadable liveset read is no change.
-        c.observe(XhaReach { peer_live: Option::None, peer_statefile: Option::None, ..cut_off }, false, at(100));
+        c.observe(
+            XhaReach {
+                peer_live: Option::None,
+                peer_statefile: Option::None,
+                ..cut_off
+            },
+            false,
+            at(100),
+        );
         assert_eq!(c.changed_at, Some(at(11)));
         // XHA's removal lines in xha.log, then the fence's DRBD disconnect
         // and the reboot's reconnect.
         c.observe(cut_off, true, at(244));
-        c.observe(XhaReach { peer_alive: false, drbd_connected: false, ..cut_off }, false, at(248));
+        c.observe(
+            XhaReach {
+                peer_alive: false,
+                drbd_connected: false,
+                ..cut_off
+            },
+            false,
+            at(248),
+        );
         c.observe(cut_off, false, at(274));
         // The old clock alone would have claimed at the alert (cut + 379 s).
         let old = since.map(|t| at(379).saturating_duration_since(t));
-        assert_eq!(isolated_master_claim(Some(true), old, Option::None, w), InLiveset);
-        assert_eq!(isolated_master_claim(Some(true), c.quiet_for(since, at(379)), Option::None, w), XhaDeciding);
+        assert_eq!(
+            isolated_master_claim(Some(true), old, Option::None, w),
+            InLiveset
+        );
+        assert_eq!(
+            isolated_master_claim(Some(true), c.quiet_for(since, at(379)), Option::None, w),
+            XhaDeciding
+        );
         // Six seconds later the liveset drops the fenced peer: no alert.
-        assert_eq!(isolated_master_claim(Some(false), c.quiet_for(since, at(385)), Option::None, w), Removed);
+        assert_eq!(
+            isolated_master_claim(Some(false), c.quiet_for(since, at(385)), Option::None, w),
+            Removed
+        );
         // Nothing changes any more and the peer stays listed: the window ends.
         c.observe(cut_off, false, at(600));
-        assert_eq!(isolated_master_claim(Some(true), c.quiet_for(since, at(274 + 421)), Option::None, w), InLiveset);
+        assert_eq!(
+            isolated_master_claim(
+                Some(true),
+                c.quiet_for(since, at(274 + 421)),
+                Option::None,
+                w
+            ),
+            InLiveset
+        );
         // A clock that started after the last change counts from its start.
-        assert_eq!(c.quiet_for(Some(at(700)), at(800)), Some(Duration::from_secs(100)));
+        assert_eq!(
+            c.quiet_for(Some(at(700)), at(800)),
+            Some(Duration::from_secs(100))
+        );
         // Nothing observed: unknown, no claim.
-        assert_eq!(XhaReachClock::default().quiet_for(since, at(800)), Option::None);
+        assert_eq!(
+            XhaReachClock::default().quiet_for(since, at(800)),
+            Option::None
+        );
     }
 
     /// An input that keeps changing (a flapping link) cannot hold the alert
@@ -40856,28 +41393,64 @@ poll_interval_ms = 10
     /// without a liveset claim; the claim itself still needs a quiet window.
     #[test]
     fn a_flapping_input_ends_in_the_no_claim_alert_never_the_claim() {
-        use super::{IsolatedMasterClaim::*, XhaReach, XhaReachClock, isolated_master_claim, xha_decision_window};
+        use super::{
+            IsolatedMasterClaim::*, XhaReach, XhaReachClock, isolated_master_claim,
+            xha_decision_window,
+        };
         let w = xha_decision_window(120);
         let t0 = std::time::Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         let since = Some(t0);
-        let base = XhaReach { p: false, peer_alive: true, drbd_connected: true,
-                              peer_live: Some(true), peer_statefile: Some(true) };
+        let base = XhaReach {
+            p: false,
+            peer_alive: true,
+            drbd_connected: true,
+            peer_live: Some(true),
+            peer_statefile: Some(true),
+        };
         let mut c = XhaReachClock::default();
         let mut seen = Vec::new();
         // The replication link flaps every 40 s for 20 minutes.
         for k in 0..=30u64 {
             let s = k * 40;
-            c.observe(XhaReach { peer_alive: k % 2 == 0, ..base }, false, at(s));
+            c.observe(
+                XhaReach {
+                    peer_alive: k % 2 == 0,
+                    ..base
+                },
+                false,
+                at(s),
+            );
             let age = since.map(|t| at(s).saturating_duration_since(t));
-            seen.push((s, isolated_master_claim(Some(true), c.quiet_for(since, at(s)), age, w)));
+            seen.push((
+                s,
+                isolated_master_claim(Some(true), c.quiet_for(since, at(s)), age, w),
+            ));
         }
         assert!(seen.iter().all(|(_, cl)| *cl != InLiveset), "{seen:?}");
-        assert!(seen.iter().filter(|(s, _)| *s < 900).all(|(_, cl)| *cl == XhaDeciding), "{seen:?}");
-        assert!(seen.iter().filter(|(s, _)| *s >= 900).all(|(_, cl)| *cl == LivesetUnknown), "{seen:?}");
+        assert!(
+            seen.iter()
+                .filter(|(s, _)| *s < 900)
+                .all(|(_, cl)| *cl == XhaDeciding),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|(s, _)| *s >= 900)
+                .all(|(_, cl)| *cl == LivesetUnknown),
+            "{seen:?}"
+        );
         // Once it stops changing, the window can end in the claim again.
         c.observe(base, false, at(1300));
-        assert_eq!(isolated_master_claim(Some(true), c.quiet_for(since, at(1300 + 421)), Some(Duration::from_secs(1721)), w), InLiveset);
+        assert_eq!(
+            isolated_master_claim(
+                Some(true),
+                c.quiet_for(since, at(1300 + 421)),
+                Some(Duration::from_secs(1721)),
+                w
+            ),
+            InLiveset
+        );
     }
 
     /// XHA's account in xha.log that it is deciding, from the survivor's
@@ -40885,13 +41458,29 @@ poll_interval_ms = 10
     #[test]
     fn xha_log_lines_that_say_xha_is_deciding() {
         use super::{scan_xha_log_deciding, xha_log_deciding};
-        assert!(xha_log_deciding("[debug] SM: Node (1) will be removed from liveset."));
-        assert!(xha_log_deciding("[warn] Host (-1) and the local host do not agree on the view to the pool membership."));
-        assert!(xha_log_deciding("[notice] Liveset has been updated.  new liveset = (10)"));
-        assert!(xha_log_deciding("SC: (script_service_do_query_liveset) \"Heartbeat approaching timeout\" turned FALSE"));
-        assert!(xha_log_deciding("reporting \"State-File approaching timeout\". host[1].time_since_last_update_on_sf=61510."));
-        assert!(!xha_log_deciding("[info] SC: class=gw weight has changed from 0 to 1"));
-        let dir = format!("{}/target/test-ha/xha-deciding-{}", env!("CARGO_MANIFEST_DIR"), std::process::id());
+        assert!(xha_log_deciding(
+            "[debug] SM: Node (1) will be removed from liveset."
+        ));
+        assert!(xha_log_deciding(
+            "[warn] Host (-1) and the local host do not agree on the view to the pool membership."
+        ));
+        assert!(xha_log_deciding(
+            "[notice] Liveset has been updated.  new liveset = (10)"
+        ));
+        assert!(xha_log_deciding(
+            "SC: (script_service_do_query_liveset) \"Heartbeat approaching timeout\" turned FALSE"
+        ));
+        assert!(xha_log_deciding(
+            "reporting \"State-File approaching timeout\". host[1].time_since_last_update_on_sf=61510."
+        ));
+        assert!(!xha_log_deciding(
+            "[info] SC: class=gw weight has changed from 0 to 1"
+        ));
+        let dir = format!(
+            "{}/target/test-ha/xha-deciding-{}",
+            env!("CARGO_MANIFEST_DIR"),
+            std::process::id()
+        );
         let _ = std::fs::create_dir_all(&dir);
         let f = &format!("{dir}/xha.log");
         std::fs::write(f, "[notice] Liveset has been updated.\n").unwrap();
@@ -40912,7 +41501,10 @@ poll_interval_ms = 10
         let (moved, off2) = scan_xha_log_deciding(f, end);
         assert_eq!((moved, end), (false, Some(bytes.len() as u64)));
         assert_eq!(off2, end);
-        assert!(scan_xha_log_deciding(f, Some(0)).0, "the lossy text still matches");
+        assert!(
+            scan_xha_log_deciding(f, Some(0)).0,
+            "the lossy text still matches"
+        );
         // Rotated (shorter than the offset): restart from the end, no change.
         std::fs::write(f, "x\n").unwrap();
         assert!(!scan_xha_log_deciding(f, Some(1 << 20)).0);
@@ -42109,8 +42701,8 @@ poll_interval_ms = 10
 
     #[test]
     fn peer_emergency_matrix() {
-        use PeerEmergencyAction::*;
         use crate::mgmt_reach::PView;
+        use PeerEmergencyAction::*;
         let settled = PView::settled_for_test();
         let cut = PView::default();
         let settling = PView {
@@ -42123,33 +42715,49 @@ poll_interval_ms = 10
             stale: false,
         };
         // Pool HA off, or nothing seen: nothing.
-        assert_eq!(peer_emergency_decision(true, Some(false), &settled, true, true, false, false), None);
-        assert_eq!(peer_emergency_decision(true, Some(true), &settled, false, false, false, false), None);
+        assert_eq!(
+            peer_emergency_decision(true, Some(false), &settled, true, true, false, false),
+            None
+        );
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &settled, false, false, false, false),
+            None
+        );
         // Confirmed and P holds: resolve without the settle.
-        assert_eq!(peer_emergency_decision(true, Some(true), &settling, true, true, false, false), Resolve);
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &settling, true, true, false, false),
+            Resolve
+        );
         // Confirmed but P false: hold.
-        assert_eq!(peer_emergency_decision(true, Some(true), &cut, true, true, false, false), Hold);
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &cut, true, true, false, false),
+            Hold
+        );
         // Seen once, not confirmed: hold.
-        assert_eq!(peer_emergency_decision(true, Some(true), &settled, false, true, false, false), Hold);
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &settled, false, true, false, false),
+            Hold
+        );
         // Disabled by its key, or a reset that could not be issued retried
         // too soon: hold.
-        assert_eq!(peer_emergency_decision(false, Some(true), &settled, true, true, false, false), Hold);
         assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                &settled,
-                true,
-                true,
-                true,
-                false,
-            ),
+            peer_emergency_decision(false, Some(true), &settled, true, true, false, false),
+            Hold
+        );
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &settled, true, true, true, false,),
             Hold
         );
         // Confirmed, P holding, the budget holding it: withheld (not a
         // silent hold); unconfirmed with the budget spent: a plain hold.
-        assert_eq!(peer_emergency_decision(true, Some(true), &settled, true, true, false, true), Withheld);
-        assert_eq!(peer_emergency_decision(true, Some(true), &settled, false, true, false, true), Hold);
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &settled, true, true, false, true),
+            Withheld
+        );
+        assert_eq!(
+            peer_emergency_decision(true, Some(true), &settled, false, true, false, true),
+            Hold
+        );
     }
 
     /// Two sightings at least 30 s apart confirm, whatever came in between:
@@ -42162,7 +42770,9 @@ poll_interval_ms = 10
         use xapi::PeerXapiRole::*;
         let t0 = std::time::Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
-        let step = |s: MismatchSightings, r: xapi::PeerXapiRole, t: u64| armed_mismatch_confirm(s, &r, at(t));
+        let step = |s: MismatchSightings, r: xapi::PeerXapiRole, t: u64| {
+            armed_mismatch_confirm(s, &r, at(t))
+        };
         let (s, c) = step(MismatchSightings::default(), ArmedMismatch, 0);
         assert!(s.open() && !c);
         let (s, c) = step(s, Unknown, 10);
@@ -42224,8 +42834,15 @@ poll_interval_ms = 10
                 let role = if p.p { role.clone() } else { Unreachable };
                 let (s, confirmed) = armed_mismatch_confirm(sightings, &role, now);
                 sightings = s;
-                if peer_emergency_decision(true, Some(true), p, confirmed, sightings.open(), false, false)
-                    == PeerEmergencyAction::Resolve
+                if peer_emergency_decision(
+                    true,
+                    Some(true),
+                    p,
+                    confirmed,
+                    sightings.open(),
+                    false,
+                    false,
+                ) == PeerEmergencyAction::Resolve
                 {
                     return true;
                 }
@@ -42661,8 +43278,8 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // After a split-brain whose datapath release failed, the generic
         // watchdog would enable the host a minute after convergence, and a start
         // or migration here could then reuse the stale attachment.
-        let p =
-            crate::heal_state::test_tmp_dir().join(format!("twinstor-test-hostenable-{}", std::process::id()));
+        let p = crate::heal_state::test_tmp_dir()
+            .join(format!("twinstor-test-hostenable-{}", std::process::id()));
         let path = p.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&p);
         assert!(!boundary_owns_host_enable(&path), "no record");
@@ -42907,14 +43524,26 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // args: rejoined, ha, record_present, ha_before_peer_left
         // HA seen on while the peer was live, off at its rejoin, no record:
         // it went off while the peer was away, not by TwinStor. Alert only.
-        assert_eq!(rejoin_ha_off(true, Some(false), false, Some(true)), OffWhilePeerAway);
+        assert_eq!(
+            rejoin_ha_off(true, Some(false), false, Some(true)),
+            OffWhilePeerAway
+        );
         // HA already seen off while the peer was live: an earlier disable.
-        assert_eq!(rejoin_ha_off(true, Some(false), false, Some(false)), OffBeforePeerLeft);
+        assert_eq!(
+            rejoin_ha_off(true, Some(false), false, Some(false)),
+            OffBeforePeerLeft
+        );
         // Never sampled while the peer was live (a master of a few minutes):
         // its own outcome, never read as an operator disable.
-        assert_eq!(rejoin_ha_off(true, Some(false), false, None), OffBeforeUnknown);
+        assert_eq!(
+            rejoin_ha_off(true, Some(false), false, None),
+            OffBeforeUnknown
+        );
         // Not a rejoin edge, HA on, HA unread, or a TwinStor record: nothing.
-        assert_eq!(rejoin_ha_off(false, Some(false), false, Some(true)), Nothing);
+        assert_eq!(
+            rejoin_ha_off(false, Some(false), false, Some(true)),
+            Nothing
+        );
         assert_eq!(rejoin_ha_off(true, Some(true), false, Some(true)), Nothing);
         assert_eq!(rejoin_ha_off(true, None, false, Some(true)), Nothing);
         assert_eq!(rejoin_ha_off(true, Some(false), true, Some(true)), Nothing);
@@ -42945,9 +43574,15 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         }
         assert_eq!(last, OffWhilePeerAway);
         // An unread HA never overwrites what was seen.
-        assert_eq!(ha_at_peer_alive_next(Some(true), Some(true), None), Some(true));
+        assert_eq!(
+            ha_at_peer_alive_next(Some(true), Some(true), None),
+            Some(true)
+        );
         // A sample with the peer away keeps it too.
-        assert_eq!(ha_at_peer_alive_next(Some(true), Some(false), Some(false)), Some(true));
+        assert_eq!(
+            ha_at_peer_alive_next(Some(true), Some(false), Some(false)),
+            Some(true)
+        );
         // After that rejoin, HA off is what was seen with the peer live.
         assert_eq!(before, Some(false));
     }
@@ -43004,7 +43639,11 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             // Sample 2: the peer live again, pool HA off, no record.
             w.observe(Some(true), Some(false), false)
         };
-        assert_eq!(sample(false), Nothing, "the 10-minute samples alone miss it");
+        assert_eq!(
+            sample(false),
+            Nothing,
+            "the 10-minute samples alone miss it"
+        );
         assert_eq!(sample(true), OffWhilePeerAway, "before: on");
         // HA already seen off while the peer was live: still only a log.
         let mut w = RejoinWatch::default();
@@ -43017,10 +43656,20 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         w.peer_was_away(150);
         assert_eq!(w.observe(Some(true), Some(false), true), Nothing);
         // The views that set the latch.
-        for v in [PartitionView::PeerGone, PartitionView::PeerParked, PartitionView::PeerParkedPending, PartitionView::PeerClientIsolated] {
+        for v in [
+            PartitionView::PeerGone,
+            PartitionView::PeerParked,
+            PartitionView::PeerParkedPending,
+            PartitionView::PeerClientIsolated,
+        ] {
             assert!(peer_away_view(v), "{v:?}");
         }
-        for v in [PartitionView::None, PartitionView::Settling, PartitionView::ClientIsolated, PartitionView::ParkedMember] {
+        for v in [
+            PartitionView::None,
+            PartitionView::Settling,
+            PartitionView::ClientIsolated,
+            PartitionView::ParkedMember,
+        ] {
             assert!(!peer_away_view(v), "{v:?}");
         }
     }
@@ -43039,23 +43688,35 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         let mut w = RejoinWatch::default();
         w.observe_at(Some(true), Some(true), false, 100);
         w.peer_was_away(150);
-        assert_eq!(w.observe_at(Some(true), Some(false), false, 700), OffWhilePeerAway);
+        assert_eq!(
+            w.observe_at(Some(true), Some(false), false, 700),
+            OffWhilePeerAway
+        );
         // The view shows the peer away again, and it returns: same episode.
         w.peer_was_away(800);
-        assert_eq!(w.observe_at(Some(true), Some(false), false, 1300), AlreadyReported);
+        assert_eq!(
+            w.observe_at(Some(true), Some(false), false, 1300),
+            AlreadyReported
+        );
         // Pool HA on again, then off by an operator with the peer present,
         // then an absence: a new episode, with "before" a genuine sample.
         assert_eq!(w.observe_at(Some(true), Some(true), false, 1900), Nothing);
         assert_eq!(w.observe_at(Some(true), Some(false), false, 2500), Nothing);
         w.peer_was_away(2600);
-        assert_eq!(w.observe_at(Some(true), Some(false), false, 3100), OffBeforePeerLeft);
+        assert_eq!(
+            w.observe_at(Some(true), Some(false), false, 3100),
+            OffBeforePeerLeft
+        );
         // A "live" sample taken during the absence (XAPI still read the
         // cut-off peer live): before is unknown, not "seen off".
         let mut w = RejoinWatch::default();
         w.observe_at(Some(true), Some(true), false, 100);
         w.observe_at(Some(true), Some(false), false, 700);
         w.peer_was_away(500);
-        assert_eq!(w.observe_at(Some(true), Some(false), false, 1300), OffBeforeUnknown);
+        assert_eq!(
+            w.observe_at(Some(true), Some(false), false, 1300),
+            OffBeforeUnknown
+        );
         // The view showing the peer away at sample time: not live.
         assert_eq!(rejoin_peer_live(Some(true), true), Some(false));
         assert_eq!(rejoin_peer_live(Some(true), false), Some(true));
@@ -43444,7 +44105,12 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         sm.rearm_attempt = REARM_TS_AFTER;
         let failed = || Some(RearmEnable::Failed("HA enable in progress".into()));
         assert!(sm.rearm_enable_followup(failed(), true).await);
-        assert_eq!(seam_actions(&sm, "toolstack-restart count=1"), 1, "{:?}", sm.test_ha.as_ref().unwrap().actions);
+        assert_eq!(
+            seam_actions(&sm, "toolstack-restart count=1"),
+            1,
+            "{:?}",
+            sm.test_ha.as_ref().unwrap().actions
+        );
         // At the cap: no restart.
         assert!(ha_rearm_ts_write(&sm.rearm_ts_path, REARM_TS_CAP, 0));
         assert!(!sm.rearm_enable_followup(failed(), true).await);
@@ -43459,8 +44125,15 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         assert!(!sm.rearm_enable_followup(failed(), true).await);
         assert!(!sm.rearm_enable_followup(failed(), true).await);
         assert_eq!(seam_actions(&sm, "toolstack-restart"), 0);
-        assert_eq!(seam_actions(&sm, "alert-unqueued: ") , 1, "one alert, paced");
-        assert!(sm.test_ha.as_ref().unwrap().actions.iter().any(|a| a.contains("restart count cannot be written")));
+        assert_eq!(seam_actions(&sm, "alert-unqueued: "), 1, "one alert, paced");
+        assert!(
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .any(|a| a.contains("restart count cannot be written"))
+        );
     }
 
     #[test]
@@ -44587,7 +45260,8 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             ("none", None, InitSaOutcome::Hold),
         ];
         for (label, hs, expect) in cases {
-            let sb_marker = crate::heal_state::test_tmp_dir().join(format!("twinstor-test-init-fast-{label}"));
+            let sb_marker =
+                crate::heal_state::test_tmp_dir().join(format!("twinstor-test-init-fast-{label}"));
             std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
             let drbd = std::sync::Arc::new(MockDrbd::new(dual_master_standalone()));
             drbd.set_handshake(hs);
@@ -45392,7 +46066,8 @@ poll_interval_ms = 10
 
     #[test]
     fn fork_records_roundtrip() {
-        let p = crate::heal_state::test_tmp_dir().join(format!("twinstor-test-forkrec-{}", std::process::id()));
+        let p = crate::heal_state::test_tmp_dir()
+            .join(format!("twinstor-test-forkrec-{}", std::process::id()));
         let p = p.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&p);
         assert_eq!(read_fork_record(&p), None);
@@ -47462,7 +48137,8 @@ poll_interval_ms = 10
         }));
         let fake = std::sync::Arc::new(fake);
         let (mut sm, marker) = lb_machine("yield-exported", drbd.clone(), fake.clone(), iscsi_stop);
-        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-lb-yield-exported-marker");
+        let yield_file =
+            crate::heal_state::test_tmp_dir().join("twinstor-test-lb-yield-exported-marker");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
         sm.yield_path = yield_file.to_string_lossy().to_string();
         sm.resolve_split_brain().await;
@@ -48124,13 +48800,19 @@ poll_interval_ms = 10
         let p = format!("{dir}/obligation");
         let _ = std::fs::remove_file(&p);
         ha_obligation_write_at(&p, "sr-1", 120, ObligationState::Owed);
-        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 120, Option::None)));
+        assert_eq!(
+            ha_obligation_fields_at(&p),
+            Some(("sr-1".into(), 120, Option::None))
+        );
         ha_obligation_touch_attempt_at(&p);
         let stamp = ha_obligation_fields_at(&p).unwrap().2;
         assert!(stamp.is_some());
         // A later writer (the tick, say) owes it again: the stamp stays.
         ha_obligation_write_at(&p, "sr-1", 90, ObligationState::Owed);
-        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 90, stamp)));
+        assert_eq!(
+            ha_obligation_fields_at(&p),
+            Some(("sr-1".into(), 90, stamp))
+        );
         let leftovers = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -48167,7 +48849,11 @@ poll_interval_ms = 10
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(ha_obligation_fields_at(&p).unwrap().2, stamp, "the stamp survived");
+        assert_eq!(
+            ha_obligation_fields_at(&p).unwrap().2,
+            stamp,
+            "the stamp survived"
+        );
         let leftovers = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -48183,9 +48869,15 @@ poll_interval_ms = 10
         let dir = seam_dir("obligation-ntol");
         let p = format!("{dir}/obligation");
         std::fs::write(&p, "sr-1 120 1234 ntol=0").unwrap();
-        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 120, Some(1234))));
+        assert_eq!(
+            ha_obligation_fields_at(&p),
+            Some(("sr-1".into(), 120, Some(1234)))
+        );
         std::fs::write(&p, "sr-1 120 ntol=0").unwrap();
-        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 120, Option::None)));
+        assert_eq!(
+            ha_obligation_fields_at(&p),
+            Some(("sr-1".into(), 120, Option::None))
+        );
         ha_obligation_touch_attempt_at(&p);
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(!text.contains("ntol"), "{text}");
@@ -50624,7 +51316,10 @@ poll_interval_ms = 10
         // No probe has answered: every gated action is withheld and recorded.
         assert!(!sm.ha_gate("survivor_ha_reset", Positive));
         assert!(!sm.ha_gate("ha_deadlock_exit", Absence));
-        assert_eq!(sm.ha_withheld.as_ref().map(|w| w.action), Some("ha_deadlock_exit"));
+        assert_eq!(
+            sm.ha_withheld.as_ref().map(|w| w.action),
+            Some("ha_deadlock_exit")
+        );
         // P holds since 100 s: positive-evidence repairs act, absence-triggered
         // ones wait out the settle.
         sm.test_p = Some(p_settling(100));
@@ -50692,17 +51387,54 @@ poll_interval_ms = 10
     fn readmission_revive_and_runbook_hold_only_on_ha_off_or_park() {
         use ReadmissionAction::*;
         for action in [Revive, AlertManual] {
-            assert_eq!(readmission_scope(action, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }), (action, None));
-            assert_eq!(readmission_scope(action, ReadmissionScope { pool_ha: None, startup_loop: false, ..Default::default() }), (action, None));
+            assert_eq!(
+                readmission_scope(
+                    action,
+                    ReadmissionScope {
+                        pool_ha: Some(true),
+                        startup_loop: false,
+                        ..Default::default()
+                    }
+                ),
+                (action, None)
+            );
+            assert_eq!(
+                readmission_scope(
+                    action,
+                    ReadmissionScope {
+                        pool_ha: None,
+                        startup_loop: false,
+                        ..Default::default()
+                    }
+                ),
+                (action, None)
+            );
             for (ha, park) in [(Some(false), false), (Some(true), true), (None, true)] {
-                let (a, why) = readmission_scope(action, ReadmissionScope { pool_ha: ha, startup_loop: park, ..Default::default() });
+                let (a, why) = readmission_scope(
+                    action,
+                    ReadmissionScope {
+                        pool_ha: ha,
+                        startup_loop: park,
+                        ..Default::default()
+                    },
+                );
                 assert_eq!(a, Wait, "{action:?} with pool HA {ha:?}, parked {park}");
                 assert!(why.is_some());
             }
         }
         // The dance keeps its own fire-time gates; the rest pass unchanged.
         for action in [Schedule, Wait, Clear, AlertStormFirst] {
-            assert_eq!(readmission_scope(action, ReadmissionScope { pool_ha: None, startup_loop: true, ..Default::default() }), (action, None));
+            assert_eq!(
+                readmission_scope(
+                    action,
+                    ReadmissionScope {
+                        pool_ha: None,
+                        startup_loop: true,
+                        ..Default::default()
+                    }
+                ),
+                (action, None)
+            );
         }
     }
 
@@ -50748,19 +51480,39 @@ poll_interval_ms = 10
         // unreadable; held on a slave cut off from its master.
         let ha = crate::config::HaConfig::default();
         for d in [AlertManual, Revive] {
-            let off_seen = ReadmissionScope { pool_ha: Option::None, pool_ha_off_seen: true, ..Default::default() };
+            let off_seen = ReadmissionScope {
+                pool_ha: Option::None,
+                pool_ha_off_seen: true,
+                ..Default::default()
+            };
             let (a, why) = readmission_plan(d, &ha, off_seen);
             assert_eq!(a, Wait);
             assert!(why.unwrap().contains("1906"));
-            let cut = ReadmissionScope { pool_ha: Option::None, cut_from_master: true, ..Default::default() };
+            let cut = ReadmissionScope {
+                pool_ha: Option::None,
+                cut_from_master: true,
+                ..Default::default()
+            };
             assert_eq!(readmission_plan(d, &ha, cut).0, Wait);
             // Unknown pool HA, management up, no 1906: proceeds.
-            assert_eq!(readmission_plan(d, &ha, ReadmissionScope::default()), (d, Option::None));
+            assert_eq!(
+                readmission_plan(d, &ha, ReadmissionScope::default()),
+                (d, Option::None)
+            );
         }
         assert!(readmission_cut_from_master(false, true, Some(false)));
-        assert!(!readmission_cut_from_master(true, true, Some(false)), "P true");
-        assert!(!readmission_cut_from_master(false, false, Some(false)), "peer not alive");
-        assert!(!readmission_cut_from_master(false, true, Some(true)), "the master");
+        assert!(
+            !readmission_cut_from_master(true, true, Some(false)),
+            "P true"
+        );
+        assert!(
+            !readmission_cut_from_master(false, false, Some(false)),
+            "peer not alive"
+        );
+        assert!(
+            !readmission_cut_from_master(false, true, Some(true)),
+            "the master"
+        );
     }
 
     /// A rebooted, still-isolated ex-master is locally armed, its xhad
@@ -50787,7 +51539,17 @@ poll_interval_ms = 10
         // peer rejoins. No TwinStor record exists, so no obligation: the
         // re-arm decision has nothing to do, and the rejoin edge only alerts.
         assert_eq!(
-            ha_rearm_decision(false, Some(false), Some(true), true, true, true, true, false, true),
+            ha_rearm_decision(
+                false,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             HaRearmAction::None
         );
         assert_eq!(
@@ -50796,15 +51558,38 @@ poll_interval_ms = 10
         );
         // With a record (an owed re-arm or a local-disarm record), no alert:
         // the record's own path owns it.
-        assert_eq!(rejoin_ha_off(true, Some(false), true, Some(true)), RejoinHaOff::Nothing);
+        assert_eq!(
+            rejoin_ha_off(true, Some(false), true, Some(true)),
+            RejoinHaOff::Nothing
+        );
         // An owed re-arm still acts once its gates hold, and holds without the
         // management-plane input (P and the peer shown present).
         assert_eq!(
-            ha_rearm_decision(true, Some(false), Some(true), true, true, true, true, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             HaRearmAction::Attempt
         );
         assert_eq!(
-            ha_rearm_decision(true, Some(false), Some(true), true, true, true, false, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                false,
+                false,
+                true
+            ),
             HaRearmAction::Hold
         );
     }
@@ -50837,7 +51622,9 @@ poll_interval_ms = 10
             sites += 1;
             let from = i.saturating_sub(12);
             assert!(
-                lines[from..i].iter().any(|p| p.contains("note_local_ha_disarm()")),
+                lines[from..i]
+                    .iter()
+                    .any(|p| p.contains("note_local_ha_disarm()")),
                 "local disarm without a record at line {}",
                 i + 1
             );
@@ -50847,7 +51634,12 @@ poll_interval_ms = 10
 
     // ---- HA arbitration, Increment 1: second-master demote guard ---------
 
-    fn liveset_masters_xml(local_status: &str, local_master: &str, peer_live: &str, peer_master: &str) -> String {
+    fn liveset_masters_xml(
+        local_status: &str,
+        local_master: &str,
+        peer_live: &str,
+        peer_master: &str,
+    ) -> String {
         format!(
             r#"<ha_liveset_info version="1.0">
   <status>{local_status}</status>
@@ -50860,9 +51652,11 @@ poll_interval_ms = 10
 
     #[test]
     fn liveset_master_flags_parse() {
-        let l = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "TRUE", "TRUE")).unwrap();
+        let l =
+            parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "TRUE", "TRUE")).unwrap();
         assert!(l.local_online && !l.local_master && l.peer_live && l.peer_master);
-        let l = parse_liveset_masters(&liveset_masters_xml("Online", "TRUE", "TRUE", "FALSE")).unwrap();
+        let l =
+            parse_liveset_masters(&liveset_masters_xml("Online", "TRUE", "TRUE", "FALSE")).unwrap();
         assert!(l.local_master && !l.peer_master);
         // The "Starting" output carries this host only: no peer entry.
         let starting = r#"<ha_liveset_info><status>Starting</status><localhost><HostID>AAAA</HostID></localhost>
@@ -50883,19 +51677,43 @@ poll_interval_ms = 10
         let second = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "TRUE", "TRUE"));
         assert!(second_master_evidence_a(second, true));
         // First read: watch.
-        assert_eq!(second_master_decision(true, Some(t0), false, false, true, t0), Watch);
         assert_eq!(
-            second_master_decision(true, Some(t0), false, false, true, t0 + Duration::from_secs(29)),
+            second_master_decision(true, Some(t0), false, false, true, t0),
+            Watch
+        );
+        assert_eq!(
+            second_master_decision(
+                true,
+                Some(t0),
+                false,
+                false,
+                true,
+                t0 + Duration::from_secs(29)
+            ),
             Watch
         );
         // Confirming read 30 s later: demote, with no P requirement.
         assert_eq!(
-            second_master_decision(true, Some(t0), false, false, true, t0 + Duration::from_secs(30)),
+            second_master_decision(
+                true,
+                Some(t0),
+                false,
+                false,
+                true,
+                t0 + Duration::from_secs(30)
+            ),
             Demote
         );
         // Not allowed (key off, no peer address, budget): alert only.
         assert_eq!(
-            second_master_decision(true, Some(t0), false, false, false, t0 + Duration::from_secs(30)),
+            second_master_decision(
+                true,
+                Some(t0),
+                false,
+                false,
+                false,
+                t0 + Duration::from_secs(30)
+            ),
             AlertOnly
         );
         // Holds: this host holds the lock, the local xapi does not answer as
@@ -50905,10 +51723,14 @@ poll_interval_ms = 10
         assert!(!second_master_evidence_a(second, false));
         let gone = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "FALSE", "TRUE"));
         assert!(!second_master_evidence_a(gone, true));
-        let joining = parse_liveset_masters(&liveset_masters_xml("Starting", "FALSE", "TRUE", "TRUE"));
+        let joining =
+            parse_liveset_masters(&liveset_masters_xml("Starting", "FALSE", "TRUE", "TRUE"));
         assert!(!second_master_evidence_a(joining, true));
         assert!(!second_master_evidence_a(Option::None, true));
-        assert_eq!(second_master_decision(false, Option::None, false, false, true, t0), None);
+        assert_eq!(
+            second_master_decision(false, Option::None, false, false, true, t0),
+            None
+        );
     }
 
     /// A pool disable released a parked ex-master while it was still cut
@@ -50919,21 +51741,99 @@ poll_interval_ms = 10
     fn a_released_ex_master_demotes_when_the_peer_is_shown_alive() {
         use SecondMasterAction::*;
         let now = std::time::Instant::now();
-        assert!(released_while_cut(true, true, Some(false), true, true, false, Some(0)));
-        assert_eq!(second_master_decision(false, Option::None, true, true, true, now), Demote);
-        assert_eq!(second_master_decision(false, Option::None, true, false, true, now), AlertOnly);
+        assert!(released_while_cut(
+            true,
+            true,
+            Some(false),
+            true,
+            true,
+            false,
+            Some(0)
+        ));
+        assert_eq!(
+            second_master_decision(false, Option::None, true, true, true, now),
+            Demote
+        );
+        assert_eq!(
+            second_master_decision(false, Option::None, true, false, true, now),
+            AlertOnly
+        );
         // Never seen parked, released by anything but an invalid pool state
         // (an operator's local emergency disable), still armed, a slave in
         // pool.conf, not answering as master, P back, VMs running, or the VM
         // count unreadable: no evidence.
-        assert!(!released_while_cut(false, true, Some(false), true, true, false, Some(0)));
-        assert!(!released_while_cut(true, false, Some(false), true, true, false, Some(0)));
-        assert!(!released_while_cut(true, true, Some(true), true, true, false, Some(0)));
-        assert!(!released_while_cut(true, true, Some(false), false, true, false, Some(0)));
-        assert!(!released_while_cut(true, true, Some(false), true, false, false, Some(0)));
-        assert!(!released_while_cut(true, true, Some(false), true, true, true, Some(0)));
-        assert!(!released_while_cut(true, true, Some(false), true, true, false, Some(2)));
-        assert!(!released_while_cut(true, true, Some(false), true, true, false, Option::None));
+        assert!(!released_while_cut(
+            false,
+            true,
+            Some(false),
+            true,
+            true,
+            false,
+            Some(0)
+        ));
+        assert!(!released_while_cut(
+            true,
+            false,
+            Some(false),
+            true,
+            true,
+            false,
+            Some(0)
+        ));
+        assert!(!released_while_cut(
+            true,
+            true,
+            Some(true),
+            true,
+            true,
+            false,
+            Some(0)
+        ));
+        assert!(!released_while_cut(
+            true,
+            true,
+            Some(false),
+            false,
+            true,
+            false,
+            Some(0)
+        ));
+        assert!(!released_while_cut(
+            true,
+            true,
+            Some(false),
+            true,
+            false,
+            false,
+            Some(0)
+        ));
+        assert!(!released_while_cut(
+            true,
+            true,
+            Some(false),
+            true,
+            true,
+            true,
+            Some(0)
+        ));
+        assert!(!released_while_cut(
+            true,
+            true,
+            Some(false),
+            true,
+            true,
+            false,
+            Some(2)
+        ));
+        assert!(!released_while_cut(
+            true,
+            true,
+            Some(false),
+            true,
+            true,
+            false,
+            Option::None
+        ));
     }
 
     /// No management-plane probe while P is false: each answers at once with
@@ -50983,7 +51883,11 @@ poll_interval_ms = 10
         seam(&mut sm).slave_of = Some("127.0.0.1".into()); // slave of itself
         sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, false)
             .await;
-        assert_eq!(sm.masterless_last_recover, Option::None, "withheld, cooldown kept");
+        assert_eq!(
+            sm.masterless_last_recover,
+            Option::None,
+            "withheld, cooldown kept"
+        );
         assert_eq!(
             sm.ha_withheld.as_ref().map(|w| w.action),
             Some("masterless_transition")
@@ -51019,13 +51923,18 @@ poll_interval_ms = 10
         ] {
             let xml = liveset_xml(status, peer_live, peer_sf);
             let l = parse_peer_liveset(&xml).unwrap();
-            let lone_survivor_confirmable = l.local_online && !l.peer_live && !l.peer_statefile_access;
+            let lone_survivor_confirmable =
+                l.local_online && !l.peer_live && !l.peer_statefile_access;
             let locked = crate::mgmt_reach::startup_loop_locked(Some(true), l.local_online, false);
             assert!(!(lone_survivor_confirmable && locked), "{status}");
         }
         // Whatever the peer's replication state, an armed, unjoined, cut-off
         // host is locked.
-        assert!(crate::mgmt_reach::startup_loop_locked(Some(true), false, false));
+        assert!(crate::mgmt_reach::startup_loop_locked(
+            Some(true),
+            false,
+            false
+        ));
     }
 
     /// A repair withheld on the peer's answer is re-evaluated every tick; the
@@ -51125,7 +52034,9 @@ poll_interval_ms = 10
     fn age_last_demote(sm: &StateMachine) {
         let boot = current_boot_id();
         let mut b = demote_budget_read(&sm.second_master_budget_path, &boot);
-        b.last_demote = b.last_demote.saturating_sub(SECOND_MASTER_DEMOTE_RETRY.as_secs() + 1);
+        b.last_demote = b
+            .last_demote
+            .saturating_sub(SECOND_MASTER_DEMOTE_RETRY.as_secs() + 1);
         demote_budget_write(&sm.second_master_budget_path, &boot, &b);
     }
 
@@ -51134,7 +52045,16 @@ poll_interval_ms = 10
     /// delivered, not again for a day while the condition holds.
     #[tokio::test]
     async fn the_second_master_alert_is_paced_from_its_delivery() {
-        let alerts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("answers as a second pool master")).cloned().collect::<Vec<_>>();
+        let alerts = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("answers as a second pool master"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let mut sm = seam_sm("second-master-paced");
         second_master_shape(&mut sm);
         seam(&mut sm).addr_answers = false;
@@ -51145,10 +52065,16 @@ poll_interval_ms = 10
         let a = alerts(&sm);
         assert_eq!(a.len(), 2, "raised again while undelivered: {a:?}");
         assert!(a.iter().all(|x| x.starts_with("alert-unqueued: ")), "{a:?}");
-        assert_eq!(demote_budget_read(&sm.second_master_budget_path, &current_boot_id()).last_alert, 0);
+        assert_eq!(
+            demote_budget_read(&sm.second_master_budget_path, &current_boot_id()).last_alert,
+            0
+        );
         seam(&mut sm).alerts_fail = false;
         confirmed_check(&mut sm).await;
-        assert_ne!(demote_budget_read(&sm.second_master_budget_path, &current_boot_id()).last_alert, 0);
+        assert_ne!(
+            demote_budget_read(&sm.second_master_budget_path, &current_boot_id()).last_alert,
+            0
+        );
         confirmed_check(&mut sm).await;
         assert_eq!(alerts(&sm).len(), 3, "delivered: paced");
     }
@@ -51159,14 +52085,29 @@ poll_interval_ms = 10
     /// its wedge ends, the disarmed host's own alert once it reads armed.
     #[tokio::test]
     async fn condition_alerts_are_withdrawn_when_their_condition_ends() {
-        let forgets = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.starts_with("forget-")).cloned().collect::<Vec<_>>();
+        let forgets = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.starts_with("forget-"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         // Isolation: each clear path withdraws every isolated-master variant
         // of both sides; with no clock running nothing is withdrawn.
-        let all = [MASTER_ISOLATED_ALERT, MASTER_ISOLATED_HA_OFF_ALERT, ISOLATED_MASTER_IN_LIVESET_ALERT,
-                   isolated_master_unknown_liveset_alert(false), isolated_master_unknown_liveset_alert(true)];
+        let all = [
+            MASTER_ISOLATED_ALERT,
+            MASTER_ISOLATED_HA_OFF_ALERT,
+            ISOLATED_MASTER_IN_LIVESET_ALERT,
+            isolated_master_unknown_liveset_alert(false),
+            isolated_master_unknown_liveset_alert(true),
+        ];
         let withdrew_all = |sm: &StateMachine| {
             let f = forgets(sm);
-            all.iter().all(|b| f.contains(&format!("forget-alert: {b}")))
+            all.iter()
+                .all(|b| f.contains(&format!("forget-alert: {b}")))
         };
         let t = std::time::Instant::now();
         // Master side, the isolation over.
@@ -51197,7 +52138,10 @@ poll_interval_ms = 10
         let n = forgets(&sm).len();
         sm.isolated_master_answers_again(true);
         assert_eq!(forgets(&sm).len(), n, "once per alert");
-        assert!(sm.isolated_master_since.is_some(), "the clock itself keeps its debounce");
+        assert!(
+            sm.isolated_master_since.is_some(),
+            "the clock itself keeps its debounce"
+        );
         // Connected side, the clock cleared.
         let mut sm = seam_sm("withdraw-isolation-connected");
         sm.isolated_master_since = Some(t);
@@ -51211,20 +52155,39 @@ poll_interval_ms = 10
         sm.set_peer_emergency_hold(Some((1000, "x".into())));
         assert!(forgets(&sm).is_empty(), "the same hold: kept");
         sm.set_peer_emergency_hold(Option::None);
-        assert_eq!(forgets(&sm), vec![format!("forget-advice: {}", peer_emergency_hold_key(1000))]);
+        assert_eq!(
+            forgets(&sm),
+            vec![format!("forget-advice: {}", peer_emergency_hold_key(1000))]
+        );
         // The first-sighting alert's wedge ended.
         let mut sm = seam_sm("withdraw-first");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget { disarm_alerted: 77, ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &current_boot_id(),
+            &PeerEmergencyBudget {
+                disarm_alerted: 77,
+                ..Default::default()
+            },
+        );
         sm.peer_disarm_mark_clear();
-        assert_eq!(forgets(&sm), vec![format!("forget-advice: {}", peer_disarm_first_key(77))]);
+        assert_eq!(
+            forgets(&sm),
+            vec![format!("forget-advice: {}", peer_disarm_first_key(77))]
+        );
         // The disarmed host reads armed again.
         let mut sm = seam_sm("withdraw-disarmed");
         sm.self_unwedge_vm_alert_raised = true;
         sm.self_unwedge_episode_reset(Some(false));
         assert!(forgets(&sm).is_empty());
         sm.self_unwedge_episode_reset(Some(true));
-        assert_eq!(forgets(&sm), vec![format!("forget-advice: {}", disarmed_host_alert_key(&sm.config.node.name))]);
+        assert_eq!(
+            forgets(&sm),
+            vec![format!(
+                "forget-advice: {}",
+                disarmed_host_alert_key(&sm.config.node.name)
+            )]
+        );
     }
 
     /// The second-master demote waits for a pool HA cycle in flight, as
@@ -51237,7 +52200,10 @@ poll_interval_ms = 10
         sm.ha_reset_inflight.store(true, Ordering::SeqCst);
         confirmed_check(&mut sm).await;
         assert_eq!(seam_actions(&sm, "demote"), 0);
-        assert_eq!(sm.ha_withheld.as_ref().map(|w| w.action), Some("second_master_demote"));
+        assert_eq!(
+            sm.ha_withheld.as_ref().map(|w| w.action),
+            Some("second_master_demote")
+        );
         sm.ha_reset_inflight.store(false, Ordering::SeqCst);
         confirmed_check(&mut sm).await;
         assert_eq!(seam_actions(&sm, "demote"), 1);
@@ -51269,7 +52235,10 @@ poll_interval_ms = 10
             confirmed_check(&mut sm).await;
             age_last_demote(&sm);
         }
-        assert_eq!(seam_actions(&sm, "demote"), SECOND_MASTER_DEMOTE_CAP as usize);
+        assert_eq!(
+            seam_actions(&sm, "demote"),
+            SECOND_MASTER_DEMOTE_CAP as usize
+        );
         let spent = sm
             .test_ha
             .as_ref()
@@ -51301,8 +52270,14 @@ poll_interval_ms = 10
         assert_eq!(demote_budget_age(b, true, 1000 + 3600).count, 3);
         let quiet = demote_budget_age(b, false, 1000 + SECOND_MASTER_EPISODE_QUIET);
         assert_eq!(quiet.count, 0);
-        assert!(demote_budget_allows(&quiet, 1000 + SECOND_MASTER_EPISODE_QUIET));
-        assert_eq!(demote_budget_age(b, false, 1000 + SECOND_MASTER_EPISODE_QUIET - 1).count, 3);
+        assert!(demote_budget_allows(
+            &quiet,
+            1000 + SECOND_MASTER_EPISODE_QUIET
+        ));
+        assert_eq!(
+            demote_budget_age(b, false, 1000 + SECOND_MASTER_EPISODE_QUIET - 1).count,
+            3
+        );
     }
 
     #[tokio::test]
@@ -51313,14 +52288,21 @@ poll_interval_ms = 10
             confirmed_check(&mut sm).await;
             age_last_demote(&sm);
         }
-        assert_eq!(seam_actions(&sm, "demote"), SECOND_MASTER_DEMOTE_CAP as usize);
+        assert_eq!(
+            seam_actions(&sm, "demote"),
+            SECOND_MASTER_DEMOTE_CAP as usize
+        );
         // A new daemon on the same boot, same state file.
         let path = sm.second_master_budget_path.clone();
         let mut again = seam_sm("restart-2");
         again.second_master_budget_path = path;
         second_master_shape(&mut again);
         confirmed_check(&mut again).await;
-        assert_eq!(seam_actions(&again, "demote"), 0, "no fresh budget after a restart");
+        assert_eq!(
+            seam_actions(&again, "demote"),
+            0,
+            "no fresh budget after a restart"
+        );
     }
 
     #[tokio::test]
@@ -51331,7 +52313,11 @@ poll_interval_ms = 10
         confirmed_check(&mut sm).await;
         assert_eq!(seam_actions(&sm, "demote"), 0);
         let t = sm.test_ha.as_ref().unwrap();
-        assert!(t.actions.iter().any(|a| a.contains("does not answer")), "{:?}", t.actions);
+        assert!(
+            t.actions.iter().any(|a| a.contains("does not answer")),
+            "{:?}",
+            t.actions
+        );
         // The address answers: the demote runs.
         seam(&mut sm).addr_answers = true;
         confirmed_check(&mut sm).await;
@@ -51377,13 +52363,19 @@ poll_interval_ms = 10
         seam(&mut sm).xhad = Option::None;
         sm.park_log_offset = Option::None;
         check_now(&mut sm).await;
-        append_log(&sm.xha_log_path, "ha_start_daemon: Could not join the existing liveset (1903)");
+        append_log(
+            &sm.xha_log_path,
+            "ha_start_daemon: Could not join the existing liveset (1903)",
+        );
         check_now(&mut sm).await;
         assert!(!sm.seen_parked, "a timeout never confirms a park");
         // An explicit not-Online answer and a failed join after it: parked.
         seam(&mut sm).xhad = Some(XhaHostState::Starting);
         check_now(&mut sm).await;
-        append_log(&sm.xha_log_path, "ha_start_daemon: Could not join the existing liveset (1903)");
+        append_log(
+            &sm.xha_log_path,
+            "ha_start_daemon: Could not join the existing liveset (1903)",
+        );
         check_now(&mut sm).await;
         assert!(sm.seen_parked);
         // P back: forgotten.
@@ -51400,7 +52392,10 @@ poll_interval_ms = 10
     ) {
         parked_shape(sm);
         check_now(sm).await;
-        append_log(&sm.xha_log_path, "Could not join the existing liveset (1903)");
+        append_log(
+            &sm.xha_log_path,
+            "Could not join the existing liveset (1903)",
+        );
         check_now(sm).await;
         assert!(sm.seen_parked);
         if invalid_pool_state {
@@ -51453,7 +52448,11 @@ poll_interval_ms = 10
         assert!(sm.released_by_pool);
         assert_eq!(seam_actions(&sm, "demote"), 0);
         let t = sm.test_ha.as_ref().unwrap();
-        let alert = t.actions.iter().find(|a| a.starts_with("alert")).expect("alert");
+        let alert = t
+            .actions
+            .iter()
+            .find(|a| a.starts_with("alert"))
+            .expect("alert");
         assert!(!alert.contains("reset-master"), "{alert}");
     }
 
@@ -51574,7 +52573,10 @@ poll_interval_ms = 10
         t.agent_live = Some(false);
         sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
         sm.check_peer_emergency().await;
-        sm.peer_mismatch.first = sm.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.peer_mismatch.first = sm
+            .peer_mismatch
+            .first
+            .map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
         // Confirmed while another cycle is in flight: held.
         sm.ha_reset_inflight.store(true, Ordering::SeqCst);
         sm.check_peer_emergency().await;
@@ -51604,8 +52606,15 @@ poll_interval_ms = 10
         t.agent_live = Some(false);
         sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
         sm.check_peer_emergency().await;
-        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0, "one sighting only");
-        sm.peer_mismatch.first = sm.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        assert_eq!(
+            seam_actions(&sm, "peer_emergency_reset"),
+            0,
+            "one sighting only"
+        );
+        sm.peer_mismatch.first = sm
+            .peer_mismatch
+            .first
+            .map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
         // Holds: a healthy peer answering as a slave.
@@ -51650,7 +52659,10 @@ poll_interval_ms = 10
         let a = 10_000;
         let own = ha_task("own", a + 3);
         let stale = a + OWN_TASK_STALE_AFTER;
-        assert_eq!(pending_task_decision(&[], Some(a), stale, true), PendingTaskAction::None);
+        assert_eq!(
+            pending_task_decision(&[], Some(a), stale, true),
+            PendingTaskAction::None
+        );
         assert_eq!(
             pending_task_decision(std::slice::from_ref(&own), Some(a), stale, true),
             PendingTaskAction::Cancel(own.clone())
@@ -51675,7 +52687,10 @@ poll_interval_ms = 10
             pending_task_decision(std::slice::from_ref(&own), Option::None, stale, true),
             PendingTaskAction::Foreign(own.clone())
         );
-        let undated = xapi::PendingHaTask { created_unix: Option::None, ..own.clone() };
+        let undated = xapi::PendingHaTask {
+            created_unix: Option::None,
+            ..own.clone()
+        };
         assert_eq!(
             pending_task_decision(std::slice::from_ref(&undated), Some(a), stale, true),
             PendingTaskAction::Foreign(undated.clone())
@@ -51728,18 +52743,97 @@ poll_interval_ms = 10
         let slave = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
         let master = xapi::PeerXapiRole::Master;
         let long = Some(RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER);
-        let d = |rec, ha, armed, live, p, me: Option<bool>, peer: &xapi::PeerXapiRole, hold, task| {
-            recorded_disarm_rearm_decision(rec, ha, armed, live, p, me, peer, hold, task)
-        };
+        let d =
+            |rec, ha, armed, live, p, me: Option<bool>, peer: &xapi::PeerXapiRole, hold, task| {
+                recorded_disarm_rearm_decision(rec, ha, armed, live, p, me, peer, hold, task)
+            };
         // The master acts after 120 s of both hosts live.
-        assert_eq!(d(true, Some(true), Some(false), Some(RECORDED_REARM_LIVESET_FOR), true, Some(true), &slave, false, false), Cycle);
+        assert_eq!(
+            d(
+                true,
+                Some(true),
+                Some(false),
+                Some(RECORDED_REARM_LIVESET_FOR),
+                true,
+                Some(true),
+                &slave,
+                false,
+                false
+            ),
+            Cycle
+        );
         // The slave waits 10 minutes more, then acts if still disarmed.
-        assert!(matches!(d(true, Some(true), Some(false), Some(RECORDED_REARM_LIVESET_FOR), true, Some(false), &master, false, false), Wait(_)));
-        assert_eq!(d(true, Some(true), Some(false), long, true, Some(false), &master, false, false), Cycle);
+        assert!(matches!(
+            d(
+                true,
+                Some(true),
+                Some(false),
+                Some(RECORDED_REARM_LIVESET_FOR),
+                true,
+                Some(false),
+                &master,
+                false,
+                false
+            ),
+            Wait(_)
+        ));
+        assert_eq!(
+            d(
+                true,
+                Some(true),
+                Some(false),
+                long,
+                true,
+                Some(false),
+                &master,
+                false,
+                false
+            ),
+            Cycle
+        );
         // Not this state.
-        assert_eq!(d(false, Some(true), Some(false), long, true, Some(true), &slave, false, false), None);
-        assert_eq!(d(true, Some(false), Some(false), long, true, Some(true), &slave, false, false), None);
-        assert_eq!(d(true, Some(true), Some(true), long, true, Some(true), &slave, false, false), None);
+        assert_eq!(
+            d(
+                false,
+                Some(true),
+                Some(false),
+                long,
+                true,
+                Some(true),
+                &slave,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            d(
+                true,
+                Some(false),
+                Some(false),
+                long,
+                true,
+                Some(true),
+                &slave,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            d(
+                true,
+                Some(true),
+                Some(true),
+                long,
+                true,
+                Some(true),
+                &slave,
+                false,
+                false
+            ),
+            None
+        );
         // Each gate holds it.
         for (live, p, peer, hold, task) in [
             (Some(Duration::from_secs(60)), true, &slave, false, false),
@@ -51749,9 +52843,35 @@ poll_interval_ms = 10
             (long, true, &master, false, false), // two masters
             (long, true, &xapi::PeerXapiRole::Unknown, false, false),
         ] {
-            assert!(matches!(d(true, Some(true), Some(false), live, p, Some(true), peer, hold, task), Wait(_)));
+            assert!(matches!(
+                d(
+                    true,
+                    Some(true),
+                    Some(false),
+                    live,
+                    p,
+                    Some(true),
+                    peer,
+                    hold,
+                    task
+                ),
+                Wait(_)
+            ));
         }
-        assert!(matches!(d(true, Some(true), Some(false), long, true, Option::None, &master, false, false), Wait(_)));
+        assert!(matches!(
+            d(
+                true,
+                Some(true),
+                Some(false),
+                long,
+                true,
+                Option::None,
+                &master,
+                false,
+                false
+            ),
+            Wait(_)
+        ));
     }
 
     /// One host of the shape: a record of its own disarm in this boot, back
@@ -51810,24 +52930,56 @@ poll_interval_ms = 10
         sm.readmission_flap_alert_owed = true;
         sm.self_unwedge_cleared_send().await;
         sm.readmission_flap_alert_send().await;
-        assert!(sm.self_unwedge_report.is_some() && sm.readmission_flap_alert_owed, "not delivered: still owed");
+        assert!(
+            sm.self_unwedge_report.is_some() && sm.readmission_flap_alert_owed,
+            "not delivered: still owed"
+        );
         seam(&mut sm).alerts_fail = false;
         sm.self_unwedge_cleared_send().await;
         sm.readmission_flap_alert_send().await;
         assert!(sm.self_unwedge_report.is_none() && !sm.readmission_flap_alert_owed);
         let acts = &sm.test_ha.as_ref().unwrap().actions;
-        assert_eq!(acts.iter().filter(|a| a.contains("cleared its own local HA state")).count(), 2);
-        assert_eq!(acts.iter().filter(|a| a.contains("has not completed readmission")).count(), 2);
+        assert_eq!(
+            acts.iter()
+                .filter(|a| a.contains("cleared its own local HA state"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            acts.iter()
+                .filter(|a| a.contains("has not completed readmission"))
+                .count(),
+            2
+        );
         // Never queued: the caller's own next pass is the retry, so no
         // queued copy can be delivered after its re-send.
-        assert!(acts.iter().filter(|a| a.contains("cleared its own local HA state")).all(|a| a.starts_with("advice-unqueued: ")), "{acts:?}");
-        assert!(acts.iter().filter(|a| a.contains("has not completed readmission")).all(|a| a.starts_with("advice-unqueued: ")), "{acts:?}");
+        assert!(
+            acts.iter()
+                .filter(|a| a.contains("cleared its own local HA state"))
+                .all(|a| a.starts_with("advice-unqueued: ")),
+            "{acts:?}"
+        );
+        assert!(
+            acts.iter()
+                .filter(|a| a.contains("has not completed readmission"))
+                .all(|a| a.starts_with("advice-unqueued: ")),
+            "{acts:?}"
+        );
         sm.self_unwedge_cleared_send().await;
         let acts = &sm.test_ha.as_ref().unwrap().actions;
-        assert_eq!(acts.iter().filter(|a| a.contains("cleared its own local HA state")).count(), 2, "sent once delivered");
+        assert_eq!(
+            acts.iter()
+                .filter(|a| a.contains("cleared its own local HA state"))
+                .count(),
+            2,
+            "sent once delivered"
+        );
         let mut pace = LogPace::default();
         assert!(pace.is_due("k", Duration::from_secs(60)));
-        assert!(pace.is_due("k", Duration::from_secs(60)), "not marked by asking");
+        assert!(
+            pace.is_due("k", Duration::from_secs(60)),
+            "not marked by asking"
+        );
         pace.mark("k");
         assert!(!pace.is_due("k", Duration::from_secs(60)));
     }
@@ -51838,19 +52990,47 @@ poll_interval_ms = 10
     /// TwinStor attempts.
     #[tokio::test]
     async fn the_self_clear_report_follows_the_command_result() {
-        let report = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("XAPI's HA emergency mode")).cloned().collect::<Vec<_>>();
+        let report = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("XAPI's HA emergency mode"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let mut sm = seam_sm("self-clear-ok");
         sm.self_unwedge_clear().await;
         let r = report(&sm);
         assert_eq!(r.len(), 1);
-        assert!(sm.test_ha.as_ref().unwrap().actions.contains(&"emergency-disable-local".to_string()));
-        assert!(r[0].contains("which returned success") && r[0].contains("attempts that cycle"), "{}", r[0]);
-        assert!(!r[0].contains("unaffected") && !r[0].contains("re-arms it"), "{}", r[0]);
+        assert!(
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .contains(&"emergency-disable-local".to_string())
+        );
+        assert!(
+            r[0].contains("which returned success") && r[0].contains("attempts that cycle"),
+            "{}",
+            r[0]
+        );
+        assert!(
+            !r[0].contains("unaffected") && !r[0].contains("re-arms it"),
+            "{}",
+            r[0]
+        );
         let mut sm = seam_sm("self-clear-failed");
         seam(&mut sm).emergency_disable_err = Some("timed out after 30s".into());
         sm.self_unwedge_clear().await;
         let r = report(&sm);
-        assert!(r[0].contains("which failed: timed out after 30s") && r[0].contains("'xe pool-ha-disable'"), "{}", r[0]);
+        assert!(
+            r[0].contains("which failed: timed out after 30s")
+                && r[0].contains("'xe pool-ha-disable'"),
+            "{}",
+            r[0]
+        );
         assert!(!r[0].contains("returned success"));
         // Undelivered: kept and sent again on the next pass.
         let mut sm = seam_sm("self-clear-undelivered");
@@ -51868,7 +53048,15 @@ poll_interval_ms = 10
     /// reads its own xapi, and a slave with P reads as before.
     #[tokio::test]
     async fn the_pbd_check_waits_for_p_on_a_slave() {
-        let lists = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| *a == "pbd-list").count();
+        let lists = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| *a == "pbd-list")
+                .count()
+        };
         for (role, p, expect) in [
             (Some(false), false, 0),
             (Option::None, false, 0),
@@ -51903,10 +53091,16 @@ poll_interval_ms = 10
     #[test]
     fn the_flap_and_revive_alerts_say_only_what_was_observed() {
         let flap = readmission_flap_alert_text(2, 120);
-        assert!(flap.contains(disarmed_host_risk(2)) && flap.contains("ha-config:timeout=120"), "{flap}");
+        assert!(
+            flap.contains(disarmed_host_risk(2)) && flap.contains("ha-config:timeout=120"),
+            "{flap}"
+        );
         assert!(readmission_flap_alert_text(0, 90).contains(disarmed_host_risk(0)));
         for t in [flap.as_str(), REVIVE_FAILED_ALERT] {
-            assert!(!t.contains("unaffected") && !t.contains("VMs keep running"), "{t}");
+            assert!(
+                !t.contains("unaffected") && !t.contains("VMs keep running"),
+                "{t}"
+            );
         }
     }
 
@@ -51920,9 +53114,16 @@ poll_interval_ms = 10
         seam(&mut sm).local_armed = Some(false);
         sm.note_demote_while_disarmed().await;
         let acts = &sm.test_ha.as_ref().unwrap().actions;
-        let a = acts.iter().find(|a| a.contains("demoted from a second pool master")).expect("alerted");
+        let a = acts
+            .iter()
+            .find(|a| a.contains("demoted from a second pool master"))
+            .expect("alerted");
         assert!(a.starts_with("advice: "), "{a}");
-        assert!(a.contains(&format!("on the pool master {} run", sm.config.node.peer)) && a.contains("ha-config:timeout="), "{a}");
+        assert!(
+            a.contains(&format!("on the pool master {} run", sm.config.node.peer))
+                && a.contains("ha-config:timeout="),
+            "{a}"
+        );
     }
 
     /// A source file without its `#[cfg(test)]` modules (wherever they sit
@@ -51933,7 +53134,9 @@ poll_interval_ms = 10
         let mut lines = src.lines().peekable();
         while let Some(l) = lines.next() {
             if l.trim() == "#[cfg(test)]"
-                && lines.peek().is_some_and(|n| n.trim_start().starts_with("mod ") && n.trim_end().ends_with('{'))
+                && lines.peek().is_some_and(|n| {
+                    n.trim_start().starts_with("mod ") && n.trim_end().ends_with('{')
+                })
             {
                 let mut depth = 0i32;
                 for m in lines.by_ref() {
@@ -51964,15 +53167,23 @@ poll_interval_ms = 10
             ("arbitration.rs", include_str!("arbitration.rs")),
         ] {
             let prod = production_code(src);
-            let lines: Vec<&str> = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+            let lines: Vec<&str> = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
             for (i, l) in lines.iter().enumerate() {
                 if let Some(at) = l.find("heartbeat-sr-uuids=") {
                     let rest = &l[at + "heartbeat-sr-uuids=".len()..];
                     let filled = crate::xapi::fill_sr_uuid(rest, Some(uuid));
                     assert!(
-                        rest.starts_with('{') || rest.starts_with('"') || rest.starts_with("`") || rest.is_empty()
-                            || rest.starts_with("<twinstor SR \\") || filled.starts_with(uuid),
-                        "{name}:{}: SR placeholder not filled at send: {l}", i + 1
+                        rest.starts_with('{')
+                            || rest.starts_with('"')
+                            || rest.starts_with("`")
+                            || rest.is_empty()
+                            || rest.starts_with("<twinstor SR \\")
+                            || filled.starts_with(uuid),
+                        "{name}:{}: SR placeholder not filled at send: {l}",
+                        i + 1
                     );
                 }
                 for bad in ["<SR>", "<sr>", "<SR uuid>", "<sr-uuid>", "<heartbeat SR>"] {
@@ -51983,7 +53194,10 @@ poll_interval_ms = 10
         // The whole production code is scanned, not only what precedes the
         // first test module.
         let xapi_prod = production_code(include_str!("xapi.rs"));
-        assert!(xapi_prod.contains("pub async fn local_xapi_role()"), "code after the first test module");
+        assert!(
+            xapi_prod.contains("pub async fn local_xapi_role()"),
+            "code after the first test module"
+        );
         assert!(!xapi_prod.contains("mod alert_delivery_tests"));
         for body in [
             recorded_rearm_manual("a", "b", 120),
@@ -51991,7 +53205,10 @@ poll_interval_ms = 10
             wedge_alert_body(120),
         ] {
             let filled = crate::xapi::fill_sr_uuid(&body, Some(uuid));
-            assert!(filled.contains(&format!("heartbeat-sr-uuids={uuid} ha-config:timeout=120")), "{filled}");
+            assert!(
+                filled.contains(&format!("heartbeat-sr-uuids={uuid} ha-config:timeout=120")),
+                "{filled}"
+            );
             assert!(!filled.contains("trap"), "{filled}");
         }
     }
@@ -52003,15 +53220,27 @@ poll_interval_ms = 10
     fn the_view_texts_state_their_conditions() {
         use crate::arbitration::{PartitionView, verdict};
         let hold = verdict(PartitionView::WholeSwitchHold);
-        assert!(hold.contains("unless auto_resolve_peer_emergency is off"), "{hold}");
+        assert!(
+            hold.contains("unless auto_resolve_peer_emergency is off"),
+            "{hold}"
+        );
         assert!(WHOLE_SWITCH_HOLD_NEXT.contains("unless auto_resolve_peer_emergency is off"));
         let pd = verdict(PartitionView::PeerDisarmed);
-        assert!(pd.contains(&format!("at most {PEER_EMERGENCY_BUDGET} resets in {} hours", PEER_EMERGENCY_BUDGET_WINDOW / 3600)), "{pd}");
+        assert!(
+            pd.contains(&format!(
+                "at most {PEER_EMERGENCY_BUDGET} resets in {} hours",
+                PEER_EMERGENCY_BUDGET_WINDOW / 3600
+            )),
+            "{pd}"
+        );
         for v in [PartitionView::PeerDisarmed, PartitionView::DisarmedMember] {
             assert!(!verdict(v).contains("trap"), "{}", verdict(v));
         }
         let d = dance_disarmed_alert("a", "b", "x", 120);
-        assert!(!d.contains("management networks are up"), "the advice prefix says it: {d}");
+        assert!(
+            !d.contains("management networks are up"),
+            "the advice prefix says it: {d}"
+        );
     }
 
     /// A disarm record's age: a `written` in the future (the clock stepped
@@ -52036,18 +53265,28 @@ poll_interval_ms = 10
         // The fast guard's record, just written.
         std::fs::write(
             &m.disarm_record_path,
-            format!("boot_id={}\nxapi_pid=1\nwritten={}\n", current_boot_id(), unix_now_secs()),
+            format!(
+                "boot_id={}\nxapi_pid=1\nwritten={}\n",
+                current_boot_id(),
+                unix_now_secs()
+            ),
         )
         .unwrap();
         m.whole_switch_guard.store(true, Ordering::Relaxed);
         // The tick's HA check while the guard's disable is still landing.
         seam(&mut m).local_armed = Some(true);
         m.check_disarm_trap(Some(true)).await;
-        assert!(std::path::Path::new(&m.disarm_record_path).exists(), "kept while the disarm lands");
+        assert!(
+            std::path::Path::new(&m.disarm_record_path).exists(),
+            "kept while the disarm lands"
+        );
         // Even with the guard flag not seen yet, a fresh record is settling.
         m.whole_switch_guard.store(false, Ordering::Relaxed);
         m.check_disarm_trap(Some(true)).await;
-        assert!(std::path::Path::new(&m.disarm_record_path).exists(), "kept while settling");
+        assert!(
+            std::path::Path::new(&m.disarm_record_path).exists(),
+            "kept while settling"
+        );
         // The tick's hold pass.
         m.whole_switch_guard.store(true, Ordering::Relaxed);
         m.whole_switch_held = true;
@@ -52066,7 +53305,11 @@ poll_interval_ms = 10
         let mut m = disarmed_member("hold-record-spent", true);
         std::fs::write(
             &m.disarm_record_path,
-            format!("boot_id={}\nxapi_pid=1\nwritten={}\n", current_boot_id(), unix_now_secs() - DISARM_RECORD_SETTLE),
+            format!(
+                "boot_id={}\nxapi_pid=1\nwritten={}\n",
+                current_boot_id(),
+                unix_now_secs() - DISARM_RECORD_SETTLE
+            ),
         )
         .unwrap();
         seam(&mut m).local_armed = Some(true);
@@ -52128,20 +53371,43 @@ poll_interval_ms = 10
             created_unix: Some(created),
         }];
         let since = 1_000;
-        assert!(sm.routine_task_hold_step(since, since + 60).await, "not yet");
+        assert!(
+            sm.routine_task_hold_step(since, since + 60).await,
+            "not yet"
+        );
         assert_eq!(seam_actions(&sm, "alert"), 0);
-        assert!(sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER).await);
+        assert!(
+            sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER)
+                .await
+        );
         let t = sm.test_ha.as_ref().unwrap();
-        let alert = t.actions.iter().find(|a| a.starts_with("alert")).expect("one report");
-        assert!(alert.contains("pool.disable_ha") && alert.contains("task-1"), "{alert}");
+        let alert = t
+            .actions
+            .iter()
+            .find(|a| a.starts_with("alert"))
+            .expect("one report");
+        assert!(
+            alert.contains("pool.disable_ha") && alert.contains("task-1"),
+            "{alert}"
+        );
         assert!(alert.contains("pending for 15 minutes"), "{alert}");
-        assert_eq!(seam_actions(&sm, "task-cancel"), 0, "someone else's: left alone");
+        assert_eq!(
+            seam_actions(&sm, "task-cancel"),
+            0,
+            "someone else's: left alone"
+        );
         // Paced: a second pass does not alert again.
-        assert!(sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER + 600).await);
+        assert!(
+            sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER + 600)
+                .await
+        );
         assert_eq!(seam_actions(&sm, "alert"), 1);
         // Gone: the hold ends.
         seam(&mut sm).pending_tasks.clear();
-        assert!(!sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER + 1200).await);
+        assert!(
+            !sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER + 1200)
+                .await
+        );
     }
 
     /// The stuck-task clock follows the task: a different task starts it
@@ -52154,7 +53420,10 @@ poll_interval_ms = 10
             name: "pool.disable_ha".into(),
             created_unix: Some(created),
         };
-        let mut h = TaskHold { since: 0, task: String::new() };
+        let mut h = TaskHold {
+            since: 0,
+            task: String::new(),
+        };
         h.observe(&[t("a", 1)], 100);
         h.observe(&[t("a", 1)], 500);
         assert_eq!(h.since, 100, "the same task keeps its clock");
@@ -52175,7 +53444,16 @@ poll_interval_ms = 10
         let now_unix = crate::heal_state::unix_now();
         for (pool_ha, tasks, unreadable, runs) in [
             (Some(true), vec![], false, true),
-            (Some(true), vec![xapi::PendingHaTask { uuid: "t".into(), name: "pool.enable_ha".into(), created_unix: Some(1) }], false, false),
+            (
+                Some(true),
+                vec![xapi::PendingHaTask {
+                    uuid: "t".into(),
+                    name: "pool.enable_ha".into(),
+                    created_unix: Some(1),
+                }],
+                false,
+                false,
+            ),
             (Some(true), vec![], true, false),
             (Some(false), vec![], false, false),
             (Option::None, vec![], false, false),
@@ -52189,9 +53467,16 @@ poll_interval_ms = 10
             t.pending_unreadable = unreadable;
             sm.readmission_dance_t = Some(now_unix + 30);
             sm.drive_readmission_dance(now_unix + 30).await;
-            assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), usize::from(runs), "{pool_ha:?}");
+            assert_eq!(
+                seam_actions(&sm, "readmission_dance_phase1"),
+                usize::from(runs),
+                "{pool_ha:?}"
+            );
             assert_eq!(sm.readmission_dance_t.is_some(), runs);
-            assert_eq!(sm.dance_disarm_watch, runs.then_some(now_unix + 30 + DANCE_REARM_WAIT));
+            assert_eq!(
+                sm.dance_disarm_watch,
+                runs.then_some(now_unix + 30 + DANCE_REARM_WAIT)
+            );
         }
         // Unreadable when phase 1's window opens (the time left is then at
         // most the lead): not held into a shorter quiet period, cancelled.
@@ -52205,13 +53490,26 @@ poll_interval_ms = 10
         sm.readmission_dance_t = Some(at);
         sm.drive_readmission_dance(at).await;
         assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), 0);
-        assert_eq!(sm.readmission_dance_t, Option::None, "cancelled, never fired late");
+        assert_eq!(
+            sm.readmission_dance_t,
+            Option::None,
+            "cancelled, never fired late"
+        );
         // The hold lasts only while more than the normal lead (T + 60 s) is
         // left: at T + 60 s or less, the dance is cancelled.
         let lead = 120 + 60;
-        assert_eq!(dance_phase1_check(Some(true), Option::None, lead + 1, lead), DancePhase1::Hold("XAPI's task list is unreadable"));
-        assert!(matches!(dance_phase1_check(Some(true), Option::None, lead, lead), DancePhase1::Cancel(_)));
-        assert!(matches!(dance_phase1_check(Some(true), Option::None, 121, lead), DancePhase1::Cancel(_)));
+        assert_eq!(
+            dance_phase1_check(Some(true), Option::None, lead + 1, lead),
+            DancePhase1::Hold("XAPI's task list is unreadable")
+        );
+        assert!(matches!(
+            dance_phase1_check(Some(true), Option::None, lead, lead),
+            DancePhase1::Cancel(_)
+        ));
+        assert!(matches!(
+            dance_phase1_check(Some(true), Option::None, 121, lead),
+            DancePhase1::Cancel(_)
+        ));
     }
 
     /// The re-admission plan: with the default keys (the dance on), a join
@@ -52226,44 +53524,134 @@ poll_interval_ms = 10
     #[test]
     fn the_readmission_plan_with_the_dance_off_turns_it_into_the_runbook_branch() {
         let on = crate::config::HaConfig::default();
-        assert!(on.readmission_assist && on.rejoin_assist, "both on by default");
-        let ha = crate::config::HaConfig { readmission_assist: false, ..on.clone() };
+        assert!(
+            on.readmission_assist && on.rejoin_assist,
+            "both on by default"
+        );
+        let ha = crate::config::HaConfig {
+            readmission_assist: false,
+            ..on.clone()
+        };
         let t0 = std::time::Instant::now();
-        let embrace = XhaLogSignals { embrace: true, activity: true, ..Default::default() };
+        let embrace = XhaLogSignals {
+            embrace: true,
+            activity: true,
+            ..Default::default()
+        };
         let decide = |state, signals, at: u64| {
-            readmission_decision(true, state, signals, true, true, Some(t0), None, None,
-                                 t0 + Duration::from_secs(at))
+            readmission_decision(
+                true,
+                state,
+                signals,
+                true,
+                true,
+                Some(t0),
+                None,
+                None,
+                t0 + Duration::from_secs(at),
+            )
         };
         // Inside the window: nothing yet.
         let d = decide(XhaHostState::Starting, embrace, 299);
-        assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }).0, ReadmissionAction::Wait);
+        assert_eq!(
+            readmission_plan(
+                d,
+                &ha,
+                ReadmissionScope {
+                    pool_ha: Some(true),
+                    startup_loop: false,
+                    ..Default::default()
+                }
+            )
+            .0,
+            ReadmissionAction::Wait
+        );
         // Past it: the dance's case; with the dance off, the runbook branch.
         let d = decide(XhaHostState::Starting, embrace, 300);
         assert_eq!(d, ReadmissionAction::Schedule);
         for pool_ha in [Some(true), Option::None] {
-            assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha, startup_loop: false, ..Default::default() }), (ReadmissionAction::AlertManual, Option::None));
+            assert_eq!(
+                readmission_plan(
+                    d,
+                    &ha,
+                    ReadmissionScope {
+                        pool_ha,
+                        startup_loop: false,
+                        ..Default::default()
+                    }
+                ),
+                (ReadmissionAction::AlertManual, Option::None)
+            );
         }
         // Held in XAPI's startup loop (armed, not Online, P false).
-        assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha: Some(true), startup_loop: true, ..Default::default() }).0, ReadmissionAction::Wait);
+        assert_eq!(
+            readmission_plan(
+                d,
+                &ha,
+                ReadmissionScope {
+                    pool_ha: Some(true),
+                    startup_loop: true,
+                    ..Default::default()
+                }
+            )
+            .0,
+            ReadmissionAction::Wait
+        );
         // With the default keys, the dance is scheduled.
-        assert_eq!(readmission_plan(d, &on, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }).0, ReadmissionAction::Schedule);
+        assert_eq!(
+            readmission_plan(
+                d,
+                &on,
+                ReadmissionScope {
+                    pool_ha: Some(true),
+                    startup_loop: false,
+                    ..Default::default()
+                }
+            )
+            .0,
+            ReadmissionAction::Schedule
+        );
         // A dead, silent HA daemon: the revive, unchanged by the dance key.
         let d = decide(XhaHostState::Down, XhaLogSignals::default(), 300);
-        assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }).0, ReadmissionAction::Revive);
+        assert_eq!(
+            readmission_plan(
+                d,
+                &ha,
+                ReadmissionScope {
+                    pool_ha: Some(true),
+                    startup_loop: false,
+                    ..Default::default()
+                }
+            )
+            .0,
+            ReadmissionAction::Revive
+        );
     }
 
     /// Every corrected text names the host a command runs on.
     #[test]
     fn the_corrected_texts_name_the_hosts_to_run_commands_on() {
         let a = peer_not_recruited_alert("x", "hostA", "hostB", 120);
-        assert!(a.contains("On the pool master hostA run 'xe pool-ha-disable'"), "{a}");
-        assert!(a.contains("'xe host-emergency-ha-disable --force' on hostB"), "{a}");
+        assert!(
+            a.contains("On the pool master hostA run 'xe pool-ha-disable'"),
+            "{a}"
+        );
+        assert!(
+            a.contains("'xe host-emergency-ha-disable --force' on hostB"),
+            "{a}"
+        );
         assert!(a.contains("then on hostA run 'xe pool-ha-enable"), "{a}");
         assert!(!a.contains("the peer"), "{a}");
         let h = peer_emergency_hold_alert(0, "y", "hostA", "hostB", 120);
-        assert!(h.contains("the peer host hostB answers") && h.contains("on the pool master hostA run"), "{h}");
+        assert!(
+            h.contains("the peer host hostB answers") && h.contains("on the pool master hostA run"),
+            "{h}"
+        );
         let d = dance_disarmed_alert("hostB", "hostA", "z", 90);
-        assert!(d.contains("on the pool master hostA run") && d.contains("ha-config:timeout=90'"), "{d}");
+        assert!(
+            d.contains("on the pool master hostA run") && d.contains("ha-config:timeout=90'"),
+            "{d}"
+        );
         assert!(!d.contains("fate-shared |"), "{d}");
     }
 
@@ -52275,8 +53663,16 @@ poll_interval_ms = 10
         // Alerts carry the absolute time only (they can wait in the queue);
         // status texts add the distance.
         let soon = unix_now_secs() + 3600;
-        assert!(!operator_time(soon).contains("min"), "{}", operator_time(soon));
-        assert!(operator_time_rel(soon).contains("in 60 min"), "{}", operator_time_rel(soon));
+        assert!(
+            !operator_time(soon).contains("min"),
+            "{}",
+            operator_time(soon)
+        );
+        assert!(
+            operator_time_rel(soon).contains("in 60 min"),
+            "{}",
+            operator_time_rel(soon)
+        );
         let off = local_utc_offset_now().expect("the C library gives an offset");
         assert!(off.abs() <= 14 * 3600);
         // 01:54:16 UTC on a +01:00 host.
@@ -52300,7 +53696,10 @@ poll_interval_ms = 10
         assert_eq!(from(Some(60), true), 60, "the configured value wins");
         assert_eq!(from(Some(60), false), 60);
         let sm = inc1_sm();
-        assert_eq!(sm.ha_timeout_now(), crate::setup::configured_ha_timeout_for(sm.arbitrated));
+        assert_eq!(
+            sm.ha_timeout_now(),
+            crate::setup::configured_ha_timeout_for(sm.arbitrated)
+        );
     }
 
     /// The pool-HA-off alerts give the configured timeout, never the
@@ -52321,10 +53720,16 @@ poll_interval_ms = 10
     fn the_hold_and_disarmed_lines_say_the_real_state() {
         assert!(rearm_hold_line(Some(ObligationState::Owed)).contains("owed but not attempted"));
         let enabled = rearm_hold_line(Some(ObligationState::Enabled));
-        assert!(enabled.contains("re-enabled pool HA") && !enabled.contains("owed"), "{enabled}");
+        assert!(
+            enabled.contains("re-enabled pool HA") && !enabled.contains("owed"),
+            "{enabled}"
+        );
         assert!(rearm_hold_line(Some(ObligationState::Pending { until: 1 })).contains("pending"));
         let none = disarmed_host_risk(0);
-        assert!(none.contains("runs no VMs") && !none.contains("while they still run here"), "{none}");
+        assert!(
+            none.contains("runs no VMs") && !none.contains("while they still run here"),
+            "{none}"
+        );
         assert!(disarmed_host_risk(2).contains("while they still run here"));
     }
 
@@ -52347,16 +53752,48 @@ poll_interval_ms = 10
             sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
             sm
         };
-        let first = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("reports itself locally disarmed under the armed pool.")).cloned().collect::<Vec<_>>();
+        let first = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("reports itself locally disarmed under the armed pool."))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let mut sm = wedged("pe-first-alert", Some(2));
         sm.check_peer_emergency().await;
         let a = first(&sm);
         assert_eq!(a.len(), 1);
-        assert!(a[0].starts_with("advice: "), "routed as advice to disable HA: {}", a[0]);
-        assert!(a[0].contains(&format!("the peer host {} reports", sm.config.node.peer)), "{}", a[0]);
-        assert!(a[0].contains("It runs 2 VM(s) according to the pool database"), "{}", a[0]);
-        assert!(a[0].contains("resets pool HA automatically once a second probe confirms it"), "{}", a[0]);
-        assert!(a[0].contains(&format!("on the pool master {} run 'xe pool-ha-disable'", sm.config.node.name)), "{}", a[0]);
+        assert!(
+            a[0].starts_with("advice: "),
+            "routed as advice to disable HA: {}",
+            a[0]
+        );
+        assert!(
+            a[0].contains(&format!("the peer host {} reports", sm.config.node.peer)),
+            "{}",
+            a[0]
+        );
+        assert!(
+            a[0].contains("It runs 2 VM(s) according to the pool database"),
+            "{}",
+            a[0]
+        );
+        assert!(
+            a[0].contains("resets pool HA automatically once a second probe confirms it"),
+            "{}",
+            a[0]
+        );
+        assert!(
+            a[0].contains(&format!(
+                "on the pool master {} run 'xe pool-ha-disable'",
+                sm.config.node.name
+            )),
+            "{}",
+            a[0]
+        );
         // Same wedge, later probes: no second one.
         sm.check_peer_emergency().await;
         sm.peer_mismatch = MismatchSightings::default();
@@ -52381,32 +53818,68 @@ poll_interval_ms = 10
         let mut sm = wedged("pe-first-hold", Some(2));
         let now = unix_now_secs();
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
-            resets: vec![now - 3000, now - 2000, now - 1000], ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &current_boot_id(),
+            &PeerEmergencyBudget {
+                resets: vec![now - 3000, now - 2000, now - 1000],
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         let a = first(&sm);
         let until = now - 3000 + PEER_EMERGENCY_BUDGET_WINDOW;
-        assert!(a.len() == 1 && a[0].contains(&format!("on hold until {}", local_hm(until))), "{a:?}");
-        assert!(!a[0].contains(" min)"), "no relative time in an alert: {}", a[0]);
+        assert!(
+            a.len() == 1 && a[0].contains(&format!("on hold until {}", local_hm(until))),
+            "{a:?}"
+        );
+        assert!(
+            !a[0].contains(" min)"),
+            "no relative time in an alert: {}",
+            a[0]
+        );
         let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
         sm.peer_mismatch.first = back(sm.peer_mismatch.first);
         sm.peer_mismatch.last = back(sm.peer_mismatch.last);
         sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
         sm.check_peer_emergency().await;
-        let holds = sm.test_ha.as_ref().unwrap().actions.iter().filter(|x| x.contains("is on hold until") && x.contains("answers that it is locally disarmed")).count();
-        assert_eq!(holds, 0, "the hold alert is not sent again for the same hold");
-        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).alerted_until, until, "marked once delivered");
+        let holds = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .filter(|x| {
+                x.contains("is on hold until") && x.contains("answers that it is locally disarmed")
+            })
+            .count();
+        assert_eq!(
+            holds, 0,
+            "the hold alert is not sent again for the same hold"
+        );
+        assert_eq!(
+            peer_emergency_budget_read(&path, &current_boot_id()).alerted_until,
+            until,
+            "marked once delivered"
+        );
         // Not delivered: the hold stays unalerted, so its own alert goes out later.
         let mut sm = wedged("pe-first-undelivered", Some(2));
         seam(&mut sm).alerts_fail = true;
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
-            resets: vec![now - 3000, now - 2000, now - 1000], ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &current_boot_id(),
+            &PeerEmergencyBudget {
+                resets: vec![now - 3000, now - 2000, now - 1000],
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         sm.check_peer_emergency().await;
-        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).alerted_until, 0);
+        assert_eq!(
+            peer_emergency_budget_read(&path, &current_boot_id()).alerted_until,
+            0
+        );
         // A restarted daemon in the same wedge: no second alert.
         let mut sm = wedged("pe-first-restart", Some(2));
         let path = sm.peer_emergency_budget_path.clone();
@@ -52418,15 +53891,25 @@ poll_interval_ms = 10
         assert!(first(&again).is_empty(), "kept in the budget file");
         // What applies, said: reset turned off.
         let mut sm = wedged("pe-first-disabled", Some(2));
-        std::sync::Arc::make_mut(&mut sm.config).ha.auto_resolve_peer_emergency = false;
+        std::sync::Arc::make_mut(&mut sm.config)
+            .ha
+            .auto_resolve_peer_emergency = false;
         sm.check_peer_emergency().await;
-        assert!(first(&sm)[0].contains("turned off by configuration"), "{:?}", first(&sm));
+        assert!(
+            first(&sm)[0].contains("turned off by configuration"),
+            "{:?}",
+            first(&sm)
+        );
         // The reset needs P only (no settle), as does the sighting: a
         // settling view still expects the reset; no P, no sighting.
         let mut sm = wedged("pe-first-settling", Some(2));
         sm.test_p = Some(p_settling(10));
         sm.check_peer_emergency().await;
-        assert!(first(&sm)[0].contains("once a second probe confirms it"), "{:?}", first(&sm));
+        assert!(
+            first(&sm)[0].contains("once a second probe confirms it"),
+            "{:?}",
+            first(&sm)
+        );
         let mut sm = wedged("pe-first-no-p", Some(2));
         sm.test_p = Some(crate::mgmt_reach::PView::default());
         sm.check_peer_emergency().await;
@@ -52434,15 +53917,28 @@ poll_interval_ms = 10
         // TwinStor's own doing, or a relapse window: no first-sighting alert.
         let mut sm = wedged("pe-first-relapse", Some(2));
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
-            resets: vec![now - 900], freed_at: now - 300, freed_reset: now - 900, ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &current_boot_id(),
+            &PeerEmergencyBudget {
+                resets: vec![now - 900],
+                freed_at: now - 300,
+                freed_reset: now - 900,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
-        assert!(first(&sm).is_empty(), "the relapse alert speaks for that wedge");
+        assert!(
+            first(&sm).is_empty(),
+            "the relapse alert speaks for that wedge"
+        );
         let mut sm = wedged("pe-first-own", Some(2));
         sm.whole_switch_held = true;
         sm.check_peer_emergency().await;
-        assert!(first(&sm).is_empty(), "a whole-switch hold disarmed both hosts");
+        assert!(
+            first(&sm).is_empty(),
+            "a whole-switch hold disarmed both hosts"
+        );
         // Not latched: once the explanation ends, a later sighting alerts.
         sm.whole_switch_held = false;
         sm.check_peer_emergency().await;
@@ -52466,44 +53962,82 @@ poll_interval_ms = 10
             sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
             sm
         };
-        let first = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("reports itself locally disarmed under the armed pool.")).count();
+        let first = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("reports itself locally disarmed under the armed pool."))
+                .count()
+        };
         // Mastership lost then regained: a wedge seen then is a new one.
         let mut sm = wedged("pe-mark-master");
         let path = sm.peer_emergency_budget_path.clone();
         sm.check_peer_emergency().await;
         assert_eq!(first(&sm), 1);
-        assert_ne!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0);
+        assert_ne!(
+            peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted,
+            0
+        );
         seam(&mut sm).master_resilient = Some(false);
         sm.check_peer_emergency().await;
-        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0, "cleared on losing mastership");
+        assert_eq!(
+            peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted,
+            0,
+            "cleared on losing mastership"
+        );
         seam(&mut sm).master_resilient = Some(true);
         sm.check_peer_emergency().await;
         assert_eq!(first(&sm), 2, "alerted again as master");
         // Unknown mastership (an unanswered read) changes nothing.
         seam(&mut sm).master_resilient = Option::None;
         sm.check_peer_emergency().await;
-        assert_ne!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0);
+        assert_ne!(
+            peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted,
+            0
+        );
         // No longer master right before the send: dropped, tried again later.
         let mut sm = wedged("pe-mark-dropped");
         let path = sm.peer_emergency_budget_path.clone();
         seam(&mut sm).master_at_send = Some(Some(false));
         sm.check_peer_emergency().await;
         assert_eq!(first(&sm), 0);
-        assert!(sm.peer_disarm_alerted, "in flight until its outcome is read");
+        assert!(
+            sm.peer_disarm_alerted,
+            "in flight until its outcome is read"
+        );
         seam(&mut sm).master_at_send = Option::None;
         sm.check_peer_emergency().await;
-        assert_eq!(first(&sm), 1, "the drop cleared the mark; the next sighting sends it");
-        assert_ne!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0);
+        assert_eq!(
+            first(&sm),
+            1,
+            "the drop cleared the mark; the next sighting sends it"
+        );
+        assert_ne!(
+            peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted,
+            0
+        );
         // A late delivery naming an older hold keeps the newer hold's mark.
         let mut sm = wedged("pe-mark-max");
         let path = sm.peer_emergency_budget_path.clone();
         let now = unix_now_secs();
-        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
-            alerted_until: now + 7200, disarm_alerted: now, ..Default::default()
-        });
-        *sm.peer_disarm_alert_result.lock().unwrap() = Some(FirstAlertOutcome::Delivered(Some(now + 600)));
+        peer_emergency_budget_write(
+            &path,
+            &current_boot_id(),
+            &PeerEmergencyBudget {
+                alerted_until: now + 7200,
+                disarm_alerted: now,
+                ..Default::default()
+            },
+        );
+        *sm.peer_disarm_alert_result.lock().unwrap() =
+            Some(FirstAlertOutcome::Delivered(Some(now + 600)));
         sm.check_peer_emergency().await;
-        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).alerted_until, now + 7200);
+        assert_eq!(
+            peer_emergency_budget_read(&path, &current_boot_id()).alerted_until,
+            now + 7200
+        );
     }
 
     /// A slave disarmed whose xapi restarted refuses local calls with "pool
@@ -52516,7 +54050,17 @@ poll_interval_ms = 10
         let t0 = std::time::Instant::now();
         let later = t0 + SELF_UNWEDGE_AFTER + Duration::from_secs(1);
         let decide = |(pool, master): (Option<bool>, bool)| {
-            ha_self_unwedge_decision(Some(false), pool, false, true, master, true, Some(t0), Option::None, later)
+            ha_self_unwedge_decision(
+                Some(false),
+                pool,
+                false,
+                true,
+                master,
+                true,
+                Some(t0),
+                Option::None,
+                later,
+            )
         };
         let local = SelfUnwedgeEvidence {
             pool_read: Option::None,
@@ -52524,13 +54068,27 @@ poll_interval_ms = 10
             peer_agent_master: false,
             peer_login_master: true,
         };
-        assert_eq!(local.for_alert(), (Some(true), true), "the alert sees the wedge");
-        assert_eq!(decide(local.for_action()), SelfUnwedgeAction::Hold, "no self-clear on local evidence");
+        assert_eq!(
+            local.for_alert(),
+            (Some(true), true),
+            "the alert sees the wedge"
+        );
+        assert_eq!(
+            decide(local.for_action()),
+            SelfUnwedgeAction::Hold,
+            "no self-clear on local evidence"
+        );
         // The refusal alone, with the peer's agent live: still no pool read.
-        let refusal = SelfUnwedgeEvidence { peer_agent_master: true, ..local };
+        let refusal = SelfUnwedgeEvidence {
+            peer_agent_master: true,
+            ..local
+        };
         assert_eq!(decide(refusal.for_action()), SelfUnwedgeAction::Hold);
         // A pool read wins over the refusal for the alert too.
-        let off = SelfUnwedgeEvidence { pool_read: Some(false), ..local };
+        let off = SelfUnwedgeEvidence {
+            pool_read: Some(false),
+            ..local
+        };
         assert_eq!(off.for_alert().0, Some(false));
         // Pool read on and the peer's agent live: the self-clear acts.
         let read = SelfUnwedgeEvidence {
@@ -52552,9 +54110,14 @@ poll_interval_ms = 10
         sm.self_unwedge_vm_alerted_at = Some(t);
         sm.self_unwedge_episode_reset(Some(false));
         sm.self_unwedge_episode_reset(Option::None);
-        assert!(sm.self_unwedge_vm_alerted_at.is_some(), "still the same episode");
+        assert!(
+            sm.self_unwedge_vm_alerted_at.is_some(),
+            "still the same episode"
+        );
         sm.self_unwedge_episode_reset(Some(true));
-        assert!(sm.self_unwedge_miss_alerted_at.is_none() && sm.self_unwedge_vm_alerted_at.is_none());
+        assert!(
+            sm.self_unwedge_miss_alerted_at.is_none() && sm.self_unwedge_vm_alerted_at.is_none()
+        );
     }
 
     /// During a whole-switch cut the isolated-master check (and its "fix
@@ -52572,18 +54135,46 @@ poll_interval_ms = 10
     /// until pool HA is cycled, and the pool-level commands on the master.
     #[test]
     fn the_revive_says_what_it_found() {
-        assert_eq!(revive_cause(Some(false), Some(true), false), ReviveCause::LocallyDisarmed { by_twinstor: false });
-        assert_eq!(revive_cause(Some(false), Option::None, true), ReviveCause::LocallyDisarmed { by_twinstor: true });
-        assert_eq!(revive_cause(Some(true), Some(true), false), ReviveCause::BootRace);
-        assert_eq!(revive_cause(Option::None, Some(true), false), ReviveCause::BootRace);
+        assert_eq!(
+            revive_cause(Some(false), Some(true), false),
+            ReviveCause::LocallyDisarmed { by_twinstor: false }
+        );
+        assert_eq!(
+            revive_cause(Some(false), Option::None, true),
+            ReviveCause::LocallyDisarmed { by_twinstor: true }
+        );
+        assert_eq!(
+            revive_cause(Some(true), Some(true), false),
+            ReviveCause::BootRace
+        );
+        assert_eq!(
+            revive_cause(Option::None, Some(true), false),
+            ReviveCause::BootRace
+        );
         let off = revived_disarmed_alert("hostB", "hostA", false, 90, true);
-        assert!(!off.contains("armed pool") && off.contains("Pool HA now reads off"), "{off}");
+        assert!(
+            !off.contains("armed pool") && off.contains("Pool HA now reads off"),
+            "{off}"
+        );
         assert!(!off.contains("xe pool-ha-disable"), "{off}");
         let a = revived_disarmed_alert("hostB", "hostA", false, 90, false);
-        assert!(a.starts_with("TwinStor on hostB: the HA daemon was not running"), "{a}");
-        assert!(a.contains("locally disarmed under the armed pool (TwinStor did not disarm it)"), "{a}");
-        assert!(a.contains("stays locally disarmed until pool HA is cycled"), "{a}");
-        assert!(a.contains("on the pool master hostA run 'xe pool-ha-disable'") && a.contains("ha-config:timeout=90'"), "{a}");
+        assert!(
+            a.starts_with("TwinStor on hostB: the HA daemon was not running"),
+            "{a}"
+        );
+        assert!(
+            a.contains("locally disarmed under the armed pool (TwinStor did not disarm it)"),
+            "{a}"
+        );
+        assert!(
+            a.contains("stays locally disarmed until pool HA is cycled"),
+            "{a}"
+        );
+        assert!(
+            a.contains("on the pool master hostA run 'xe pool-ha-disable'")
+                && a.contains("ha-config:timeout=90'"),
+            "{a}"
+        );
         assert!(!a.contains("during boot"), "{a}");
     }
 
@@ -52592,11 +54183,20 @@ poll_interval_ms = 10
     #[test]
     fn the_armed_mismatch_alert_names_the_master_and_the_timeout() {
         let m = armed_mismatch_alert(true, "hostA", "hostB", 120);
-        assert!(m.contains("(hostA, the pool master)") && m.contains("Re-align now on hostA"), "{m}");
+        assert!(
+            m.contains("(hostA, the pool master)") && m.contains("Re-align now on hostA"),
+            "{m}"
+        );
         let s = armed_mismatch_alert(false, "hostB", "hostA", 90);
-        assert!(s.contains("on the master (hostA) run 'xe pool-ha-disable'"), "{s}");
+        assert!(
+            s.contains("on the master (hostA) run 'xe pool-ha-disable'"),
+            "{s}"
+        );
         for t in [&m, &s] {
-            assert!(t.contains("ha-config:timeout=") && !t.contains("fate-shared |"), "{t}");
+            assert!(
+                t.contains("ha-config:timeout=") && !t.contains("fate-shared |"),
+                "{t}"
+            );
         }
     }
 
@@ -52611,15 +54211,30 @@ poll_interval_ms = 10
     #[test]
     fn the_disarmed_host_alert_says_who_resets_and_where_to_run_what() {
         let a = disarmed_host_vms_alert("hostA", "hostB", 2, 120);
-        assert!(a.starts_with("TwinStor on hostA:") && a.contains("runs 2 VM(s)"), "{a}");
-        assert!(a.contains("TwinStor on the pool master (hostB) may reset pool HA automatically"), "{a}");
+        assert!(
+            a.starts_with("TwinStor on hostA:") && a.contains("runs 2 VM(s)"),
+            "{a}"
+        );
+        assert!(
+            a.contains("TwinStor on the pool master (hostB) may reset pool HA automatically"),
+            "{a}"
+        );
         assert!(a.contains("if 'twinstor status' on this host still shows it disarmed after 5 minutes, it has not"), "{a}");
-        assert!(!a.contains("still present"), "XAPI messages never disappear: {a}");
+        assert!(
+            !a.contains("still present"),
+            "XAPI messages never disappear: {a}"
+        );
         assert!(!a.contains("usually within"), "{a}");
         assert!(a.contains("on hostB run 'xe pool-ha-disable'"), "{a}");
         assert!(a.contains("ha-config:timeout=120"), "{a}");
-        assert!(a.contains("stays off until it is re-enabled by hand"), "{a}");
-        assert!(disarm_record_this_boot("boot_id=b1\nxapi_pid=1\ncycled=1\n", "b1"));
+        assert!(
+            a.contains("stays off until it is re-enabled by hand"),
+            "{a}"
+        );
+        assert!(disarm_record_this_boot(
+            "boot_id=b1\nxapi_pid=1\ncycled=1\n",
+            "b1"
+        ));
         assert!(!disarm_record_this_boot("boot_id=b0\n", "b1"));
         assert!(!disarm_record_this_boot("boot_id=b1\n", ""));
     }
@@ -52631,15 +54246,28 @@ poll_interval_ms = 10
     #[test]
     fn the_join_deadlock_runbook_disables_pool_ha_before_every_enable() {
         let a = join_deadlock_runbook_alert("hostA", "hostB", "hostB", 120);
-        let at = |needle: &str, from: usize| from + a[from..].find(needle).unwrap_or_else(|| panic!("{needle}: {a}"));
+        let at = |needle: &str, from: usize| {
+            from + a[from..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {a}"))
+        };
         let d1 = at("on the pool master (hostB) run 'xe pool-ha-disable'", 0);
         let e1 = at("'xe pool-ha-enable", d1);
-        let em = at("'xe host-emergency-ha-disable --force' on both hosts (hostA and hostB) within 30 seconds", e1);
+        let em = at(
+            "'xe host-emergency-ha-disable --force' on both hosts (hostA and hostB) within 30 seconds",
+            e1,
+        );
         let w = at("wait 150 seconds", em);
         let d2 = at("on hostB run 'xe pool-ha-disable'", w);
-        let e2 = at("'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout=120'", d2);
+        let e2 = at(
+            "'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout=120'",
+            d2,
+        );
         assert!(d1 < e1 && e1 < em && em < w && w < d2 && d2 < e2);
-        assert!(!a.contains("VMs keep running") && !a.contains("unaffected; VMs"), "{a}");
+        assert!(
+            !a.contains("VMs keep running") && !a.contains("unaffected; VMs"),
+            "{a}"
+        );
     }
 
     /// With the dance on: after phase 1 disarmed this host, a phase 2 that
@@ -52661,13 +54289,26 @@ poll_interval_ms = 10
         }))
         .await;
         let t = m.test_ha.as_ref().unwrap();
-        let alerts: Vec<_> = t.actions.iter().filter(|a| a.starts_with("advice")).collect();
+        let alerts: Vec<_> = t
+            .actions
+            .iter()
+            .filter(|a| a.starts_with("advice"))
+            .collect();
         assert_eq!(alerts.len(), 1);
         let a = alerts[0];
-        assert!(a.contains(&format!("TwinStor on {}", m.config.node.name)), "{a}");
-        assert!(a.contains("stays locally disarmed") && a.contains("pool.enable_ha"), "{a}");
+        assert!(
+            a.contains(&format!("TwinStor on {}", m.config.node.name)),
+            "{a}"
+        );
+        assert!(
+            a.contains("stays locally disarmed") && a.contains("pool.enable_ha"),
+            "{a}"
+        );
         assert!(a.contains("xe pool-ha-enable heartbeat-sr-uuids="), "{a}");
-        assert!(!a.contains("recorded-disarm") && !a.contains("obligation"), "{a}");
+        assert!(
+            !a.contains("recorded-disarm") && !a.contains("obligation"),
+            "{a}"
+        );
         // Its gate closed at the sync point (P not settled): the same, at once.
         let now_unix = crate::heal_state::unix_now();
         let mut m = seam_sm("dance-p2-gated");
@@ -52696,21 +54337,41 @@ poll_interval_ms = 10
         assert_eq!(seam_actions(&m, "advice"), 0);
         seam(&mut m).local_armed = Option::None;
         m.dance_disarm_watch_pass(1000).await;
-        assert_eq!((seam_actions(&m, "advice"), m.dance_disarm_watch), (0, Some(1000)));
+        assert_eq!(
+            (seam_actions(&m, "advice"), m.dance_disarm_watch),
+            (0, Some(1000))
+        );
         seam(&mut m).local_armed = Some(false);
         m.dance_disarm_watch_pass(1000).await;
         m.dance_disarm_watch_pass(1100).await;
         assert_eq!(seam_actions(&m, "advice"), 1);
-        let a = m.test_ha.as_ref().unwrap().actions.iter().find(|a| a.starts_with("advice")).unwrap().clone();
-        assert!(a.contains(&format!("TwinStor on {}", m.config.node.name)), "{a}");
-        assert!(a.contains("no pool HA cycle re-armed it") && a.contains("stays locally disarmed"), "{a}");
+        let a = m
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .find(|a| a.starts_with("advice"))
+            .unwrap()
+            .clone();
+        assert!(
+            a.contains(&format!("TwinStor on {}", m.config.node.name)),
+            "{a}"
+        );
+        assert!(
+            a.contains("no pool HA cycle re-armed it") && a.contains("stays locally disarmed"),
+            "{a}"
+        );
         for (armed, pool_ha) in [(Some(true), Some(true)), (Some(false), Some(false))] {
             let mut m = seam_sm("dance-watch-ok");
             m.dance_disarm_watch = Some(1000);
             seam(&mut m).local_armed = armed;
             seam(&mut m).pool_ha = pool_ha;
             m.dance_disarm_watch_pass(2000).await;
-            assert_eq!((seam_actions(&m, "advice"), m.dance_disarm_watch), (0, Option::None));
+            assert_eq!(
+                (seam_actions(&m, "advice"), m.dance_disarm_watch),
+                (0, Option::None)
+            );
         }
     }
 
@@ -52729,14 +54390,22 @@ poll_interval_ms = 10
         assert_eq!(seam_actions(&sl, "recorded_rearm_cycle"), 0);
         // The cycle re-armed both hosts: the slave never runs one.
         seam(&mut sl).local_armed = Some(true);
-        rearm_check_after(&mut sl, RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER).await;
+        rearm_check_after(
+            &mut sl,
+            RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER,
+        )
+        .await;
         assert_eq!(seam_actions(&sl, "recorded_rearm_cycle"), 0);
         // Once per record: even if the master stayed disarmed, no second cycle.
         for _ in 0..3 {
             rearm_check_after(&mut m, Duration::from_secs(3600)).await;
         }
         assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
-        assert!(std::fs::read_to_string(&m.disarm_record_path).unwrap().contains("cycled=1"));
+        assert!(
+            std::fs::read_to_string(&m.disarm_record_path)
+                .unwrap()
+                .contains("cycled=1")
+        );
     }
 
     /// A slave that alone holds a record acts after its defer; two masters
@@ -52744,7 +54413,11 @@ poll_interval_ms = 10
     #[tokio::test]
     async fn recorded_rearm_on_a_lone_slave_record_and_never_between_two_masters() {
         let mut sl = disarmed_member("rr-slave", false);
-        rearm_check_after(&mut sl, RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER).await;
+        rearm_check_after(
+            &mut sl,
+            RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER,
+        )
+        .await;
         assert_eq!(seam_actions(&sl, "recorded_rearm_cycle"), 1);
         let mut dual = disarmed_member("rr-dual", true);
         dual.test_peer_role = xapi::PeerXapiRole::Master;
@@ -52814,15 +54487,25 @@ poll_interval_ms = 10
     /// WFBitMapS for the frozen writes to drain. The lift now releases it.
     #[tokio::test(start_paused = true)]
     async fn arbitrated_survivor_frozen_in_wfbitmap_toward_an_outdated_peer_is_lifted() {
-        let (mut sm, drbd) =
-            arb_frozen_winner("arb-wfb", Some(crate::drbd::Replication::WFBitMap), DiskState::Outdated);
+        let (mut sm, drbd) = arb_frozen_winner(
+            "arb-wfb",
+            Some(crate::drbd::Replication::WFBitMap),
+            DiskState::Outdated,
+        );
         two_passes(&mut sm).await;
-        assert!(drbd.calls().contains(&"resume_io"), "calls: {:?}", drbd.calls());
+        assert!(
+            drbd.calls().contains(&"resume_io"),
+            "calls: {:?}",
+            drbd.calls()
+        );
         assert!(!std::path::Path::new(&sm.yield_path).exists());
         cleanup(&sm);
         // SyncSource toward an Inconsistent peer: the same.
-        let (mut sm, drbd) =
-            arb_frozen_winner("arb-src", Some(crate::drbd::Replication::SyncSource), DiskState::Inconsistent);
+        let (mut sm, drbd) = arb_frozen_winner(
+            "arb-src",
+            Some(crate::drbd::Replication::SyncSource),
+            DiskState::Inconsistent,
+        );
         two_passes(&mut sm).await;
         assert!(drbd.calls().contains(&"resume_io"));
         cleanup(&sm);
@@ -52837,7 +54520,11 @@ poll_interval_ms = 10
     async fn arbitrated_survivor_lift_holds_outside_its_exact_shape() {
         use crate::drbd::Replication::WFBitMap;
         let held = |sm: &StateMachine, drbd: &MockDrbd, why: &str| {
-            assert!(!drbd.calls().contains(&"resume_io"), "{why}: calls {:?}", drbd.calls());
+            assert!(
+                !drbd.calls().contains(&"resume_io"),
+                "{why}: calls {:?}",
+                drbd.calls()
+            );
             assert!(std::path::Path::new(&sm.yield_path).exists(), "{why}");
         };
         // Local copy not UpToDate.
@@ -52960,7 +54647,8 @@ poll_interval_ms = 10
             .to_path_buf();
         sm.disarm_record_path = dir.join("disarm").to_string_lossy().to_string();
         // TwinStor's own disarm in this boot (the whole-switch guard's latch).
-        sm.whole_switch_guard_ever_disarmed.store(true, Ordering::Relaxed);
+        sm.whole_switch_guard_ever_disarmed
+            .store(true, Ordering::Relaxed);
         confirmed_check(&mut sm).await;
         assert_eq!(seam_actions(&sm, "demote"), 1);
         let rec = std::fs::read_to_string(&sm.disarm_record_path).unwrap();
@@ -52980,15 +54668,21 @@ poll_interval_ms = 10
         t.agent_live = Some(false);
         master.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
         master.check_peer_emergency().await;
-        master.peer_mismatch.first =
-            master.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        master.peer_mismatch.first = master
+            .peer_mismatch
+            .first
+            .map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
         master.check_peer_emergency().await;
         assert_eq!(seam_actions(&master, "peer_emergency_reset"), 1);
 
         // Normal demoted slave (answers HOST_IS_SLAVE): the recorded re-arm
         // acts after its defer; the master's trigger never fires.
         let mut slave = disarmed_member("own-normal-slave", false);
-        rearm_check_after(&mut slave, RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER).await;
+        rearm_check_after(
+            &mut slave,
+            RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER,
+        )
+        .await;
         assert_eq!(seam_actions(&slave, "recorded_rearm_cycle"), 1);
         let mut master = seam_sm("own-normal-master");
         master.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
@@ -53007,7 +54701,11 @@ poll_interval_ms = 10
     async fn arbitrated_survivor_lift_review_cases() {
         use crate::drbd::Replication::WFBitMap;
         let no_resume = |drbd: &MockDrbd, why: &str| {
-            assert!(!drbd.calls().contains(&"resume_io"), "{why}: calls {:?}", drbd.calls());
+            assert!(
+                !drbd.calls().contains(&"resume_io"),
+                "{why}: calls {:?}",
+                drbd.calls()
+            );
         };
         // Secondary: hold.
         let (mut sm, drbd) = arb_frozen_winner("arb-r1", Some(WFBitMap), DiskState::Outdated);
@@ -53045,11 +54743,17 @@ poll_interval_ms = 10
         // A fence-peer run still deciding (it holds the handler's lock).
         let (mut sm, drbd) = arb_frozen_winner("arb-r5", Some(WFBitMap), DiskState::Outdated);
         std::fs::write(&sm.fence_lock_path, "").unwrap();
-        let held = std::fs::OpenOptions::new().read(true).open(&sm.fence_lock_path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&sm.fence_lock_path)
+            .unwrap();
         {
             use std::os::unix::io::AsRawFd;
             // SAFETY: locking a descriptor the test owns.
-            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+            assert_eq!(
+                unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
         }
         assert!(fence_run_in_flight(&sm.fence_lock_path));
         two_passes(&mut sm).await;
@@ -53064,7 +54768,11 @@ poll_interval_ms = 10
         let (mut sm, drbd) = arb_frozen_winner("arb-r6", Some(WFBitMap), DiskState::Outdated);
         write_fork_record(&sm.latch_path, Some(0x1111_2222_3333_4444));
         two_passes(&mut sm).await;
-        assert!(drbd.calls().contains(&"resume_io"), "stale latch: {:?}", drbd.calls());
+        assert!(
+            drbd.calls().contains(&"resume_io"),
+            "stale latch: {:?}",
+            drbd.calls()
+        );
         cleanup(&sm);
         // A latch for this fork (same generation, was-Primary bit aside): hold.
         let (mut sm, drbd) = arb_frozen_winner("arb-r7", Some(WFBitMap), DiskState::Outdated);
@@ -53097,7 +54805,10 @@ poll_interval_ms = 10
         rearm_check_after(&mut m, Duration::from_secs(3600)).await;
         assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 0);
         let rec = std::fs::read_to_string(&m.disarm_record_path).unwrap();
-        assert!(disarm_record_usable(&rec, &current_boot_id()), "record unused: {rec}");
+        assert!(
+            disarm_record_usable(&rec, &current_boot_id()),
+            "record unused: {rec}"
+        );
         m.ha_reset_inflight.store(false, Ordering::SeqCst);
         rearm_check_after(&mut m, Duration::from_secs(3600)).await;
         assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
@@ -53135,7 +54846,14 @@ poll_interval_ms = 10
         // One reset 20 minutes ago (the first wedge): the second is reset.
         let mut sm = wedged("pe-budget-second");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 1200], ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 1200],
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         confirm(&mut sm);
         sm.check_peer_emergency().await;
@@ -53145,25 +54863,58 @@ poll_interval_ms = 10
         let mut sm = wedged("pe-budget-spent");
         let path = sm.peer_emergency_budget_path.clone();
         let spent = vec![now - 5 * 3600, now - 3600, now - 1200];
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: spent.clone(), ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: spent.clone(),
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         confirm(&mut sm);
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
         let w = sm.ha_withheld.clone().unwrap();
         assert_eq!(w.action, "peer_emergency_resolve");
-        assert!(w.reason.contains("3 resets already ran in the last 6 hours"), "{}", w.reason);
+        assert!(
+            w.reason
+                .contains("3 resets already ran in the last 6 hours"),
+            "{}",
+            w.reason
+        );
         let until = now - 5 * 3600 + PEER_EMERGENCY_BUDGET_WINDOW;
         assert!(w.reason.contains(&local_hm(until)), "{}", w.reason);
         let note = hold_note(sm.peer_emergency_hold.as_ref(), now);
         let text = view_text_with(crate::arbitration::PartitionView::PeerDisarmed, note);
-        assert!(text.contains(&format!("on hold until {}", local_hm(until))), "{text}");
+        assert!(
+            text.contains(&format!("on hold until {}", local_hm(until))),
+            "{text}"
+        );
         assert_eq!(seam_actions(&sm, "advice"), 1);
-        let a = sm.test_ha.as_ref().unwrap().actions.iter().find(|a| a.starts_with("advice")).unwrap().clone();
-        assert!(a.contains("locally disarmed under the armed pool") && a.contains("may restart them on another host"), "{a}");
-        assert!(a.contains("xe pool-ha-disable") && a.contains("xe pool-ha-enable heartbeat-sr-uuids="), "{a}");
+        let a = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .find(|a| a.starts_with("advice"))
+            .unwrap()
+            .clone();
+        assert!(
+            a.contains("locally disarmed under the armed pool")
+                && a.contains("may restart them on another host"),
+            "{a}"
+        );
+        assert!(
+            a.contains("xe pool-ha-disable") && a.contains("xe pool-ha-enable heartbeat-sr-uuids="),
+            "{a}"
+        );
         // The configured timeout, never the per-mode placeholder.
-        assert!(a.contains(&format!("ha-config:timeout={}'", sm.ha_timeout_now())), "{a}");
+        assert!(
+            a.contains(&format!("ha-config:timeout={}'", sm.ha_timeout_now())),
+            "{a}"
+        );
         assert!(!a.contains("fate-shared |"), "{a}");
         // Paced: the next pass and a restarted daemon add no alert, and the
         // restarted daemon is held by the same budget.
@@ -53174,24 +54925,50 @@ poll_interval_ms = 10
         again.check_peer_emergency().await;
         confirm(&mut again);
         again.check_peer_emergency().await;
-        assert_eq!(seam_actions(&again, "peer_emergency_reset") + seam_actions(&again, "advice"), 0);
+        assert_eq!(
+            seam_actions(&again, "peer_emergency_reset") + seam_actions(&again, "advice"),
+            0
+        );
         assert!(again.ha_withheld.is_some());
         // Too soon after the last reset: withheld for the spacing.
         let mut sm = wedged("pe-budget-spacing");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 300], ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 300],
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         confirm(&mut sm);
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
-        assert!(sm.ha_withheld.clone().unwrap().reason.contains("less than 10 minutes ago"));
+        assert!(
+            sm.ha_withheld
+                .clone()
+                .unwrap()
+                .reason
+                .contains("less than 10 minutes ago")
+        );
         // Pure: the budget ages out, and another boot's budget is not read.
-        let b = |resets: Vec<u64>| PeerEmergencyBudget { resets, ..Default::default() };
-        assert_eq!(peer_emergency_budget_hold(&b(spent.clone()), now + 5 * 3600), Option::None);
+        let b = |resets: Vec<u64>| PeerEmergencyBudget {
+            resets,
+            ..Default::default()
+        };
+        assert_eq!(
+            peer_emergency_budget_hold(&b(spent.clone()), now + 5 * 3600),
+            Option::None
+        );
         let h = peer_emergency_budget_hold(&b(vec![now - 300]), now).unwrap();
         assert_eq!((h.rule, h.until), (BudgetRule::Spacing, now + 300));
         assert!(!h.alerts());
-        assert!(peer_emergency_budget_read(&path, "another-boot").resets.is_empty());
+        assert!(
+            peer_emergency_budget_read(&path, "another-boot")
+                .resets
+                .is_empty()
+        );
         // Past its end the hold adds nothing to the view.
         assert_eq!(hold_note(Some(&(now, "x".into())), now), Option::None);
     }
@@ -53207,25 +54984,52 @@ poll_interval_ms = 10
     #[tokio::test]
     async fn a_futile_reset_holds_the_next_for_an_hour_and_only_a_refused_one_is_given_back() {
         let now = crate::heal_state::unix_now();
-        let futile = PeerEmergencyBudget { resets: vec![now - 900], futile: now - 900, ..Default::default() };
+        let futile = PeerEmergencyBudget {
+            resets: vec![now - 900],
+            futile: now - 900,
+            ..Default::default()
+        };
         let h = peer_emergency_budget_hold(&futile, now).unwrap();
-        assert_eq!((h.rule, h.until), (BudgetRule::AfterFutile, now - 900 + 3600));
-        assert!(h.alerts() && h.why.contains("did not free the peer"), "{}", h.why);
-        let freed = PeerEmergencyBudget { futile: 0, ..futile.clone() };
+        assert_eq!(
+            (h.rule, h.until),
+            (BudgetRule::AfterFutile, now - 900 + 3600)
+        );
+        assert!(
+            h.alerts() && h.why.contains("did not free the peer"),
+            "{}",
+            h.why
+        );
+        let freed = PeerEmergencyBudget {
+            futile: 0,
+            ..futile.clone()
+        };
         assert_eq!(peer_emergency_budget_hold(&freed, now), Option::None);
         // The later end wins: the budget spent for longer than the hour.
-        let both = PeerEmergencyBudget { resets: vec![now - 3000, now - 2000, now - 900], futile: now - 900, ..Default::default() };
-        assert_eq!(peer_emergency_budget_hold(&both, now).unwrap().rule, BudgetRule::Budget);
+        let both = PeerEmergencyBudget {
+            resets: vec![now - 3000, now - 2000, now - 900],
+            futile: now - 900,
+            ..Default::default()
+        };
+        assert_eq!(
+            peer_emergency_budget_hold(&both, now).unwrap().rule,
+            BudgetRule::Budget
+        );
         let boot = current_boot_id();
         // The verdict's steps: futile on an armed-mismatch answer, freed on
         // two normal answers in a row, futile without a verdict in time.
         let t0 = std::time::Instant::now();
         let v = ResetVerdict::new(t0);
         let slave = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
-        assert_eq!(reset_verdict_step(v, &xapi::PeerXapiRole::ArmedMismatch, true, t0).1, Some(true));
+        assert_eq!(
+            reset_verdict_step(v, &xapi::PeerXapiRole::ArmedMismatch, true, t0).1,
+            Some(true)
+        );
         let (v1, none) = reset_verdict_step(v, &slave, true, t0);
         assert_eq!(none, Option::None);
-        assert_eq!(reset_verdict_step(v1.unwrap(), &slave, true, t0).1, Some(false));
+        assert_eq!(
+            reset_verdict_step(v1.unwrap(), &slave, true, t0).1,
+            Some(false)
+        );
         // A master answer is a second master, not a freed slave: it breaks
         // the run, and master answers alone end futile at the bound.
         let (vm, none) = reset_verdict_step(v1.unwrap(), &xapi::PeerXapiRole::Master, true, t0);
@@ -53233,10 +55037,32 @@ poll_interval_ms = 10
         let (vm, _) = reset_verdict_step(v, &xapi::PeerXapiRole::Master, true, t0);
         let (vm, none) = reset_verdict_step(vm.unwrap(), &xapi::PeerXapiRole::Master, true, t0);
         assert_eq!(none, Option::None);
-        assert_eq!(reset_verdict_step(vm.unwrap(), &xapi::PeerXapiRole::Master, true, t0 + PEER_EMERGENCY_CONFIRM_AFTER).1, Some(true));
+        assert_eq!(
+            reset_verdict_step(
+                vm.unwrap(),
+                &xapi::PeerXapiRole::Master,
+                true,
+                t0 + PEER_EMERGENCY_CONFIRM_AFTER
+            )
+            .1,
+            Some(true)
+        );
         let (v2, _) = reset_verdict_step(v1.unwrap(), &xapi::PeerXapiRole::Unknown, true, t0);
-        assert_eq!(v2.unwrap().normal_in_row, 0, "an unknown answer breaks the run");
-        assert_eq!(reset_verdict_step(v, &xapi::PeerXapiRole::Unreachable, false, t0 + PEER_EMERGENCY_CONFIRM_AFTER).1, Some(true));
+        assert_eq!(
+            v2.unwrap().normal_in_row,
+            0,
+            "an unknown answer breaks the run"
+        );
+        assert_eq!(
+            reset_verdict_step(
+                v,
+                &xapi::PeerXapiRole::Unreachable,
+                false,
+                t0 + PEER_EMERGENCY_CONFIRM_AFTER
+            )
+            .1,
+            Some(true)
+        );
         // Through the check, the peer's agent answering throughout.
         let wedged = |name: &str| {
             let mut sm = seam_sm(name);
@@ -53255,15 +55081,18 @@ poll_interval_ms = 10
             sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
         };
         let cycled = |sm: &mut StateMachine| {
-            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
-                disabled: true,
-                enabled: true,
-                disable_note: "disable".into(),
-                operator_off: false,
-                disable_issued: true,
-                disable_may_land: false,
-                withheld: Option::None,
-            }));
+            sm.ha_cycle_result.lock().unwrap().push((
+                "peer_emergency",
+                PoolHaCycle {
+                    disabled: true,
+                    enabled: true,
+                    disable_note: "disable".into(),
+                    operator_off: false,
+                    disable_issued: true,
+                    disable_may_land: false,
+                    withheld: Option::None,
+                },
+            ));
         };
         // Futile: the role still answers armed-mismatch after the cycle.
         let mut sm = wedged("pe-futile");
@@ -53274,7 +55103,13 @@ poll_interval_ms = 10
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
         cycled(&mut sm);
         let alerts = |sm: &StateMachine, needle: &str| {
-            sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains(needle)).count()
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains(needle))
+                .count()
         };
         sm.check_peer_emergency().await; // the cycle returned; the agent answers
         assert!(sm.peer_emergency_resolve_at.is_some() && sm.peer_emergency_verdict.is_some());
@@ -53285,29 +55120,78 @@ poll_interval_ms = 10
             created_unix: Some(now),
         }];
         sm.check_peer_emergency().await;
-        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        assert_eq!(
+            sm.peer_emergency_verdict.unwrap().phase,
+            VerdictPhase::AwaitingHa
+        );
         seam(&mut sm).pending_unreadable = true; // unreadable: still waiting
         sm.check_peer_emergency().await;
-        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        assert_eq!(
+            sm.peer_emergency_verdict.unwrap().phase,
+            VerdictPhase::AwaitingHa
+        );
         seam(&mut sm).pending_unreadable = false;
         seam(&mut sm).pending_tasks.clear();
         sm.check_peer_emergency().await; // HA on, no task: probing starts
-        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::Probing);
+        assert_eq!(
+            sm.peer_emergency_verdict.unwrap().phase,
+            VerdictPhase::Probing
+        );
         sm.check_peer_emergency().await; // the agent answers, the xapi still disarmed
-        assert_eq!(alerts(&sm, "freed it"), 0, "no freed alert on the agent alone");
-        assert!(sm.peer_emergency_resolve_at.is_none(), "the confirmation ends on the verdict");
+        assert_eq!(
+            alerts(&sm, "freed it"),
+            0,
+            "no freed alert on the agent alone"
+        );
+        assert!(
+            sm.peer_emergency_resolve_at.is_none(),
+            "the confirmation ends on the verdict"
+        );
         let b = peer_emergency_budget_read(&path, &boot);
-        assert!(b.futile >= *b.resets.last().unwrap(), "from the later of reset and verdict");
-        let f = sm.test_ha.as_ref().unwrap().actions.iter().find(|a| a.contains("ran, but")).unwrap().clone();
-        assert!(f.contains(&format!("{} still reports that it is locally disarmed", sm.config.node.peer)), "{f}");
-        assert!(f.contains(&format!("will not try again until {}", local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE))), "{f}");
-        assert!(f.contains("may restart them on another host") && f.contains("xe pool-ha-disable"), "{f}");
+        assert!(
+            b.futile >= *b.resets.last().unwrap(),
+            "from the later of reset and verdict"
+        );
+        let f = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .find(|a| a.contains("ran, but"))
+            .unwrap()
+            .clone();
+        assert!(
+            f.contains(&format!(
+                "{} still reports that it is locally disarmed",
+                sm.config.node.peer
+            )),
+            "{f}"
+        );
+        assert!(
+            f.contains(&format!(
+                "will not try again until {}",
+                local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)
+            )),
+            "{f}"
+        );
+        assert!(
+            f.contains("may restart them on another host") && f.contains("xe pool-ha-disable"),
+            "{f}"
+        );
         confirm(&mut sm);
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1, "held");
         let w = sm.ha_withheld.clone().unwrap();
-        assert!(w.reason.contains("did not free the peer") && w.reason.contains("60 minutes"), "{}", w.reason);
-        assert_eq!(sm.peer_emergency_hold.clone().unwrap().0, b.futile + PEER_EMERGENCY_AFTER_FUTILE);
+        assert!(
+            w.reason.contains("did not free the peer") && w.reason.contains("60 minutes"),
+            "{}",
+            w.reason
+        );
+        assert_eq!(
+            sm.peer_emergency_hold.clone().unwrap().0,
+            b.futile + PEER_EMERGENCY_AFTER_FUTILE
+        );
         sm.check_peer_emergency().await;
         // One alert for the futile reset, standing for its hold too.
         assert_eq!(alerts(&sm, "ran, but") + alerts(&sm, "is on hold until"), 1);
@@ -53325,7 +55209,15 @@ poll_interval_ms = 10
         sm.check_peer_emergency().await; // HA on, no task: probing starts
         sm.check_peer_emergency().await; // one normal answer
         assert!(sm.peer_emergency_verdict.is_some());
-        let freed = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("now answers normally as a slave")).count();
+        let freed = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("now answers normally as a slave"))
+                .count()
+        };
         assert_eq!(freed(&sm), 0);
         sm.check_peer_emergency().await; // two
         assert!(sm.peer_emergency_verdict.is_none() && sm.peer_emergency_resolve_at.is_none());
@@ -53357,21 +55249,36 @@ poll_interval_ms = 10
             seam(&mut sm).master_resilient = Some(true);
             seam(&mut sm).pool_ha = Some(true);
             let path = sm.peer_emergency_budget_path.clone();
-            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 30], pending: now - 30, ..Default::default() });
+            peer_emergency_budget_write(
+                &path,
+                &boot,
+                &PeerEmergencyBudget {
+                    resets: vec![now - 30],
+                    pending: now - 30,
+                    ..Default::default()
+                },
+            );
             sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
-            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
-                disabled: false,
-                enabled: false,
-                disable_note: "x".into(),
-                operator_off: off,
-                disable_issued: issued,
-                disable_may_land: may_land,
-                withheld: Option::None,
-            }));
+            sm.ha_cycle_result.lock().unwrap().push((
+                "peer_emergency",
+                PoolHaCycle {
+                    disabled: false,
+                    enabled: false,
+                    disable_note: "x".into(),
+                    operator_off: off,
+                    disable_issued: issued,
+                    disable_may_land: may_land,
+                    withheld: Option::None,
+                },
+            ));
             sm.check_peer_emergency().await;
             let b = peer_emergency_budget_read(&path, &boot);
             assert_eq!(b.resets.len(), kept, "{issued} {may_land} {off}");
-            assert_eq!(b.pending != 0, kept == 1, "the mark goes with a reset given back");
+            assert_eq!(
+                b.pending != 0,
+                kept == 1,
+                "the mark goes with a reset given back"
+            );
         }
         // A timed-out disable stays spent whatever follows; the re-arm
         // record says what to do. It took, and the watchdog re-enabled
@@ -53388,33 +55295,66 @@ poll_interval_ms = 10
             sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
             // This reset's own cycle wrote the record (just after the spend).
             let own = format!("peer_emergency:{}", now - 29);
-            ha_obligation_write_owned_at(&obl, "sr", 120, ObligationState::Pending { until: now + 420 }, &own);
+            ha_obligation_write_owned_at(
+                &obl,
+                "sr",
+                120,
+                ObligationState::Pending { until: now + 420 },
+                &own,
+            );
             let path = sm.peer_emergency_budget_path.clone();
-            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 30], pending: now - 30, ..Default::default() });
+            peer_emergency_budget_write(
+                &path,
+                &boot,
+                &PeerEmergencyBudget {
+                    resets: vec![now - 30],
+                    pending: now - 30,
+                    ..Default::default()
+                },
+            );
             sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
-            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
-                disabled: false,
-                enabled: false,
-                disable_note: "pool-ha-disable timed out".into(),
-                operator_off: false,
-                disable_issued: true,
-                disable_may_land: true,
-                withheld: Option::None,
-            }));
+            sm.ha_cycle_result.lock().unwrap().push((
+                "peer_emergency",
+                PoolHaCycle {
+                    disabled: false,
+                    enabled: false,
+                    disable_note: "pool-ha-disable timed out".into(),
+                    operator_off: false,
+                    disable_issued: true,
+                    disable_may_land: true,
+                    withheld: Option::None,
+                },
+            ));
             sm.check_peer_emergency().await;
-            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::DisableUnknown);
+            assert_eq!(
+                sm.peer_emergency_verdict.unwrap().phase,
+                VerdictPhase::DisableUnknown
+            );
             // Every pass reads pool HA on.
             sm.check_peer_emergency().await;
-            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::DisableUnknown);
+            assert_eq!(
+                sm.peer_emergency_verdict.unwrap().phase,
+                VerdictPhase::DisableUnknown
+            );
             if took {
                 ha_obligation_set_state_at(&obl, ObligationState::Owed);
                 ha_obligation_set_state_at(&obl, ObligationState::Enabled);
                 sm.check_peer_emergency().await;
-                assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+                assert_eq!(
+                    sm.peer_emergency_verdict.unwrap().phase,
+                    VerdictPhase::AwaitingHa
+                );
                 sm.check_peer_emergency().await; // HA on, no task: probing
-                assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::Probing);
+                assert_eq!(
+                    sm.peer_emergency_verdict.unwrap().phase,
+                    VerdictPhase::Probing
+                );
                 let b = peer_emergency_budget_read(&path, &boot);
-                assert_eq!((b.resets.len(), b.pending != 0), (1, true), "spent, verdict pending");
+                assert_eq!(
+                    (b.resets.len(), b.pending != 0),
+                    (1, true),
+                    "spent, verdict pending"
+                );
                 continue;
             }
             // Far past 420 s, HA on, no task: still not given back.
@@ -53428,13 +55368,26 @@ poll_interval_ms = 10
             let _ = std::fs::remove_file(&obl);
             sm.check_peer_emergency().await;
             let b = peer_emergency_budget_read(&path, &boot);
-            assert!(b.resets.len() == 1 && b.pending == 0 && b.futile == 0, "{b:?}");
+            assert!(
+                b.resets.len() == 1 && b.pending == 0 && b.futile == 0,
+                "{b:?}"
+            );
             assert!(sm.peer_emergency_resolve_at.is_none());
             // The spacing runs from the decision, not the reset's spawn.
             assert!(b.verdict_at >= now, "{b:?}");
             let h = peer_emergency_budget_hold(&b, b.verdict_at).unwrap();
-            assert_eq!((h.rule, h.until), (BudgetRule::Spacing, b.verdict_at + PEER_EMERGENCY_SPACING));
-            let alerts = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but") || a.contains("now answers normally as a slave")).count();
+            assert_eq!(
+                (h.rule, h.until),
+                (BudgetRule::Spacing, b.verdict_at + PEER_EMERGENCY_SPACING)
+            );
+            let alerts = sm
+                .test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("ran, but") || a.contains("now answers normally as a slave"))
+                .count();
             assert_eq!(alerts, 0);
         }
     }
@@ -53449,12 +55402,24 @@ poll_interval_ms = 10
     async fn only_the_resets_own_record_says_whether_its_disable_took() {
         let boot = current_boot_id();
         let now = crate::heal_state::unix_now();
-        assert!(record_is_resets(Some(&format!("peer_emergency:{}", now - 29)), now - 30));
-        assert!(!record_is_resets(Some(&format!("peer_emergency:{}", now - 31)), now - 30), "older than the reset");
-        assert!(!record_is_resets(Some(&format!("masterless:{}", now - 29)), now - 30));
+        assert!(record_is_resets(
+            Some(&format!("peer_emergency:{}", now - 29)),
+            now - 30
+        ));
+        assert!(
+            !record_is_resets(Some(&format!("peer_emergency:{}", now - 31)), now - 30),
+            "older than the reset"
+        );
+        assert!(!record_is_resets(
+            Some(&format!("masterless:{}", now - 29)),
+            now - 30
+        ));
         assert!(!record_is_resets(Option::None, now - 30));
         for (owner, state) in [
-            (Some(format!("masterless:{}", now - 10)), Some(ObligationState::Owed)),
+            (
+                Some(format!("masterless:{}", now - 10)),
+                Some(ObligationState::Owed),
+            ),
             (Option::None, Some(ObligationState::Owed)),
             (Option::None, Option::None),
         ] {
@@ -53473,24 +55438,54 @@ poll_interval_ms = 10
             }
             let path = sm.peer_emergency_budget_path.clone();
             // Resumed (restart or mastership back) in the disable phase.
-            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-                resets: vec![now - 30], pending: now - 30, pending_phase: "disable".into(), pending_since: now - 20,
-                ..Default::default()
-            });
+            peer_emergency_budget_write(
+                &path,
+                &boot,
+                &PeerEmergencyBudget {
+                    resets: vec![now - 30],
+                    pending: now - 30,
+                    pending_phase: "disable".into(),
+                    pending_since: now - 20,
+                    ..Default::default()
+                },
+            );
             sm.check_peer_emergency().await; // resumed
             sm.check_peer_emergency().await;
             let b = peer_emergency_budget_read(&path, &boot);
-            assert!(b.pending == 0 && b.futile != 0, "{owner:?} {state:?}: {b:?}");
-            let lost = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("before it could tell")).count();
+            assert!(
+                b.pending == 0 && b.futile != 0,
+                "{owner:?} {state:?}: {b:?}"
+            );
+            let lost = sm
+                .test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("before it could tell"))
+                .count();
             assert_eq!(lost, 1);
         }
         // The masterless chain leaves a record another routine holds
         // pending or owed, and writes over none or an enabled one.
         let owed = Some(ObligationState::Owed);
-        assert_eq!(masterless_record_write(Some(ObligationState::Pending { until: now + 1 }), owed, now), Option::None);
-        assert_eq!(masterless_record_write(Some(ObligationState::Pending { until: now }), owed, now), owed, "past its window");
-        assert_eq!(masterless_record_write(Some(ObligationState::Owed), owed, now), Option::None);
-        assert_eq!(masterless_record_write(Some(ObligationState::Enabled), owed, now), owed);
+        assert_eq!(
+            masterless_record_write(Some(ObligationState::Pending { until: now + 1 }), owed, now),
+            Option::None
+        );
+        assert_eq!(
+            masterless_record_write(Some(ObligationState::Pending { until: now }), owed, now),
+            owed,
+            "past its window"
+        );
+        assert_eq!(
+            masterless_record_write(Some(ObligationState::Owed), owed, now),
+            Option::None
+        );
+        assert_eq!(
+            masterless_record_write(Some(ObligationState::Enabled), owed, now),
+            owed
+        );
         assert_eq!(masterless_record_write(Option::None, owed, now), owed);
     }
 
@@ -53511,21 +55506,53 @@ poll_interval_ms = 10
         let now = ops.now_unix();
         // Another routine's disable, pending since before the pool went
         // masterless: its window long past.
-        ha_obligation_write_owned_at(&obl, "sr", 120, ObligationState::Pending { until: now - 600 }, "peer_emergency:1");
+        ha_obligation_write_owned_at(
+            &obl,
+            "sr",
+            120,
+            ObligationState::Pending { until: now - 600 },
+            "peer_emergency:1",
+        );
         sm.masterless_write_record("sr", 120).await;
         let f = ha_obligation_file_at(&obl).unwrap();
         assert_eq!(f.state, ObligationState::Owed);
-        assert!(f.owner.as_deref().is_some_and(|o| o.starts_with("masterless:")), "{f:?}");
+        assert!(
+            f.owner
+                .as_deref()
+                .is_some_and(|o| o.starts_with("masterless:")),
+            "{f:?}"
+        );
         // The watchdog's next pass: owed, HA off: the enable runs.
-        assert_eq!(obligation_step(&*ops, Some(false), true).await, ObligationStep::Proceed);
-        assert!(matches!(rearm_enable(&*ops, "sr", 120).await, RearmEnable::Returned));
+        assert_eq!(
+            obligation_step(&*ops, Some(false), true).await,
+            ObligationStep::Proceed
+        );
+        assert!(matches!(
+            rearm_enable(&*ops, "sr", 120).await,
+            RearmEnable::Returned
+        ));
         assert_eq!(ops.count("enable"), 1);
-        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 0);
+        assert_eq!(
+            ops.count("alert: TwinStor: pool HA is off and TwinStor did not"),
+            0
+        );
         // A pending record still inside its window: left as it is.
-        ha_obligation_write_owned_at(&obl, "sr", 120, ObligationState::Pending { until: now + 300 }, "peer_emergency:2");
+        ha_obligation_write_owned_at(
+            &obl,
+            "sr",
+            120,
+            ObligationState::Pending { until: now + 300 },
+            "peer_emergency:2",
+        );
         sm.masterless_write_record("sr", 120).await;
         let f = ha_obligation_file_at(&obl).unwrap();
-        assert_eq!((f.state, f.owner.as_deref()), (ObligationState::Pending { until: now + 300 }, Some("peer_emergency:2")));
+        assert_eq!(
+            (f.state, f.owner.as_deref()),
+            (
+                ObligationState::Pending { until: now + 300 },
+                Some("peer_emergency:2")
+            )
+        );
     }
 
     /// A reset judged freed, then relapsing: its futile alert is sent under
@@ -53543,14 +55570,30 @@ poll_interval_ms = 10
         let path = sm.peer_emergency_budget_path.clone();
         let reset = now - 300;
         // The verdict on a reset, probing: two slave answers free it.
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![reset], pending: reset, ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![reset],
+                pending: reset,
+                ..Default::default()
+            },
+        );
         sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
-        sm.peer_emergency_verdict = Some(ResetVerdict::at(VerdictPhase::Probing, std::time::Instant::now(), now - 200));
+        sm.peer_emergency_verdict = Some(ResetVerdict::at(
+            VerdictPhase::Probing,
+            std::time::Instant::now(),
+            now - 200,
+        ));
         sm.check_peer_emergency().await;
         sm.check_peer_emergency().await;
         let key = peer_emergency_verdict_key(reset);
         let acts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.clone();
-        assert!(acts(&sm).iter().any(|a| a.contains("now answers normally as a slave")));
+        assert!(
+            acts(&sm)
+                .iter()
+                .any(|a| a.contains("now answers normally as a slave"))
+        );
         assert!(acts(&sm).contains(&format!("keyed: {key}")));
         // It relapses (two sightings): the futile alert for the same reset.
         sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
@@ -53561,10 +55604,23 @@ poll_interval_ms = 10
         sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
         sm.check_peer_emergency().await;
         let a = acts(&sm);
-        let forget = a.iter().position(|x| *x == format!("forget-alert: {key}")).expect("the queued freed alert is dropped");
-        let relapse = a.iter().position(|x| x.contains("again reports that it is locally disarmed")).unwrap();
-        assert!(forget < relapse, "dropped before the futile alert is raised");
-        assert_eq!(a.iter().filter(|x| **x == format!("keyed: {key}")).count(), 2, "both under one key");
+        let forget = a
+            .iter()
+            .position(|x| *x == format!("forget-alert: {key}"))
+            .expect("the queued freed alert is dropped");
+        let relapse = a
+            .iter()
+            .position(|x| x.contains("again reports that it is locally disarmed"))
+            .unwrap();
+        assert!(
+            forget < relapse,
+            "dropped before the futile alert is raised"
+        );
+        assert_eq!(
+            a.iter().filter(|x| **x == format!("keyed: {key}")).count(),
+            2,
+            "both under one key"
+        );
     }
 
     /// Pool HA turned off by hand while the verdict probes the peer (the
@@ -53584,28 +55640,65 @@ poll_interval_ms = 10
             let obl = format!("{}/obligation", seam_dir(&format!("{name}-obl")));
             sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
             if let Some(r) = record {
-                ha_obligation_write_owned_at(&obl, "sr", 120, r, &format!("peer_emergency:{}", now - 300));
+                ha_obligation_write_owned_at(
+                    &obl,
+                    "sr",
+                    120,
+                    r,
+                    &format!("peer_emergency:{}", now - 300),
+                );
             }
             let path = sm.peer_emergency_budget_path.clone();
-            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-                resets: vec![now - 300], pending: now - 300, pending_phase: "probe".into(),
-                pending_since: now - 200, ..Default::default()
-            });
+            peer_emergency_budget_write(
+                &path,
+                &boot,
+                &PeerEmergencyBudget {
+                    resets: vec![now - 300],
+                    pending: now - 300,
+                    pending_phase: "probe".into(),
+                    pending_since: now - 200,
+                    ..Default::default()
+                },
+            );
             sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
-            sm.peer_emergency_verdict = Some(ResetVerdict::at(VerdictPhase::Probing, std::time::Instant::now(), now - 200));
+            sm.peer_emergency_verdict = Some(ResetVerdict::at(
+                VerdictPhase::Probing,
+                std::time::Instant::now(),
+                now - 200,
+            ));
             (sm, path)
         };
         for record in [Option::None, Some(ObligationState::Enabled)] {
             let (mut sm, path) = probing("pe-interrupted", record);
             sm.check_peer_emergency().await;
             let b = peer_emergency_budget_read(&path, &boot);
-            assert_eq!((b.pending, b.futile, b.alerted_until), (0, 0, 0), "{record:?}: {b:?}");
-            assert!(b.verdict_at >= now, "the spacing runs from the interruption");
+            assert_eq!(
+                (b.pending, b.futile, b.alerted_until),
+                (0, 0, 0),
+                "{record:?}: {b:?}"
+            );
+            assert!(
+                b.verdict_at >= now,
+                "the spacing runs from the interruption"
+            );
             assert!(sm.peer_emergency_verdict.is_none() && sm.peer_emergency_resolve_at.is_none());
-            assert!(sm.test_ha.as_ref().unwrap().actions.iter().all(|a| !a.starts_with("alert") && !a.starts_with("advice") && !a.starts_with("keyed")),
-                "no alert: {:?}", sm.test_ha.as_ref().unwrap().actions);
+            assert!(
+                sm.test_ha
+                    .as_ref()
+                    .unwrap()
+                    .actions
+                    .iter()
+                    .all(|a| !a.starts_with("alert")
+                        && !a.starts_with("advice")
+                        && !a.starts_with("keyed")),
+                "no alert: {:?}",
+                sm.test_ha.as_ref().unwrap().actions
+            );
             let hold = peer_emergency_budget_hold(&b, now).expect("the usual spacing");
-            assert!(hold.until <= b.verdict_at + PEER_EMERGENCY_SPACING, "no hour's hold: {hold:?}");
+            assert!(
+                hold.until <= b.verdict_at + PEER_EMERGENCY_SPACING,
+                "no hour's hold: {hold:?}"
+            );
         }
         // TwinStor's own record owes the enable: not interrupted.
         let (mut sm, path) = probing("pe-not-interrupted", Some(ObligationState::Owed));
@@ -53655,25 +55748,58 @@ poll_interval_ms = 10
         let old = now - PEER_EMERGENCY_VERDICT_BOUND.as_secs() - 5;
         let mut sm = wedged("pe-pending-old");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![old], pending: old, ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![old],
+                pending: old,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         let b = peer_emergency_budget_read(&path, &boot);
         assert_eq!(b.pending, 0);
-        assert!(b.futile >= now, "the hour runs from the verdict, not the old reset");
-        let a = sm.test_ha.as_ref().unwrap().actions.iter().find(|a| a.contains("ran, but")).unwrap().clone();
+        assert!(
+            b.futile >= now,
+            "the hour runs from the verdict, not the old reset"
+        );
+        let a = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .find(|a| a.contains("ran, but"))
+            .unwrap()
+            .clone();
         assert!(a.contains("before it could tell whether that freed"), "{a}");
-        assert!(a.contains(&local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)), "{a}");
+        assert!(
+            a.contains(&local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)),
+            "{a}"
+        );
         // A younger one: the verdict resumes.
         let young = now - 60;
         let mut sm = wedged("pe-pending-young");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![young], pending: young, ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![young],
+                pending: young,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         assert!(sm.peer_emergency_resolve_at.is_some() && sm.peer_emergency_verdict.is_some());
         assert_eq!(peer_emergency_budget_read(&path, &boot).pending, young);
         // An unwritable budget (its directory is a file): no reset.
         let mut sm = wedged("pe-unwritable");
-        let dir = std::path::Path::new(&sm.peer_emergency_budget_path).parent().unwrap().to_path_buf();
+        let dir = std::path::Path::new(&sm.peer_emergency_budget_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let blocker = dir.join("not-a-dir");
         std::fs::write(&blocker, "x").unwrap();
         sm.peer_emergency_budget_path = blocker.join("budget").to_string_lossy().into_owned();
@@ -53719,15 +55845,18 @@ poll_interval_ms = 10
             confirm(&mut sm);
             sm.check_peer_emergency().await;
             assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
-            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
-                disabled: true,
-                enabled: false,
-                disable_note: "disable".into(),
-                operator_off: false,
-                disable_issued: true,
-                disable_may_land: false,
-                withheld: Option::None,
-            }));
+            sm.ha_cycle_result.lock().unwrap().push((
+                "peer_emergency",
+                PoolHaCycle {
+                    disabled: true,
+                    enabled: false,
+                    disable_note: "disable".into(),
+                    operator_off: false,
+                    disable_issued: true,
+                    disable_may_land: false,
+                    withheld: Option::None,
+                },
+            ));
             if record_kept {
                 ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
             } else {
@@ -53735,14 +55864,27 @@ poll_interval_ms = 10
             }
             seam(&mut sm).pool_ha = Some(false);
             sm.check_peer_emergency().await; // the cycle returned, HA off
-            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+            assert_eq!(
+                sm.peer_emergency_verdict.unwrap().phase,
+                VerdictPhase::AwaitingHa
+            );
             // Long past the verdict's own time, HA still off.
             sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict {
                 since: v.since - PEER_EMERGENCY_CONFIRM_AFTER * 3,
                 ..v
             });
             sm.check_peer_emergency().await;
-            let alerts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but") || a.contains("now answers normally as a slave")).count();
+            let alerts = |sm: &StateMachine| {
+                sm.test_ha
+                    .as_ref()
+                    .unwrap()
+                    .actions
+                    .iter()
+                    .filter(|a| {
+                        a.contains("ran, but") || a.contains("now answers normally as a slave")
+                    })
+                    .count()
+            };
             if !record_kept {
                 // Nothing owes the enable: futile, logged only.
                 assert!(sm.peer_emergency_resolve_at.is_none());
@@ -53751,17 +55893,34 @@ poll_interval_ms = 10
                 assert_eq!(alerts(&sm), 0);
                 continue;
             }
-            assert!(sm.peer_emergency_resolve_at.is_some(), "still waiting for pool HA");
-            assert_eq!(alerts(&sm), 0, "no futile alert while the re-enable is pending");
+            assert!(
+                sm.peer_emergency_resolve_at.is_some(),
+                "still waiting for pool HA"
+            );
+            assert_eq!(
+                alerts(&sm),
+                0,
+                "no futile alert while the re-enable is pending"
+            );
             // The record's enable runs; the peer answers as a slave twice.
             seam(&mut sm).pool_ha = Some(true);
             sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
             sm.check_peer_emergency().await; // the verdict starts
-            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::Probing);
+            assert_eq!(
+                sm.peer_emergency_verdict.unwrap().phase,
+                VerdictPhase::Probing
+            );
             sm.check_peer_emergency().await;
             sm.check_peer_emergency().await;
             assert!(sm.peer_emergency_resolve_at.is_none());
-            let freed = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("now answers normally as a slave")).count();
+            let freed = sm
+                .test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("now answers normally as a slave"))
+                .count();
             assert_eq!(freed, 1);
             assert_eq!(peer_emergency_budget_read(&path, &boot).futile, 0);
         }
@@ -53788,21 +55947,42 @@ poll_interval_ms = 10
             sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
             ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
             let path = sm.peer_emergency_budget_path.clone();
-            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-                resets: vec![returned - 200],
-                pending: returned - 200,
-                pending_phase: "ha".into(),
-                pending_since: returned,
-                ..Default::default()
-            });
+            peer_emergency_budget_write(
+                &path,
+                &boot,
+                &PeerEmergencyBudget {
+                    resets: vec![returned - 200],
+                    pending: returned - 200,
+                    pending_phase: "ha".into(),
+                    pending_since: returned,
+                    ..Default::default()
+                },
+            );
             (sm, path)
         };
-        let alerts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("minutes after its pool-level HA reset")).cloned().collect::<Vec<_>>();
+        let alerts = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("minutes after its pool-level HA reset"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let task_at = now - 25 * 60;
         for (ha, task, read, enable) in [
             (Some(false), false, "pool HA reads off", true),
             (Option::None, false, "pool HA could not be read", false),
-            (Some(true), true, &*format!("an HA operation has been pending since {}", local_hm(task_at)), false),
+            (
+                Some(true),
+                true,
+                &*format!(
+                    "an HA operation has been pending since {}",
+                    local_hm(task_at)
+                ),
+                false,
+            ),
         ] {
             // A restarted daemon 20 minutes into the wait (past the cycle's
             // own 570 s bound): resumes the wait, no verdict yet.
@@ -53815,17 +55995,30 @@ poll_interval_ms = 10
                 }];
             }
             sm.check_peer_emergency().await;
-            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+            assert_eq!(
+                sm.peer_emergency_verdict.unwrap().phase,
+                VerdictPhase::AwaitingHa
+            );
             sm.check_peer_emergency().await;
-            assert!(sm.peer_emergency_resolve_at.is_some() && alerts(&sm).is_empty(), "{ha:?}");
+            assert!(
+                sm.peer_emergency_resolve_at.is_some() && alerts(&sm).is_empty(),
+                "{ha:?}"
+            );
             assert_eq!(peer_emergency_budget_read(&path, &boot).futile, 0);
             // Thirty minutes from the cycle's return: futile, one alert.
-            sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict { returned: now - 31 * 60, ..v });
+            sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict {
+                returned: now - 31 * 60,
+                ..v
+            });
             sm.check_peer_emergency().await;
             let a = alerts(&sm);
             assert_eq!(a.len(), 1, "{a:?}");
             assert!(a[0].contains(read), "{}", a[0]);
-            assert!(a[0].contains(&format!("for the peer host {}", sm.config.node.peer)), "{}", a[0]);
+            assert!(
+                a[0].contains(&format!("for the peer host {}", sm.config.node.peer)),
+                "{}",
+                a[0]
+            );
             assert_eq!(a[0].contains("xe pool-ha-enable"), enable, "{}", a[0]);
             assert!(!a[0].contains("xe pool-ha-disable"), "{}", a[0]);
             let b = peer_emergency_budget_read(&path, &boot);
@@ -53847,14 +56040,27 @@ poll_interval_ms = 10
         seam(&mut sm).pool_ha = Some(false);
         sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-            resets: vec![now - 1300], pending: now - 1300, pending_phase: "ha".into(), pending_since: now - 1200,
-            ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 1300],
+                pending: now - 1300,
+                pending_phase: "ha".into(),
+                pending_since: now - 1200,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await; // resumed, 20 minutes into the wait
-        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        assert_eq!(
+            sm.peer_emergency_verdict.unwrap().phase,
+            VerdictPhase::AwaitingHa
+        );
         sm.ha_reset_inflight.store(true, Ordering::SeqCst);
-        sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict { returned: now - 31 * 60, ..v });
+        sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict {
+            returned: now - 31 * 60,
+            ..v
+        });
         sm.check_peer_emergency().await;
         let b = peer_emergency_budget_read(&path, &boot);
         assert!(b.pending == 0 && b.futile != 0, "{b:?}");
@@ -53876,22 +56082,44 @@ poll_interval_ms = 10
             seam(&mut sm).pool_ha = Some(true);
             sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
             let path = sm.peer_emergency_budget_path.clone();
-            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-                resets: vec![now - 7300],
-                pending: now - 7300,
-                pending_phase: phase.into(),
-                pending_since: now - 7200,
-                ..Default::default()
-            });
+            peer_emergency_budget_write(
+                &path,
+                &boot,
+                &PeerEmergencyBudget {
+                    resets: vec![now - 7300],
+                    pending: now - 7300,
+                    pending_phase: phase.into(),
+                    pending_since: now - 7200,
+                    ..Default::default()
+                },
+            );
             for _ in 0..4 {
                 sm.check_peer_emergency().await;
             }
             let acts = &sm.test_ha.as_ref().unwrap().actions;
-            assert_eq!(acts.iter().filter(|a| a.contains("now answers normally as a slave")).count(), 0, "{phase}");
-            assert_eq!(acts.iter().filter(|a| a.contains("before it could tell")).count(), 1, "{phase}");
+            assert_eq!(
+                acts.iter()
+                    .filter(|a| a.contains("now answers normally as a slave"))
+                    .count(),
+                0,
+                "{phase}"
+            );
+            assert_eq!(
+                acts.iter()
+                    .filter(|a| a.contains("before it could tell"))
+                    .count(),
+                1,
+                "{phase}"
+            );
             let b = peer_emergency_budget_read(&path, &boot);
-            assert!(b.pending == 0 && b.futile >= now && b.freed_at == 0, "{b:?}");
-            assert_eq!(peer_emergency_budget_hold(&b, now).unwrap().until, b.futile + PEER_EMERGENCY_AFTER_FUTILE);
+            assert!(
+                b.pending == 0 && b.futile >= now && b.freed_at == 0,
+                "{b:?}"
+            );
+            assert_eq!(
+                peer_emergency_budget_hold(&b, now).unwrap().until,
+                b.futile + PEER_EMERGENCY_AFTER_FUTILE
+            );
         }
     }
 
@@ -53910,21 +56138,39 @@ poll_interval_ms = 10
         let obl = format!("{}/obligation", seam_dir("pe-ha-race-obl"));
         sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None))); // no record
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-            resets: vec![now - 300], pending: now - 300, pending_phase: "ha".into(), pending_since: now - 200,
-            ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 300],
+                pending: now - 300,
+                pending_phase: "ha".into(),
+                pending_since: now - 200,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await; // resumed, waiting for pool HA
-        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        assert_eq!(
+            sm.peer_emergency_verdict.unwrap().phase,
+            VerdictPhase::AwaitingHa
+        );
         // The pass's first read sees HA off; the enable lands; the record is
         // gone; the read after it sees HA on.
-        seam(&mut sm).pool_ha_next.lock().unwrap().extend([Some(false), Some(true)]);
+        seam(&mut sm)
+            .pool_ha_next
+            .lock()
+            .unwrap()
+            .extend([Some(false), Some(true)]);
         sm.check_peer_emergency().await;
         let b = peer_emergency_budget_read(&path, &boot);
         assert!(b.pending != 0 && b.futile == 0, "not futile: {b:?}");
         assert!(sm.peer_emergency_resolve_at.is_some());
         // Off on both reads, no record: HA left off.
-        seam(&mut sm).pool_ha_next.lock().unwrap().extend([Some(false), Some(false)]);
+        seam(&mut sm)
+            .pool_ha_next
+            .lock()
+            .unwrap()
+            .extend([Some(false), Some(false)]);
         sm.check_peer_emergency().await;
         let b = peer_emergency_budget_read(&path, &boot);
         assert!(b.pending == 0 && b.futile != 0, "{b:?}");
@@ -53959,9 +56205,16 @@ poll_interval_ms = 10
         let reset = now - 660;
         let mut sm = wedged("pe-relapse");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-            resets: vec![reset], freed_at: now - 60, freed_reset: reset, ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![reset],
+                freed_at: now - 60,
+                freed_reset: reset,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         // One sighting is not a relapse yet.
         let b = peer_emergency_budget_read(&path, &boot);
@@ -53970,19 +56223,45 @@ poll_interval_ms = 10
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
         let b = peer_emergency_budget_read(&path, &boot);
-        assert!(b.futile >= now && b.freed_at == 0, "the hour runs from the relapse");
+        assert!(
+            b.futile >= now && b.freed_at == 0,
+            "the hour runs from the relapse"
+        );
         let w = sm.ha_withheld.clone().unwrap();
         assert!(w.reason.contains("did not free the peer"), "{}", w.reason);
-        let relapse: Vec<_> = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but")).cloned().collect();
+        let relapse: Vec<_> = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .filter(|a| a.contains("ran, but"))
+            .cloned()
+            .collect();
         assert_eq!(relapse.len(), 1);
-        assert!(relapse[0].contains("again reports that it is locally disarmed"), "{}", relapse[0]);
-        assert!(relapse[0].contains(&local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)), "{}", relapse[0]);
+        assert!(
+            relapse[0].contains("again reports that it is locally disarmed"),
+            "{}",
+            relapse[0]
+        );
+        assert!(
+            relapse[0].contains(&local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)),
+            "{}",
+            relapse[0]
+        );
         // Freed more than 30 minutes ago: a new wedge, reset after the spacing.
         let mut sm = wedged("pe-new-wedge");
         let path = sm.peer_emergency_budget_path.clone();
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
-            resets: vec![now - 2400], freed_at: now - 1860, freed_reset: now - 2400, ..Default::default()
-        });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 2400],
+                freed_at: now - 1860,
+                freed_reset: now - 2400,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         confirm(&mut sm);
         sm.check_peer_emergency().await;
@@ -54009,7 +56288,15 @@ poll_interval_ms = 10
         // started, the file then turning unwritable.
         let good = sm.peer_emergency_budget_path.clone();
         let old = now - PEER_EMERGENCY_VERDICT_BOUND.as_secs() - 5;
-        peer_emergency_budget_write(&good, &boot, &PeerEmergencyBudget { resets: vec![old], pending: old, ..Default::default() });
+        peer_emergency_budget_write(
+            &good,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![old],
+                pending: old,
+                ..Default::default()
+            },
+        );
         let dir = std::path::Path::new(&good).parent().unwrap().to_path_buf();
         let blocked = dir.join("blocked");
         std::fs::create_dir_all(&blocked).unwrap();
@@ -54020,18 +56307,47 @@ poll_interval_ms = 10
         perm.set_mode(0o500);
         std::fs::set_permissions(&blocked, perm.clone()).unwrap();
         sm.peer_emergency_budget_path = path.clone();
-        let futile = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but")).count();
-        let unwritable = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("cannot write its pool HA reset budget")).count();
+        let futile = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("ran, but"))
+                .count()
+        };
+        let unwritable = |sm: &StateMachine| {
+            sm.test_ha
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .filter(|a| a.contains("cannot write its pool HA reset budget"))
+                .count()
+        };
         // Running as root ignores the directory's mode: then nothing to test.
-        let writable = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(blocked.join("probe")).is_ok();
+        let writable = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(blocked.join("probe"))
+            .is_ok();
         if !writable {
             for _ in 0..4 {
                 sm.check_peer_emergency().await;
             }
             assert_eq!(futile(&sm), 1, "the restart path ran once, not every pass");
-            assert_eq!(unwritable(&sm), 1, "one alert while the write keeps failing");
+            assert_eq!(
+                unwritable(&sm),
+                1,
+                "one alert while the write keeps failing"
+            );
             assert_eq!(sm.pe_budget().pending, 0);
-            assert_eq!(peer_emergency_budget_read(&path, &boot).pending, old, "the file is stale");
+            assert_eq!(
+                peer_emergency_budget_read(&path, &boot).pending,
+                old,
+                "the file is stale"
+            );
             perm.set_mode(0o700);
             std::fs::set_permissions(&blocked, perm).unwrap();
             sm.check_peer_emergency().await;
@@ -54052,16 +56368,38 @@ poll_interval_ms = 10
     fn the_holds_run_from_the_later_of_the_reset_and_its_verdict() {
         let now = 1_000_000u64;
         // A futile verdict 70 minutes after its reset: an hour from the verdict.
-        let late = PeerEmergencyBudget { resets: vec![now - 4200], futile: now, verdict_at: now, ..Default::default() };
+        let late = PeerEmergencyBudget {
+            resets: vec![now - 4200],
+            futile: now,
+            verdict_at: now,
+            ..Default::default()
+        };
         let h = peer_emergency_budget_hold(&late, now + 60).unwrap();
-        assert_eq!((h.rule, h.until), (BudgetRule::AfterFutile, now + PEER_EMERGENCY_AFTER_FUTILE));
+        assert_eq!(
+            (h.rule, h.until),
+            (BudgetRule::AfterFutile, now + PEER_EMERGENCY_AFTER_FUTILE)
+        );
         // The spacing from a verdict newer than its reset.
-        let freed = PeerEmergencyBudget { resets: vec![now - 1200], verdict_at: now - 120, ..Default::default() };
+        let freed = PeerEmergencyBudget {
+            resets: vec![now - 1200],
+            verdict_at: now - 120,
+            ..Default::default()
+        };
         let h = peer_emergency_budget_hold(&freed, now).unwrap();
-        assert_eq!((h.rule, h.until), (BudgetRule::Spacing, now - 120 + PEER_EMERGENCY_SPACING));
+        assert_eq!(
+            (h.rule, h.until),
+            (BudgetRule::Spacing, now - 120 + PEER_EMERGENCY_SPACING)
+        );
         // A reset after the verdict: from the reset.
-        let after = PeerEmergencyBudget { resets: vec![now - 1200, now - 60], verdict_at: now - 600, ..Default::default() };
-        assert_eq!(peer_emergency_budget_hold(&after, now).unwrap().until, now - 60 + PEER_EMERGENCY_SPACING);
+        let after = PeerEmergencyBudget {
+            resets: vec![now - 1200, now - 60],
+            verdict_at: now - 600,
+            ..Default::default()
+        };
+        assert_eq!(
+            peer_emergency_budget_hold(&after, now).unwrap().until,
+            now - 60 + PEER_EMERGENCY_SPACING
+        );
     }
 
     /// A futile reset's alert stands for its hold: the hold alert does not
@@ -54084,7 +56422,15 @@ poll_interval_ms = 10
         let path = sm.peer_emergency_budget_path.clone();
         // A verdict lost past the cycle's bound: futile (Unknown).
         let old = now - PEER_EMERGENCY_VERDICT_BOUND.as_secs() - 5;
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![old], pending: old, ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![old],
+                pending: old,
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
         for _ in 0..3 {
@@ -54094,25 +56440,65 @@ poll_interval_ms = 10
             sm.check_peer_emergency().await;
         }
         let acts = sm.test_ha.as_ref().unwrap().actions.clone();
-        let lost: Vec<_> = acts.iter().filter(|a| a.contains("before it could tell")).collect();
+        let lost: Vec<_> = acts
+            .iter()
+            .filter(|a| a.contains("before it could tell"))
+            .collect();
         assert_eq!(lost.len(), 1);
-        assert!(lost[0].starts_with("alert: "), "plain, not advice: {}", lost[0]);
-        assert!(sm.ha_withheld.clone().unwrap().reason.contains("did not free the peer"));
-        assert_eq!(acts.iter().filter(|a| a.contains("is on hold until")).count(), 0, "one hold, one alert");
+        assert!(
+            lost[0].starts_with("alert: "),
+            "plain, not advice: {}",
+            lost[0]
+        );
+        assert!(
+            sm.ha_withheld
+                .clone()
+                .unwrap()
+                .reason
+                .contains("did not free the peer")
+        );
+        assert_eq!(
+            acts.iter()
+                .filter(|a| a.contains("is on hold until"))
+                .count(),
+            0,
+            "one hold, one alert"
+        );
         // Routing by text.
-        let h = BudgetHold { rule: BudgetRule::AfterFutile, why: "x".into(), until: now };
-        let waited = FutileWhy::Waited { last_ha: Some(true), task_since: 0, task_read_failed: false };
+        let h = BudgetHold {
+            rule: BudgetRule::AfterFutile,
+            why: "x".into(),
+            until: now,
+        };
+        let waited = FutileWhy::Waited {
+            last_ha: Some(true),
+            task_since: 0,
+            task_read_failed: false,
+        };
         let t = futile_reset_alert(waited, &h, now, "a", "b", 120);
-        assert!(t.contains("pool HA reads on,") && !t.contains("task list"), "{t}");
-        let failed = FutileWhy::Waited { last_ha: Some(true), task_since: 0, task_read_failed: true };
-        assert!(futile_reset_alert(failed, &h, now, "a", "b", 120).contains("task list could not be read"));
+        assert!(
+            t.contains("pool HA reads on,") && !t.contains("task list"),
+            "{t}"
+        );
+        let failed = FutileWhy::Waited {
+            last_ha: Some(true),
+            task_since: 0,
+            task_read_failed: true,
+        };
+        assert!(
+            futile_reset_alert(failed, &h, now, "a", "b", 120)
+                .contains("task list could not be read")
+        );
         // One alert for an unwritable budget, refused reset or not.
         let mut sm = seam_sm("pe-unwritable-one");
         sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
         seam(&mut sm).master_resilient = Some(true);
         seam(&mut sm).pool_ha = Some(true);
         sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
-        let dir = std::path::Path::new(&sm.peer_emergency_budget_path).parent().unwrap().to_path_buf();
+        let dir = std::path::Path::new(&sm.peer_emergency_budget_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let blocker = dir.join("not-a-dir");
         std::fs::write(&blocker, "x").unwrap();
         sm.peer_emergency_budget_path = blocker.join("budget").to_string_lossy().into_owned();
@@ -54125,9 +56511,22 @@ poll_interval_ms = 10
             sm.check_peer_emergency().await;
         }
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
-        let unwritable: Vec<_> = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("cannot write its pool HA reset budget")).cloned().collect();
+        let unwritable: Vec<_> = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .filter(|a| a.contains("cannot write its pool HA reset budget"))
+            .cloned()
+            .collect();
         assert_eq!(unwritable.len(), 1, "{unwritable:?}");
-        assert!(unwritable[0].contains("xe pool-ha-disable") && unwritable[0].contains(&sm.config.node.peer), "{}", unwritable[0]);
+        assert!(
+            unwritable[0].contains("xe pool-ha-disable")
+                && unwritable[0].contains(&sm.config.node.peer),
+            "{}",
+            unwritable[0]
+        );
     }
 
     /// The pacing across both kinds of hold: a spacing hold is logged and
@@ -54154,21 +56553,50 @@ poll_interval_ms = 10
             sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
         };
         // Two resets, the last 4 minutes ago: the spacing holds it.
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 3600, now - 240], ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 3600, now - 240],
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
         confirm(&mut sm);
         sm.check_peer_emergency().await;
-        assert!(sm.ha_withheld.clone().unwrap().reason.contains("the spacing"));
+        assert!(
+            sm.ha_withheld
+                .clone()
+                .unwrap()
+                .reason
+                .contains("the spacing")
+        );
         assert!(sm.peer_emergency_hold.is_some());
         assert_eq!(seam_actions(&sm, "advice"), 0);
         // A third reset ran meanwhile: the budget holds it, alerted once.
-        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 3600, now - 1800, now - 900], ..Default::default() });
+        peer_emergency_budget_write(
+            &path,
+            &boot,
+            &PeerEmergencyBudget {
+                resets: vec![now - 3600, now - 1800, now - 900],
+                ..Default::default()
+            },
+        );
         sm.check_peer_emergency().await;
-        assert!(sm.ha_withheld.clone().unwrap().reason.contains("the budget"));
+        assert!(
+            sm.ha_withheld
+                .clone()
+                .unwrap()
+                .reason
+                .contains("the budget")
+        );
         assert_eq!(seam_actions(&sm, "advice"), 1);
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "advice"), 1);
-        assert_eq!(peer_emergency_budget_read(&path, &boot).alerted_until, now - 3600 + PEER_EMERGENCY_BUDGET_WINDOW);
+        assert_eq!(
+            peer_emergency_budget_read(&path, &boot).alerted_until,
+            now - 3600 + PEER_EMERGENCY_BUDGET_WINDOW
+        );
     }
 
     /// With another pool HA cycle in flight, a confirmed peer-emergency
@@ -54184,11 +56612,18 @@ poll_interval_ms = 10
         sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
         sm.ha_reset_inflight.store(true, Ordering::SeqCst);
         sm.check_peer_emergency().await;
-        sm.peer_mismatch.first = sm.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.peer_mismatch.first = sm
+            .peer_mismatch
+            .first
+            .map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
         sm.check_peer_emergency().await;
         assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
         assert_eq!(sm.peer_emergency_unissued_at, Option::None);
-        assert!(peer_emergency_budget_read(&sm.peer_emergency_budget_path, &current_boot_id()).resets.is_empty());
+        assert!(
+            peer_emergency_budget_read(&sm.peer_emergency_budget_path, &current_boot_id())
+                .resets
+                .is_empty()
+        );
         assert_eq!(sm.peer_emergency_resolve_at, Option::None);
         sm.ha_reset_inflight.store(false, Ordering::SeqCst);
         sm.check_peer_emergency().await;
@@ -54207,11 +56642,27 @@ poll_interval_ms = 10
             disable_may_land: false,
             withheld: Option::None,
         };
-        sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", r("a")));
-        sm.ha_cycle_result.lock().unwrap().push(("recorded_rearm", r("b")));
-        assert_eq!(sm.take_ha_cycle_result("recorded_rearm").unwrap().disable_note, "b");
+        sm.ha_cycle_result
+            .lock()
+            .unwrap()
+            .push(("peer_emergency", r("a")));
+        sm.ha_cycle_result
+            .lock()
+            .unwrap()
+            .push(("recorded_rearm", r("b")));
+        assert_eq!(
+            sm.take_ha_cycle_result("recorded_rearm")
+                .unwrap()
+                .disable_note,
+            "b"
+        );
         assert_eq!(sm.take_ha_cycle_result("recorded_rearm"), Option::None);
-        assert_eq!(sm.take_ha_cycle_result("peer_emergency").unwrap().disable_note, "a");
+        assert_eq!(
+            sm.take_ha_cycle_result("peer_emergency")
+                .unwrap()
+                .disable_note,
+            "a"
+        );
     }
 
     /// Scripted pool HA operations: each call takes the next scripted answer
@@ -54249,7 +56700,10 @@ poll_interval_ms = 10
         /// pool HA reading `before` just before the disable.
         fn at(path: &str, before: Option<bool>) -> Self {
             let _ = std::fs::remove_file(path);
-            let o = Self { obl_path: path.to_string(), ..Default::default() };
+            let o = Self {
+                obl_path: path.to_string(),
+                ..Default::default()
+            };
             o.pool_ha.lock().unwrap().push_back(before);
             o
         }
@@ -54257,10 +56711,19 @@ poll_interval_ms = 10
             self.log.lock().unwrap().push(s.to_string());
         }
         fn count(&self, s: &str) -> usize {
-            self.log.lock().unwrap().iter().filter(|l| l.starts_with(s)).count()
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with(s))
+                .count()
         }
         fn task(name: &str, created: u64) -> xapi::PendingHaTask {
-            xapi::PendingHaTask { uuid: "t".into(), name: name.into(), created_unix: Some(created) }
+            xapi::PendingHaTask {
+                uuid: "t".into(),
+                name: name.into(),
+                created_unix: Some(created),
+            }
         }
     }
 
@@ -54268,18 +56731,30 @@ poll_interval_ms = 10
     impl HaOps for ScriptedHaOps {
         async fn disable(&self) -> HaCmd {
             self.note("disable");
-            self.disable.lock().unwrap().pop_front().unwrap_or(HaCmd::Done)
+            self.disable
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(HaCmd::Done)
         }
         async fn enable(&self, _sr: &str, _timeout: u64) -> HaCmd {
             self.note("enable");
-            self.enable.lock().unwrap().pop_front().unwrap_or(HaCmd::Done)
+            self.enable
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(HaCmd::Done)
         }
         async fn pool_ha(&self) -> Option<bool> {
             self.note("pool_ha");
             self.pool_ha.lock().unwrap().pop_front().flatten()
         }
         async fn pending_tasks(&self) -> Option<Vec<xapi::PendingHaTask>> {
-            self.pending.lock().unwrap().pop_front().unwrap_or(Some(Vec::new()))
+            self.pending
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Some(Vec::new()))
         }
         async fn plug_pbds(&self) {
             self.note("plug");
@@ -54356,20 +56831,34 @@ poll_interval_ms = 10
     async fn the_survivor_reset_announces_before_its_start_checks() {
         let dir = seam_dir("survivor-order");
         let ops = ScriptedHaOps::at(&format!("{dir}/obl"), Some(true));
-        ops.disable.lock().unwrap().push_back(HaCmd::Refused("x".into()));
+        ops.disable
+            .lock()
+            .unwrap()
+            .push_back(HaCmd::Refused("x".into()));
         ops.pool_ha.lock().unwrap().push_back(Some(true));
         survivor_ha_reset_with("r", &ops, "sr", 120, true).await;
         let log = ops.log.lock().unwrap().clone();
-        let alert = log.iter().position(|l| l.starts_with("wedge-alert: ")).expect("announced");
+        let alert = log
+            .iter()
+            .position(|l| l.starts_with("wedge-alert: "))
+            .expect("announced");
         let gates = log.iter().position(|l| l == "gates").unwrap();
         let disable = log.iter().position(|l| l == "disable").unwrap();
         assert!(alert < gates, "{log:?}");
-        assert!(log[gates..disable].iter().all(|l| !l.contains("alert")), "{log:?}");
-        assert!(!log[alert].contains("VMs keep running") && log[alert].contains("if its checks pass"));
+        assert!(
+            log[gates..disable].iter().all(|l| !l.contains("alert")),
+            "{log:?}"
+        );
+        assert!(
+            !log[alert].contains("VMs keep running") && log[alert].contains("if its checks pass")
+        );
         assert!(log[alert].contains("ha-config:timeout=120"));
         // A later attempt of the same episode: no announcement.
         let ops = ScriptedHaOps::at(&format!("{dir}/obl2"), Some(true));
-        ops.disable.lock().unwrap().push_back(HaCmd::Refused("x".into()));
+        ops.disable
+            .lock()
+            .unwrap()
+            .push_back(HaCmd::Refused("x".into()));
         ops.pool_ha.lock().unwrap().push_back(Some(true));
         survivor_ha_reset_with("r", &ops, "sr", 120, false).await;
         assert_eq!(ops.count("wedge-alert"), 0);
@@ -54382,7 +56871,10 @@ poll_interval_ms = 10
         sm.sb_keepdata_stuck = 7;
         sm.survivor_episode_end();
         assert_eq!(sm.sb_keepdata_stuck, 0);
-        assert!(sm.survivor_reset_take_announce(), "a new episode announces again");
+        assert!(
+            sm.survivor_reset_take_announce(),
+            "a new episode announces again"
+        );
     }
 
     /// Before the enable, the cycle reads its fire-time gates again; one that
@@ -54391,28 +56883,43 @@ poll_interval_ms = 10
     #[tokio::test]
     async fn a_pool_ha_cycle_reads_its_gates_again_before_the_enable() {
         let ops = ScriptedHaOps::armed();
-        ops.gates.lock().unwrap().extend([Option::None, Some("P false".into())]);
+        ops.gates
+            .lock()
+            .unwrap()
+            .extend([Option::None, Some("P false".into())]);
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(r.disabled && !r.enabled);
         assert_eq!(r.withheld.as_deref(), Some("enable: P false"));
         assert_eq!(ops.count("enable"), 0);
-        assert_eq!(ops.count("clear_obligation"), 0, "the obligation does the enable later");
+        assert_eq!(
+            ops.count("clear_obligation"),
+            0,
+            "the obligation does the enable later"
+        );
         let ops = ScriptedHaOps::armed();
         let r = pool_ha_cycle(&ops, "sr", 120, "readmission_dance").await;
         assert!(r.disabled && r.enabled && r.withheld.is_none());
-        assert_eq!(ops.count("gates"), 2, "before the disable and before the enable");
+        assert_eq!(
+            ops.count("gates"),
+            2,
+            "before the disable and before the enable"
+        );
         assert_eq!(ops.count("enable"), 1);
         // A gate closed before the disable (maintenance): nothing issued,
         // nothing written.
         let ops = ScriptedHaOps::armed();
-        ops.gates.lock().unwrap().push_back(Some("a host is in maintenance".into()));
+        ops.gates
+            .lock()
+            .unwrap()
+            .push_back(Some("a host is in maintenance".into()));
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(!r.disable_issued && !r.disabled);
         assert_eq!(ops.count("disable") + ops.count("write_obligation"), 0);
     }
 
     /// Texts `xe` printed on the rigs (copied from the lab logs).
-    const XE_HA_NOT_ENABLED: &str = "The operation could not be performed because HA is not enabled on the Pool";
+    const XE_HA_NOT_ENABLED: &str =
+        "The operation could not be performed because HA is not enabled on the Pool";
     const XE_HA_DISABLE_IN_PROGRESS: &str =
         "The operation could not be performed because HA disable is in progress";
     const XE_CANNOT_FORWARD: &str = "Cannot forward messages because the server cannot be contacted. \
@@ -54434,34 +56941,59 @@ poll_interval_ms = 10
         // task's clock is never compared); HA off once it is done: ours.
         let ops = ScriptedHaOps::at(&obl, Some(true));
         ops.disable.lock().unwrap().push_back(HaCmd::TimedOut);
-        ops.pending.lock().unwrap().extend([Some(vec![]), Some(vec![task("pool.disable_ha")])]);
+        ops.pending
+            .lock()
+            .unwrap()
+            .extend([Some(vec![]), Some(vec![task("pool.disable_ha")])]);
         ops.pool_ha.lock().unwrap().push_back(Some(false));
         let r = pool_ha_cycle(&ops, "sr", 120, "recorded_rearm").await;
-        assert!(r.disable_issued && r.disabled && r.enabled && !r.operator_off, "{r:?}");
+        assert!(
+            r.disable_issued && r.disabled && r.enabled && !r.operator_off,
+            "{r:?}"
+        );
         assert_eq!(r.disable_note, "disable_timed_out_but_effective");
         assert_eq!(ops.count("write_obligation"), 1);
         // XAPI answered "HA is not enabled" (an operator got there between
         // our read and our call): not ours, whatever the text says.
-        for refusal in [XE_HA_NOT_ENABLED, XE_HA_DISABLE_IN_PROGRESS, XE_CANNOT_FORWARD, XE_CONN_REFUSED] {
+        for refusal in [
+            XE_HA_NOT_ENABLED,
+            XE_HA_DISABLE_IN_PROGRESS,
+            XE_CANNOT_FORWARD,
+            XE_CONN_REFUSED,
+        ] {
             let ops = ScriptedHaOps::at(&obl, Some(true));
-            ops.disable.lock().unwrap().push_back(HaCmd::Refused(refusal.into()));
+            ops.disable
+                .lock()
+                .unwrap()
+                .push_back(HaCmd::Refused(refusal.into()));
             ops.pool_ha.lock().unwrap().push_back(Some(false));
             let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
             assert!(r.operator_off && !r.enabled, "{refusal}");
             assert_eq!(ops.count("enable"), 0, "{refusal}");
             assert_eq!(ops.count("clear_obligation"), 1, "{refusal}");
             assert!(std::fs::metadata(&obl).is_err(), "nothing re-enables later");
-            assert_eq!(ops.count("alert: TwinStor: pool HA is off. TwinStor's own pool HA disable was refused"), 1);
+            assert_eq!(
+                ops.count(
+                    "alert: TwinStor: pool HA is off. TwinStor's own pool HA disable was refused"
+                ),
+                1
+            );
         }
         // A disable that could not be run at all: the same.
         let ops = ScriptedHaOps::at(&obl, Some(true));
-        ops.disable.lock().unwrap().push_back(HaCmd::NotRun("No such file or directory".into()));
+        ops.disable
+            .lock()
+            .unwrap()
+            .push_back(HaCmd::NotRun("No such file or directory".into()));
         ops.pool_ha.lock().unwrap().push_back(Some(false));
         assert!(pool_ha_cycle(&ops, "sr", 120, "x").await.operator_off);
         // Refused with HA still on, or unreadable: stops, no enable.
         for after in [Some(true), Option::None] {
             let ops = ScriptedHaOps::at(&obl, Some(true));
-            ops.disable.lock().unwrap().push_back(HaCmd::Refused(XE_CANNOT_FORWARD.into()));
+            ops.disable
+                .lock()
+                .unwrap()
+                .push_back(HaCmd::Refused(XE_CANNOT_FORWARD.into()));
             ops.pool_ha.lock().unwrap().push_back(after);
             let r = pool_ha_cycle(&ops, "sr", 120, "x").await;
             assert!(r.disable_issued && !r.disabled && !r.enabled && !r.operator_off);
@@ -54470,14 +57002,20 @@ poll_interval_ms = 10
         // No answer and the task list unreadable afterwards: stop, obligation kept.
         let ops = ScriptedHaOps::at(&obl, Some(true));
         ops.disable.lock().unwrap().push_back(HaCmd::TimedOut);
-        ops.pending.lock().unwrap().extend([Some(vec![]), Option::None]);
+        ops.pending
+            .lock()
+            .unwrap()
+            .extend([Some(vec![]), Option::None]);
         let r = pool_ha_cycle(&ops, "sr", 120, "x").await;
         assert!(!r.disabled && !r.operator_off);
         assert!(ha_obligation_fields_at(&obl).is_some(), "kept");
         // Before the disable: someone else's HA task pending (an operator's
         // disable under way): nothing issued, nothing written.
         let ops = ScriptedHaOps::at(&obl, Some(true));
-        ops.pending.lock().unwrap().push_back(Some(vec![task("pool.disable_ha")]));
+        ops.pending
+            .lock()
+            .unwrap()
+            .push_back(Some(vec![task("pool.disable_ha")]));
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(!r.disable_issued && !r.operator_off);
         assert_eq!(ops.count("disable") + ops.count("write_obligation"), 0);
@@ -54494,15 +57032,24 @@ poll_interval_ms = 10
         let ops = ScriptedHaOps::at(&obl, Some(false));
         let r = pool_ha_cycle(&ops, "sr", 120, "readmission_dance").await;
         assert!(r.operator_off && !r.disable_issued);
-        assert_eq!(ops.count("disable") + ops.count("clear_obligation") + ops.count("write_obligation"), 0);
-        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 1);
+        assert_eq!(
+            ops.count("disable") + ops.count("clear_obligation") + ops.count("write_obligation"),
+            0
+        );
+        assert_eq!(
+            ops.count("alert: TwinStor: pool HA is off and TwinStor did not"),
+            1
+        );
         // Already off with an earlier TwinStor re-arm owed (its enable was
         // withheld): just stop; that obligation stands, no alert.
         let ops = ScriptedHaOps::at(&obl, Some(false));
         ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(!r.operator_off && !r.disable_issued);
-        assert_eq!(ops.count("alert") + ops.count("clear_obligation") + ops.count("disable"), 0);
+        assert_eq!(
+            ops.count("alert") + ops.count("clear_obligation") + ops.count("disable"),
+            0
+        );
         assert!(ha_obligation_fields_at(&obl).is_some());
     }
 
@@ -54517,14 +57064,26 @@ poll_interval_ms = 10
         let ops = ScriptedHaOps::at(&obl, Some(true));
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(r.enabled);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Enabled);
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Enabled
+        );
         // The operator runs pool-ha-disable a minute later; the watchdog's
         // next pass reads HA off.
-        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Stop);
+        assert_eq!(
+            obligation_step(&ops, Some(false), true).await,
+            ObligationStep::Stop
+        );
         assert!(std::fs::metadata(&obl).is_err(), "the obligation went");
-        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 1);
+        assert_eq!(
+            ops.count("alert: TwinStor: pool HA is off and TwinStor did not"),
+            1
+        );
         // Nothing can enable from it any more.
-        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert!(matches!(
+            rearm_enable(&ops, "sr", 120).await,
+            RearmEnable::Withheld(_)
+        ));
         // A new cycle finding HA off with no owed re-arm: not TwinStor's.
         let ops = ScriptedHaOps::at(&obl, Some(false));
         ha_obligation_write_at(&obl, "sr", 120, ObligationState::Enabled);
@@ -54555,23 +57114,46 @@ poll_interval_ms = 10
         };
         // Lands within the window: owed, and the obligation's enable runs.
         let ops = pending_cycle().await;
-        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)), "not owed yet");
+        assert!(
+            matches!(
+                rearm_enable(&ops, "sr", 120).await,
+                RearmEnable::Withheld(_)
+            ),
+            "not owed yet"
+        );
         ops.clock.store(120, Ordering::Relaxed);
-        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Proceed);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            obligation_step(&ops, Some(false), true).await,
+            ObligationStep::Proceed
+        );
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
         assert_eq!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Returned);
         assert_eq!(ops.count("enable"), 1);
         // The window passes with HA on: it never took; nothing owed.
         let ops = pending_cycle().await;
-        ops.clock.store(OBLIGATION_PENDING_FOR + 1, Ordering::Relaxed);
-        assert_eq!(obligation_step(&ops, Some(true), true).await, ObligationStep::Stop);
+        ops.clock
+            .store(OBLIGATION_PENDING_FOR + 1, Ordering::Relaxed);
+        assert_eq!(
+            obligation_step(&ops, Some(true), true).await,
+            ObligationStep::Stop
+        );
         assert!(std::fs::metadata(&obl).is_err());
         // HA off only after the window: not TwinStor's.
         let ops = pending_cycle().await;
-        ops.clock.store(OBLIGATION_PENDING_FOR + 1, Ordering::Relaxed);
-        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Stop);
+        ops.clock
+            .store(OBLIGATION_PENDING_FOR + 1, Ordering::Relaxed);
+        assert_eq!(
+            obligation_step(&ops, Some(false), true).await,
+            ObligationStep::Stop
+        );
         assert!(std::fs::metadata(&obl).is_err());
-        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 1);
+        assert_eq!(
+            ops.count("alert: TwinStor: pool HA is off and TwinStor did not"),
+            1
+        );
         assert_eq!(ops.count("enable"), 0);
     }
 
@@ -54604,13 +57186,18 @@ poll_interval_ms = 10
             seam(&mut sm).pool_ha = ha_at_cancel;
             let attempt = ops.now_unix();
             // Pending, its window about to end.
-            ha_obligation_store(&obl, &ObligationFile {
-                sr: "sr".into(),
-                timeout: 120,
-                attempt: Some(attempt),
-                state: ObligationState::Pending { until: attempt + 30 },
-                owner: None,
-            });
+            ha_obligation_store(
+                &obl,
+                &ObligationFile {
+                    sr: "sr".into(),
+                    timeout: 120,
+                    attempt: Some(attempt),
+                    state: ObligationState::Pending {
+                        until: attempt + 30,
+                    },
+                    owner: None,
+                },
+            );
             seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
                 uuid: "t".into(),
                 name: "pool.disable_ha".into(),
@@ -54626,12 +57213,21 @@ poll_interval_ms = 10
             // The task gone; one pass later (past the original window), pool
             // HA reads off.
             seam(&mut sm).pending_tasks.clear();
-            ops.clock.fetch_add(HA_REARM_RETRY_INTERVAL.as_secs(), Ordering::Relaxed);
+            ops.clock
+                .fetch_add(HA_REARM_RETRY_INTERVAL.as_secs(), Ordering::Relaxed);
             sm.obligation_watch(Some(false)).await;
             let state = ha_obligation_file_at(&obl).map(|f| f.state);
             let case = (cancel, fails, ha_at_cancel);
-            assert_eq!(state == Some(ObligationState::Owed), owed, "{case:?}: {state:?}");
-            assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not") == 0, owed, "{case:?}");
+            assert_eq!(
+                state == Some(ObligationState::Owed),
+                owed,
+                "{case:?}: {state:?}"
+            );
+            assert_eq!(
+                ops.count("alert: TwinStor: pool HA is off and TwinStor did not") == 0,
+                owed,
+                "{case:?}"
+            );
         }
     }
 
@@ -54643,15 +57239,24 @@ poll_interval_ms = 10
         let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
         sm.test_ha_ops = Some(ops.clone());
         // An enable attempt just now (the scripted clock).
-        ha_obligation_store(&obl, &ObligationFile {
-            sr: "sr".into(),
-            timeout: 120,
-            attempt: Some(ops.now_unix()),
-            state: ObligationState::Owed,
-            owner: None,
-        });
-        assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Proceed);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        ha_obligation_store(
+            &obl,
+            &ObligationFile {
+                sr: "sr".into(),
+                timeout: 120,
+                attempt: Some(ops.now_unix()),
+                state: ObligationState::Owed,
+                owner: None,
+            },
+        );
+        assert_eq!(
+            sm.obligation_watch(Some(true)).await,
+            ObligationStep::Proceed
+        );
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
         // Settle time later, but TwinStor's own enable still pending (created
         // at its attempt, on the same scripted clock): hold, unchanged, with
         // no foreign-task alert and no cancel (not stale yet).
@@ -54667,18 +57272,34 @@ poll_interval_ms = 10
             created_unix: Some(attempt),
         }];
         assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Stop);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
-        assert_eq!(seam_actions(&sm, "alert"), 0, "own young task: the Wait branch (no foreign-task or cancel alert)");
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
+        assert_eq!(
+            seam_actions(&sm, "alert"),
+            0,
+            "own young task: the Wait branch (no foreign-task or cancel alert)"
+        );
         assert_eq!(seam_actions(&sm, "task-cancel"), 0);
         // The task list unreadable: hold too.
         seam(&mut sm).pending_tasks.clear();
         seam(&mut sm).pending_unreadable = true;
         assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Stop);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
         // Nothing pending, settled: enabled.
         seam(&mut sm).pending_unreadable = false;
-        assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Proceed);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Enabled);
+        assert_eq!(
+            sm.obligation_watch(Some(true)).await,
+            ObligationStep::Proceed
+        );
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Enabled
+        );
     }
 
     /// Every enable reads the obligation file right before it: an operator
@@ -54713,7 +57334,10 @@ poll_interval_ms = 10
         ops.on_gates.lock().unwrap().push_back(Box::new(move || {
             let _ = std::fs::remove_file(&p3);
         }));
-        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert!(matches!(
+            rearm_enable(&ops, "sr", 120).await,
+            RearmEnable::Withheld(_)
+        ));
         assert_eq!(ops.count("enable"), 1, "no second enable");
         // The re-arm itself: the record deleted while its gates are read.
         let ops = ScriptedHaOps::at(&obl, Option::None);
@@ -54722,11 +57346,17 @@ poll_interval_ms = 10
         ops.on_gates.lock().unwrap().push_back(Box::new(move || {
             let _ = std::fs::remove_file(&p4);
         }));
-        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert!(matches!(
+            rearm_enable(&ops, "sr", 120).await,
+            RearmEnable::Withheld(_)
+        ));
         assert_eq!(ops.count("enable"), 0);
         // The re-arm with no file at all.
         let ops = ScriptedHaOps::at(&obl, Option::None);
-        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert!(matches!(
+            rearm_enable(&ops, "sr", 120).await,
+            RearmEnable::Withheld(_)
+        ));
         assert_eq!(ops.count("enable"), 0);
         assert!(KEEP_HA_OFF_HOWTO.contains("/var/lib/twinstor/ha-rearm-obligation"));
     }
@@ -54744,13 +57374,26 @@ poll_interval_ms = 10
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(r.disable_issued && !r.disabled);
         ops.clock.store(330, Ordering::Relaxed);
-        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Proceed);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            obligation_step(&ops, Some(false), true).await,
+            ObligationStep::Proceed
+        );
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
         const { assert!(OBLIGATION_PENDING_FOR > OWN_TASK_STALE_AFTER) };
         // Own task still pending past the window: the watchdog extends it.
         let mut sm = seam_sm("obl-late-landing-sm");
         let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
-        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Pending { until: 1_000_000 + OBLIGATION_PENDING_FOR });
+        ha_obligation_write_at(
+            &obl,
+            "sr",
+            120,
+            ObligationState::Pending {
+                until: 1_000_000 + OBLIGATION_PENDING_FOR,
+            },
+        );
         sm.test_ha_ops = Some(ops.clone());
         let stamp = crate::heal_state::unix_now();
         seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
@@ -54758,16 +57401,30 @@ poll_interval_ms = 10
             name: "pool.disable_ha".into(),
             created_unix: Some(stamp),
         }];
-        ops.clock.store(OBLIGATION_PENDING_FOR + 30, Ordering::Relaxed);
-        assert!(sm.pending_ha_task_holds(Some(stamp)).await, "own task: wait");
+        ops.clock
+            .store(OBLIGATION_PENDING_FOR + 30, Ordering::Relaxed);
+        assert!(
+            sm.pending_ha_task_holds(Some(stamp)).await,
+            "own task: wait"
+        );
         let until = match ha_obligation_file_at(&obl).unwrap().state {
             ObligationState::Pending { until } => until,
             s => panic!("{s:?}"),
         };
-        assert_eq!(until, 1_000_000 + OBLIGATION_PENDING_FOR + 30 + PENDING_WINDOW_EXTENSION);
-        ops.clock.store(OBLIGATION_PENDING_FOR + 60, Ordering::Relaxed);
-        assert_eq!(obligation_step(ops.as_ref(), Some(false), true).await, ObligationStep::Proceed);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            until,
+            1_000_000 + OBLIGATION_PENDING_FOR + 30 + PENDING_WINDOW_EXTENSION
+        );
+        ops.clock
+            .store(OBLIGATION_PENDING_FOR + 60, Ordering::Relaxed);
+        assert_eq!(
+            obligation_step(ops.as_ref(), Some(false), true).await,
+            ObligationStep::Proceed
+        );
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
     }
 
     /// XAPI reads pool HA enabled while an enable still runs, and back off
@@ -54783,10 +57440,19 @@ poll_interval_ms = 10
         ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
         ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
         assert_eq!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Returned);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
         // The enable fails in XAPI and HA reads off again: still TwinStor's.
-        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Proceed);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            obligation_step(&ops, Some(false), true).await,
+            ObligationStep::Proceed
+        );
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
         assert_eq!(ops.count("alert"), 0);
         // When "on" is trusted is the watchdog's own computation: see
         // `the_watchdog_trusts_on_only_once_the_last_attempt_has_settled`.
@@ -54795,14 +57461,21 @@ poll_interval_ms = 10
         ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
         let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
         assert!(r.disabled && !r.enabled);
-        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            ha_obligation_file_at(&obl).unwrap().state,
+            ObligationState::Owed
+        );
     }
 
     /// `twinstor status` prints the obligation's real state with its meaning.
     #[test]
     fn the_status_line_names_the_real_obligation_state() {
-        assert!(rearm_state_text(ObligationState::Pending { until: 1_300 }, 1_000)
-            .starts_with("pending: ") && rearm_state_text(ObligationState::Pending { until: 1_300 }, 1_000).contains("300s"));
+        assert!(
+            rearm_state_text(ObligationState::Pending { until: 1_300 }, 1_000)
+                .starts_with("pending: ")
+                && rearm_state_text(ObligationState::Pending { until: 1_300 }, 1_000)
+                    .contains("300s")
+        );
         assert!(rearm_state_text(ObligationState::Owed, 0).starts_with("owed: "));
         assert!(rearm_state_text(ObligationState::Enabled, 0).starts_with("enabled: "));
     }
@@ -54818,17 +57491,41 @@ poll_interval_ms = 10
             let attempt = it.next().and_then(|t| t.parse::<u64>().ok());
             (sr, timeout, attempt)
         };
-        let f = |attempt, state| ObligationFile { sr: "sr-1".into(), timeout: 120, attempt, state, owner: None };
-        for state in [ObligationState::Pending { until: 99 }, ObligationState::Owed, ObligationState::Enabled] {
+        let f = |attempt, state| ObligationFile {
+            sr: "sr-1".into(),
+            timeout: 120,
+            attempt,
+            state,
+            owner: None,
+        };
+        for state in [
+            ObligationState::Pending { until: 99 },
+            ObligationState::Owed,
+            ObligationState::Enabled,
+        ] {
             let line = obligation_render(&f(Some(1234), state));
-            assert_eq!(old_reader(&line), (Some("sr-1".into()), Some(120), Some(1234)), "{line}");
+            assert_eq!(
+                old_reader(&line),
+                (Some("sr-1".into()), Some(120), Some(1234)),
+                "{line}"
+            );
             assert_eq!(obligation_parse(&line), Some(f(Some(1234), state)));
             let line = obligation_render(&f(Option::None, state));
-            assert_eq!(old_reader(&line), (Some("sr-1".into()), Some(120), Option::None), "{line}");
+            assert_eq!(
+                old_reader(&line),
+                (Some("sr-1".into()), Some(120), Option::None),
+                "{line}"
+            );
             assert_eq!(obligation_parse(&line), Some(f(Option::None, state)));
         }
-        assert_eq!(obligation_parse("sr-1 120 1234").unwrap().state, ObligationState::Owed);
-        assert_eq!(obligation_parse("sr-1 120").unwrap().state, ObligationState::Owed);
+        assert_eq!(
+            obligation_parse("sr-1 120 1234").unwrap().state,
+            ObligationState::Owed
+        );
+        assert_eq!(
+            obligation_parse("sr-1 120").unwrap().state,
+            ObligationState::Owed
+        );
     }
 
     /// A refused disable's outcome says which refusal it was, read from the
@@ -54838,12 +57535,18 @@ poll_interval_ms = 10
     async fn a_refused_disables_outcome_names_the_refusal() {
         for (refusal, said) in [
             (XE_HA_NOT_ENABLED, "pool HA not enabled"),
-            (XE_HA_DISABLE_IN_PROGRESS, "another pool HA disable in progress"),
+            (
+                XE_HA_DISABLE_IN_PROGRESS,
+                "another pool HA disable in progress",
+            ),
             (XE_CANNOT_FORWARD, "the pool master could not be contacted"),
             (XE_CONN_REFUSED, "the local XAPI refused the connection"),
         ] {
             let ops = ScriptedHaOps::armed();
-            ops.disable.lock().unwrap().push_back(HaCmd::Refused(refusal.into()));
+            ops.disable
+                .lock()
+                .unwrap()
+                .push_back(HaCmd::Refused(refusal.into()));
             ops.pool_ha.lock().unwrap().push_back(Some(true));
             let r = pool_ha_cycle(&ops, "sr", 120, "x").await;
             assert!(!r.disabled && !r.operator_off);
@@ -54896,10 +57599,16 @@ poll_interval_ms = 10
         // retry goes on until its window, then gives up; the obligation stays.
         let (mut sm, ops, obl) = lone_survivor("lone-withheld");
         for _ in 0..8 {
-            ops.gates.lock().unwrap().push_back(Some("a host is in maintenance, or XAPI did not say".into()));
+            ops.gates
+                .lock()
+                .unwrap()
+                .push_back(Some("a host is in maintenance, or XAPI did not say".into()));
             drive_once(&mut sm).await;
         }
-        assert!(sm.masterless_retry.is_some(), "withheld tries do not count toward the cap");
+        assert!(
+            sm.masterless_retry.is_some(),
+            "withheld tries do not count toward the cap"
+        );
         assert_eq!(ops.count("enable"), 0);
         sm.masterless_retry.as_mut().unwrap().started =
             std::time::Instant::now() - MASTERLESS_RETRY_WINDOW - Duration::from_secs(1);
@@ -54919,10 +57628,16 @@ poll_interval_ms = 10
         // handed over to the normal re-arm path, no enable here. This host's
         // copy not serving: no enable while that holds.
         let (mut sm, ops, _obl) = lone_survivor("lone-premise");
-        sm.test_p = Some(crate::mgmt_reach::PView { p: true, ..crate::mgmt_reach::PView::settled_for_test() });
+        sm.test_p = Some(crate::mgmt_reach::PView {
+            p: true,
+            ..crate::mgmt_reach::PView::settled_for_test()
+        });
         sm.test_peer_role = xapi::PeerXapiRole::Master;
         drive_once(&mut sm).await;
-        assert!(sm.masterless_retry.is_none(), "the peer is back: handed over");
+        assert!(
+            sm.masterless_retry.is_none(),
+            "the peer is back: handed over"
+        );
         assert_eq!(ops.count("enable"), 0);
         let (mut sm, ops, _obl) = lone_survivor("lone-storage");
         seam(&mut sm).local_serving = Some(false);
@@ -54932,9 +57647,17 @@ poll_interval_ms = 10
         // A pending obligation (the chain could not read pool HA after its
         // transition): wait, then go on as owed once the watchdog says so.
         let (mut sm, ops, obl) = lone_survivor("lone-pending");
-        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Pending { until: u64::MAX });
+        ha_obligation_write_at(
+            &obl,
+            "sr",
+            120,
+            ObligationState::Pending { until: u64::MAX },
+        );
         drive_once(&mut sm).await;
-        assert!(sm.masterless_retry.is_some(), "pending: waits, does not stop");
+        assert!(
+            sm.masterless_retry.is_some(),
+            "pending: waits, does not stop"
+        );
         assert_eq!(ops.count("enable"), 0);
         ha_obligation_set_state_at(&obl, ObligationState::Owed);
         drive_once(&mut sm).await;
@@ -54942,7 +57665,10 @@ poll_interval_ms = 10
         // Five issued enables (each refused): the cap.
         let (mut sm, ops, _obl) = lone_survivor("lone-cap");
         for _ in 0..MASTERLESS_RETRY_CAP {
-            ops.enable.lock().unwrap().push_back(HaCmd::Refused("The SR has no attached PBDs".into()));
+            ops.enable
+                .lock()
+                .unwrap()
+                .push_back(HaCmd::Refused("The SR has no attached PBDs".into()));
             drive_once(&mut sm).await;
         }
         assert_eq!(ops.count("enable"), MASTERLESS_RETRY_CAP as usize);
@@ -54971,11 +57697,41 @@ poll_interval_ms = 10
                 (ops.count("stop_xhad"), sm.xhad_mismatch_since.is_none())
             }
         };
-        assert_eq!(run("xhad-stop-owed", Some(ObligationState::Owed), Option::None).await, (1, true));
-        assert_eq!(run("xhad-stop-pending", Some(ObligationState::Pending { until: u64::MAX }), Option::None).await, (0, false));
-        assert_eq!(run("xhad-stop-enabled", Some(ObligationState::Enabled), Option::None).await, (0, false));
-        assert_eq!(run("xhad-stop-none", Option::None, Option::None).await, (0, false));
-        assert_eq!(run("xhad-stop-gate", Some(ObligationState::Owed), Some("P false".into())).await, (0, false));
+        assert_eq!(
+            run("xhad-stop-owed", Some(ObligationState::Owed), Option::None).await,
+            (1, true)
+        );
+        assert_eq!(
+            run(
+                "xhad-stop-pending",
+                Some(ObligationState::Pending { until: u64::MAX }),
+                Option::None
+            )
+            .await,
+            (0, false)
+        );
+        assert_eq!(
+            run(
+                "xhad-stop-enabled",
+                Some(ObligationState::Enabled),
+                Option::None
+            )
+            .await,
+            (0, false)
+        );
+        assert_eq!(
+            run("xhad-stop-none", Option::None, Option::None).await,
+            (0, false)
+        );
+        assert_eq!(
+            run(
+                "xhad-stop-gate",
+                Some(ObligationState::Owed),
+                Some("P false".into())
+            )
+            .await,
+            (0, false)
+        );
     }
 
     /// The re-arm enable reads its gates again before each enable and before
@@ -54986,29 +57742,60 @@ poll_interval_ms = 10
     async fn the_rearm_enable_reads_gates_before_each_enable_and_counts_effective_as_success() {
         use super::RearmEnable::*;
         let ops = ScriptedHaOps::new();
-        ops.gates.lock().unwrap().push_back(Some("maintenance".into()));
-        assert_eq!(rearm_enable(&ops, "sr", 120).await, Withheld("maintenance".into()));
+        ops.gates
+            .lock()
+            .unwrap()
+            .push_back(Some("maintenance".into()));
+        assert_eq!(
+            rearm_enable(&ops, "sr", 120).await,
+            Withheld("maintenance".into())
+        );
         assert_eq!(ops.count("enable"), 0);
         let ops = ScriptedHaOps::new();
         ops.enable.lock().unwrap().push_back(HaCmd::Refused("The server failed to handle your request, due to an internal error. The given message may give details useful for debugging the problem.\nmessage: Xha_scripts.Xha_error(15)".into()));
-        ops.gates.lock().unwrap().extend([Option::None, Some("P false".into())]);
-        assert_eq!(rearm_enable(&ops, "sr", 120).await, Withheld("P false".into()));
+        ops.gates
+            .lock()
+            .unwrap()
+            .extend([Option::None, Some("P false".into())]);
+        assert_eq!(
+            rearm_enable(&ops, "sr", 120).await,
+            Withheld("P false".into())
+        );
         assert_eq!(ops.count("stop_xhad"), 0, "no xhad stop past a closed gate");
         assert_eq!(ops.count("enable"), 1);
         let ops = ScriptedHaOps::new();
-        ops.enable.lock().unwrap().push_back(HaCmd::Refused("message: Xha_scripts.Xha_error(15)".into()));
-        ops.gates.lock().unwrap().extend([Option::None, Option::None, Some("P false".into())]);
-        assert_eq!(rearm_enable(&ops, "sr", 120).await, Withheld("P false".into()));
+        ops.enable
+            .lock()
+            .unwrap()
+            .push_back(HaCmd::Refused("message: Xha_scripts.Xha_error(15)".into()));
+        ops.gates
+            .lock()
+            .unwrap()
+            .extend([Option::None, Option::None, Some("P false".into())]);
+        assert_eq!(
+            rearm_enable(&ops, "sr", 120).await,
+            Withheld("P false".into())
+        );
         assert_eq!(ops.count("stop_xhad"), 1);
-        assert_eq!(ops.count("enable"), 1, "no second enable past a closed gate");
+        assert_eq!(
+            ops.count("enable"),
+            1,
+            "no second enable past a closed gate"
+        );
         let ops = ScriptedHaOps::new();
         ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
         ops.pool_ha.lock().unwrap().push_back(Some(true));
         assert_eq!(rearm_enable(&ops, "sr", 120).await, Returned);
         let ops = ScriptedHaOps::new();
-        ops.enable.lock().unwrap().push_back(HaCmd::Refused(XE_HA_DISABLE_IN_PROGRESS.into()));
+        ops.enable
+            .lock()
+            .unwrap()
+            .push_back(HaCmd::Refused(XE_HA_DISABLE_IN_PROGRESS.into()));
         ops.pool_ha.lock().unwrap().push_back(Some(false));
-        assert_eq!(rearm_enable(&ops, "sr", 120).await, Failed(XE_HA_DISABLE_IN_PROGRESS.into()));
+        assert_eq!(
+            rearm_enable(&ops, "sr", 120).await,
+            Failed(XE_HA_DISABLE_IN_PROGRESS.into())
+        );
     }
 
     /// The spawned bodies run under the test seam: the re-arm enable and the
@@ -55024,14 +57811,31 @@ poll_interval_ms = 10
         ops.pool_ha.lock().unwrap().push_back(Some(true));
         sm.test_ha_ops = Some(ops.clone());
         sm.ha_reset_inflight.store(true, Ordering::SeqCst);
-        assert!(!sm.spawn_rearm_enable("sr".into(), 120, true, Some(crate::mgmt_reach::Trigger::Positive)), "refused while one runs");
+        assert!(
+            !sm.spawn_rearm_enable(
+                "sr".into(),
+                120,
+                true,
+                Some(crate::mgmt_reach::Trigger::Positive)
+            ),
+            "refused while one runs"
+        );
         sm.ha_reset_inflight.store(false, Ordering::SeqCst);
-        assert!(sm.spawn_rearm_enable("sr".into(), 120, true, Some(crate::mgmt_reach::Trigger::Positive)));
+        assert!(sm.spawn_rearm_enable(
+            "sr".into(),
+            120,
+            true,
+            Some(crate::mgmt_reach::Trigger::Positive)
+        ));
         while sm.ha_reset_inflight.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
         let now = std::time::Instant::now();
-        assert_eq!(sm.take_fresh_rearm_result(now), Some(Returned), "the pass after its start");
+        assert_eq!(
+            sm.take_fresh_rearm_result(now),
+            Some(Returned),
+            "the pass after its start"
+        );
         assert_eq!(sm.take_fresh_rearm_result(now), Option::None, "read once");
         for (r, as_master, from_slave) in [
             (Returned, true, false),
@@ -55054,8 +57858,11 @@ poll_interval_ms = 10
         assert_eq!(sm.take_fresh_rearm_result(now), Some(Failed("late".into())));
         // Older than twice the interval: dropped.
         let p = sm.rearm_pass;
-        *sm.rearm_enable_result.lock().unwrap() =
-            Some((Failed("old".into()), now - i * 2 - Duration::from_secs(1), p));
+        *sm.rearm_enable_result.lock().unwrap() = Some((
+            Failed("old".into()),
+            now - i * 2 - Duration::from_secs(1),
+            p,
+        ));
         assert_eq!(sm.take_fresh_rearm_result(now), Option::None);
         // Started two passes ago (a pass went by without reading it): dropped.
         let p = sm.rearm_pass.wrapping_sub(1);
@@ -55074,12 +57881,17 @@ poll_interval_ms = 10
         ));
         // Not yet run (single-threaded test runtime): the re-admission check
         // holds while it is in flight.
-        assert!(readmission_cycle_holds(true, sm.ha_reset_inflight.load(Ordering::SeqCst)));
+        assert!(readmission_cycle_holds(
+            true,
+            sm.ha_reset_inflight.load(Ordering::SeqCst)
+        ));
         while sm.ha_reset_inflight.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
         assert_eq!(sm.take_ha_cycle_result("peer_emergency"), Option::None);
-        let r = sm.take_ha_cycle_result("readmission_dance").expect("the dance's own result");
+        let r = sm
+            .take_ha_cycle_result("readmission_dance")
+            .expect("the dance's own result");
         assert!(r.disabled && r.enabled);
         assert_eq!(ops.count("disable"), 1);
         assert_eq!(ops.count("enable"), 1);
@@ -55098,7 +57910,13 @@ poll_interval_ms = 10
             assert!(!sm.ha_gate(action, Positive));
             assert!(!sm.ha_gate(action, Absence));
         }
-        assert!(sm.ha_withheld.as_ref().unwrap().reason.contains("in flight"));
+        assert!(
+            sm.ha_withheld
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("in flight")
+        );
         // The dance's phase 1: cancelled, no disarm.
         let now_unix = crate::heal_state::unix_now();
         seam(&mut sm).xhad = Some(XhaHostState::Starting);
@@ -55109,7 +57927,8 @@ poll_interval_ms = 10
         let t = seam(&mut sm);
         t.slave_of = Some("127.0.0.1".into());
         t.peer_dead_liveset = Some(true);
-        sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, true).await;
+        sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, true)
+            .await;
         assert_eq!(seam_actions(&sm, "masterless_transition"), 0);
         // Flag cleared: the gate passes again.
         sm.ha_reset_inflight.store(false, Ordering::SeqCst);
@@ -55134,7 +57953,10 @@ poll_interval_ms = 10
         });
         assert!(!sm.forwarded_xapi_dead());
         // k failures in a row: the settle clock reset.
-        sm.test_p = Some(crate::mgmt_reach::PView { probes: 6, ..Default::default() });
+        sm.test_p = Some(crate::mgmt_reach::PView {
+            probes: 6,
+            ..Default::default()
+        });
         assert!(sm.forwarded_xapi_dead());
         // The master never skips (its xe is local).
         seam(&mut sm).conf_master = Some(true);
@@ -55158,6 +57980,12 @@ poll_interval_ms = 10
         assert_eq!(seam_actions(&sm, "demote"), 1);
         assert!(!std::path::Path::new(&sm.disarm_record_path).exists());
         let t = sm.test_ha.as_ref().unwrap();
-        assert!(t.actions.iter().any(|a| a.contains("TwinStor did not disarm it")), "{:?}", t.actions);
+        assert!(
+            t.actions
+                .iter()
+                .any(|a| a.contains("TwinStor did not disarm it")),
+            "{:?}",
+            t.actions
+        );
     }
 }

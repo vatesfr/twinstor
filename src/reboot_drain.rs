@@ -55,8 +55,9 @@ static OVERRIDE_PATH: std::sync::LazyLock<String> =
 /// into an XO alert. In `/var/lib` so it survives the reboot. Written only when the
 /// drain proceeded while this host was the last UpToDate copy (the concerning
 /// cases); consumed (deleted) once by the daemon at startup.
-static BREADCRUMB_PATH: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/last-reboot-drain"));
+static BREADCRUMB_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::heal_state::state_path("/var/lib/twinstor/last-reboot-drain")
+});
 
 /// How often to re-read DRBD state while holding.
 const POLL: Duration = Duration::from_secs(5);
@@ -200,7 +201,10 @@ fn write_breadcrumb(outcome: Outcome, done: Option<f64>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(BREADCRUMB_PATH.as_str(), line) {
-        warn!("reboot-drain: could not write breadcrumb {}: {e}", BREADCRUMB_PATH.as_str());
+        warn!(
+            "reboot-drain: could not write breadcrumb {}: {e}",
+            BREADCRUMB_PATH.as_str()
+        );
     }
 }
 

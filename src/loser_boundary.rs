@@ -4358,7 +4358,8 @@ db 3 512 1 ---s-- 1.0 11111111-0e92-8ef9-e8bc-c04ab12160da - -\n";
     }
 
     fn store(tag: &str) -> Store {
-        let p = crate::heal_state::test_tmp_dir().join(format!("twinstor-test-lb-{tag}-{}", std::process::id()));
+        let p = crate::heal_state::test_tmp_dir()
+            .join(format!("twinstor-test-lb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         Store::new(p)
     }
@@ -4405,7 +4406,8 @@ db 3 512 1 ---s-- 1.0 11111111-0e92-8ef9-e8bc-c04ab12160da - -\n";
 
     #[test]
     fn a_target_never_created_this_boot_is_not_exported() {
-        let base = crate::heal_state::test_tmp_dir().join(format!("twinstor-lio-{}", std::process::id()));
+        let base =
+            crate::heal_state::test_tmp_dir().join(format!("twinstor-lio-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let iqn = "iqn.2026-01.example:twinstor";
         // LIO module not loaded / configfs not mounted: no fabric directory.

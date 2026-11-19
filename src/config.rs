@@ -440,7 +440,10 @@ lun_serial = "twinstor0001"
         assert!(!config.ha.rejoin_assist);
         assert!(config.ha.readmission_assist);
         let toml = format!("{MINIMAL_CONFIG}\n[ha]\nreadmission_assist = false\n");
-        assert!(!parse(&toml).unwrap().ha.readmission_assist, "an explicit opt-out is kept");
+        assert!(
+            !parse(&toml).unwrap().ha.readmission_assist,
+            "an explicit opt-out is kept"
+        );
         let toml = format!("{MINIMAL_CONFIG}\n[ha]\nreadmission_assist = true\n");
         assert!(parse(&toml).unwrap().ha.readmission_assist);
     }

@@ -297,10 +297,14 @@ mod tests {
         let err = run_cmd_for("false", &[], 5).await.unwrap_err();
         assert!(!is_timeout(&err), "{err}");
         assert_eq!(ended(&err), Ended::Exited(String::new()));
-        let err = run_cmd_for("sh", &["-c", "echo refused >&2; exit 1"], 5).await.unwrap_err();
+        let err = run_cmd_for("sh", &["-c", "echo refused >&2; exit 1"], 5)
+            .await
+            .unwrap_err();
         assert_eq!(ended(&err), Ended::Exited("refused".into()));
         assert!(err.to_string().contains("exit Some(1): refused"), "{err}");
-        let err = run_cmd_for("/nonexistent/twinstor-test-binary", &[], 5).await.unwrap_err();
+        let err = run_cmd_for("/nonexistent/twinstor-test-binary", &[], 5)
+            .await
+            .unwrap_err();
         assert!(matches!(ended(&err), Ended::NotRun(_)), "{err}");
     }
 

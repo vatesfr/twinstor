@@ -2205,7 +2205,10 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         println!("{g}ha re-arm:   {}", st.paint(Sev::Warn, &text));
     }
     if let Some((view, verdict)) = partition_view_status() {
-        println!("{g}partition:   {}", st.paint(Sev::Warn, &format!("{view}: {verdict}")));
+        println!(
+            "{g}partition:   {}",
+            st.paint(Sev::Warn, &format!("{view}: {verdict}"))
+        );
     }
     if let Some(line) = mgmt_reach_status() {
         println!("{g}mgmt reach:  {line}");
@@ -3675,7 +3678,6 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
     Ok(())
 }
 
-
 /// The partition view the daemon published (`None` when there is none to
 /// report, the file is missing, or it is stale).
 fn partition_view_status() -> Option<(String, String)> {
@@ -3755,7 +3757,10 @@ mod tests {
             updated_unix: 1000,
         };
         let l = super::mgmt_reach_line(&snap, 1005);
-        assert!(l.contains("10.0.0.2:443 NOT answering") && l.contains("1/6"), "{l}");
+        assert!(
+            l.contains("10.0.0.2:443 NOT answering") && l.contains("1/6"),
+            "{l}"
+        );
         let settling = crate::mgmt_reach::StatusSnapshot {
             p: true,
             answered: 6,
@@ -3766,7 +3771,11 @@ mod tests {
         let stale = super::mgmt_reach_line(&settling, 2000);
         assert!(stale.contains("snapshot 1000s old"), "{stale}");
         // A daemon just started: the window is still filling.
-        let warming = crate::mgmt_reach::StatusSnapshot { probes: 2, answered: 2, ..snap.clone() };
+        let warming = crate::mgmt_reach::StatusSnapshot {
+            probes: 2,
+            answered: 2,
+            ..snap.clone()
+        };
         let w = super::mgmt_reach_line(&warming, 1005);
         assert!(w.contains("warming up") && w.contains("2 of 6"), "{w}");
     }
@@ -3889,7 +3898,8 @@ mod tests {
     async fn write_atomic_replaces_the_file_and_keeps_it_private() {
         use super::write_atomic;
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::heal_state::test_tmp_dir().join(format!("tw-write-atomic-{}", std::process::id()));
+        let dir = crate::heal_state::test_tmp_dir()
+            .join(format!("tw-write-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("twinstor.toml");

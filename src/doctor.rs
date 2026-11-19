@@ -320,7 +320,10 @@ fn print_report(d: &Diagnosis) {
     // only at an HA enable. Without the peer there, a heartbeat-first rejoin
     // can leave it a second master.
     if d.pool_ha == Some(true) {
-        println!("{}\n", ha_peers_advice(d.ha_peers_names_peer, d.sr_uuid.as_deref()));
+        println!(
+            "{}\n",
+            ha_peers_advice(d.ha_peers_names_peer, d.sr_uuid.as_deref())
+        );
     }
 
     let in_effect = d
