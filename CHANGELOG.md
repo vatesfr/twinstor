@@ -7,6 +7,428 @@ TwinStor is in the 0.x tech-preview series: treat every release as
 potentially behaviour-changing and read the notes before upgrading a live
 pool.
 
+## [0.7.5] - 2026-11-19
+
+TwinStor no longer changes pool HA across a management partition, its HA
+repairs are re-checked when they fire, an arbitrated-mode storage freeze is
+fixed, and fate-shared replication rides out heavier packet loss. Validated
+on a fate-shared and on an arbitrated lab pool. Upgrade both hosts; the
+DRBD resource file is migrated live (see Upgrading).
+
+### During a partition
+- **No HA change across a management partition.** When one host loses its
+  client and management network but keeps replication, TwinStor no longer
+  disables pool HA, disarms a host or restarts a toolstack across the cut.
+  Every such action now checks, when it fires, that the peer's management
+  address answers: a TCP connect to port 443 every 10 s, answered by at
+  least 4 of the last 6 probes including the last one. A repair triggered by
+  a missing answer (the peer's xapi silent, the local HA daemon not in the
+  liveset) also waits 330 s after the network returns, the time XAPI took to
+  reassemble the pool by itself in tests. A withheld action is logged
+  (`ha_action_withheld`), shown by `twinstor status`, and retried later.
+- A host that XAPI holds in its HA startup loop (locally armed, not in the
+  liveset, the peer's management address silent) is never disarmed,
+  transitioned to master or reset by TwinStor, whatever replication says.
+  The whole-switch hold keeps its exemption.
+- Pool HA is re-armed only when TwinStor recorded that it turned it off.
+  Pool HA found off after a peer rejoin, with no such record, raises an
+  alert instead of being re-enabled (it overrode an operator's disable in a
+  test). Every local emergency disarm TwinStor makes is now recorded.
+- A host held out of the pool in XAPI's HA startup loop alerted "stop xhad on
+  both hosts for 90s, then re-arm" and could restart its HA daemon. Neither
+  happens any more on such a host, nor on a pool whose HA reads off. An
+  unknown pool HA state does not hold them: a host in a real join deadlock
+  often cannot read it.
+- A slave cut off from its pool master, on a pool whose HA an operator
+  had just turned off, raised the join-deadlock runbook ("on the pool
+  master run 'xe pool-ha-disable' ...") every few minutes: pool HA could
+  not be read from there, and its HA daemon's exit had cleared the armed
+  flag that held such a host back. The revive and the runbook alert now
+  also wait while a slave is cut off from its master's management address
+  with the peer alive on replication, and when the host's own HA daemon
+  last exited with "Invalid pool state (1906)" (what it logs when pool HA
+  is disabled) and nothing restarted it.
+- While the peer's management address does not answer, the probes that
+  could only time out are not sent, and a pool slave skips its XAPI
+  housekeeping (every call would go to the unreachable master), which keeps
+  the daemon's check loop at its normal pace during a cut.
+- On a slave whose pool master's management address is silent, the
+  once-a-minute check for an unplugged TwinStor PBD no longer asks the
+  master (the call could only time out, holding the daemon's loop for
+  15 seconds every minute).
+
+### Repairs
+- Every pool HA disable and enable the daemon issues on its own (the
+  peer-emergency reset, the recorded-disarm re-arm, the re-admission
+  recovery, the survivor's dual-master reset, the re-arm owed after
+  TwinStor's own disable, the masterless recovery; not setup or the
+  doctor's operator-run fix) runs outside the check loop and re-checks,
+  right before each step, that the peer's management address answers (not
+  on the masterless recovery's lone-survivor path, whose premise is a peer
+  gone), that this host's pool role is unchanged, that XAPI does not hold it
+  in its HA startup loop and that no host is in maintenance. Before a
+  disable, pool HA must read on and no pool HA operation may be pending in
+  XAPI; otherwise nothing is issued. A disable counts as TwinStor's only if
+  it returned, or got no answer in time and pool HA then reads off; any
+  error answer from XAPI with pool HA off afterwards is not taken as
+  TwinStor's: nothing re-enables it, and an alert says that pool HA is off,
+  that TwinStor's own disable was refused, and how to re-enable it by hand.
+  A withheld enable is left to the re-arm obligation (on the lone-survivor
+  path, to its own retry every 2 minutes: at most 5 enables issued and 30
+  minutes in all, each only while this host's copy serves and the peer is
+  still gone; once the peer is back, the normal re-arm takes over). The survivor's
+  dual-master reset no longer writes the pool's failures-to-tolerate after
+  its re-enable: pool HA disable and enable leave it unchanged, and writing
+  back a value read before the disable could undo an operator's change made
+  meanwhile.
+- The peer's xapi role is read from its real answer: a slave wedged
+  disarmed under an armed pool, or one just released from the HA startup
+  loop, no longer reads as the pool master.
+- While pool HA is on and the peer's management address answers, the pool
+  master checks every minute whether the peer's XAPI answers as locally
+  disarmed under the armed pool, so the reset that frees such a peer starts
+  before XAPI's own HA restarts the peer's VMs elsewhere.
+- The peer-emergency reset (a pool HA disable and re-enable) acts only when
+  the peer's xapi answers that it is locally disarmed under the armed pool,
+  on two probes 30 s to 5 minutes apart (the second taken 30 s after the
+  first, not at the next minute's check), and the probe the reset fires on
+  must itself give that answer; a single normal answer in between, as the
+  disarmed slave's xapi gives while it restarts itself, does not reset the
+  count, two in a row do. Its older signature (the peer's agent not
+  answering) and the fast paths that fired during a normal rejoin are gone;
+  `[ha] readmission_flap_debounce`, which tuned that signature, is still
+  accepted but has no effect.
+- The peer-emergency reset is limited by a budget instead of a one-hour
+  cooldown: at most 3 resets in 6 hours, at least 10 minutes apart (an hour
+  after a reset that did not free the peer), kept for the boot across daemon
+  restarts, with each reset's pending verdict (a daemon restarted past the
+  verdict's time counts that reset as not having freed the peer); a budget
+  that cannot be written runs no reset. A reset whose disable was refused or
+  never issued is given back;
+  one that timed out may still take and counts. Whether a reset freed the peer is
+  read from the peer's own xapi answer (two normal answers in a row after
+  the reset, none locally disarmed), not from its agent, which answers
+  throughout the wedge: the "freed, no action needed" alert is sent only
+  then; a peer that answers locally disarmed again within 30 minutes of
+  that verdict is the same wedge, and the reset counts as not having freed
+  it. The verdict starts once pool HA reads on with no HA task pending
+  (after the re-arm record's enable when the reset's own did not run), and
+  whether a timed-out disable took is read from the re-arm record; every
+  such wait ends 30 minutes after the reset's cycle, the reset then counting
+  as not having freed the peer, with an alert saying only what was read. A
+  verdict taken up again past that bound (a daemon restart, mastership
+  back) is never reported as freed. Pool HA turned off by hand while the
+  verdict probes the peer ends that verdict with no judgement: no hour's
+  hold and no alert (the HA-off alert already says it). A reset that did
+  not free the peer raises one alert saying so, until when TwinStor waits, and the manual
+  pool HA cycle. A second wedge on the same master soon after a reset was
+  left unrepaired for the rest of the hour, with
+  nothing saying why, while XAPI showed the wedged host's running VMs as
+  halted. While the budget holds a reset, TwinStor logs it as withheld with
+  the rule that holds it, the PeerDisarmed status says until when, and for
+  the long holds (the budget, the hour after a futile reset) one alert says
+  that the peer's VMs are unprotected and may be restarted on another host,
+  with the manual pool HA cycle.
+- The re-arm record now says what TwinStor knows: its disable is pending
+  (issued, not yet seen to take, for 7 minutes, and up to 4 minutes after
+  TwinStor's own HA task was last seen pending; a cancelled task ends it once
+  pool HA reads on),
+  owed (pool HA read off after TwinStor's own
+  disable) or enabled (TwinStor's enable call returned success, or pool HA
+  has read on and stayed so for the settle period with no HA task pending).
+  Only an owed record leads to an enable, and every enable reads the record
+  again right before it runs; a pool HA-off seen after the record became
+  enabled, or after a pending disable's window, is not TwinStor's and is
+  never re-enabled (an alert says so). A record written by an earlier
+  version reads as owed; the file stays readable by 0.7.4.
+- A host that TwinStor itself disarmed (a whole-switch hold, a stand-down)
+  and that is back in the HA liveset still locally disarmed under the armed
+  pool, where HA protects nothing, gets one pool HA cycle (disable, then
+  enable), which re-arms both hosts. It runs once per disarm, from the pool
+  master when both hosts were disarmed, only with both hosts live in the
+  liveset for 2 minutes, the peer's management address answering, a single
+  pool master and no HA operation pending; `[ha]
+  auto_resolve_peer_emergency = false` turns it into an alert. In a test both
+  hosts stayed in that state for over 15 minutes after a whole-switch hold.
+- A host whose xapi answers as pool master demotes itself to slave of the
+  peer when its own HA liveset names the peer as master (two reads 30 s
+  apart), or when XAPI released it from the HA startup loop because the
+  pool's HA was disabled while it was cut off, and the peer is shown alive.
+  It only points pool.conf at a peer management address that answers, and
+  demotes at most 3 times per incident. In a test a host stayed a second
+  master for 20 minutes after a partial heal; nothing else collapsed it.
+- The automatic XHA re-admission recovery (`[ha] readmission_assist`, still
+  on by default: a local HA disarm on both hosts, then one pool HA cycle) is
+  gated where it acts. Before its local disarm each host checks only itself:
+  the fire-time gate (the peer's management address answering for the
+  settle period), pool HA on, XAPI's task list readable and showing no
+  pending HA task (unreadable, the dance is cancelled rather than leave
+  phase 1 less than its normal lead of the HA timeout plus a minute before
+  the sync point), not held in XAPI's HA startup loop, and its own HA daemon out of
+  the liveset (for the 5-minute suspicion window). Phase 2 runs through the
+  gated pool HA cycle off the daemon's loop; if it does not start, one alert
+  says so at once, and a host still locally disarmed 300 s after the sync
+  point raises an alert about itself. Each alert names the
+  host, says it stays locally disarmed, and gives the manual re-arm.
+  TwinStor does not retry. A scheduled recovery is cancelled as soon as the
+  host is back in the HA liveset.
+- An HA re-arm that waits on a pending pool HA operation in XAPI no longer
+  waits forever: TwinStor cancels its own operation once it has been pending
+  for 6 minutes after its attempt (a failed enable could leave it pending and
+  block every later re-arm). An operation TwinStor did not start is reported
+  in `twinstor status` and by an alert, and never touched.
+- A pool HA operation left pending in XAPI that holds TwinStor's HA repairs
+  for more than 6 minutes is reported (or, if TwinStor started it,
+  cancelled) even when no re-arm is owed; the alert names the task and how
+  long it has been pending. An unreadable task list holds the re-arm rather
+  than reading as "nothing pending".
+- Hosts are identified by UUID, never by name-label. The peer's enabled
+  flag (which gates the pool HA re-arm) and its host-metrics-live (which
+  feeds the dual-master and stranded-master checks) were looked up by
+  name-label using the peer's hostname. After a host was renamed in Xen
+  Orchestra, both lookups matched nothing: the re-arm held forever, so pool
+  HA stayed off after a TwinStor recovery disable, and the two master checks
+  only worked when this host's own XAPI was hung. The peer's hostname is now
+  resolved to its UUID once (again if that host was re-installed or
+  re-joined), and every peer query goes by UUID.
+- Pool HA is re-armed when the pool master has moved. The re-arm is owed on
+  the host that disabled pool HA, and only the pool master attempted it:
+  when the master later moved to the peer (an XHA election, or the operator
+  designating it), pool HA stayed off for good. A holder that is no longer
+  master now enables from the slave side (XAPI forwards the call to the
+  master), with the same preconditions plus this host enabled, and only once
+  its own last attempt has settled, so a master holding its own re-arm goes
+  first and two enables do not race. From the slave side it runs the local
+  self-heals (statefile refresh, PBD plug), not the orphan-xhad stop or the
+  toolstack restart, which act on the master.
+- The re-arm's toolstack escalation now actually runs. In 0.7.4 it called
+  `xe-toolstack-restart` by its bare name, which is not on the daemon's
+  PATH, so it never ran; it now uses the full path. It restarts the pool
+  master's toolstack to clear a stuck "HA ... in progress" lock when a
+  re-arm `pool-ha-enable` owed by TwinStor keeps failing: only on the
+  master, only after the lighter remedies failed twice, only while the
+  peer's management address answers, at least 10 minutes apart, and at
+  most twice per incident (the count is kept on disk across daemon
+  restarts, counted before the restart runs, and cleared when the re-arm
+  is fulfilled).
+- The protected-VM watchdog starts VMs only on the host that holds the HA
+  master lock in its own liveset.
+- The isolated-master stand-down (arbitrated) takes "I am the master" from
+  the local xapi, not from pool.conf alone.
+
+### Storage
+- Fate-shared pools: DRBD now waits 3 s instead of 0.5 s for a ping reply
+  (or, with both hosts Primary, a missing acknowledgement) before it drops
+  the replication connection. At 0.5 s a link losing 20% of its packets was
+  dropped and reconnected many times a minute, because TCP needs
+  retransmits to get a lost packet through, and every drop started a
+  fence-peer round. A dead peer is now noticed up to 2.5 s later. Arbitrated
+  pools keep 0.5 s: there the same timer also decides how fast replication
+  moves from a failed direct cable to the switched path. Existing pools get
+  the new value when `twinstor upgrade-apply` migrates their resource file
+  (see Upgrading).
+- Arbitrated mode: when XHA fenced one host and the survivor had frozen its
+  own I/O on the disconnect, the survivor's freeze could never lift once the
+  fenced host came back behind: DRBD waits for the frozen writes before it
+  starts the resync, and TwinStor waited for the resync. The HA statefile
+  watchdog then reset the survivor too, and both hosts rebooted. The freeze
+  now lifts once DRBD has made the survivor the resync source (no
+  split-brain, the peer behind) and the connection has held 5 s; in tests
+  the survivor resumed I/O about 20 s after the peer reconnected. The whole
+  freeze must still end within the pool's HA timeout (see Known
+  limitations).
+
+### Alerts and status
+- Alerts no longer advise `xe host-emergency-ha-disable --force` as a
+  harmless first step. Run on one host that runs VMs while pool HA stays
+  armed and the master's HA is live, it gets that host declared dead after
+  about the HA timeout, and XAPI restarts its VMs on the other host while
+  they still run (seen in testing about two minutes after the command). The
+  alerts now give the pool-level command first (`xe pool-ha-disable` on the
+  master), use the emergency disable only after that, or on both hosts
+  within 30 seconds when the pool-level command fails, state the configured
+  HA timeout, and no longer claim that VMs are unaffected. The emergency
+  master transition's manual procedure applies only if no host answers as
+  pool master. A host locally disarmed under the armed pool that runs VMs,
+  not by TwinStor's own recorded disarm, now raises an alert saying so.
+  The pool master raises one too, once per wedge (kept across a restart),
+  on first seeing its peer answer that way, saying whether TwinStor's reset
+  is expected, on hold until a given time, or turned off by configuration;
+  not when TwinStor's own hold or reset explains the peer's state, nor
+  within 30 minutes of a reset that freed it.
+- A host held out of the pool after a fence (its HA daemon still starting)
+  no longer alerts that the isolated pool master "is still in the HA
+  liveset": it has no liveset of its own to tell. It now alerts that the
+  master does not answer on the management network and that, if it still
+  runs VMs, clients likely cannot reach them. A host whose liveset still
+  shows the master does not claim so until XHA has had longer than it takes
+  to decide (three heartbeat timeouts plus a minute) since both the
+  isolation was first seen and the last change this host saw in what XHA
+  decides on (the master's management address, the peer on replication, the
+  DRBD connection, the peer's liveset entry, or XHA's own log of a
+  membership change): the master may be about to be removed. It waits at
+  most 15 minutes from the isolation; past that, with changes still seen,
+  the alert goes out without the liveset claim. The alert
+  also needs the master's management address silent, not merely this host's
+  `xe` failing (a slave disarmed under the armed pool fails `xe` with
+  nothing cut).
+- When the peer rejoined with pool HA off and the master had not been master
+  long enough to see HA while the peer was live, TwinStor logged that HA "was
+  already off while the peer was alive" and raised no alert. It now raises
+  the "pool HA is off and TwinStor did not turn it off" alert, saying it does
+  not know whether HA was on before; HA is still not re-enabled.
+- "Pool HA is off and TwinStor did not turn it off" depended on the pool
+  master sampling the peer as not live (every 10 minutes): a peer fenced
+  and back between two samples, with pool HA turned off by hand meanwhile,
+  got no such alert. The master now also remembers a peer absence its
+  partition view showed (peer gone, parked or cut off from its clients)
+  and takes it as the peer's last state at the next sample. Still alert
+  only; nothing re-enables pool HA. One pool-HA-off episode is reported
+  once; and "HA was seen off while the peer was live" is said only when
+  that sample was taken before the peer's absence began.
+- "The twinstor daemon on <peer> has not reported liveness for ~23
+  minutes" was raised a few minutes after a long management-network cut
+  ended, while the peer's daemon had run throughout: its report travels
+  over the management network and could not arrive. The time the peer's
+  management address is silent is no longer counted, the staleness counts
+  from its return, and the alert says that no report arrived rather than
+  that the daemon is down.
+- The no-tiebreaker alert said the gateway had been unreachable "for ~30
+  minutes" after a 3-minute outage that followed an earlier one. The checks
+  now also use the partition view's 10-second probe of the same targets: a
+  gateway that answered most of those probes since the previous check starts
+  the count of failed checks afresh, and the alert states the time since the
+  last answer, or how many probes answered over the failing period.
+- Alerts that advise `pool-ha-disable` or `host-emergency-ha-disable` say
+  that the advice applies only when both hosts' management networks are up.
+- Alerts whose remedy is `pool-ha-disable` or `host-emergency-ha-disable`
+  are held back, not dropped, while a host is held out of the pool, and are
+  delivered once none is.
+- An alert held because XAPI did not answer is no longer delivered once
+  untrue: "serving without redundancy" is withdrawn when redundancy
+  returns, an isolated-master alert (either side's) when the isolation
+  clears, a reset-hold alert when its hold ends, the master's alert about a
+  disarmed peer when that wedge ends, and a disarmed host's own alert once
+  it reads armed again; any other held alert is dropped once 15 minutes
+  old unless raised again (checked every second, and again right before
+  delivery). A one-off report (such as a cleared wedge) and a day-paced
+  alert (such as a second pool master) count as sent only once delivered:
+  they are not queued, and are raised again until delivered.
+- `twinstor status` shows the partition view (for example ClientIsolated,
+  Parked, PeerParked, Rejoining) with what to do, the peer's management
+  reachability, the last withheld HA action, why an owed HA re-arm waits,
+  and a warning when this host's local.db `ha_peers` lacks the peer.
+  `twinstor doctor` reports `ha_peers` with its remedy.
+- `twinstor status` no longer reads healthy on a second pool master or on a
+  host left disarmed under the armed pool (views SecondMaster and
+  DisarmedMember); in a test both hosts of a dual master read healthy.
+- The partition view names the side that is cut off from its own client
+  probe: when XHA keeps the cut-off host by host order, that host says its
+  VMs are likely unreachable and its own network needs fixing, and the
+  fenced host says its own network is fine and the peer is cut off. A host
+  reads Parked only after a failed HA join, a host that stood its own storage
+  down (and its peer) says so instead of naming an XHA restart, both hosts
+  of a whole-switch hold show the hold, no view is shown while the
+  management probes warm up after a daemon start, and a view must hold for
+  about 30 s before it replaces another.
+- While the peer's management address answers again but the probes have not
+  confirmed it yet (after a cut is restored, or a peer reboots), and when a
+  peer shown unreachable everywhere answers on replication again, the view
+  reads Settling at once instead of naming a side cut off. A host armed for
+  HA and out of the liveset reads Joining before its first failed HA join,
+  and a confirmed park holds until the host joins, the peer's management
+  address answers, or the host is released, instead of flapping with XAPI's
+  join cycle. The Rejoining views no longer say the network was away.
+- A host disarmed under the armed pool with its HA daemon stopped reads
+  DisarmedMember (its own XAPI refuses logins with the armed-mismatch code;
+  not asked on a pool whose HA was last read off), and the master reads
+  PeerDisarmed, not healthy, while it sees the peer in that state.
+- Advice to disable HA stays held while a host is held out of the pool even
+  when the view reads Settling (a management link that answers now and
+  then): the hold follows the park itself, not the text shown.
+- A whole-switch hold keeps its status line for as long as it lasts.
+
+### Configuration
+- `[ha] rejoin_assist` (default on) governs the rejoin repairs (the
+  stranded-master yield and reset, the returning-slave reconnect, the
+  HA-deadlock exit, the masterless active rejoin, the dual-master yield, the
+  self-unwedge, the HA-daemon revive and the second-master demote); setting
+  `rejoin_assist = false` switches them off and keeps their detections and
+  alerts.
+- `[ha] readmission_assist` (default on) now governs only the re-admission
+  recovery, whose two phases are also gated when they fire.
+- `[ha] auto_resolve_peer_emergency` now also governs the re-arm of a host
+  TwinStor itself disarmed (the recorded-disarm pool HA cycle): with it off,
+  that host gets an alert asking for the cycle instead.
+
+### Known limitations
+- XHA still keeps the lowest-index host in a one-against-one tie, which can
+  be the host that lost its network; that host's VMs then run where clients
+  cannot reach them until the network returns.
+- Arbitrated mode: the surviving host's frozen I/O is lifted only once the
+  fenced host is back and replication has picked a direction, about 20 s
+  after the fenced host reconnects. The whole freeze must end within the
+  pool's HA timeout (90 s by default on arbitrated pools), or XHA still
+  resets the survivor and both hosts reboot. The fix therefore only helps
+  where the fenced host boots and reconnects in under about a minute. On
+  the test hosts, back on the network about 50 to 55 s after the fence, the
+  freeze lasted from 71 s to just over 90 s and the survivor was still
+  reset in 4 runs of 15. A host that takes longer to boot, as most servers
+  do, sees both hosts reboot as in 0.7.4. If the
+  fenced host takes longer to come back than the HA statefile watchdog
+  allows (about 105 s), the survivor can still be reset by that watchdog,
+  and both hosts reboot.
+- Arbitrated mode: the same freeze is not lifted when replication makes the
+  frozen survivor the copy that receives the resync instead of the one that
+  sends it; that case can still end the same way.
+- Arbitrated mode: an isolated master that stands its storage down keeps
+  answering as pool master until its network returns, so two masters answer
+  during the hold; the second-master demote ends it after the release.
+- Arbitrated mode: lifting the survivor's frozen I/O relies on DRBD
+  refusing to make a Primary the resync target (its default `rr-conflict`
+  policy); the generated resource file does not set that option itself.
+- After a TwinStor re-enable whose call got no answer, pool HA reads on
+  before it is certain; if an operator disables pool HA within the
+  following settle period (5 minutes, longer while an HA task is pending
+  or XAPI's task list cannot be read), TwinStor still takes the HA-off as
+  its own and re-enables it.
+- An operator's pool HA disable is read as TwinStor's, and TwinStor
+  re-enables pool HA, when it lands between TwinStor's disable and its
+  enable, during the 7 minutes TwinStor's own disable is pending, or up to 4
+  minutes after TwinStor's own disable was last seen pending in XAPI.
+- To keep pool HA off after TwinStor turned it off, delete
+  /var/lib/twinstor/ha-rearm-obligation on the host that raised the alert:
+  TwinStor then issues no further enable for it.
+- The other limitations of 0.7.4 are unchanged. On fate-shared pools, the
+  3 s ping timeout makes the heavy packet loss case rarer, not impossible;
+  arbitrated pools are unchanged there.
+
+### Upgrading
+- Upgrade the two hosts back to back with `twinstor upgrade-apply`. No
+  configuration change is needed: `[ha] rejoin_assist` is new and defaults
+  on, `[ha] readmission_assist` keeps its default (on), and the
+  configuration file is not rewritten.
+- The DRBD resource file moves from configuration version 6 to 7. On each
+  host, `twinstor upgrade-apply` regenerates it from the current template,
+  keeps the old file beside it
+  (`/etc/drbd.d/twinstor-<resource>.res.pre-regen`), and applies the new
+  one live with `drbdadm adjust` before it restarts the daemon; replication
+  stays connected. If the live apply is refused, the old file is put back
+  and the upgrade goes on; `twinstor status` then shows a `config:` line,
+  safe to leave until a maintenance window. The lines that can differ:
+  - the configuration version line;
+  - fate-shared pools: `ping-timeout 30;` (3 s) instead of
+    `ping-timeout 5;` (arbitrated pools keep 5);
+  - `c-fill-target` and `c-min-rate`, recomputed from the link speeds
+    measured during the migration, as setup computes them: unchanged unless
+    a speed reads differently from when the file was written. An arbitrated
+    pool whose file was written before 0.7.4 and not regenerated since gets
+    the sizing 0.7.4 introduced: the fill target from the direct cable, and
+    the floor the lower of 80% of the cable and half the switched link
+    (before, both came from the switched link);
+  - in a file written before 0.7.4, comment lines (wording only).
+- A 0.7.4 peer keeps its own behaviour until it is upgraded.
+
 ## [0.7.4] - 2026-10-29
 
 A small fix release for 0.7.3. Upgrade both hosts.
