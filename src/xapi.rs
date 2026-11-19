@@ -63,13 +63,7 @@ fn first_token(s: &str) -> Option<String> {
 /// [`is_pool_master_resilient`] instead.
 pub async fn is_pool_master() -> Option<bool> {
     let pool_master = xe_minimal(&["pool-list", "params=master"]).await?;
-    let my_hostname = hostname::get().ok()?.to_string_lossy().to_string();
-    let my_uuid = xe_minimal(&[
-        "host-list",
-        &format!("hostname={my_hostname}"),
-        "params=uuid",
-    ])
-    .await?;
+    let my_uuid = local_host_uuid().await?;
     if pool_master.is_empty() || my_uuid.is_empty() {
         return None;
     }
@@ -94,23 +88,157 @@ pub async fn pool_master_hostname() -> Option<String> {
     first_token(&host).filter(|s| !s.is_empty())
 }
 
-/// The peer's management address as XAPI records it (`xe host-list
-/// hostname=<peer> params=address`). XAPI uses this path for inter-host RPC,
-/// including the pool-master demotion that the dual-master auto-heal triggers
-/// with a toolstack restart; in an arbitrated topology it differs from the
-/// DRBD replication link. The address is cached in the local DB, so it is
+/// The peer's management address as XAPI records it (its host record's
+/// `address`). XAPI uses this path for inter-host RPC, including the
+/// pool-master demotion that the dual-master auto-heal triggers with a
+/// toolstack restart; in an arbitrated topology it differs from the DRBD
+/// replication link. The address is cached in the local DB, so it is
 /// answerable even while the pool is wedged. `None` if XAPI cannot answer or
 /// returns empty.
 pub async fn peer_management_address(peer_hostname: &str) -> Option<String> {
-    let addr = xe_minimal(&[
-        "host-list",
-        &format!("hostname={peer_hostname}"),
-        "params=address",
+    let addr = host_param(peer_hostname, "address").await?;
+    first_token(&addr)
+}
+
+// Host identity. A host is named in XAPI queries by its UUID, never by a name:
+// the operator can rename a host in XO at any time (its `name-label`), and a
+// lookup by `name-label` then silently matches nothing. This host's UUID comes
+// from the local inventory ([`local_host_uuid`]). The peer is configured by its
+// hostname, which DRBD needs and which a rename in XO does not change; it is
+// resolved to a UUID once and cached for the daemon's lifetime. Every peer
+// query then goes by `uuid=`, and only [`resolve_host_uuid`] queries by
+// hostname.
+
+/// Host UUIDs resolved from hostnames. Host UUIDs do not change while a host
+/// stays in the pool; a host re-installed or re-joined under a new UUID is
+/// noticed when its cached UUID matches no host, and resolved again.
+struct HostUuidCache {
+    entries: Vec<(String, String)>,
+}
+
+impl HostUuidCache {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&self, hostname: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|(h, _)| h == hostname)
+            .map(|(_, u)| u.clone())
+    }
+
+    fn put(&mut self, hostname: &str, uuid: &str) {
+        self.entries.retain(|(h, _)| h != hostname);
+        self.entries.push((hostname.to_string(), uuid.to_string()));
+    }
+
+    /// Drop `hostname`'s entry if it still holds `uuid` (another caller may
+    /// have re-resolved it meanwhile).
+    fn forget(&mut self, hostname: &str, uuid: &str) {
+        self.entries.retain(|(h, u)| !(h == hostname && u == uuid));
+    }
+}
+
+static HOST_UUIDS: std::sync::Mutex<HostUuidCache> = std::sync::Mutex::new(HostUuidCache::new());
+
+/// The UUID of the host whose hostname is `hostname`, from the cache or by one
+/// `host-list hostname=` query, with whether it came from the cache. `None`
+/// when XAPI cannot answer or no host has that hostname. Only a single match is
+/// cached: a duplicate hostname (a misconfigured pool) yields the first match
+/// uncached, so it is looked up again next time.
+async fn resolve_host_uuid<Q, F>(
+    cache: &std::sync::Mutex<HostUuidCache>,
+    hostname: &str,
+    xe: &Q,
+) -> Option<(String, bool)>
+where
+    Q: Fn(Vec<String>) -> F,
+    F: std::future::Future<Output = Option<String>>,
+{
+    if let Some(u) = cache.lock().ok().and_then(|c| c.get(hostname)) {
+        return Some((u, true));
+    }
+    let answer = xe(vec![
+        "host-list".into(),
+        format!("hostname={hostname}"),
+        "params=uuid".into(),
     ])
     .await?;
-    // A duplicate hostname would comma-join two addresses; take the first so
-    // the ping gate gets a usable address.
-    first_token(&addr)
+    let uuid = first_token(&answer)?;
+    if !answer.contains(',')
+        && let Ok(mut c) = cache.lock()
+    {
+        c.put(hostname, &uuid);
+    }
+    Some((uuid, false))
+}
+
+/// One parameter of the host whose hostname is `hostname`, queried by its
+/// UUID. `None` when XAPI cannot answer or no host has that hostname. An empty
+/// answer for a cached UUID means that UUID names no host any more: the entry
+/// is dropped and the hostname resolved again, once.
+async fn host_param_with<Q, F>(
+    cache: &std::sync::Mutex<HostUuidCache>,
+    hostname: &str,
+    param: &str,
+    xe: &Q,
+) -> Option<String>
+where
+    Q: Fn(Vec<String>) -> F,
+    F: std::future::Future<Output = Option<String>>,
+{
+    let query = |uuid: &str| {
+        xe(vec![
+            "host-list".into(),
+            format!("uuid={uuid}"),
+            format!("params={param}"),
+        ])
+    };
+    let (uuid, cached) = resolve_host_uuid(cache, hostname, xe).await?;
+    let answer = query(&uuid).await?;
+    if !answer.is_empty() || !cached {
+        return Some(answer);
+    }
+    if let Ok(mut c) = cache.lock() {
+        c.forget(hostname, &uuid);
+    }
+    let (fresh, _) = resolve_host_uuid(cache, hostname, xe).await?;
+    if fresh == uuid {
+        return Some(answer);
+    }
+    query(&fresh).await
+}
+
+/// [`host_param_with`] against live XAPI and the daemon-wide cache.
+pub(crate) async fn host_param(hostname: &str, param: &str) -> Option<String> {
+    let xe = |args: Vec<String>| async move {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        xe_minimal(&refs).await
+    };
+    host_param_with(&HOST_UUIDS, hostname, param, &xe).await
+}
+
+/// The XAPI UUID of the host whose hostname is `hostname`, checked against the
+/// pool. `None` when XAPI cannot answer or no host has that hostname.
+pub(crate) async fn host_uuid(hostname: &str) -> Option<String> {
+    host_param(hostname, "uuid")
+        .await
+        .and_then(|s| first_token(&s))
+}
+
+/// One parameter of this host, queried by its inventory UUID. `None` when the
+/// inventory is unreadable or XAPI cannot answer.
+async fn local_host_param(param: &str) -> Option<String> {
+    let uuid = local_host_uuid().await?;
+    xe_minimal(&[
+        "host-list",
+        &format!("uuid={uuid}"),
+        &format!("params={param}"),
+    ])
+    .await
 }
 
 /// This host's UUID from the XCP-ng inventory (`INSTALLATION_UUID`). A local
@@ -1080,7 +1208,7 @@ pub async fn is_pool_master_resilient_sourced() -> (Option<bool>, bool) {
 /// or a start-limit stop, and the data plane keeps serving without the daemon,
 /// so nothing else would notice.
 pub async fn stamp_daemon_alive(now_unix: u64, fs_freeze: bool) -> bool {
-    let Some(uuid) = local_host_uuid_by_name().await else {
+    let Some(uuid) = local_host_uuid().await else {
         return false;
     };
     // The same param-set advertises this daemon's version, so the peer can
@@ -1109,7 +1237,7 @@ pub async fn stamp_daemon_alive(now_unix: u64, fs_freeze: bool) -> bool {
 /// lets the peer-alive interlock in `upgrade-apply` refuse a concurrent restart
 /// on the other node.
 pub async fn clear_daemon_alive() -> bool {
-    let Some(uuid) = local_host_uuid_by_name().await else {
+    let Some(uuid) = local_host_uuid().await else {
         return false;
     };
     xe_minimal(&[
@@ -1127,7 +1255,7 @@ pub async fn clear_daemon_alive() -> bool {
 /// after a restart (it re-stamps on its first tick), not merely that systemctl
 /// started a process.
 pub async fn local_daemon_alive_stamp() -> Option<u64> {
-    let uuid = local_host_uuid_by_name().await?;
+    let uuid = local_host_uuid().await?;
     xe_minimal(&[
         "host-param-get",
         &format!("uuid={uuid}"),
@@ -1146,7 +1274,7 @@ pub async fn set_host_other_config(pairs: &[(&str, String)]) -> bool {
     if pairs.is_empty() {
         return true;
     }
-    let Some(uuid) = local_host_uuid_by_name().await else {
+    let Some(uuid) = local_host_uuid().await else {
         return false;
     };
     let mut args: Vec<String> = vec!["host-param-set".to_string(), format!("uuid={uuid}")];
@@ -1179,39 +1307,14 @@ pub async fn set_sr_other_config(sr_uuid: &str, pairs: &[(&str, String)]) -> boo
 /// stamp). Callers must not treat a missing stamp as down, and must treat a
 /// `None` version as unknown, never as a skew.
 pub async fn peer_daemon_alive(peer_hostname: &str) -> (Option<u64>, Option<bool>, Option<String>) {
-    let Some(uuid) = xe_minimal(&[
-        "host-list",
-        &format!("hostname={peer_hostname}"),
-        "params=uuid",
-    ])
-    .await
-    .and_then(|s| first_token(&s)) else {
+    let Some(config) = host_param(peer_hostname, "other-config").await else {
         return (None, None, None);
     };
-    let stamp = xe_minimal(&[
-        "host-param-get",
-        &format!("uuid={uuid}"),
-        "param-name=other-config",
-        "param-key=twinstor-alive",
-    ])
-    .await
-    .and_then(|s| s.trim().parse::<u64>().ok());
-    let version = xe_minimal(&[
-        "host-param-get",
-        &format!("uuid={uuid}"),
-        "param-name=other-config",
-        "param-key=twinstor-version",
-    ])
-    .await
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty());
-    let live = match xe_minimal(&[
-        "host-list",
-        &format!("hostname={peer_hostname}"),
-        "params=host-metrics-live",
-    ])
-    .await
-    .as_deref()
+    let stamp = other_config_value(&config, "twinstor-alive").and_then(|s| s.parse::<u64>().ok());
+    let version = other_config_value(&config, "twinstor-version").filter(|s| !s.is_empty());
+    let live = match host_param(peer_hostname, "host-metrics-live")
+        .await
+        .as_deref()
     {
         Some("true") => Some(true),
         Some("false") => Some(false),
@@ -1225,19 +1328,7 @@ pub async fn peer_daemon_alive(peer_hostname: &str) -> (Option<u64>, Option<bool
 /// it (`twinstor-version`, read in the same call). `None` when XAPI cannot
 /// answer; a missing key (a release without freeze mode) reads as off.
 pub async fn peer_fs_freeze(peer_hostname: &str) -> Option<bool> {
-    let uuid = xe_minimal(&[
-        "host-list",
-        &format!("hostname={peer_hostname}"),
-        "params=uuid",
-    ])
-    .await
-    .and_then(|s| first_token(&s))?;
-    let config = xe_minimal(&[
-        "host-param-get",
-        &format!("uuid={uuid}"),
-        "param-name=other-config",
-    ])
-    .await?;
+    let config = host_param(peer_hostname, "other-config").await?;
     Some(fs_freeze_in_other_config(&config))
 }
 
@@ -1283,15 +1374,6 @@ pub fn version_has_freeze(version: &str) -> bool {
     }
 }
 
-/// This host's XAPI UUID, resolved by hostname (same convention as
-/// `send_alert`).
-async fn local_host_uuid_by_name() -> Option<String> {
-    let name = hostname::get().ok()?.to_string_lossy().to_string();
-    xe_minimal(&["host-list", &format!("hostname={name}"), "params=uuid"])
-        .await
-        .and_then(|s| first_token(&s))
-}
-
 /// Raise the no-tiebreaker alert: the fence-peer's effective probe set (the
 /// default gateway plus the ping-targets file) is empty or has been entirely
 /// unreachable for a sustained period. In that state any replication
@@ -1330,11 +1412,7 @@ pub async fn send_peer_daemon_down_alert(peer: &str, minutes: u64) -> bool {
 /// XAPI cannot answer (callers must treat that as "cannot decide safely",
 /// not as zero). Used by the replication-failback dance to pick the cheaper side.
 pub async fn resident_vm_count(hostname: &str) -> Option<usize> {
-    let host_uuid =
-        xe_minimal(&["host-list", &format!("hostname={hostname}"), "params=uuid"]).await?;
-    if host_uuid.is_empty() {
-        return None;
-    }
+    let host_uuid = host_uuid(hostname).await?;
     let vms = xe_minimal(&[
         "vm-list",
         &format!("resident-on={host_uuid}"),
@@ -1651,13 +1729,7 @@ fn pending_ha_task_in(names: &str) -> Option<String> {
 /// could not be determined (XAPI unreachable, timeout, or unexpected output).
 /// Callers treat `None` as "cannot confirm" and must not block on it.
 pub async fn is_host_enabled() -> Option<bool> {
-    let my_hostname = hostname::get().ok()?.to_string_lossy().to_string();
-    let out = xe_minimal(&[
-        "host-list",
-        &format!("hostname={my_hostname}"),
-        "params=enabled",
-    ])
-    .await?;
+    let out = local_host_param("enabled").await?;
     match out.as_str() {
         "true" => Some(true),
         "false" => Some(false),
@@ -2116,16 +2188,9 @@ async fn send_alert_keyed(name: &str, key: &str, body: &str) -> bool {
         );
         return false;
     }
-    let host_uuid = xe_minimal(&[
-        "host-list",
-        "params=uuid",
-        &format!(
-            "hostname={}",
-            hostname::get().unwrap_or_default().to_string_lossy()
-        ),
-    ])
-    .await
-    .unwrap_or_default();
+    // The local query doubles as the reachability probe the gate needs: it
+    // reads empty when XAPI does not answer.
+    let host_uuid = local_host_param("uuid").await.unwrap_or_default();
 
     if host_uuid.is_empty() {
         let _ = ALERT_GATE.lock().map(|mut g| g.unreachable(now));
@@ -2870,15 +2935,8 @@ pub async fn local_running_vm_count() -> u32 {
 /// unreadable. Used to detect a stranded former master: a peer that is alive on
 /// the replication link but reads not live here is acting as its own pool
 /// master, so this node is the spurious second master.
-pub async fn peer_host_live(peer_name: &str) -> Option<bool> {
-    match xe_minimal(&[
-        "host-list",
-        &format!("name-label={peer_name}"),
-        "params=host-metrics-live",
-    ])
-    .await?
-    .trim()
-    {
+pub async fn peer_host_live(peer_hostname: &str) -> Option<bool> {
+    match host_param(peer_hostname, "host-metrics-live").await?.trim() {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
@@ -2891,17 +2949,324 @@ pub async fn peer_host_live(peer_name: &str) -> Option<bool> {
 /// switch-isolated; `enabled` is false throughout an isolation and the whole
 /// rejoin, and true only once the peer is fully re-admitted. That makes it the
 /// right precondition for a `pool-ha-enable` re-arm.
-pub async fn peer_host_enabled(peer_name: &str) -> Option<bool> {
-    match xe_minimal(&[
-        "host-list",
-        &format!("name-label={peer_name}"),
-        "params=enabled",
-    ])
-    .await?
-    .trim()
-    {
+pub async fn peer_host_enabled(peer_hostname: &str) -> Option<bool> {
+    match host_param(peer_hostname, "enabled").await?.trim() {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod host_identity_tests {
+    use super::{HostUuidCache, host_param_with, resolve_host_uuid};
+    use std::sync::Mutex;
+
+    // Spelled in pieces so the source guard below does not match this module.
+    const HOST_LIST: &str = concat!("host", "-list");
+    const BY_HOSTNAME: &str = concat!("hostname", "=");
+    const BY_NAME_LABEL: &str = concat!("name-label", "=");
+
+    struct FakeHost {
+        uuid: String,
+        hostname: String,
+        name_label: String,
+        enabled: bool,
+    }
+
+    /// A pool DB answering `xe host-list <filters> params=<p> --minimal` the
+    /// way XAPI does: matching values comma-joined, empty when nothing
+    /// matches, `None` (the bounded call failing) while XAPI is down.
+    struct FakeXapi {
+        hosts: Mutex<Vec<FakeHost>>,
+        calls: Mutex<Vec<Vec<String>>>,
+        down: Mutex<bool>,
+    }
+
+    fn host(uuid: &str, hostname: &str, name_label: &str) -> FakeHost {
+        FakeHost {
+            uuid: uuid.into(),
+            hostname: hostname.into(),
+            name_label: name_label.into(),
+            enabled: true,
+        }
+    }
+
+    impl FakeXapi {
+        /// The customer pool from the field report: both hosts renamed in XO,
+        /// so no name-label equals a hostname.
+        fn renamed_pool() -> Self {
+            Self {
+                hosts: Mutex::new(vec![
+                    host(
+                        "987a31e2-0000-0000-0000-000000000001",
+                        "xcp-ng-zanepsdm",
+                        "xcp-ng-host 1",
+                    ),
+                    host(
+                        "5b1c0d44-0000-0000-0000-000000000002",
+                        "xcp-ng-upzpwzfj",
+                        "xcp-ng-host2",
+                    ),
+                ]),
+                calls: Mutex::new(Vec::new()),
+                down: Mutex::new(false),
+            }
+        }
+
+        fn answer(&self, args: &[String]) -> Option<String> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if *self.down.lock().unwrap() {
+                return None;
+            }
+            assert_eq!(args.first().map(String::as_str), Some(HOST_LIST));
+            let hosts = self.hosts.lock().unwrap();
+            let mut matching: Vec<&FakeHost> = hosts.iter().collect();
+            let mut param = "uuid";
+            for a in &args[1..] {
+                if let Some(v) = a.strip_prefix(BY_HOSTNAME) {
+                    matching.retain(|h| h.hostname == v);
+                } else if let Some(v) = a.strip_prefix(BY_NAME_LABEL) {
+                    matching.retain(|h| h.name_label == v);
+                } else if let Some(v) = a.strip_prefix("uuid=") {
+                    matching.retain(|h| h.uuid == v);
+                } else if let Some(v) = a.strip_prefix("params=") {
+                    param = match v {
+                        "uuid" => "uuid",
+                        "enabled" => "enabled",
+                        other => panic!("fake XAPI has no param {other}"),
+                    };
+                } else {
+                    panic!("fake XAPI does not understand {a}");
+                }
+            }
+            let values: Vec<String> = matching
+                .iter()
+                .map(|h| match param {
+                    "uuid" => h.uuid.clone(),
+                    _ => h.enabled.to_string(),
+                })
+                .collect();
+            Some(values.join(","))
+        }
+
+        fn calls_by_hostname(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.iter().any(|a| a.starts_with(BY_HOSTNAME)))
+                .count()
+        }
+
+        fn any_call_by_name_label(&self) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.iter().any(|a| a.starts_with(BY_NAME_LABEL)))
+        }
+    }
+
+    fn cache() -> Mutex<HostUuidCache> {
+        Mutex::new(HostUuidCache::new())
+    }
+
+    const PEER: &str = "xcp-ng-upzpwzfj";
+    const PEER_UUID: &str = "5b1c0d44-0000-0000-0000-000000000002";
+
+    #[tokio::test]
+    async fn a_renamed_peer_is_still_found() {
+        let fake = FakeXapi::renamed_pool();
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        // The 0.7.4 lookup: the peer's hostname as a name-label matches nothing
+        // once the host is renamed, which held the pool-HA re-arm forever.
+        assert_eq!(
+            fake.answer(&[
+                HOST_LIST.into(),
+                format!("{BY_NAME_LABEL}{PEER}"),
+                "params=enabled".into()
+            ])
+            .as_deref(),
+            Some("")
+        );
+        fake.calls.lock().unwrap().clear();
+        assert_eq!(
+            host_param_with(&cache(), PEER, "enabled", &xe)
+                .await
+                .as_deref(),
+            Some("true")
+        );
+        assert!(!fake.any_call_by_name_label());
+    }
+
+    #[tokio::test]
+    async fn the_hostname_is_resolved_once_then_every_query_goes_by_uuid() {
+        let fake = FakeXapi::renamed_pool();
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        let c = cache();
+        for _ in 0..3 {
+            assert_eq!(
+                host_param_with(&c, PEER, "enabled", &xe).await.as_deref(),
+                Some("true")
+            );
+        }
+        assert_eq!(fake.calls_by_hostname(), 1);
+        assert_eq!(c.lock().unwrap().get(PEER).as_deref(), Some(PEER_UUID));
+        // Renaming the host again changes nothing.
+        fake.hosts.lock().unwrap()[1].name_label = "renamed once more".into();
+        fake.hosts.lock().unwrap()[1].enabled = false;
+        assert_eq!(
+            host_param_with(&c, PEER, "enabled", &xe).await.as_deref(),
+            Some("false")
+        );
+        assert_eq!(fake.calls_by_hostname(), 1);
+    }
+
+    #[tokio::test]
+    async fn xapi_down_answers_unknown_and_caches_nothing() {
+        let fake = FakeXapi::renamed_pool();
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        let c = cache();
+        *fake.down.lock().unwrap() = true;
+        assert_eq!(host_param_with(&c, PEER, "enabled", &xe).await, None);
+        assert_eq!(c.lock().unwrap().get(PEER), None);
+        *fake.down.lock().unwrap() = false;
+        assert_eq!(
+            host_param_with(&c, PEER, "enabled", &xe).await.as_deref(),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn xapi_down_after_caching_keeps_the_entry() {
+        let fake = FakeXapi::renamed_pool();
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        let c = cache();
+        host_param_with(&c, PEER, "enabled", &xe).await;
+        *fake.down.lock().unwrap() = true;
+        assert_eq!(host_param_with(&c, PEER, "enabled", &xe).await, None);
+        assert_eq!(c.lock().unwrap().get(PEER).as_deref(), Some(PEER_UUID));
+    }
+
+    #[tokio::test]
+    async fn a_peer_rejoined_under_a_new_uuid_is_resolved_again() {
+        let fake = FakeXapi::renamed_pool();
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        let c = cache();
+        host_param_with(&c, PEER, "enabled", &xe).await;
+        let new_uuid = "c0ffee00-0000-0000-0000-000000000003";
+        fake.hosts.lock().unwrap()[1].uuid = new_uuid.into();
+        assert_eq!(
+            host_param_with(&c, PEER, "enabled", &xe).await.as_deref(),
+            Some("true")
+        );
+        assert_eq!(c.lock().unwrap().get(PEER).as_deref(), Some(new_uuid));
+        assert_eq!(fake.calls_by_hostname(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_gone_from_the_pool_reads_unknown() {
+        let fake = FakeXapi::renamed_pool();
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        let c = cache();
+        host_param_with(&c, PEER, "enabled", &xe).await;
+        fake.hosts.lock().unwrap().remove(1);
+        assert_eq!(host_param_with(&c, PEER, "enabled", &xe).await, None);
+        assert_eq!(c.lock().unwrap().get(PEER), None);
+        assert_eq!(
+            host_param_with(&c, "no-such-host", "enabled", &xe).await,
+            None
+        );
+        assert_eq!(c.lock().unwrap().get("no-such-host"), None);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_hostname_answers_the_first_match_uncached() {
+        let fake = FakeXapi::renamed_pool();
+        fake.hosts.lock().unwrap().push(host(
+            "dddddddd-0000-0000-0000-000000000004",
+            PEER,
+            "a clone",
+        ));
+        let xe = |args: Vec<String>| {
+            let r = fake.answer(&args);
+            async move { r }
+        };
+        let c = cache();
+        assert_eq!(
+            resolve_host_uuid(&c, PEER, &xe).await,
+            Some((PEER_UUID.to_string(), false))
+        );
+        assert_eq!(c.lock().unwrap().get(PEER), None);
+        resolve_host_uuid(&c, PEER, &xe).await;
+        assert_eq!(fake.calls_by_hostname(), 2);
+    }
+
+    #[test]
+    fn forget_drops_only_the_uuid_it_names() {
+        let mut c = HostUuidCache::new();
+        c.put(PEER, "old");
+        c.put(PEER, "new");
+        c.forget(PEER, "old");
+        assert_eq!(c.get(PEER).as_deref(), Some("new"));
+        c.forget(PEER, "new");
+        assert_eq!(c.get(PEER), None);
+    }
+
+    /// No host query in the daemon may name a host by `name-label` (renameable
+    /// in XO at any time), and only the resolver may query by hostname.
+    #[test]
+    fn host_queries_never_go_by_name() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let host_list = concat!("\"host", "-list\"");
+        let by_hostname = concat!("hostname=", "{");
+        let mut hostname_queries = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains(host_list) {
+                    for (j, l) in lines.iter().enumerate().skip(i).take(5) {
+                        assert!(
+                            !l.contains(BY_NAME_LABEL),
+                            "{}:{}: a host-list by name-label",
+                            path.display(),
+                            j + 1
+                        );
+                    }
+                }
+                if line.contains(by_hostname) {
+                    hostname_queries.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+        assert_eq!(
+            hostname_queries.len(),
+            1,
+            "only resolve_host_uuid may query by hostname: {hostname_queries:?}"
+        );
     }
 }
