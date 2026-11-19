@@ -2679,8 +2679,14 @@ enum HaRearmAction {
     None,
     /// HA is armed (by the daemon or an operator): the obligation is fulfilled.
     Fulfilled,
-    /// Conditions are right: attempt the re-arm now.
+    /// Conditions are right on the pool master: attempt the re-arm now, with
+    /// the master-side remedies.
     Attempt,
+    /// The obligation is held by a node that is no longer the pool master (the
+    /// master moved to the peer after the disable): enable from here, which
+    /// xapi forwards to the master. Paced by `settled`, and without the
+    /// master-side remedies, which would act on the wrong host.
+    AttemptFromSlave,
     /// Obligation stands but conditions are wrong (not master, storage
     /// unhealthy, peer gone, xe unreadable): retry on a later cycle.
     Hold,
@@ -2690,7 +2696,8 @@ enum HaRearmAction {
 fn ha_rearm_decision(
     has_obligation: bool,
     ha: Option<bool>,
-    is_master: bool,
+    master: Option<bool>,
+    this_host_enabled: bool,
     storage_healthy: bool,
     peer_reachable: bool,
     peer_mgmt_reachable: bool,
@@ -2719,9 +2726,19 @@ fn ha_rearm_decision(
         // switch-path isolation the link is up while xapi is not, and an enable
         // then fails and wedges the enable pipeline ("HA enable is in
         // progress"), stranding the re-arm.
-        Some(false) if is_master && storage_healthy && peer_reachable && peer_mgmt_reachable => {
-            HaRearmAction::Attempt
-        }
+        //
+        // The obligation stays on the node that disabled HA, but the master
+        // can move to the peer afterwards (XHA elects a new one, or the
+        // operator designates it). That node then re-arms from the slave side:
+        // `pool-ha-enable` is a pool call that xapi forwards to the master. It
+        // also needs this host enabled, and it waits for `settled` so that a
+        // master holding its own obligation attempts first and two enables do
+        // not race.
+        Some(false) if storage_healthy && peer_reachable && peer_mgmt_reachable => match master {
+            Some(true) => HaRearmAction::Attempt,
+            Some(false) if this_host_enabled && settled => HaRearmAction::AttemptFromSlave,
+            _ => HaRearmAction::Hold,
+        },
         _ => HaRearmAction::Hold,
     }
 }
@@ -6387,7 +6404,16 @@ impl std::fmt::Display for NodeState {
 }
 
 /// Inputs of an HA re-arm hold, kept to log the hold again only on change.
-type HaRearmHoldInputs = (bool, bool, bool, bool, bool, bool, Option<bool>);
+type HaRearmHoldInputs = (
+    Option<bool>,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+    Option<bool>,
+);
 
 pub struct StateMachine {
     config: Arc<Config>,
@@ -19632,10 +19658,11 @@ impl StateMachine {
     }
 
     /// Retry a persisted daemon-initiated HA re-arm until it sticks. Runs on
-    /// the HA watchdog's 10-minute cadence; only the master attempts (enable
-    /// is pool-wide) and only with storage healthy and the peer daemon
-    /// reachable, so the retry cannot land in the window that stranded the
-    /// original attempt.
+    /// the HA watchdog's cadence, only with storage healthy and the peer
+    /// reachable on both planes, so the retry cannot land in the window that
+    /// stranded the original attempt. The master attempts with the full
+    /// remedies; a holder that is no longer master enables from the slave side
+    /// (see [`HaRearmAction::AttemptFromSlave`]).
     async fn fulfil_ha_rearm_obligation(&mut self, ha: Option<bool>) {
         let obligation = ha_obligation_read();
         if obligation.is_some() {
@@ -19672,7 +19699,14 @@ impl StateMachine {
                 return;
             }
         }
-        let (storage_healthy, peer_ok, peer_mgmt_ok, is_master, operator_maintenance);
+        let (
+            storage_healthy,
+            peer_ok,
+            peer_mgmt_ok,
+            master,
+            this_host_enabled,
+            operator_maintenance,
+        );
         match obligation {
             None => {
                 // No incident pending: clear the escalation state so the next
@@ -19699,7 +19733,8 @@ impl StateMachine {
                 // isolation from wedging the pipeline ("HA enable is in
                 // progress").
                 peer_mgmt_ok = xapi::peer_host_enabled(&self.config.node.peer).await == Some(true);
-                is_master = xapi::is_pool_master_resilient().await == Some(true);
+                master = xapi::is_pool_master_resilient().await;
+                this_host_enabled = xapi::is_host_enabled().await == Some(true);
                 // Defer the re-arm while any host is in operator maintenance (RPU /
                 // update): the operator wants HA off, so don't fight it. The
                 // obligation persists and re-arms once maintenance clears.
@@ -19738,10 +19773,12 @@ impl StateMachine {
         } else {
             self.rearm_maint_alert_at = None;
         }
+        let is_master = master == Some(true);
         match ha_rearm_decision(
             true,
             ha,
-            is_master,
+            master,
+            this_host_enabled,
             storage_healthy,
             peer_ok,
             peer_mgmt_ok,
@@ -19753,7 +19790,8 @@ impl StateMachine {
                 // Why pool HA stays off while a re-arm is owed: logged when the
                 // reason changes, else every 10 minutes.
                 let why = (
-                    is_master,
+                    master,
+                    this_host_enabled,
                     storage_healthy,
                     peer_ok,
                     peer_mgmt_ok,
@@ -19764,7 +19802,8 @@ impl StateMachine {
                 if self.ha_rearm_hold_logged != Some(why)
                     || self.log_pace.due("ha_rearm_hold", Duration::from_secs(600))
                 {
-                    info!(heal_event = "ha_rearm_hold", pool_ha = ?ha, is_master, storage_healthy,
+                    info!(heal_event = "ha_rearm_hold", pool_ha = ?ha, is_master, master = ?master,
+                          this_host_enabled, storage_healthy,
                           peer_replication_ok = peer_ok, peer_enabled_in_pool = peer_mgmt_ok,
                           operator_maintenance, settled_after_last_attempt = settled,
                           "a pool-HA re-arm is owed but not attempted yet (every input listed; all \
@@ -19785,6 +19824,30 @@ impl StateMachine {
                      recovery disable. No action needed.",
                 )
                 .await;
+            }
+            HaRearmAction::AttemptFromSlave => {
+                warn!(
+                    heal_event = "ha_rearm_retry_from_slave",
+                    "pool HA is still off from a daemon-initiated disable and the pool \
+                       master has moved to the peer; re-arming from this host (xapi \
+                       forwards the enable to the master)"
+                );
+                // The local self-heals only: the orphan-xhad stop and the
+                // toolstack restart act on the master's state, so they stay in
+                // the master's branch and do not count toward its escalation.
+                if self.xha_host_state().await == XhaHostState::Down {
+                    self.reactivate_statefile_lvs().await;
+                }
+                self.ensure_twinstor_pbds_plugged().await;
+                ha_obligation_touch_attempt();
+                let sr_arg = format!("heartbeat-sr-uuids={sr}");
+                let to_arg = format!("ha-config:timeout={timeout}");
+                if let Err(e) =
+                    crate::cmd::run_cmd("xe", &["pool-ha-enable", &sr_arg, &to_arg]).await
+                {
+                    warn!(heal_event = "ha_rearm_retry_from_slave_failed", error = %e,
+                          "the forwarded pool-ha-enable failed; retrying on a later cycle");
+                }
             }
             HaRearmAction::Attempt => {
                 self.rearm_attempt = self.rearm_attempt.saturating_add(1);
@@ -35975,51 +36038,264 @@ Domain-0-clone                               9  1024     1     -b----      10.0
     #[test]
     fn ha_rearm_decision_matrix() {
         use HaRearmAction::*;
-        // args: has_obligation, ha, is_master, storage_healthy, peer_reachable,
-        //       peer_mgmt_reachable, operator_maintenance, settled
+        // args: has_obligation, ha, master, this_host_enabled, storage_healthy,
+        //       peer_reachable, peer_mgmt_reachable, operator_maintenance, settled
         // No obligation: nothing, whatever the state.
         assert_eq!(
-            ha_rearm_decision(false, Some(false), true, true, true, true, false, true),
+            ha_rearm_decision(
+                false,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             None
         );
         // Armed and settled (no recent enable attempt): fulfilled.
         assert_eq!(
-            ha_rearm_decision(true, Some(true), false, false, false, false, false, true),
+            ha_rearm_decision(
+                true,
+                Some(true),
+                Some(false),
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
             Fulfilled
         );
         // Armed but an enable attempt is recent: xapi's flag is optimistic
         // mid-enable and rolls back on failure, so hold for a settled read.
         assert_eq!(
-            ha_rearm_decision(true, Some(true), true, true, true, true, false, false),
+            ha_rearm_decision(
+                true,
+                Some(true),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
             Hold
         );
         // Off, master, healthy, peer reachable on both planes: attempt.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, true, true, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             Attempt
         );
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, true, true, false, false),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
             Attempt
         );
         // Maintenance: all attempt preconditions met, but a host is in operator
         // maintenance: hold (never fight a rolling upgrade or planned HA-off). The
         // obligation persists and re-arms once maintenance clears.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, true, true, true, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
             Hold
         );
-        // Any missing precondition: hold for a later cycle.
+        // Not the master (it moved to the peer after the disable), settled,
+        // this host enabled: re-arm from the slave side.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), false, true, true, true, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(false),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            AttemptFromSlave
+        );
+        // ...but not right after an attempt: a master holding its own
+        // obligation goes first, and two enables never race.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(false),
+                true,
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
+            Hold
+        );
+        // ...nor while this host is not enabled in the pool: the forwarded
+        // enable would be doomed.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(false),
+                false,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            Hold
+        );
+        // ...nor during operator maintenance.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(false),
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+            Hold
+        );
+        // Mastership unknown: hold, never guess.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Option::None,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            Hold
+        );
+        // Any other missing precondition: hold for a later cycle, master or not.
+        for master in [Some(true), Some(false)] {
+            assert_eq!(
+                ha_rearm_decision(
+                    true,
+                    Some(false),
+                    master,
+                    true,
+                    false,
+                    true,
+                    true,
+                    false,
+                    true
+                ),
+                Hold
+            );
+            assert_eq!(
+                ha_rearm_decision(
+                    true,
+                    Some(false),
+                    master,
+                    true,
+                    true,
+                    false,
+                    true,
+                    false,
+                    true
+                ),
+                Hold
+            );
+            assert_eq!(
+                ha_rearm_decision(
+                    true,
+                    Some(false),
+                    master,
+                    true,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true
+                ),
+                Hold
+            );
+        }
+        // The master's own attempt does not need this host's enabled flag.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                false,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            Attempt
+        );
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                false,
+                true,
+                true,
+                false,
+                true
+            ),
             Hold
         );
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, false, true, true, false, true),
-            Hold
-        );
-        assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, false, true, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                false,
+                true,
+                false,
+                true
+            ),
             Hold
         );
         // Peer reachable on replication but not yet re-admitted (enabled) on the
@@ -36027,12 +36303,32 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // hold. An attempt here fires a doomed pool-ha-enable that wedges the
         // enable pipeline and strands the re-arm.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, true, false, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                false,
+                false,
+                true
+            ),
             Hold
         );
         // xe unreadable: hold, never guess.
         assert_eq!(
-            ha_rearm_decision(true, Option::None, true, true, true, true, false, true),
+            ha_rearm_decision(
+                true,
+                Option::None,
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             Hold
         );
     }
@@ -36364,24 +36660,134 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // peer is doomed and would strand the enable pipeline; this gate is what
         // makes writing the obligation early at the disable safe.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, false, false, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
             Hold
         );
         // Peer's replication link returns but xapi is not yet re-admitted
         // (rejoining, toolstack not converged): still hold.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, true, false, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                false,
+                false,
+                true
+            ),
             Hold
         );
         // Peer fully re-admitted, we are the sole serving master, storage
         // healthy: attempt, which fires because the obligation exists from the disable.
         assert_eq!(
-            ha_rearm_decision(true, Some(false), true, true, true, true, false, true),
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             Attempt
         );
         // Enable landed and settled past xapi's optimistic-flag window: fulfilled.
         assert_eq!(
-            ha_rearm_decision(true, Some(true), true, true, true, true, false, true),
+            ha_rearm_decision(
+                true,
+                Some(true),
+                Some(true),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            Fulfilled
+        );
+    }
+
+    #[test]
+    fn rearm_obligation_survives_a_master_move() {
+        // The field report: the master disabled pool HA to clear an HA
+        // disagreement and wrote the obligation; the master then moved back to
+        // the peer, so the holder was a slave and the new master owed nothing.
+        // HA stayed off for good. Walk that timeline through the decision.
+        use HaRearmAction::*;
+        // Still master, peer rejoining (not yet enabled in the pool): hold.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(true),
+                true,
+                true,
+                true,
+                false,
+                false,
+                true
+            ),
+            Hold
+        );
+        // The master moves to the peer; the peer is enabled; storage healthy;
+        // the holder's last attempt is settled: it re-arms from the slave side.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(false),
+                Some(false),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            AttemptFromSlave
+        );
+        // Right after that attempt, while xapi's flag may still be optimistic.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(true),
+                Some(false),
+                true,
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
+            Hold
+        );
+        // Armed and settled: fulfilled on the slave too, which clears its file.
+        assert_eq!(
+            ha_rearm_decision(
+                true,
+                Some(true),
+                Some(false),
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             Fulfilled
         );
     }
