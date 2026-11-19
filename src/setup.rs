@@ -37,7 +37,9 @@ pub(crate) fn parse_ping_targets(text: &str) -> Vec<String> {
 // collapse under load. A fixed resync-rate without those knobs re-imposes the
 // cap and still collapses under application I/O. Existing pools pick up
 // template changes via `regenerate-config` (a live disk-options adjust).
-pub(crate) const CONFIG_VERSION: u32 = 6;
+// Version 7: fate-shared pools wait 3 s instead of 0.5 s for a DRBD ping reply
+// (see `drbd_ping_timeout`); applied live by the same adjust.
+pub(crate) const CONFIG_VERSION: u32 = 7;
 const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 
 /// Single source of truth for the arbitrated-mode caveat, shown by both the
@@ -610,7 +612,14 @@ initiator_iqns = [{iqn_list}]
 
     tokio::fs::write(
         format!("{DRBD_CONF_DIR}/{res}.res"),
-        render_res_file(res, fencing_policy, fill_target, &min_rate, &topology),
+        render_res_file(
+            res,
+            fencing_policy,
+            drbd_ping_timeout(direct.is_some()),
+            fill_target,
+            &min_rate,
+            &topology,
+        ),
     )
     .await
     .context("writing DRBD config")?;
@@ -1579,12 +1588,27 @@ async fn stable_device_path(dev: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Render the full DRBD resource file from its four variable inputs. Shared
+/// DRBD `ping-timeout` (tenths of a second): how long DRBD waits for a ping
+/// reply, and in dual-primary for a missing ack packet, before it drops the
+/// connection. A link that loses packets without going down needs TCP
+/// retransmits (the first after 200 ms, then backing off), so at 0.5 s a
+/// 20% loss made DRBD drop and reconnect the link many times a minute, and
+/// every drop started a fence-peer round. Fate-shared mode waits 3 s; the
+/// cost is that a dead peer is noticed up to 2.5 s later, small next to the
+/// XHA timeout. Arbitrated mode keeps 0.5 s: there the same timer decides how
+/// fast replication moves from a failed direct cable to the switched path,
+/// and heavy loss hurts only when both paths lose packets at once.
+pub(crate) fn drbd_ping_timeout(arbitrated: bool) -> u32 {
+    if arbitrated { 5 } else { 30 }
+}
+
+/// Render the full DRBD resource file from its variable inputs. Shared
 /// between setup (initial write) and `regenerate-config` (upgrading a
 /// setup-time file in place), so the two can never drift.
 pub(crate) fn render_res_file(
     res: &str,
     fencing_policy: &str,
+    ping_timeout: u32,
     fill_target: &str,
     min_rate: &str,
     topology: &str,
@@ -1647,7 +1671,7 @@ resource {res} {{
         allow-two-primaries;
         timeout 50;
         ping-int 2;
-        ping-timeout 5;
+        ping-timeout {ping_timeout};
         ko-count 3;
         # Never let DRBD silently auto-discard a diverged copy. In all split-brain
         # cases, including 0-primary (both nodes Secondary at reconnect, which the
@@ -4244,9 +4268,9 @@ mod tests {
         }
     }
     use super::{
-        SharedSetup, chap_check_value, drbd_topology, ha_timeout_secs, iqn_is_lio_compatible,
-        patch_lvm_global_filter, peer_uuid_from_pool, resync_fill_target, resync_min_rate,
-        resync_sizing, sanitize_iqn,
+        SharedSetup, chap_check_value, drbd_ping_timeout, drbd_topology, ha_timeout_secs,
+        iqn_is_lio_compatible, patch_lvm_global_filter, peer_uuid_from_pool, render_res_file,
+        resync_fill_target, resync_min_rate, resync_sizing, sanitize_iqn,
     };
     use super::{tiebreaker_gate, validate_local_name_matches_xapi, validate_node_names};
 
@@ -4633,6 +4657,22 @@ mod tests {
             resync_sizing(Some(1000), true, None),
             ("1M", "62M".to_string())
         );
+    }
+
+    #[test]
+    fn only_fate_shared_waits_longer_for_a_ping_reply() {
+        let render = |arbitrated: bool| {
+            render_res_file(
+                "twinstor-data",
+                "resource-only",
+                drbd_ping_timeout(arbitrated),
+                "1M",
+                "62M",
+                "",
+            )
+        };
+        assert!(render(false).contains("        ping-timeout 30;\n"));
+        assert!(render(true).contains("        ping-timeout 5;\n"));
     }
 
     #[test]

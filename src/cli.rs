@@ -2854,7 +2854,12 @@ async fn rebuild_res_text(
         "resource-only"
     };
     Ok(crate::setup::render_res_file(
-        res, fencing, fill, &min_rate, &topology,
+        res,
+        fencing,
+        crate::setup::drbd_ping_timeout(direct_pair.is_some()),
+        fill,
+        &min_rate,
+        &topology,
     ))
 }
 
