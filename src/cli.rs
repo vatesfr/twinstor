@@ -1877,7 +1877,12 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         iscsi_active,
         receiving,
     );
-    let degraded = drbd_sev > Sev::Good
+    // A second master, or a host left disarmed under the armed pool, is never
+    // healthy, whatever storage says.
+    let ha_view_degrades =
+        partition_view_status().filter(|(v, _)| crate::arbitration::degrades_health(v));
+    let degraded = ha_view_degrades.is_some()
+        || drbd_sev > Sev::Good
         || readiness_sev > Sev::Good
         || iscsi_active.is_none()
         || syncing
@@ -1911,7 +1916,9 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         // its copy, a single path is expected and is not reported; a missing
         // multipath map still is.
         let other_reason = |copying: bool| -> Option<String> {
-            Some(if iscsi_active.is_none() {
+            Some(if let Some((view, verdict)) = &ha_view_degrades {
+                format!("{view}: {verdict}")
+            } else if iscsi_active.is_none() {
                 "iSCSI target state unknown (targetcli timed out or could not run; backing may be wedged)"
                 .to_string()
             } else if let Some(h) = &heal {
@@ -1919,7 +1926,10 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             } else if ha_enabled == Some(false) {
                 "pool HA disabled (no automatic host failover)".to_string()
             } else if ha_enabled.is_none() {
-                "pool HA unknown (XAPI did not answer)".to_string()
+                match partition_view_status() {
+                    Some((view, verdict)) => format!("{view}: {verdict}"),
+                    None => "pool HA unknown (XAPI did not answer)".to_string(),
+                }
             } else if cap_sev > Sev::Good {
                 format!(
                     "SR {}% full (guests hit ENOSPC when it fills)",
@@ -2175,18 +2185,50 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
             )
         ),
         None => {
-            println!(
-                "{g}pool HA:     {}",
-                st.paint(Sev::Warn, "unknown (XAPI did not answer)")
-            )
+            let text = match partition_view_status() {
+                Some((view, _)) => format!("unknown (XAPI did not answer; see partition: {view})"),
+                None => "unknown (XAPI did not answer)".to_string(),
+            };
+            println!("{g}pool HA:     {}", st.paint(Sev::Warn, &text))
         }
     }
-    if crate::state_machine::ha_rearm_obligation_pending() {
+    // Printed only while a TwinStor re-arm record stands: its real state,
+    // what it means, and (when owed) what holds the re-arm.
+    if let Some(state) = crate::state_machine::ha_rearm_status_line() {
+        let why = std::fs::read_to_string(crate::arbitration::REARM_HOLD_PATH.as_str())
+            .ok()
+            .and_then(|t| crate::arbitration::status_value(&t, "reason"));
+        let text = match why {
+            Some(w) if state.starts_with("owed") => format!("{state}; now: {w}"),
+            _ => state,
+        };
+        println!("{g}ha re-arm:   {}", st.paint(Sev::Warn, &text));
+    }
+    if let Some((view, verdict)) = partition_view_status() {
+        println!("{g}partition:   {}", st.paint(Sev::Warn, &format!("{view}: {verdict}")));
+    }
+    if let Some(line) = mgmt_reach_status() {
+        println!("{g}mgmt reach:  {line}");
+    }
+    if let Some(line) = ha_withheld_status() {
+        println!("{g}withheld:    {}", st.paint(Sev::Warn, &line));
+    }
+    // XAPI demotes a returning ex-master through local.db ha_peers, rewritten
+    // only by an HA enable: without the peer there, a heartbeat-first rejoin
+    // can leave a second master.
+    if ha_enabled == Some(true)
+        && let Some(peer_uuid) = crate::xapi::host_uuid(&peer_host).await
+        && std::fs::read_to_string("/var/lib/xcp/local.db")
+            .ok()
+            .and_then(|db| crate::mgmt_reach::ha_peers_names(&db, &peer_uuid))
+            == Some(false)
+    {
         println!(
-            "{g}ha re-arm:   {}",
+            "{g}ha_peers:    {}",
             st.paint(
                 Sev::Warn,
-                "pending: TwinStor disarmed HA itself and is re-arming it automatically (no action needed)"
+                "this host's local.db does not name the peer; cycle pool HA once \
+                 (pool-ha-disable, then pool-ha-enable) while both hosts are up"
             )
         );
     }
@@ -3633,8 +3675,102 @@ async fn run_regenerate_config(config: Arc<Config>, yes: bool, persist_only: boo
     Ok(())
 }
 
+
+/// The partition view the daemon published (`None` when there is none to
+/// report, the file is missing, or it is stale).
+fn partition_view_status() -> Option<(String, String)> {
+    let text = std::fs::read_to_string(crate::arbitration::STATUS_PATH.as_str()).ok()?;
+    status_fresh(&text, 60)?;
+    let view = crate::arbitration::status_value(&text, "view")?;
+    if view == "none" {
+        return None;
+    }
+    let verdict = crate::arbitration::status_value(&text, "verdict").unwrap_or_default();
+    Some((view, verdict))
+}
+
+/// One line on the peer's management reachability (P), from the prober's
+/// snapshot.
+fn mgmt_reach_status() -> Option<String> {
+    let text = std::fs::read_to_string(crate::mgmt_reach::STATUS_PATH.as_str()).ok()?;
+    let snap = crate::mgmt_reach::parse_status(&text)?;
+    Some(mgmt_reach_line(&snap, crate::heal_state::unix_now()))
+}
+
+fn mgmt_reach_line(snap: &crate::mgmt_reach::StatusSnapshot, now_unix: u64) -> String {
+    let addr = snap.address.as_deref().unwrap_or("unknown address");
+    let age = now_unix.saturating_sub(snap.updated_unix);
+    let settle = crate::mgmt_reach::SETTLE.as_secs();
+    if (snap.probes as usize) < crate::mgmt_reach::WINDOW {
+        return format!(
+            "peer {addr}:443 warming up ({} of {} probes so far; no partition view until then)",
+            snap.probes,
+            crate::mgmt_reach::WINDOW
+        );
+    }
+    let state = match (snap.p, snap.settled_secs) {
+        (true, Some(s)) if s >= settle => "answering".to_string(),
+        (true, Some(s)) => format!("answering again for {s}s (repairs wait {settle}s)"),
+        (true, None) => "answering".to_string(),
+        (false, _) => "NOT answering: HA changes across the pair are withheld".to_string(),
+    };
+    let stale = if age > 60 {
+        format!(" (snapshot {age}s old: is the daemon running?)")
+    } else {
+        String::new()
+    };
+    format!(
+        "peer {addr}:443 {state}; {}/{} of the last probes answered{stale}",
+        snap.answered, snap.probes
+    )
+}
+
+/// The last HA action the daemon withheld, if within the last 10 minutes.
+fn ha_withheld_status() -> Option<String> {
+    let text = std::fs::read_to_string(crate::arbitration::WITHHELD_PATH.as_str()).ok()?;
+    status_fresh(&text, 600)?;
+    let action = crate::arbitration::status_value(&text, "action")?;
+    let reason = crate::arbitration::status_value(&text, "reason").unwrap_or_default();
+    Some(format!("{action} withheld: {reason}"))
+}
+
+/// `Some(())` when a status file was updated within `max_age_secs`.
+fn status_fresh(text: &str, max_age_secs: u64) -> Option<()> {
+    let at: u64 = crate::arbitration::status_value(text, "updated_unix")?
+        .parse()
+        .ok()?;
+    (crate::heal_state::unix_now().saturating_sub(at) <= max_age_secs).then_some(())
+}
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mgmt_reach_line_names_the_state() {
+        let snap = crate::mgmt_reach::StatusSnapshot {
+            p: false,
+            answered: 1,
+            probes: 6,
+            settled_secs: None,
+            address: Some("10.0.0.2".into()),
+            updated_unix: 1000,
+        };
+        let l = super::mgmt_reach_line(&snap, 1005);
+        assert!(l.contains("10.0.0.2:443 NOT answering") && l.contains("1/6"), "{l}");
+        let settling = crate::mgmt_reach::StatusSnapshot {
+            p: true,
+            answered: 6,
+            settled_secs: Some(100),
+            ..snap.clone()
+        };
+        assert!(super::mgmt_reach_line(&settling, 1005).contains("answering again for 100s"));
+        let stale = super::mgmt_reach_line(&settling, 2000);
+        assert!(stale.contains("snapshot 1000s old"), "{stale}");
+        // A daemon just started: the window is still filling.
+        let warming = crate::mgmt_reach::StatusSnapshot { probes: 2, answered: 2, ..snap.clone() };
+        let w = super::mgmt_reach_line(&warming, 1005);
+        assert!(w.contains("warming up") && w.contains("2 of 6"), "{w}");
+    }
+
     use super::{
         critical_now, receiving_copy, receiving_reason, single_path_expected, with_receiving,
     };
@@ -3753,7 +3889,7 @@ mod tests {
     async fn write_atomic_replaces_the_file_and_keeps_it_private() {
         use super::write_atomic;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tw-write-atomic-{}", std::process::id()));
+        let dir = crate::heal_state::test_tmp_dir().join(format!("tw-write-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("twinstor.toml");
@@ -4184,7 +4320,7 @@ chap_password = "s3cr3t"
 
     #[test]
     fn kernel_module_coverage_scan() {
-        let root = std::env::temp_dir().join("twinstor-test-modules");
+        let root = crate::heal_state::test_tmp_dir().join("twinstor-test-modules");
         let _ = std::fs::remove_dir_all(&root);
         // Kernel A has the kmod in extra/drbd, kernel B has a weak-updates
         // symlink dir, kernel C has nothing.

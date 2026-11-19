@@ -71,7 +71,7 @@ pub(crate) struct Watch {
 /// The once-per-boot record: the boot it was written in, and what happened.
 pub(crate) fn record_path() -> String {
     std::env::var("TWINSTOR_AUTOSTART_RECORD")
-        .unwrap_or_else(|_| "/var/lib/twinstor/autostart-completion".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/autostart-completion"))
 }
 
 pub(crate) fn record_text(boot_id: &str, outcome: &str) -> String {

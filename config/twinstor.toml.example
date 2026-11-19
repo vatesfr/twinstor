@@ -42,9 +42,23 @@ initiator_iqns = ["iqn.1993-08.org.debian:01:node-a", "iqn.1993-08.org.debian:01
 # the daemon detects the signature and runs the safe recovery: quiesce both
 # HA daemons >90s, then a synchronized re-arm (timeout-preserving). Only runs
 # when storage is fully healthy and the peer is reachable; capped at once per
-# hour. `false` keeps the detection + alert (naming the manual runbook) and
-# only disables the automated recovery.
+# hour. Each phase fires only while the peer's management address has
+# answered for the settle period (about 5.5 minutes), and before its local
+# disarm each host checks itself: pool HA on, no pending HA task, not held in
+# XAPI's HA startup loop, its HA daemon out of the liveset for 5 minutes. On
+# by default; `false` keeps the detection and its alert (naming the manual
+# runbook) and leaves the recovery to the operator.
 # readmission_assist = true
+
+# Whether the daemon may run its rejoin repairs BY ITSELF: the stranded
+# former-master yield and forced reset, the returning-slave reconnect, the
+# HA-deadlock exit, the masterless active rejoin, the dual-master yield, the
+# local self-unwedge, the dead-HA-daemon revive, and the demote of a second
+# pool master. Each needs its own evidence and fires only while the peer's
+# management address answers (repairs triggered by a missing answer also wait
+# out the settle period after the network returns, during which XAPI usually
+# reassembles the pool by itself). `false` keeps every detection and alert.
+# rejoin_assist = true
 
 # Auto-heal an isolated pool master by DURABLE STORAGE STAND-DOWN (arbitrated
 # mode only; inert on a single-path/fate-shared deployment). When this master
@@ -68,6 +82,23 @@ initiator_iqns = ["iqn.1993-08.org.debian:01:node-a", "iqn.1993-08.org.debian:01
 # UpToDate and the SR is plugged on both; never one HA still protects or one
 # that ran since the boot. Needs the pool's auto_poweron too, as XCP-ng does.
 # complete_autostart = true
+
+# Whether the daemon may cycle pool HA (disable, then re-enable) for a host
+# left locally disarmed under the armed pool: the pool master's reset when
+# the peer's XAPI says so (budgeted: 3 resets in 6 hours, 10 minutes apart),
+# and the re-arm of a host TwinStor disarmed itself (a whole-switch hold, a
+# stand-down). `false` keeps the detection and alerts with the manual cycle.
+# auto_resolve_peer_emergency = true
+
+# Whether the daemon may start a halted HA-protected VM (restart priority
+# set, ha-always-run still true) that XAPI left halted, at most once an hour
+# per VM; a VM shut down through XAPI or marked suspect is never started.
+# restart_halted_protected_vms = true
+
+# Whether the daemon may stop a stuck local HA daemon when pool HA reads off
+# but the daemon is still present, so the re-arm's pool-ha-enable does not
+# keep failing with DAEMON_IS_PRESENT (storage healthy, after a settle).
+# reconcile_stuck_xhad = true
 
 [reboot_drain]
 # Host-side reboot-safety backstop (twinstor-reboot-drain.service). During the

@@ -121,15 +121,34 @@ fn default_failback_auto() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HaConfig {
-    /// Whether the daemon may run the XHA re-admission recovery by itself
-    /// when it detects the staggered-restart join deadlock (both xhad
-    /// instances cycling through exit 12/13 after a fence storm). `false`
-    /// keeps the detection and alert (naming the manual quiesce-and-sync-start
-    /// runbook) and only disables the automated recovery. The recovery never
-    /// runs unless local storage is fully healthy and the peer is reachable,
-    /// and is capped at once per hour.
+    /// Whether the daemon may run the XHA re-admission dance by itself when it
+    /// detects the staggered-restart join deadlock (both xhad instances
+    /// cycling through exit 12/13 after a fence storm). On by default, as
+    /// the product runs on unattended sites: `false` keeps the detection and
+    /// alert (naming the manual quiesce-and-sync-start runbook) and only
+    /// disables the dance. The dance never runs unless local storage is fully
+    /// healthy and the peer is reachable, is capped at once per hour, and each
+    /// of its two phases fires only while the peer's management address has
+    /// answered for the settle period (phase 1 is cancelled otherwise). Before
+    /// its local disarm each host checks only itself: pool HA on, no pending
+    /// HA task (an unreadable task list holds the disarm), not held in
+    /// XAPI's startup loop, its HA daemon
+    /// out of the liveset. The dead-xhad revive is governed by
+    /// `rejoin_assist`.
     #[serde(default = "default_readmission_assist")]
     pub readmission_assist: bool,
+    /// Whether the daemon may run its rejoin repairs: the stranded
+    /// former-master toolstack yield and its forced reset, the returning-slave
+    /// reconnect, the HA-deadlock exit, the masterless active rejoin, the
+    /// dual-master auto-heal yield, the local self-unwedge, the dead-xhad
+    /// revive, and the second-master demote. Each still needs its own
+    /// evidence and, at the moment it fires, the peer's management address
+    /// answering (and, for repairs triggered by an absence of answer, answering
+    /// for the settle period). `false` keeps every detection, log and alert
+    /// and only disables these actions. Does not gate the lone-survivor
+    /// transition or an owed HA re-arm. Default on.
+    #[serde(default = "default_true")]
+    pub rejoin_assist: bool,
     /// Whether the daemon may start a protected VM it finds halted while
     /// the pool is fully healthy (HA armed, hosts enabled, storage
     /// converged): the state XAPI leaves behind when its bounded HA
@@ -151,13 +170,24 @@ pub struct HaConfig {
     /// minutes; one alert after 5 failures).
     #[serde(default = "default_true")]
     pub restart_halted_protected_vms: bool,
-    /// Automated pool-level HA reset when the peer is stuck in xapi
-    /// emergency mode over an HA-armed mismatch (a state xapi does not leave
-    /// by itself: pool-ha-enable cannot recruit the wedged slave). Default
-    /// on. Guards: the signature (pool HA armed, peer agent unresponsive,
-    /// peer daemon alive on the replication network) must persist 10
-    /// minutes; at most one action an hour; re-arm through the persisted
-    /// obligation.
+    /// Whether the daemon may run its two pool-HA-cycle repairs (a pool HA
+    /// disable, then the re-enable through the persisted re-arm obligation),
+    /// both for a host left locally disarmed under the armed pool. Default on.
+    /// - Peer-emergency reset, from the pool master: the peer's xapi answers
+    ///   HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED on two probes at least 30 s
+    ///   apart (its xapi restarted while disarmed, a state xapi does not leave
+    ///   by itself), with the peer's management address answering; at most 3
+    ///   resets in 6 hours, at least 10 minutes apart (kept for the boot
+    ///   across daemon restarts).
+    /// - Recorded-disarm re-arm: a host TwinStor disarmed itself (a
+    ///   whole-switch hold, a stand-down) is back in the liveset still locally
+    ///   disarmed; one cycle per disarm record, from the pool master when both
+    ///   hosts hold one, with both hosts live in the liveset, the peer's
+    ///   management address answering, a single master and no HA operation
+    ///   pending.
+    ///
+    /// `false` keeps the detection and alerts (with the manual pool HA cycle)
+    /// and disables both actions.
     #[serde(default = "default_true")]
     pub auto_resolve_peer_emergency: bool,
     /// Auto-resolve the isolated-master trap by a durable storage stand-down.
@@ -188,19 +218,13 @@ pub struct HaConfig {
     /// it never interferes with a daemon that is re-arming.
     #[serde(default = "default_true")]
     pub reconcile_stuck_xhad: bool,
-    /// Bridge brief flaps of the peer-emergency signature so the master's
-    /// pool-HA-cycle recovery is not starved during a readmission wedge.
-    /// `peer_agent_responsive` flaps between Some(false) and Some(true) for tens
-    /// of minutes while a returning node is stuck re-admitting, which resets
-    /// peer_emergency's 600s maturity clock on every blip and can delay recovery
-    /// by over an hour. When on, a brief blip to "live" while an emergency is
-    /// already tracked is treated as still not live (the clock keeps maturing);
-    /// only a sustained clear past the flap tolerance (a real recovery) resets
-    /// it. Default on: it only lets the existing pool-HA recovery mature (no new
-    /// recovery path), does nothing unless an emergency is already tracked, and
-    /// re-confirms on raw liveness before acting, so it cannot disturb a healthy
-    /// pool. Set false to pass the raw signal through.
+    /// No effect any more; accepted so existing configuration files still
+    /// parse. It bridged flaps of the peer-emergency resolver's older
+    /// signature (the peer's agent not answering), which is retired: the
+    /// resolver now acts only on the peer's xapi answering that it is locally
+    /// disarmed under the armed pool.
     #[serde(default = "default_true")]
+    #[allow(dead_code)]
     pub readmission_flap_debounce: bool,
     /// Whether the pool master starts, once after its boot, the VMs marked
     /// `other-config:auto_poweron=true` that XCP-ng's own autostart left
@@ -220,6 +244,7 @@ impl Default for HaConfig {
     fn default() -> Self {
         Self {
             readmission_assist: default_readmission_assist(),
+            rejoin_assist: true,
             restart_halted_protected_vms: true,
             auto_resolve_peer_emergency: true,
             self_standdown_isolated_master: true,
@@ -393,6 +418,31 @@ lun_serial = "twinstor0001"
         // start an unauthenticated, wide-open target.
         let toml = format!("{MINIMAL_CONFIG}\nchap_user = \"u\"\n");
         assert!(parse(&toml).is_err());
+    }
+
+    /// A key this version does not know (one a test build had, since
+    /// removed) is ignored, never a parse error.
+    #[test]
+    fn an_unknown_ha_key_is_ignored() {
+        let toml = format!("{MINIMAL_CONFIG}\n[ha]\ndisarmed_host_fast_revive = true\n");
+        assert!(parse(&toml).is_ok());
+    }
+
+    /// `rejoin_assist` and `readmission_assist` (the dance) both default on;
+    /// an explicit value in the file is kept either way.
+    #[test]
+    fn ha_assist_keys_default_and_explicit_values_are_kept() {
+        let config = parse(MINIMAL_CONFIG).unwrap();
+        assert!(config.ha.rejoin_assist);
+        assert!(config.ha.readmission_assist);
+        let toml = format!("{MINIMAL_CONFIG}\n[ha]\nrejoin_assist = false\n");
+        let config = parse(&toml).unwrap();
+        assert!(!config.ha.rejoin_assist);
+        assert!(config.ha.readmission_assist);
+        let toml = format!("{MINIMAL_CONFIG}\n[ha]\nreadmission_assist = false\n");
+        assert!(!parse(&toml).unwrap().ha.readmission_assist, "an explicit opt-out is kept");
+        let toml = format!("{MINIMAL_CONFIG}\n[ha]\nreadmission_assist = true\n");
+        assert!(parse(&toml).unwrap().ha.readmission_assist);
     }
 
     #[test]

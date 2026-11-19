@@ -48,13 +48,15 @@ use crate::drbd::{
 /// Operator escape hatch. In `/run` so it is cleared on boot (a one-shot for this
 /// shutdown); touching it makes the drain proceed without waiting. Re-checked each
 /// poll, so a stuck hold can be released from another shell.
-const OVERRIDE_PATH: &str = "/run/twinstor/allow-unsafe-reboot";
+static OVERRIDE_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/run/twinstor/allow-unsafe-reboot"));
 
 /// Breadcrumb the drain leaves for the daemon to pick up on the next boot and turn
 /// into an XO alert. In `/var/lib` so it survives the reboot. Written only when the
 /// drain proceeded while this host was the last UpToDate copy (the concerning
 /// cases); consumed (deleted) once by the daemon at startup.
-const BREADCRUMB_PATH: &str = "/var/lib/twinstor/last-reboot-drain";
+static BREADCRUMB_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/last-reboot-drain"));
 
 /// How often to re-read DRBD state while holding.
 const POLL: Duration = Duration::from_secs(5);
@@ -174,7 +176,7 @@ impl Outcome {
 }
 
 fn override_present() -> bool {
-    Path::new(OVERRIDE_PATH).exists()
+    Path::new(OVERRIDE_PATH.as_str()).exists()
 }
 
 fn pct(s: &DrbdStatus) -> String {
@@ -194,11 +196,11 @@ fn write_breadcrumb(outcome: Outcome, done: Option<f64>) {
     // Ensure the parent dir exists: at shutdown the daemon may not have run this
     // boot (so /var/lib/twinstor might be absent), and a missing dir would silently
     // drop the next-boot alert.
-    if let Some(parent) = Path::new(BREADCRUMB_PATH).parent() {
+    if let Some(parent) = Path::new(BREADCRUMB_PATH.as_str()).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(BREADCRUMB_PATH, line) {
-        warn!("reboot-drain: could not write breadcrumb {BREADCRUMB_PATH}: {e}");
+    if let Err(e) = std::fs::write(BREADCRUMB_PATH.as_str(), line) {
+        warn!("reboot-drain: could not write breadcrumb {}: {e}", BREADCRUMB_PATH.as_str());
     }
 }
 
@@ -207,7 +209,7 @@ fn write_breadcrumb(outcome: Outcome, done: Option<f64>) {
 /// Does not delete the file; delivery is confirmed first (see
 /// `deliver_pending_reboot_alert`).
 fn reboot_alert_body() -> Option<String> {
-    let raw = std::fs::read_to_string(BREADCRUMB_PATH).ok()?;
+    let raw = std::fs::read_to_string(BREADCRUMB_PATH.as_str()).ok()?;
     let mut it = raw.split_whitespace();
     let tag = it.next()?;
     let done = it.next().unwrap_or("-");
@@ -254,7 +256,7 @@ pub async fn deliver_pending_reboot_alert() {
     let mut backoff = Duration::from_secs(5);
     loop {
         if crate::xapi::send_reboot_unsafe_alert(&body).await {
-            let _ = std::fs::remove_file(BREADCRUMB_PATH);
+            let _ = std::fs::remove_file(BREADCRUMB_PATH.as_str());
             info!("reboot-drain: next-boot alert delivered");
             return;
         }
@@ -366,7 +368,8 @@ pub async fn run(config: &Config) -> Result<()> {
         // Operator escape taken before the drain looked at DRBD: proceed without a
         // wait and without a breadcrumb (we never determined it was unsafe).
         warn!(
-            "reboot-drain: operator override present ({OVERRIDE_PATH}); proceeding without a storage-safety wait"
+            "reboot-drain: operator override present ({}); proceeding without a storage-safety wait",
+            OVERRIDE_PATH.as_str()
         );
         return Ok(());
     }
@@ -420,8 +423,9 @@ async fn hold_for_resync(drbd: &DrbdController, initial: &DrbdStatus, max_secs: 
     warn!(
         "reboot-drain: holding this host's reboot: it holds the only UpToDate replica and the \
          peer is still resyncing ({}). Rebooting now would drop all guest I/O and strand the \
-         rebuild. Waiting up to {cap_secs}s for the peer to become UpToDate. Override: touch {OVERRIDE_PATH}",
-        pct(initial)
+         rebuild. Waiting up to {cap_secs}s for the peer to become UpToDate. Override: touch {}",
+        pct(initial),
+        OVERRIDE_PATH.as_str()
     );
 
     // Consecutive holding polls with no active resync; see STALL_GRACE_POLLS.
@@ -431,7 +435,8 @@ async fn hold_for_resync(drbd: &DrbdController, initial: &DrbdStatus, max_secs: 
         // peer transition to UpToDate should be caught without a POLL of lag.
         if override_present() {
             warn!(
-                "reboot-drain: override appeared ({OVERRIDE_PATH}); proceeding while the peer is still catching up"
+                "reboot-drain: override appeared ({}); proceeding while the peer is still catching up",
+                OVERRIDE_PATH.as_str()
             );
             write_breadcrumb(Outcome::OverrideDuringHold, None);
             return Ok(());

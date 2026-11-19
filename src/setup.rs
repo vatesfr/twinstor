@@ -2931,6 +2931,22 @@ pub(crate) fn ha_timeout_secs(arbitrated: bool) -> u32 {
     if arbitrated { 90 } else { 120 }
 }
 
+/// The HA timeout to give in an alert's re-enable command: the pool's
+/// configured one (xhad.conf), else the default of the mode this host is in.
+pub(crate) fn configured_ha_timeout() -> u32 {
+    configured_ha_timeout_for(std::path::Path::new(DIRECT_PEER_PATH).exists())
+}
+
+/// `configured_ha_timeout` for a known mode: the one definition of the
+/// fallback to the mode's default.
+pub(crate) fn configured_ha_timeout_for(arbitrated: bool) -> u32 {
+    configured_ha_timeout_from(effective_xha_timeout(), arbitrated)
+}
+
+pub(crate) fn configured_ha_timeout_from(configured: Option<u32>, arbitrated: bool) -> u32 {
+    configured.unwrap_or_else(|| ha_timeout_secs(arbitrated))
+}
+
 /// The HA timeout XHA actually runs with on this host (`StateFileTimeout` in
 /// `xhad.conf`): what applies when the pool's `ha-config:timeout` is unset.
 pub(crate) fn effective_xha_timeout() -> Option<u32> {
@@ -3205,7 +3221,7 @@ mod tests {
 
     impl FenceRig {
         fn new(tag: &str) -> Self {
-            let root = std::env::temp_dir()
+            let root = crate::heal_state::test_tmp_dir()
                 .join(format!("twinstor-test-fence-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             for d in ["bin", "etc", "run", "state"] {
@@ -4569,7 +4585,7 @@ mod tests {
 
     #[tokio::test]
     async fn zvol_alias_reverse_resolves_and_misses_cleanly() {
-        let td = std::env::temp_dir().join("twinstor-test-zvol");
+        let td = crate::heal_state::test_tmp_dir().join("twinstor-test-zvol");
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(td.join("dev")).unwrap();
         std::fs::create_dir_all(td.join("zvol/localzfs/nested")).unwrap();

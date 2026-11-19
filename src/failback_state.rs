@@ -16,8 +16,10 @@
 
 use tracing::debug;
 
-pub const FAILBACK_STATE_PATH: &str = "/run/twinstor/failback-state.json";
-pub const FAILBACK_REQUEST_PATH: &str = "/run/twinstor/failback-request";
+pub static FAILBACK_STATE_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/run/twinstor/failback-state.json"));
+pub static FAILBACK_REQUEST_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/run/twinstor/failback-request"));
 
 /// A parsed snapshot for display. (Strikes and the update timestamp stay in
 /// the raw JSON for `status --json`; the human renderer doesn't need them.)
@@ -33,22 +35,22 @@ pub fn write(mode: &str, reason: &str, eta_secs: u64, strikes: u32) {
         r#"{{"mode":"{mode}","reason":"{reason}","eta_secs":{eta_secs},"strikes":{strikes},"updated_unix":{}}}"#,
         crate::heal_state::unix_now(),
     );
-    if let Some(dir) = std::path::Path::new(FAILBACK_STATE_PATH).parent() {
+    if let Some(dir) = std::path::Path::new(FAILBACK_STATE_PATH.as_str()).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(FAILBACK_STATE_PATH, body) {
+    if let Err(e) = std::fs::write(FAILBACK_STATE_PATH.as_str(), body) {
         debug!(error = %e, "could not write failback-state file");
     }
 }
 
 /// Remove the state file (back on the direct link, or daemon starting fresh).
 pub fn clear() {
-    let _ = std::fs::remove_file(FAILBACK_STATE_PATH);
+    let _ = std::fs::remove_file(FAILBACK_STATE_PATH.as_str());
 }
 
 /// Read and minimally parse for display. None when absent or garbled.
 pub fn read() -> Option<FailbackState> {
-    let text = std::fs::read_to_string(FAILBACK_STATE_PATH).ok()?;
+    let text = std::fs::read_to_string(FAILBACK_STATE_PATH.as_str()).ok()?;
     Some(FailbackState {
         mode: json_str(&text, "mode")?,
         reason: json_str(&text, "reason").unwrap_or_default(),
@@ -58,20 +60,20 @@ pub fn read() -> Option<FailbackState> {
 
 /// Raw file content for `status --json` embedding (it is already JSON).
 pub fn read_raw() -> Option<String> {
-    std::fs::read_to_string(FAILBACK_STATE_PATH).ok()
+    std::fs::read_to_string(FAILBACK_STATE_PATH.as_str()).ok()
 }
 
 /// CLI side: ask the daemon for an immediate guarded failback.
 pub fn place_request() -> std::io::Result<()> {
-    if let Some(dir) = std::path::Path::new(FAILBACK_REQUEST_PATH).parent() {
+    if let Some(dir) = std::path::Path::new(FAILBACK_REQUEST_PATH.as_str()).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(FAILBACK_REQUEST_PATH, b"requested\n")
+    std::fs::write(FAILBACK_REQUEST_PATH.as_str(), b"requested\n")
 }
 
 /// Daemon side: consume a pending request (returns whether one existed).
 pub fn consume_request() -> bool {
-    std::fs::remove_file(FAILBACK_REQUEST_PATH).is_ok()
+    std::fs::remove_file(FAILBACK_REQUEST_PATH.as_str()).is_ok()
 }
 
 fn json_str(text: &str, key: &str) -> Option<String> {

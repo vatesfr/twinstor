@@ -34,7 +34,11 @@ async fn run_cmd_unbounded(cmd: &str, args: &[&str], quiet: bool) -> Result<()> 
         } else {
             warn!(command = %full, exit = ?code, stderr = %stderr.trim(), "command failed");
         }
-        bail!("{full}: exit {code:?}: {stderr}");
+        return Err(anyhow::Error::new(ExitFailed {
+            command: full,
+            code,
+            stderr: stderr.trim().to_string(),
+        }));
     }
     if changes_drbd_state(cmd, args) {
         // Every DRBD state change the daemon made is in the log, whatever
@@ -100,8 +104,73 @@ async fn bounded<T>(
         Ok(r) => r,
         Err(_) => {
             warn!(command = %full, timeout_secs = bound.as_secs(), "command timed out; killed");
-            bail!("{full}: timed out after {}s", bound.as_secs());
+            Err(anyhow::Error::new(TimedOut {
+                command: full.to_string(),
+                secs: bound.as_secs(),
+            }))
         }
+    }
+}
+
+/// The error of a bounded command that did not finish within its bound (as
+/// opposed to one that failed). Displays as before: "<command>: timed out
+/// after Ns".
+#[derive(Debug)]
+pub struct TimedOut {
+    command: String,
+    secs: u64,
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: timed out after {}s", self.command, self.secs)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Whether a command error is its bound running out, not a failure.
+pub fn is_timeout(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<TimedOut>().is_some()
+}
+
+/// The error of a command that ran and exited with a failure status: the
+/// program answered (for `xe`, XAPI or the CLI refused the call). Displays
+/// as before: "<command>: exit <code>: <stderr>".
+#[derive(Debug)]
+pub struct ExitFailed {
+    command: String,
+    code: Option<i32>,
+    stderr: String,
+}
+
+impl std::fmt::Display for ExitFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: exit {:?}: {}", self.command, self.code, self.stderr)
+    }
+}
+
+impl std::error::Error for ExitFailed {}
+
+/// How a bounded command ended, when it did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// Its bound ran out: it may still have taken effect.
+    TimedOut,
+    /// It ran and exited with a failure status; its error output.
+    Exited(String),
+    /// It could not be run at all.
+    NotRun(String),
+}
+
+/// Classify a command error by how the command ended (not by its text).
+pub fn ended(e: &anyhow::Error) -> Ended {
+    if is_timeout(e) {
+        Ended::TimedOut
+    } else if let Some(x) = e.downcast_ref::<ExitFailed>() {
+        Ended::Exited(x.stderr.clone())
+    } else {
+        Ended::NotRun(e.to_string())
     }
 }
 
@@ -214,8 +283,25 @@ mod tests {
         // the real child.
         let res = fut.await;
         assert!(res.is_err(), "a hung command must time out, not block");
-        let msg = res.unwrap_err().to_string();
+        let err = res.unwrap_err();
+        assert!(is_timeout(&err), "typed as a timeout");
+        let msg = err.to_string();
         assert!(msg.contains("timed out"), "error should say timeout: {msg}");
+    }
+
+    /// A command that fails at once is a failure, not a timeout: callers that
+    /// must tell "our call ran out of time" from "XAPI refused it" can, by how
+    /// it ended, not by its text.
+    #[tokio::test]
+    async fn a_failing_command_is_not_a_timeout() {
+        let err = run_cmd_for("false", &[], 5).await.unwrap_err();
+        assert!(!is_timeout(&err), "{err}");
+        assert_eq!(ended(&err), Ended::Exited(String::new()));
+        let err = run_cmd_for("sh", &["-c", "echo refused >&2; exit 1"], 5).await.unwrap_err();
+        assert_eq!(ended(&err), Ended::Exited("refused".into()));
+        assert!(err.to_string().contains("exit Some(1): refused"), "{err}");
+        let err = run_cmd_for("/nonexistent/twinstor-test-binary", &[], 5).await.unwrap_err();
+        assert!(matches!(ended(&err), Ended::NotRun(_)), "{err}");
     }
 
     #[tokio::test]

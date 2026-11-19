@@ -64,6 +64,8 @@ struct Diagnosis {
     // pool other-config:default_ha_timeout (None = unreadable, Some(None) = unset)
     default_ha_timeout: Option<Option<String>>,
     freeze_engaged: bool,
+    // local.db ha_peers names the peer (None = unreadable)
+    ha_peers_names_peer: Option<bool>,
 }
 
 impl Diagnosis {
@@ -152,7 +154,14 @@ async fn diagnose(config: &Config) -> Diagnosis {
         &crate::state_machine::fs_freeze_off_marker(),
         &crate::state_machine::peer_fs_freeze_record(),
     );
+    let ha_peers_names_peer = match crate::xapi::host_uuid(&config.node.peer).await {
+        Some(peer_uuid) => std::fs::read_to_string("/var/lib/xcp/local.db")
+            .ok()
+            .and_then(|db| crate::mgmt_reach::ha_peers_names(&db, &peer_uuid)),
+        None => None,
+    };
     Diagnosis {
+        ha_peers_names_peer,
         storage,
         heal,
         daemon_active: daemon,
@@ -201,6 +210,21 @@ fn default_ha_timeout_advice(current: Option<Option<&str>>, in_effect: u32) -> S
 const OK: &str = "[ ok ]";
 const BAD: &str = "[FAIL]";
 const WARN: &str = "[warn]";
+/// The doctor line for local.db `ha_peers` while pool HA is on.
+fn ha_peers_advice(names_peer: Option<bool>, sr: Option<&str>) -> String {
+    match names_peer {
+        Some(true) => "ha_peers:    names the peer".to_string(),
+        Some(false) => format!(
+            "ha_peers:    this host's local.db does not name the peer. A host that rejoins \
+             heartbeat-first after a partition can then stay a second master. Cycle pool HA \
+             once, from the pool master: xe pool-ha-disable; xe pool-ha-enable \
+             heartbeat-sr-uuids={}",
+            sr.unwrap_or("<twinstor SR uuid>")
+        ),
+        None => "ha_peers:    unknown (local.db or the peer's host record unreadable)".to_string(),
+    }
+}
+
 fn knot_mark(present: bool) -> &'static str {
     if present { BAD } else { OK }
 }
@@ -290,6 +314,13 @@ fn print_report(d: &Diagnosis) {
             Some(t) => println!("HA timeout:  {t}s\n"),
             None => println!("HA timeout:  unknown (could not read it)\n"),
         }
+    }
+
+    // XAPI demotes a returning ex-master through local.db ha_peers, written
+    // only at an HA enable. Without the peer there, a heartbeat-first rejoin
+    // can leave it a second master.
+    if d.pool_ha == Some(true) {
+        println!("{}\n", ha_peers_advice(d.ha_peers_names_peer, d.sr_uuid.as_deref()));
     }
 
     let in_effect = d
@@ -605,6 +636,14 @@ mod tests {
     use crate::drbd::{Replication, Role};
 
     #[test]
+    fn ha_peers_advice_names_the_remedy() {
+        assert!(ha_peers_advice(Some(true), None).contains("names the peer"));
+        let missing = ha_peers_advice(Some(false), Some("sr-1"));
+        assert!(missing.contains("xe pool-ha-enable heartbeat-sr-uuids=sr-1"));
+        assert!(ha_peers_advice(None, None).contains("unknown"));
+    }
+
+    #[test]
     fn default_ha_timeout_advice_names_the_value_a_bare_enable_would_use() {
         let unset = default_ha_timeout_advice(Some(None), 120);
         assert!(unset.contains(WARN) && unset.contains("60 s"));
@@ -661,6 +700,7 @@ mod tests {
     #[test]
     fn fix_blocked_while_healing_or_mid_episode() {
         let base = Diagnosis {
+            ha_peers_names_peer: None,
             storage: Some(healthy()),
             heal: None,
             daemon_active: false,
@@ -715,6 +755,7 @@ mod tests {
     // DrbdStatus/HealState aren't Clone; rebuild the parts the tests vary.
     fn cloneish(b: &Diagnosis) -> Diagnosis {
         Diagnosis {
+            ha_peers_names_peer: b.ha_peers_names_peer,
             storage: b.storage.as_ref().map(|_| healthy()),
             heal: None,
             daemon_active: b.daemon_active,

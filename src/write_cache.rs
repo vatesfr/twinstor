@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn whole_disk_resolves_to_itself() {
-        let tmp = std::env::temp_dir().join("twinstor-test-wc-disk");
+        let tmp = crate::heal_state::test_tmp_dir().join("twinstor-test-wc-disk");
         let _ = std::fs::remove_dir_all(&tmp);
         mkdirs(&tmp, &["nvme0n1"]);
         let mut out = Vec::new();
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn partition_resolves_to_parent_disk() {
-        let tmp = std::env::temp_dir().join("twinstor-test-wc-part");
+        let tmp = crate::heal_state::test_tmp_dir().join("twinstor-test-wc-part");
         let _ = std::fs::remove_dir_all(&tmp);
         mkdirs(&tmp, &["nvme0n1/nvme0n1p3", "nvme0n1p3"]);
         touch(&tmp, "nvme0n1p3/partition");
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn lv_resolves_through_slaves_to_disks() {
         // dm-0 (LV) -> sda3 (PV partition) -> sda, plus a second PV disk.
-        let tmp = std::env::temp_dir().join("twinstor-test-wc-lv");
+        let tmp = crate::heal_state::test_tmp_dir().join("twinstor-test-wc-lv");
         let _ = std::fs::remove_dir_all(&tmp);
         mkdirs(
             &tmp,

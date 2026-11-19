@@ -1,4 +1,5 @@
 mod advertise;
+mod arbitration;
 mod autostart;
 mod cli;
 mod cmd;
@@ -10,6 +11,7 @@ mod failback_state;
 mod heal_state;
 mod iscsi;
 mod loser_boundary;
+mod mgmt_reach;
 mod multipath;
 mod peer_signal;
 mod pool_join;
@@ -89,6 +91,7 @@ fn main() -> std::process::ExitCode {
     // soundness guard around the C library), so this must happen before the
     // tokio runtime spins up its worker threads.
     let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    state_machine::set_local_utc_offset(offset.whole_seconds());
 
     // Promote --no-color to the NO_COLOR env var before clap parses: clap
     // renders its own usage/help errors (colored) before Cli::run could

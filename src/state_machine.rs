@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use crate::xapi;
 /// reconnect to deterministic resolution. Overridable via env var for testing.
 pub(crate) fn split_brain_marker() -> String {
     std::env::var("TWINSTOR_SPLIT_BRAIN_MARKER")
-        .unwrap_or_else(|_| "/run/twinstor/split-brain".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/split-brain"))
 }
 
 /// An operator ran `twinstor discard-and-resync` on this node: its copy is
@@ -28,7 +28,7 @@ pub(crate) fn split_brain_marker() -> String {
 /// var for testing.
 pub(crate) fn operator_discard_marker() -> String {
     std::env::var("TWINSTOR_DISCARD_REQUEST_FILE")
-        .unwrap_or_else(|_| "/var/lib/twinstor/discard-requested".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/discard-requested"))
 }
 
 /// What the daemon does while an operator discard is pending.
@@ -65,7 +65,7 @@ fn operator_discard_gate(s: &DrbdStatus) -> OperatorDiscard {
 /// resync, an operator force).
 fn peer_served_marker() -> String {
     std::env::var("TWINSTOR_PEER_SERVED_MARKER")
-        .unwrap_or_else(|_| "/var/lib/twinstor/boot-gate-peer-served".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/boot-gate-peer-served"))
 }
 
 /// Write a small state file durably: temp file, fsync, rename, fsync the
@@ -113,7 +113,7 @@ fn peer_served_still_applies(recorded: Option<Option<u64>>, current: Option<u64>
 fn peer_served_path_for_new() -> String {
     if cfg!(test) {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        return std::env::temp_dir()
+        return crate::heal_state::test_tmp_dir()
             .join(format!(
                 "twinstor-test-peer-served-{}-{}",
                 std::process::id(),
@@ -136,7 +136,7 @@ fn peer_served_path_for_new() -> String {
 /// Overridable via env var for testing.
 fn fence_yield_marker() -> String {
     std::env::var("TWINSTOR_FENCE_YIELD_MARKER")
-        .unwrap_or_else(|_| "/run/twinstor/fence-yielded".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/fence-yielded"))
 }
 
 /// The loser crash-boundary record. Test builds get a private file per
@@ -145,7 +145,7 @@ fn loser_boundary_path() -> String {
     if cfg!(test) {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return std::env::temp_dir()
+        return crate::heal_state::test_tmp_dir()
             .join(format!(
                 "twinstor-test-loser-boundary-{}-{n}",
                 std::process::id()
@@ -192,7 +192,7 @@ fn default_guest_control(
 /// from an earlier fork goes stale by itself.
 pub(crate) fn yield_latch_marker() -> String {
     std::env::var("TWINSTOR_YIELD_LATCH_MARKER")
-        .unwrap_or_else(|_| "/var/lib/twinstor/yield-loser-latched".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/yield-loser-latched"))
 }
 
 /// The generation a latched yield was bound to when the daemon resumed this
@@ -211,7 +211,7 @@ fn relatch_pending_path(latch: &str) -> String {
 /// Removed at every episode end.
 pub(crate) fn win_claim_marker() -> String {
     std::env::var("TWINSTOR_WIN_CLAIM_MARKER")
-        .unwrap_or_else(|_| "/var/lib/twinstor/split-brain-win-claim".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/split-brain-win-claim"))
 }
 
 /// Fate-shared freeze mode opt-out. Freeze mode is on by default on a
@@ -234,7 +234,7 @@ pub(crate) fn fs_freeze_off_marker() -> String {
 /// verdict holds through a partition and a daemon restart during one.
 pub(crate) fn peer_fs_freeze_record() -> String {
     std::env::var("TWINSTOR_PEER_FS_FREEZE")
-        .unwrap_or_else(|_| "/var/lib/twinstor/peer-fs-freeze".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/peer-fs-freeze"))
 }
 
 /// Where install.sh puts the binary the next daemon starts from.
@@ -272,7 +272,7 @@ pub(crate) fn fs_freeze_engaged(arbitrated: bool, off_marker: &str, peer_record:
 /// guests; holds the peer's generation. Served as `R<gen>`.
 fn give_way_marker() -> String {
     std::env::var("TWINSTOR_GIVE_WAY_MARKER")
-        .unwrap_or_else(|_| "/run/twinstor/give-way".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/give-way"))
 }
 
 /// Companion of the give-way record: the peer took it (see
@@ -285,7 +285,7 @@ fn give_way_taken_path(give_way: &str) -> String {
 /// disconnected from the peer (the survivor then keeps its copy).
 fn split_guests_marker() -> String {
     std::env::var("TWINSTOR_SPLIT_GUESTS_MARKER")
-        .unwrap_or_else(|_| "/run/twinstor/split-guests".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/split-guests"))
 }
 
 /// `real` in production; a per-instance temp path under test, so parallel
@@ -295,7 +295,7 @@ fn test_private_path(tag: &str, real: String) -> String {
         return real;
     }
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    std::env::temp_dir()
+    crate::heal_state::test_tmp_dir()
         .join(format!(
             "twinstor-test-{tag}-{}-{}",
             std::process::id(),
@@ -428,6 +428,38 @@ fn mutual_yield_takes_win(
 fn same_gen(a: u64, b: u64) -> bool {
     let (a, b) = (a & !1, b & !1);
     a != 0 && a == b
+}
+
+/// Whether a loser latch binds the current fork: present and recorded for
+/// this copy's live generation. A latch from an earlier fork (the copy's
+/// generation has moved on) does not; an unreadable latch or generation
+/// does, which is the side that holds.
+fn latch_blocks(record: Option<Option<u64>>, current: Option<u64>) -> bool {
+    match (record, current) {
+        (None, _) => false,
+        (Some(Some(latched)), Some(cur)) => same_gen(latched, cur),
+        (Some(_), _) => true,
+    }
+}
+
+/// Whether a fence-peer handler run holds its lock (`flock` on
+/// `<run dir>/fence-peer.lock`, held by a run until it exits), i.e. a run is
+/// still deciding and its verdict is not written yet. Probed with a
+/// non-blocking exclusive lock released at once; a missing lock file means
+/// no run since boot.
+fn fence_run_in_flight(lock_path: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock_path) else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor this function owns; released below or
+    // when `f` is dropped.
+    let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if got {
+        // SAFETY: as above.
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+    }
+    !got
 }
 
 /// What this node attests on the beacon about the split-brain fork, from
@@ -606,7 +638,7 @@ fn guest_free_yield(scan: &Result<crate::loser_boundary::LocalScan, String>) -> 
 /// peer already went by the lineage. Cleared with the yield.
 fn yield_guests_marker() -> String {
     std::env::var("TWINSTOR_YIELD_GUESTS_MARKER")
-        .unwrap_or_else(|_| "/run/twinstor/yield-with-guests".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/yield-with-guests"))
 }
 
 /// The once-per-yield guest decision (see `yield_guests_marker`): `true`
@@ -645,7 +677,7 @@ async fn fence_handler_running() -> bool {
     }
     let lock = format!(
         "{}/fence-peer.lock",
-        std::env::var("TWINSTOR_RUN_DIR").unwrap_or_else(|_| "/run/twinstor".to_string())
+        std::env::var("TWINSTOR_RUN_DIR").unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor"))
     );
     if !std::path::Path::new(&lock).exists() {
         return false;
@@ -789,7 +821,7 @@ const SB_REFUSAL_RUN_GAP: Duration = Duration::from_secs(120);
 /// reboot starts the resolution over).
 fn discard_offer_marker() -> String {
     std::env::var("TWINSTOR_DISCARD_OFFER_MARKER")
-        .unwrap_or_else(|_| "/run/twinstor/discard-offer-parked".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/discard-offer-parked"))
 }
 
 /// How long a fence-peer yield hold (gateway fine, peer unreachable) lasts
@@ -899,7 +931,8 @@ const STANDDOWN_REJOIN_STABLE: Duration = Duration::from_secs(45);
 /// node is still isolated, bring-up stays parked (Secondary, no iSCSI, no
 /// promote) so a reboot can never let VMs run here. Cleared only when the
 /// client network returns with the peer reachable on replication.
-const ISOLATED_STANDDOWN_MARKER: &str = "/var/lib/twinstor/isolated-standdown";
+static ISOLATED_STANDDOWN_MARKER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/isolated-standdown"));
 /// Masterless-pool watchdog timings. `pool.conf == slave:<own address>` means
 /// this node is a slave of itself: a rejoining master that XHA did not
 /// propose as master gets demoted by xapi to a slave of its own database's
@@ -1461,6 +1494,437 @@ fn parse_peer_liveset(xml: &str) -> Option<PeerLiveset> {
         });
     }
     peer
+}
+
+/// The peer's membership in this host's own liveset, as evidence: only a
+/// liveset this host is Online in says anything about the peer. A host whose
+/// xhad is Starting (parked in XAPI's HA startup loop, or still joining) has
+/// no liveset of its own, whatever stale entries its xhad reports.
+fn own_liveset_peer_membership(ls: Option<PeerLiveset>) -> Option<bool> {
+    ls.filter(|l| l.local_online).map(|l| l.peer_live)
+}
+
+/// What the connected side may say about an isolated pool master, from the
+/// peer's membership in this host's own liveset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolatedMasterClaim {
+    /// The master left this host's liveset: XHA removed it; no alert.
+    Removed,
+    /// The master is a live member of this host's liveset.
+    InLiveset,
+    /// This host has no readable liveset of its own (xhad not Online, HA
+    /// off, or an unreadable answer): the alert makes no liveset claim.
+    LivesetUnknown,
+    /// The liveset still shows the master, but the isolation has not lasted
+    /// longer than XHA takes to decide and update the survivor's liveset:
+    /// XHA may be about to remove it. No alert yet; the check runs again on
+    /// the next pass, and the window always ends.
+    XhaDeciding,
+}
+
+/// The connected side's isolated-master alert when it has no readable
+/// liveset membership: it says only what was observed. `None` covers a
+/// local xhad that is not Online, a query that failed or timed out, and an
+/// answer that could not be used. With pool HA last read off there is no
+/// liveset and no HA to keep enabled, so that variant says so instead.
+fn isolated_master_unknown_liveset_alert(pool_ha_off: bool) -> &'static str {
+    if pool_ha_off {
+        "TwinStor: the pool master does not answer on the management network while its \
+         daemon is alive on the replication link (storage is safe). Pool HA is off, so \
+         nothing restarts its VMs elsewhere: if it runs VMs, clients likely cannot reach \
+         them. Reconnect its network; the pool reunifies on its own."
+    } else {
+        "TwinStor: the pool master does not answer on the management network while its \
+         daemon is alive on the replication link (storage is safe). This host cannot tell \
+         the master's membership in an HA liveset of its own (its HA daemon is not Online \
+         here, the query failed or gave no usable answer, or what XHA sees kept changing \
+         for 15 minutes). If the master runs \
+         VMs, clients likely cannot reach them: reconnect its network; the pool reunifies \
+         on its own. Do not disable pool HA."
+    }
+}
+
+/// How long after the later of the isolation's first sighting (the
+/// connected side's isolated-master clock) and the last change in XHA's
+/// inputs (`XhaReachClock`) XHA may still be deciding and the survivor's
+/// liveset may still show the peer: the fault
+/// handler starts about T_hb after the last heartbeat, the verdict comes at
+/// about 2 x T_hb (T0+243 s at T_hb 120 in testing), and the survivor's
+/// liveset drops the fenced host up to about one more T_hb later (T0+384 s
+/// in the same run). 3 x T_hb plus a minute covers that; at T_hb 120 that is
+/// 420 s, at 90 it is 330 s.
+fn xha_decision_window(t_hb_secs: u32) -> Duration {
+    Duration::from_secs(u64::from(t_hb_secs) * 3 + 60)
+}
+
+/// Whether the connected side's isolated-master alert must wait: the alert
+/// says the pool master is cut off, so it needs the master's management
+/// address silent (P false), not merely this host's `xe` failing (a slave
+/// whose own xapi refuses calls and restarts itself fails `xe` with nothing
+/// cut).
+fn isolated_master_alert_held(p: bool) -> Option<&'static str> {
+    p.then_some("the master's management address answers")
+}
+
+/// How long the connected side waits for XHA at most, from the isolation
+/// clock's start: an input that keeps changing (a flapping link) must not
+/// hold the alert forever. Past it, without a quiet window, the alert makes
+/// no liveset claim.
+const ISOLATED_MASTER_CLAIM_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// `quiet_for` is how long both the isolation clock and every XHA input this
+/// host sees have been unchanged (`XhaReachClock::quiet_for`); unknown makes
+/// no claim. `isolated_for` is the isolation clock's age: past
+/// `ISOLATED_MASTER_CLAIM_CAP` the wait ends with the no-claim alert, never
+/// the claim while changes are still seen.
+fn isolated_master_claim(
+    membership: Option<bool>,
+    quiet_for: Option<Duration>,
+    isolated_for: Option<Duration>,
+    xha_decision: Duration,
+) -> IsolatedMasterClaim {
+    let capped = isolated_for.is_some_and(|d| d >= ISOLATED_MASTER_CLAIM_CAP);
+    match (membership, quiet_for) {
+        (Some(false), _) => IsolatedMasterClaim::Removed,
+        (Some(true), Some(q)) if q > xha_decision => IsolatedMasterClaim::InLiveset,
+        (Some(true), Some(_)) if !capped => IsolatedMasterClaim::XhaDeciding,
+        (Some(true), _) | (None, _) => IsolatedMasterClaim::LivesetUnknown,
+    }
+}
+
+/// What this host sees of the inputs XHA decides on, for the connected
+/// side's isolated-master claim: the peer's management address (P), the
+/// peer on replication, the DRBD connection, and the peer's entry in this
+/// host's own liveset. An unreadable liveset keeps its last known values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct XhaReach {
+    p: bool,
+    peer_alive: bool,
+    drbd_connected: bool,
+    peer_live: Option<bool>,
+    peer_statefile: Option<bool>,
+}
+
+/// The last change in `XhaReach`, or in XHA's own account of the pool in
+/// xha.log (a membership disagreement, a node to be removed, a liveset
+/// update, a heartbeat or statefile timeout approaching or receding), seen
+/// while the isolation clock runs. XHA may still be deciding until three
+/// heartbeat timeouts and a minute after the later of the isolation clock's
+/// start and that change.
+#[derive(Debug, Clone, Default)]
+struct XhaReachClock {
+    last: Option<XhaReach>,
+    changed_at: Option<std::time::Instant>,
+    log_offset: Option<u64>,
+}
+
+impl XhaReachClock {
+    fn observe(&mut self, mut r: XhaReach, xha_log_moved: bool, now: std::time::Instant) {
+        if let Some(last) = self.last {
+            r.peer_live = r.peer_live.or(last.peer_live);
+            r.peer_statefile = r.peer_statefile.or(last.peer_statefile);
+            if r != last || xha_log_moved {
+                self.changed_at = Some(now);
+            }
+        } else {
+            self.changed_at = Some(now);
+        }
+        self.last = Some(r);
+    }
+
+    /// How long the isolation clock (`since`) and the observed inputs have
+    /// both been unchanged; unknown without an observation.
+    fn quiet_for(
+        &self,
+        since: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> Option<Duration> {
+        let from = since?.max(self.changed_at?);
+        Some(now.saturating_duration_since(from))
+    }
+}
+
+/// Whether xha.log text says XHA is deciding on the pool's membership.
+fn xha_log_deciding(text: &str) -> bool {
+    [
+        "approaching timeout",
+        "will be removed from liveset",
+        "Liveset has been updated",
+        "do not agree on the view",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
+/// New xha.log text since `offset` (from the end when `offset` is unset or
+/// past the end): whether it says XHA is deciding, and the next offset.
+fn scan_xha_log_deciding(path: &str, offset: Option<u64>) -> (bool, Option<u64>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (false, offset);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let Some(start) = offset.filter(|o| *o <= len) else {
+        return (false, Some(len));
+    };
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return (false, offset);
+    }
+    // Bytes, decoded lossily: a non-UTF-8 byte or a read that ends inside a
+    // multi-byte character must not stop the offset from advancing.
+    let mut buf = Vec::new();
+    let _ = f.take(4 * 1024 * 1024).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    (xha_log_deciding(&text), Some(start + buf.len() as u64))
+}
+
+/// The master flags of this host's own liveset (`calldaemon
+/// query_liveset`): which host holds XHA's statefile master lock. Only one
+/// host can hold it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LivesetMasters {
+    /// This host is Online in its own liveset.
+    local_online: bool,
+    /// This host's entry says `master=TRUE`.
+    local_master: bool,
+    /// The peer's entry: `liveness=TRUE`, and `master=TRUE`.
+    peer_live: bool,
+    peer_master: bool,
+}
+
+/// Parse the master flags out of `calldaemon query_liveset`. `None` when the
+/// local host's entry is missing, or there is not exactly one peer entry.
+fn parse_liveset_masters(xml: &str) -> Option<LivesetMasters> {
+    let head = xml.split("<host>").next().unwrap_or("");
+    let local_online = xml_tag(head, "status") == Some("Online");
+    let lh_start = xml.find("<localhost>")? + "<localhost>".len();
+    let lh_end = xml[lh_start..].find("</localhost>")? + lh_start;
+    let local_id = xml_tag(&xml[lh_start..lh_end], "HostID")?;
+    let mut local_master = None;
+    let mut peer: Option<(bool, bool)> = None;
+    for block in xml.split("<host>").skip(1) {
+        let block = block.split("</host>").next().unwrap_or("");
+        let Some(id) = xml_tag(block, "HostID") else {
+            continue;
+        };
+        let master = xml_tag(block, "master")? == "TRUE";
+        if id == local_id {
+            local_master = Some(master);
+            continue;
+        }
+        if peer.is_some() {
+            return None;
+        }
+        peer = Some((xml_tag(block, "liveness")? == "TRUE", master));
+    }
+    let (peer_live, peer_master) = peer?;
+    Some(LivesetMasters {
+        local_online,
+        local_master: local_master?,
+        peer_live,
+        peer_master,
+    })
+}
+
+/// Evidence (a) of the second-master demote guard, on one read: this host's
+/// own Online xhad shows the peer live and holding the master lock and this
+/// host not holding it, while the local xapi answers as master.
+fn second_master_evidence_a(liveset: Option<LivesetMasters>, local_xapi_master: bool) -> bool {
+    local_xapi_master
+        && liveset.is_some_and(|l| l.local_online && l.peer_live && l.peer_master && !l.local_master)
+}
+
+/// Two reads at least this far apart must show evidence (a) before a demote.
+const SECOND_MASTER_CONFIRM: Duration = Duration::from_secs(30);
+/// Pace and cap of the demote itself (an xapi restart each).
+const SECOND_MASTER_DEMOTE_RETRY: Duration = Duration::from_secs(300);
+const SECOND_MASTER_DEMOTE_CAP: u32 = 3;
+/// Cadence of the second-master check.
+const SECOND_MASTER_CHECK_EVERY: Duration = Duration::from_secs(10);
+
+/// Evidence (b): this host was seen parked by XAPI (a confirmed failed join
+/// while locally armed and cut off), XAPI then released it because the pool
+/// state turned invalid (a pool HA disable on the other host: xhad logs the
+/// invalid pool state and xapi clears the armed flag), and it still says
+/// master, answers as master, is still cut off and runs no VMs. An
+/// operator's local emergency disable is not such a release. An unreadable
+/// VM count is not zero.
+#[allow(clippy::too_many_arguments)]
+fn released_while_cut(
+    seen_parked: bool,
+    released_by_pool: bool,
+    local_armed: Option<bool>,
+    conf_master: bool,
+    local_xapi_master: bool,
+    p: bool,
+    running_vms: Option<u32>,
+) -> bool {
+    seen_parked
+        && released_by_pool
+        && local_armed == Some(false)
+        && conf_master
+        && local_xapi_master
+        && !p
+        && running_vms == Some(0)
+}
+
+/// xha.log signals of a park and of XAPI's release from it, read from
+/// `offset`: a failed join (the HA startup loop) and the invalid pool state
+/// xhad reads when the pool's HA was disabled (the release). Returns them
+/// with the new offset; a rotated log restarts at 0.
+fn scan_park_signals(path: &str, offset: u64) -> (bool, bool, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (false, false, offset);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = if len < offset { 0 } else { offset };
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return (false, false, offset);
+    }
+    let mut buf = String::new();
+    let _ = f.take(4 * 1024 * 1024).read_to_string(&mut buf);
+    let join_failed = buf.contains("(1903)")
+        || buf.contains("(1901)")
+        || buf.contains("Could not join the existing liveset");
+    let invalid_pool = buf.contains("Invalid pool state")
+        || buf.contains("INVALID_POOL_STATE")
+        || buf.contains("(1906)")
+        || buf.contains("(1910)")
+        || buf.contains("(1610)")
+        || buf.contains("(1508)");
+    (join_failed, invalid_pool, start + buf.len() as u64)
+}
+
+/// The demote guard's budget, kept under /run/twinstor for the boot (a daemon
+/// restart must not grant a fresh one): demotes in this episode, the last
+/// demote, the last alert and the last time any evidence held (unix seconds).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DemoteBudget {
+    count: u32,
+    last_demote: u64,
+    last_alert: u64,
+    last_evidence: u64,
+}
+
+/// An episode ends only after this long without any second-master evidence.
+/// A demote that took leaves the host a slave, so evidence that comes back
+/// within hours is the same incident flapping; 6 hours outlasts the longest
+/// parks seen in testing (40 minutes) and the 3-hour parks still to be tested,
+/// and still lets an unrelated incident on a later shift start fresh.
+const SECOND_MASTER_EPISODE_QUIET: u64 = 6 * 3600;
+
+fn second_master_budget_path_default() -> String {
+    std::env::var("TWINSTOR_SECOND_MASTER_BUDGET")
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/second-master-demote"))
+}
+
+fn demote_budget_read(path: &str, boot_id: &str) -> DemoteBudget {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return DemoteBudget::default();
+    };
+    let get = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .map(str::trim)
+    };
+    if get("boot_id") != Some(boot_id) {
+        return DemoteBudget::default();
+    }
+    let n = |k: &str| get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+    DemoteBudget {
+        count: n("count") as u32,
+        last_demote: n("last_demote"),
+        last_alert: n("last_alert"),
+        last_evidence: n("last_evidence"),
+    }
+}
+
+fn demote_budget_write(path: &str, boot_id: &str, b: &DemoteBudget) {
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        path,
+        format!(
+            "boot_id={boot_id}\ncount={}\nlast_demote={}\nlast_alert={}\nlast_evidence={}\n",
+            b.count, b.last_demote, b.last_alert, b.last_evidence
+        ),
+    );
+}
+
+/// Age the budget: evidence now refreshes the episode; an episode quiet for
+/// `SECOND_MASTER_EPISODE_QUIET` starts the count again.
+fn demote_budget_age(mut b: DemoteBudget, evidence: bool, now_unix: u64) -> DemoteBudget {
+    if b.count > 0 && now_unix.saturating_sub(b.last_evidence) >= SECOND_MASTER_EPISODE_QUIET {
+        b.count = 0;
+    }
+    if evidence {
+        b.last_evidence = now_unix;
+    }
+    b
+}
+
+/// The demote may run now: budget left and paced.
+fn demote_budget_allows(b: &DemoteBudget, now_unix: u64) -> bool {
+    b.count < SECOND_MASTER_DEMOTE_CAP && !demote_paced(b, now_unix)
+}
+
+/// A demote ran less than `SECOND_MASTER_DEMOTE_RETRY` ago: the next one
+/// waits, silently (the earlier one's xapi restart may still be landing).
+fn demote_paced(b: &DemoteBudget, now_unix: u64) -> bool {
+    b.count > 0 && now_unix.saturating_sub(b.last_demote) < SECOND_MASTER_DEMOTE_RETRY.as_secs()
+}
+
+/// What the second-master guard does this read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondMasterAction {
+    None,
+    /// Evidence (a) on a first read: wait for the confirming one.
+    Watch,
+    /// Demote: rewrite pool.conf to slave of the peer and restart xapi.
+    Demote,
+    /// The evidence holds but the demote cannot or may not run (dark peer,
+    /// no peer address, disabled, cap reached, paced): alert only.
+    AlertOnly,
+}
+
+/// The second-master demote guard. A host whose local xapi answers as master
+/// demotes itself when it has positive local evidence that it is not the
+/// master: (a) its own Online liveset names the peer as master, on two reads
+/// at least `SECOND_MASTER_CONFIRM` apart; or (b) it was released from the
+/// startup loop while cut off and the peer is shown alive (beacon line or
+/// DRBD Connected). Demote-only, so it needs no P and is not deferred while
+/// this host is a liveset member. A dark (b) is alert-only.
+#[allow(clippy::too_many_arguments)]
+fn second_master_decision(
+    evidence_a: bool,
+    a_since: Option<std::time::Instant>,
+    evidence_b: bool,
+    peer_shown_alive: bool,
+    may_act: bool,
+    now: std::time::Instant,
+) -> SecondMasterAction {
+    if evidence_a {
+        return match a_since {
+            Some(t) if now.duration_since(t) >= SECOND_MASTER_CONFIRM => {
+                if may_act {
+                    SecondMasterAction::Demote
+                } else {
+                    SecondMasterAction::AlertOnly
+                }
+            }
+            _ => SecondMasterAction::Watch,
+        };
+    }
+    if evidence_b {
+        return if peer_shown_alive && may_act {
+            SecondMasterAction::Demote
+        } else {
+            SecondMasterAction::AlertOnly
+        };
+    }
+    SecondMasterAction::None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2305,6 +2769,214 @@ fn stamped_in_earlier_boot(marker_content: &str, current_boot_id: &str) -> bool 
 /// This boot's kernel boot_id (stable for the life of a boot, changes on reboot).
 /// Empty string if unreadable, which [`slave_fence_needs_ha_disable`] treats
 /// as the safe non-matching value.
+/// The partition-view task: every 10 s, off the serial tick, classify the
+/// partition from local and replication-side signals
+/// (`arbitration::classify_partition`), publish it for `twinstor status` and
+/// for the alert filter, and log each change.
+fn spawn_partition_view(
+    config: Arc<Config>,
+    mgmt: crate::mgmt_reach::Shared,
+    whole_switch_guard: Arc<AtomicBool>,
+    hold_flag: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        use crate::drbd::DrbdControl;
+        let drbd = crate::drbd::DrbdController::new(&config);
+        use crate::arbitration::{
+            PartitionView, ViewHysteresis, ViewInputs, classify_partition,
+        };
+        let mut last = PartitionView::None;
+        let mut shown = ViewHysteresis::default();
+        // A park is confirmed only by a failed HA join in xha.log, read from
+        // when this host first looked cut off out of the liveset (not in the
+        // liveset, P false); "not in the liveset yet" alone is every boot.
+        // Once confirmed it is remembered for the boot (`ParkMemory`, kept
+        // under /run across a daemon restart) until the host joins, P holds,
+        // or it reads disarmed for good.
+        let mut park_offset: Option<u64> = None;
+        let mut stand_down_link = crate::arbitration::StandDownLink::default();
+        let mut park = if std::path::Path::new(crate::arbitration::PARK_PATH.as_str()).exists() {
+            crate::arbitration::ParkMemory::remembered()
+        } else {
+            crate::arbitration::ParkMemory::default()
+        };
+        let mut park_remembered = park.confirmed();
+        // This host's own XAPI answer to a login, read at most once a minute
+        // and only while it reads locally disarmed out of the liveset on a
+        // pool whose HA was not last read off (`own_login_probe_wanted`).
+        let mut own_role_read_at: Option<std::time::Instant> = None;
+        let mut own_xapi_armed_mismatch = false;
+        loop {
+            let now = std::time::Instant::now();
+            let pv = mgmt.lock().map(|s| s.view(now)).unwrap_or_default();
+            let local_armed = xapi::local_ha_armed();
+            let (xhad_online, peer_live_in_liveset, liveset_names_peer_master, holds_master_lock) =
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    crate::cmd::cmd_output(CALLDAEMON, &["query_liveset"]),
+                )
+                .await
+                {
+                    Ok(Ok(xml)) => match parse_peer_liveset(&xml) {
+                        Some(l) => {
+                            let masters = parse_liveset_masters(&xml);
+                            (
+                                l.local_online,
+                                Some(l.peer_live),
+                                second_master_evidence_a(masters, true),
+                                masters.is_some_and(|m| m.local_online && m.local_master),
+                            )
+                        }
+                        None => (false, None, false, false),
+                    },
+                    _ => (false, None, false, false),
+                };
+            let join_failed = if !xhad_online && !pv.p {
+                let off = *park_offset
+                    .get_or_insert_with(|| std::fs::metadata(XHA_LOG).map(|m| m.len()).unwrap_or(0));
+                let (join_failed, _, next) = scan_park_signals(XHA_LOG, off);
+                park_offset = Some(next);
+                join_failed
+            } else {
+                park_offset = None;
+                false
+            };
+            let park_confirmed = park.observe(join_failed, xhad_online, pv.p, local_armed);
+            if park_confirmed != park_remembered {
+                if park_confirmed {
+                    crate::arbitration::write_status(crate::arbitration::PARK_PATH.as_str(), &[]);
+                } else {
+                    let _ = std::fs::remove_file(crate::arbitration::PARK_PATH.as_str());
+                }
+                park_remembered = park_confirmed;
+            }
+            // Local evidence of a host disarmed under the armed pool when its
+            // xhad does not run: its own XAPI refuses logins with
+            // HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED.
+            if own_login_probe_wanted(local_armed, xhad_online, xapi::last_known_pool_ha())
+                && std::path::Path::new(XHAD_CONF).exists()
+            {
+                if own_role_read_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+                    own_role_read_at = Some(now);
+                    own_xapi_armed_mismatch =
+                        xapi::local_xapi_role().await == xapi::PeerXapiRole::ArmedMismatch;
+                }
+            } else {
+                own_role_read_at = None;
+                own_xapi_armed_mismatch = false;
+            }
+            // The xapi reads only when their view can hold.
+            let local_xapi_master = if liveset_names_peer_master {
+                xapi::is_pool_master().await
+            } else {
+                None
+            };
+            let pool_ha = if xhad_online && local_armed == Some(false) {
+                xapi::is_ha_enabled().await
+            } else {
+                None
+            };
+            let own_clients = tiebreaker_reachable().await;
+            note_tiebreaker_probe(own_clients);
+            let mut targets = vec![config.network.peer_address.to_string()];
+            targets.extend(read_direct_peer_ips().await);
+            let mut peer_alive = false;
+            for ip in &targets {
+                if crate::cmd::run_cmd_for("ping", &["-c", "1", "-W", "1", ip], 3)
+                    .await
+                    .is_ok()
+                {
+                    peer_alive = true;
+                    break;
+                }
+            }
+            let conf_master = xapi::local_pool_role() == Some(true);
+            let (link_connected, peer_secondary) = match drbd.status().await {
+                Ok(st) => (
+                    st.connection == ConnectionState::Connected,
+                    st.peer_role == Some(Role::Secondary),
+                ),
+                Err(_) => (false, false),
+            };
+            let peer_left_on_held_link =
+                stand_down_link.observe(link_connected, peer_live_in_liveset) && peer_secondary;
+            let whole_switch_hold =
+                whole_switch_guard.load(Ordering::Relaxed) || hold_flag.load(Ordering::Relaxed);
+            let stood_down = std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists();
+            // Only read inside the settle window, where Rejoining needs it.
+            let local_xapi_answers = if pv.p && !pv.settled() {
+                xapi::is_pool_master().await.is_some()
+            } else {
+                true
+            };
+            let inputs = ViewInputs {
+                p_window_full: pv.probes as usize >= crate::mgmt_reach::WINDOW,
+                holds_master_lock,
+                park_confirmed,
+                own_clients,
+                p: pv.p,
+                last_probe_answered: pv.last_answered,
+                own_xapi_armed_mismatch,
+                peer_disarmed: peer_disarmed_recently(mono_secs()),
+                settled: pv.settled(),
+                peer_alive,
+                local_armed,
+                xhad_online,
+                peer_live_in_liveset,
+                conf_master,
+                local_xapi_answers,
+                local_xapi_master,
+                liveset_names_peer_master,
+                pool_ha,
+                whole_switch_hold,
+                stood_down,
+                peer_left_on_held_link,
+            };
+            let evaluated = classify_partition(&inputs);
+            // The advice hold is published from the inputs, before the view:
+            // a parked host shown as Settling still holds it.
+            crate::arbitration::set_advice_hold(crate::arbitration::holds_ha_disable_advice(&inputs));
+            let view = shown.update_with(evaluated, &inputs);
+            crate::arbitration::set_current(view);
+            let text = view_text(view, crate::heal_state::unix_now());
+            if view != last {
+                info!(
+                    heal_event = "partition_view",
+                    from = last.name(),
+                    to = view.name(),
+                    p = pv.p,
+                    answered = pv.answered,
+                    peer_alive,
+                    own_clients = ?own_clients,
+                    local_armed = ?local_armed,
+                    xhad_online,
+                    "partition view changed: {text}"
+                );
+                last = view;
+            }
+            crate::arbitration::write_status(
+                crate::arbitration::STATUS_PATH.as_str(),
+                &[("view", view.name()), ("verdict", &text)],
+            );
+            tokio::time::sleep(crate::mgmt_reach::PROBE_EVERY).await;
+        }
+    });
+}
+
+/// A view's text, with the hold on TwinStor's peer-emergency reset added to
+/// PeerDisarmed while the budget holds it.
+fn view_text(view: crate::arbitration::PartitionView, now_unix: u64) -> String {
+    view_text_with(view, peer_emergency_hold_note(now_unix))
+}
+
+fn view_text_with(view: crate::arbitration::PartitionView, note: Option<String>) -> String {
+    let base = crate::arbitration::verdict(view);
+    match (view, note) {
+        (crate::arbitration::PartitionView::PeerDisarmed, Some(note)) => format!("{base} {note}"),
+        _ => base.to_string(),
+    }
+}
+
 fn current_boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
@@ -2423,7 +3095,7 @@ fn standdown_allowed_ha(ha_enabled: Option<bool>) -> bool {
 /// operator who wants HA off on purpose removes the file (alerts say so).
 fn ha_rearm_obligation_path() -> String {
     std::env::var("TWINSTOR_HA_REARM_OBLIGATION")
-        .unwrap_or_else(|_| "/var/lib/twinstor/ha-rearm-obligation".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/ha-rearm-obligation"))
 }
 
 /// Boot-stamped record that this daemon emergency-disarmed the local HA
@@ -2436,16 +3108,17 @@ fn ha_rearm_obligation_path() -> String {
 /// (see `disarm_trap_decision`).
 fn ha_local_disarm_path() -> String {
     std::env::var("TWINSTOR_HA_LOCAL_DISARM")
-        .unwrap_or_else(|_| "/var/lib/twinstor/ha-local-disarm".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/ha-local-disarm"))
 }
 
 /// Record a local emergency HA disarm under this boot's id and the running
-/// xapi's PID, before the disarm. Only a host whose local HA is armed: that
-/// disarm is what sets the trap, and a pool whose HA was already off on
-/// purpose must never be re-armed by this. Free function: the whole-switch
+/// xapi's PID, before the disarm. Not on a host whose local HA already
+/// reads disarmed (a pool whose HA was already off on purpose must never be
+/// re-armed by this); an unreadable armed state still records it, so
+/// TwinStor's own disarm is never taken for someone else's. Free function: the whole-switch
 /// fast guard runs in a detached task.
 fn note_local_ha_disarm() {
-    if cfg!(test) || crate::xapi::local_ha_armed() != Some(true) {
+    if cfg!(test) || crate::xapi::local_ha_armed() == Some(false) {
         return;
     }
     let p = ha_local_disarm_path();
@@ -2454,8 +3127,30 @@ fn note_local_ha_disarm() {
     }
     let _ = std::fs::write(
         &p,
-        format!("boot_id={}\nxapi_pid={}\n", current_boot_id(), xapi_pid()),
+        format!(
+            "boot_id={}\nxapi_pid={}\nwritten={}\n",
+            current_boot_id(),
+            xapi_pid(),
+            unix_now_secs()
+        ),
     );
+}
+
+/// How long after a disarm record is written the local armed flag may still
+/// read armed: the emergency disable it precedes can still be landing (the
+/// fast guard runs it off the tick). The record is not taken as spent then.
+const DISARM_RECORD_SETTLE: u64 = 120;
+
+/// The record's age (unix seconds), when it says when it was written. A
+/// `written` in the future (the wall clock stepped back) has no age: the
+/// record counts as settled, not as settling for the length of the step.
+fn disarm_record_age(record: &str, now_unix: u64) -> Option<u64> {
+    record
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("written="))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|w| *w <= now_unix)
+        .map(|w| now_unix - w)
 }
 
 /// The running xapi's PID, empty when none runs or it cannot be read.
@@ -2465,6 +3160,16 @@ fn xapi_pid() -> String {
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The running xapi's PID through the bounded command helper (empty when
+/// none runs, or the lookup fails or times out). For the tick; the free
+/// `xapi_pid` stays for the disarm record, written right before a disarm.
+async fn xapi_pid_bounded() -> String {
+    crate::cmd::cmd_output_for("pgrep", &["-o", "-x", "xapi"], 5)
+        .await
+        .map(|o| o.trim().to_string())
         .unwrap_or_default()
 }
 
@@ -2506,16 +3211,480 @@ fn disarm_trap_decision(
     is_master: bool,
     hold_standing: bool,
 ) -> DisarmTrapAction {
+    // A hold standing (the tick's, or the fast guard's), or a record still
+    // settling: the disarm is deliberate and may not have landed yet, so a
+    // local armed read is no proof that a pool cycle realigned the host.
+    if hold_standing {
+        return DisarmTrapAction::Keep;
+    }
     if local_armed == Some(true) {
         return DisarmTrapAction::Clear;
     }
     match ha {
         Some(false) if !restarted => DisarmTrapAction::Clear,
-        Some(false) if hold_standing => DisarmTrapAction::Keep,
         Some(false) if is_master => DisarmTrapAction::Rearm,
         Some(false) => DisarmTrapAction::Clear,
         _ => DisarmTrapAction::Keep,
     }
+}
+
+/// The disarm record names this boot (a record from an earlier boot is the
+/// disarm trap's business) and has not been used for a pool HA cycle yet.
+/// Mark the recorded-disarm record used (its one pool HA cycle has issued
+/// its disable), once.
+fn mark_disarm_record_cycled(path: &str) {
+    let Ok(record) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if record.lines().any(|l| l.trim() == "cycled=1") {
+        return;
+    }
+    let sep = if record.ends_with('\n') || record.is_empty() { "" } else { "\n" };
+    let _ = std::fs::write(path, format!("{record}{sep}cycled=1\n"));
+}
+
+/// The disarm record was written in this boot (used for its cycle or not).
+fn disarm_record_this_boot(record: &str, current_boot: &str) -> bool {
+    !current_boot.trim().is_empty()
+        && record
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("boot_id="))
+            .map(str::trim)
+            == Some(current_boot.trim())
+}
+
+/// The manual runbook for the XHA join deadlock: the pool HA cycle first;
+/// only if its disable fails, the two-host emergency disable, bounded in
+/// time, after which pool HA still reads enabled, so the master's disable
+/// comes before the re-enable (the order the dance runs, and the manual
+/// recovery that worked in testing, where the master's toolstack restart
+/// ended a hung disable and left pool HA off).
+/// `host-emergency-ha-disable` on one host that runs VMs, under an armed pool
+/// with the master's HA live, gets that host declared dead after about the
+/// HA timeout and its VMs restarted on the other host while they still run.
+fn join_deadlock_runbook_alert(me: &str, peer: &str, master: &str, t: u32) -> String {
+    format!(
+        "TwinStor: the XHA daemon has been unable to rejoin the liveset for over 5 minutes. If \
+         it is simply not running (calldaemon gethoststate reports nothing), restart it first: \
+         'systemctl restart attach-static-vdis' then 'PATH=/usr/libexec/xapi/cluster-stack/xhad:$PATH \
+         ha_start_daemon'. For the join deadlock (the post-fence-storm embrace): on the pool \
+         master ({master}) run 'xe pool-ha-disable', then {enable}. Only if that disable fails: run 'xe \
+         host-emergency-ha-disable --force' on both hosts ({me} and {peer}) within 30 seconds of \
+         each other, wait \
+         {} seconds (the HA timeout of {t} s plus 30), then on {master} run 'xe \
+         pool-ha-disable' (if it hangs, 'xe-toolstack-restart' on {master} ends it and leaves \
+         pool HA off), then {enable}. Storage is unaffected. A host disarmed alone for longer \
+         than the HA timeout can have its VMs restarted on the other host while they still run.",
+        t + 30,
+        enable = format!(
+            "'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"
+        ),
+    )
+}
+
+/// A peer the pool-level recovery did not recruit: the pool HA cycle by
+/// hand, with the peer's own emergency disable only while pool HA is off.
+/// Raised on the pool master (`master`), about `peer`.
+fn peer_not_recruited_alert(what: &str, master: &str, peer: &str, t: u32) -> String {
+    format!(
+        "TwinStor: {what}. On the pool master {master} run 'xe pool-ha-disable'; if the HA \
+         daemon on {peer} still cycles, run 'xe host-emergency-ha-disable --force' on {peer}; \
+         then on {master} run 'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
+         ha-config:timeout={t}'. Storage is healthy."
+    )
+}
+
+/// A host locally disarmed under the armed pool (the armed-mismatch
+/// sentinel): what its next reboot does, and the re-alignment, on the named
+/// master, with the configured timeout.
+fn armed_mismatch_alert(i_am_master: bool, me: &str, peer: &str, t: u32) -> String {
+    let enable = format!(
+        "'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"
+    );
+    if i_am_master {
+        format!(
+            "TwinStor: this host ({me}, the pool master) is locally HA-disarmed while pool HA \
+             is enabled. At its next reboot, xapi will silently disable pool HA (upstream \
+             behavior). Re-align now on {me}: 'xe pool-ha-disable', then {enable}."
+        )
+    } else {
+        format!(
+            "TwinStor: this host ({me}) is locally HA-disarmed while pool HA is enabled. At its \
+             next reboot, xapi will wedge it in emergency mode (xe unusable, storage attach \
+             blocked; upstream behavior). Re-align now: on the master ({peer}) run 'xe \
+             pool-ha-disable', then {enable}."
+        )
+    }
+}
+
+/// What the HA daemon revive found: the boot-time statefile race (the
+/// daemon died while the host is armed), or a host locally disarmed under
+/// the armed pool whose daemon is simply not running (an emergency disable),
+/// and whether TwinStor's own disarm record (this boot) stands for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviveCause {
+    BootRace,
+    LocallyDisarmed { by_twinstor: bool },
+}
+
+fn revive_cause(local_armed: Option<bool>, pool_ha: Option<bool>, own_record: bool) -> ReviveCause {
+    if local_armed == Some(false) && pool_ha != Some(false) {
+        ReviveCause::LocallyDisarmed { by_twinstor: own_record }
+    } else {
+        ReviveCause::BootRace
+    }
+}
+
+/// The revive's alert on a host locally disarmed under the armed pool: only
+/// what is known, and the pool-level cycle that re-arms it, on the named
+/// master.
+fn revived_disarmed_alert(me: &str, master: &str, by_twinstor: bool, t: u32, pool_off: bool) -> String {
+    let who = if by_twinstor { "" } else { " (TwinStor did not disarm it)" };
+    if pool_off {
+        // Pool HA was turned off meanwhile: no "armed pool" claim, nothing
+        // to cycle.
+        return format!(
+            "TwinStor on {me}: the HA daemon was not running on this host, which was locally \
+             disarmed{who}; TwinStor restarted it. Pool HA now reads off: when you turn it back \
+             on, on the pool master {master} run 'xe pool-ha-enable \
+             heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'."
+        );
+    }
+    format!(
+        "TwinStor on {me}: the HA daemon was not running on this host, which is locally \
+         disarmed under the armed pool{who}. TwinStor restarted it so the host is back in the \
+         HA liveset, which keeps XAPI from treating it as dead. The host stays locally disarmed \
+         until pool HA is cycled: on the pool master {master} run 'xe pool-ha-disable', then \
+         'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'."
+    )
+}
+
+/// Whether the unplugged-PBD check would only time out: this host is a
+/// slave per pool.conf (its xe calls are forwarded to the master) or its
+/// role is unknown, and P is false.
+fn pbd_check_futile(p: bool, local_pool_role: Option<bool>) -> bool {
+    !p && local_pool_role != Some(true)
+}
+
+/// The disarmed host's own alert's queue key: one per host, whatever the
+/// VM count in its text.
+fn disarmed_host_alert_key(me: &str) -> String {
+    format!("disarmed-host-{me}")
+}
+
+/// The master's alert while isolated from the client network.
+const MASTER_ISOLATED_ALERT: &str = "TwinStor: this pool master is isolated from the client \
+     network while storage replication continues. VMs running here are likely unreachable to \
+     clients. Reconnect this host's network cable/switch port; the pool reunifies on its own. \
+     Do not disable pool HA.";
+
+/// The isolated master's alert when pool HA is off.
+const MASTER_ISOLATED_HA_OFF_ALERT: &str = "TwinStor: this pool master is isolated from the \
+     client network, but pool HA is disabled. TwinStor did not stand its storage down (with HA \
+     off, that would strand its VMs rather than fail them over). Storage keeps replicating over \
+     the direct link and no data is at risk. Enable pool HA so an isolated master can fail its \
+     VMs over to the peer.";
+
+/// The connected host's alert about an isolated master in the liveset.
+const ISOLATED_MASTER_IN_LIVESET_ALERT: &str = "TwinStor: the pool master is isolated from the \
+     client network (its daemon is alive on the replication link and it is still in the HA \
+     liveset; storage is safe). The VMs it runs are likely unreachable to clients. Reconnect its \
+     network; the pool reunifies on its own. Do not disable pool HA.";
+
+/// The self-clear's report: what it ran and what the command returned, and
+/// what re-arms the host, as what TwinStor will attempt.
+fn self_unwedge_report_text(me: &str, master: &str, failed: Option<&str>, t: u32) -> String {
+    let stuck = format!(
+        "TwinStor on {me}: this host was stuck in XAPI's HA emergency mode (locally disarmed \
+         under the armed pool, its HA daemon unable to rejoin the liveset after the pool-level \
+         reset; replication connected with both copies up to date)."
+    );
+    let manual = format!(
+        "on the pool master {master} run 'xe pool-ha-disable', then 'xe pool-ha-enable \
+         heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"
+    );
+    match failed {
+        None => format!(
+            "{stuck} To clear its local HA state it ran 'xe host-emergency-ha-disable --force', \
+             which returned success. The host stays locally disarmed until pool HA is cycled. \
+             TwinStor on {master} attempts that cycle (its peer-emergency reset) when it sees \
+             this host answer as locally disarmed, if its automatic reset is on and its reset \
+             budget allows; if this host is not re-armed within a few minutes, {manual}."
+        ),
+        Some(e) => format!(
+            "{stuck} To clear its local HA state it ran 'xe host-emergency-ha-disable --force', \
+             which failed: {e}. TwinStor does not retry it before {} minutes. To re-arm this \
+             host by hand, {manual}.",
+            SELF_UNWEDGE_COOLDOWN.as_secs() / 60
+        ),
+    }
+}
+
+/// Serving on one copy; its held version is withdrawn when redundancy
+/// returns.
+const REDUNDANCY_LOST_ALERT: &str = "twinstor: this node is serving without redundancy: the peer \
+     is down or not a healthy replica, so the pool is running on a single copy. VMs are \
+     unaffected, but a single further failure now loses data. Bring the peer back (it resyncs \
+     automatically on return) or investigate why it is not connecting.";
+
+/// What a host locally disarmed under the armed pool risks, by whether it
+/// runs VMs, and the pool-level remedy.
+fn disarmed_host_risk(vms: u32) -> &'static str {
+    if vms == 0 {
+        "This host is locally disarmed under the armed pool and runs no VMs: XAPI can \
+         declare it dead within about the HA timeout (no VM of it is restarted elsewhere); on \
+         the master run 'xe pool-ha-disable', then re-enable pool HA"
+    } else {
+        "This host is locally disarmed under the armed pool: XAPI can restart its VMs on the \
+         other host within about the HA timeout while they still run here; on the master run \
+         'xe pool-ha-disable' now, then re-enable pool HA"
+    }
+}
+
+/// The re-admission flap alert: what was observed, and the disarmed host's
+/// risk sentence (`disarmed_host_risk`) with the exact re-enable.
+fn readmission_flap_alert_text(vms: u32, t: u32) -> String {
+    format!(
+        "TwinStor: a returning host rejoined the XHA liveset but has not completed \
+         readmission: it stays locally HA-disarmed while its slave->master XAPI intermittently \
+         fails, and it will not clear on its own. {}: 'xe pool-ha-enable \
+         heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'.",
+        disarmed_host_risk(vms)
+    )
+}
+
+/// The failed revive's alert: what TwinStor saw and did, nothing more.
+const REVIVE_FAILED_ALERT: &str = "TwinStor: the XHA daemon on this host is dead and an \
+     automatic restart did not bring it back Online. Replication was connected with both copies \
+     up to date when TwinStor restarted it. Investigate /var/log/xha.log; to retry manually run \
+     'systemctl restart attach-static-vdis' then 'PATH=/usr/libexec/xapi/cluster-stack/xhad:$PATH \
+     ha_start_daemon' (the script needs its own directory on PATH).";
+
+/// Whether the self-unwedge check would only time out on its reads: P false.
+fn self_unwedge_reads_futile(p: bool) -> bool {
+    !p
+}
+
+/// What the self-unwedge check knows about pool HA and the peer, kept by
+/// source: the self-clear acts on the pool read and the peer's agent only;
+/// the local xapi's refusal ("pool HA enabled, this host disabled", read
+/// only when the pool read fails) and the peer's own login answer inform the
+/// log line and the alert only (the refusal can be stale once pool HA is
+/// turned off by hand).
+#[derive(Debug, Clone, Copy, Default)]
+struct SelfUnwedgeEvidence {
+    pool_read: Option<bool>,
+    local_refusal: bool,
+    peer_agent_master: bool,
+    peer_login_master: bool,
+}
+
+impl SelfUnwedgeEvidence {
+    /// (pool HA, peer is the live master) for the self-clear.
+    fn for_action(&self) -> (Option<bool>, bool) {
+        (self.pool_read, self.peer_agent_master)
+    }
+
+    /// The same for the alert, local evidence allowed.
+    fn for_alert(&self) -> (Option<bool>, bool) {
+        let pool = match self.pool_read {
+            Some(v) => Some(v),
+            None if self.local_refusal => Some(true),
+            None => None,
+        };
+        (pool, self.peer_agent_master || self.peer_login_master)
+    }
+}
+
+/// A reset judged to have freed `peer`: what was observed, without a cause.
+fn freed_alert(peer: &str) -> String {
+    format!(
+        "TwinStor: the peer host {peer} reported itself locally disarmed under the armed pool. An \
+         automatic pool-level HA reset ran, and {peer} now answers normally as a slave (twice, \
+         with no locally-disarmed answer since). No action needed."
+    )
+}
+
+/// How a first-sighting alert sent off the tick ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstAlertOutcome {
+    /// Delivered; the long hold it named, if any.
+    Delivered(Option<u64>),
+    /// Handed to XAPI's queue (or held for a parked host), or not needed
+    /// (no VM on the peer): the wedge counts as alerted.
+    Kept,
+    /// Not sent (this host stopped being master): the next sighting
+    /// tries again.
+    Dropped,
+}
+
+/// The reset-hold alert's queue key: its hold's end.
+fn peer_emergency_hold_key(until: u64) -> String {
+    format!("peer-emergency-hold-{until}")
+}
+
+/// The first-sighting alert's queue key: when its wedge was first alerted.
+fn peer_disarm_first_key(alerted: u64) -> String {
+    format!("peer-disarm-first-{alerted}")
+}
+
+/// What TwinStor does next about a peer seen locally disarmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerDisarmNext {
+    /// Its automatic reset follows once a second probe confirms it.
+    Expected,
+    /// The reset budget holds it until then, and why.
+    OnHold(u64, String),
+    /// `[ha] auto_resolve_peer_emergency` is off.
+    Disabled,
+}
+
+/// The master's alert on its first sighting of `peer` locally disarmed
+/// under the armed pool: what the pool database says runs there (the count
+/// only when read), the risk, what TwinStor does next, and the manual cycle
+/// on the master.
+fn peer_disarm_first_alert_text(
+    master: &str,
+    peer: &str,
+    vms: Option<u32>,
+    next: &PeerDisarmNext,
+    t: u32,
+) -> String {
+    let runs = match vms {
+        Some(n) => format!(" It runs {n} VM(s) according to the pool database."),
+        None => String::new(),
+    };
+    let next = match next {
+        PeerDisarmNext::Expected => {
+            "TwinStor resets pool HA automatically once a second probe confirms it.".to_string()
+        }
+        PeerDisarmNext::OnHold(until, why) => format!(
+            "TwinStor's automatic pool HA reset is on hold until {} ({why}).",
+            operator_time(*until)
+        ),
+        PeerDisarmNext::Disabled => "TwinStor's automatic pool HA reset is turned off by \
+            configuration ([ha] auto_resolve_peer_emergency = false): the manual command is needed \
+            now."
+            .to_string(),
+    };
+    format!(
+        "TwinStor: the peer host {peer} reports itself locally disarmed under the armed pool.{runs} \
+         XAPI can restart its VMs on another host while they still run there. {next} To free \
+         {peer} by hand: on the pool master {master} run 'xe pool-ha-disable', then 'xe \
+         pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'."
+    )
+}
+
+/// The re-arm hold's log line, from the record's real state.
+fn rearm_hold_line(record: Option<ObligationState>) -> &'static str {
+    match record {
+        Some(ObligationState::Owed) => "a pool-HA re-arm is owed but not attempted yet",
+        Some(ObligationState::Pending { .. }) => {
+            "TwinStor's pool HA disable is pending; its re-arm waits for it to take"
+        }
+        Some(ObligationState::Enabled) => {
+            "TwinStor re-enabled pool HA; the record is cleared once HA has settled"
+        }
+        None => "no re-arm record stands",
+    }
+}
+
+/// A host locally disarmed under the armed pool that runs VMs.
+fn disarmed_host_vms_alert(host: &str, master: &str, vms: u32, t: u32) -> String {
+    format!(
+        "TwinStor on {host}: this host is locally disarmed under the armed pool and runs {vms} \
+         VM(s). XAPI can declare it dead and restart those VMs on the other host within about \
+         the HA timeout ({t} s) while they still run here. TwinStor on the pool master \
+         ({master}) may reset pool HA automatically; if 'twinstor status' on this host still \
+         shows it disarmed after 5 minutes, it has not, and the manual command is needed: on \
+         {master} run 'xe \
+         pool-ha-disable', then re-enable with 'xe pool-ha-enable \
+         heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'. A pool HA disable run \
+         by hand stays off until it is re-enabled by hand."
+    )
+}
+
+fn disarm_record_usable(record: &str, current_boot: &str) -> bool {
+    let stamped = record
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("boot_id="))
+        .map(str::trim);
+    !current_boot.trim().is_empty()
+        && stamped == Some(current_boot.trim())
+        && !record.lines().any(|l| l.trim() == "cycled=1")
+}
+
+/// Both hosts must stay live in this host's liveset this long before the
+/// recorded-disarm re-arm; the pool's slave waits `RECORDED_REARM_SLAVE_DEFER`
+/// more, so when both hosts hold a record the master's cycle (which re-arms
+/// both) lands first and the slave's conditions no longer hold.
+const RECORDED_REARM_LIVESET_FOR: Duration = Duration::from_secs(120);
+const RECORDED_REARM_SLAVE_DEFER: Duration = Duration::from_secs(600);
+const RECORDED_REARM_CHECK_EVERY: Duration = Duration::from_secs(10);
+
+/// What the recorded-disarm re-arm does now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedRearm {
+    /// Not this state: no usable record, pool HA off, or this host armed.
+    None,
+    /// The state holds but a condition does not yet (named for the log).
+    Wait(&'static str),
+    /// Run the one pool HA cycle.
+    Cycle,
+}
+
+/// A host carrying TwinStor's own disarm record for this boot, back in the
+/// liveset locally disarmed under the armed pool (after a whole-switch hold,
+/// or a stand-down release), gets one pool HA cycle: only a pool HA enable
+/// re-arms a host locally. All must hold: pool HA on; this host disarmed; both
+/// hosts live in its own Online liveset for `RECORDED_REARM_LIVESET_FOR` (plus
+/// `RECORDED_REARM_SLAVE_DEFER` on the slave); P matured; the peer's xapi
+/// answering as the other role of a single-master pool (this host master and
+/// the peer a slave, or the reverse; never two masters, which the
+/// second-master demote resolves first); no whole-switch hold; no pending pool
+/// HA task.
+#[allow(clippy::too_many_arguments)]
+fn recorded_disarm_rearm_decision(
+    record_usable: bool,
+    pool_ha: Option<bool>,
+    local_armed: Option<bool>,
+    both_live_for: Option<Duration>,
+    p_matured: bool,
+    i_am_master: Option<bool>,
+    peer_role: &xapi::PeerXapiRole,
+    hold_standing: bool,
+    task_pending: bool,
+) -> RecordedRearm {
+    if !record_usable || pool_ha != Some(true) || local_armed != Some(false) {
+        return RecordedRearm::None;
+    }
+    if hold_standing {
+        return RecordedRearm::Wait("a whole-switch hold stands");
+    }
+    if task_pending {
+        return RecordedRearm::Wait(
+            "a pool HA operation is pending in XAPI, or its task list is unreadable",
+        );
+    }
+    if !p_matured {
+        return RecordedRearm::Wait("the peer's management address does not answer");
+    }
+    let need = match i_am_master {
+        Some(true) => RECORDED_REARM_LIVESET_FOR,
+        Some(false) => RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER,
+        None => return RecordedRearm::Wait("the local xapi does not answer"),
+    };
+    if both_live_for.is_none_or(|d| d < need) {
+        return RecordedRearm::Wait("both hosts are not yet live in the liveset long enough");
+    }
+    let single_master = matches!(
+        (i_am_master, peer_role),
+        (Some(true), xapi::PeerXapiRole::SlaveOf(_)) | (Some(false), xapi::PeerXapiRole::Master)
+    );
+    if !single_master {
+        return RecordedRearm::Wait("the pool does not have exactly one master");
+    }
+    RecordedRearm::Cycle
 }
 
 /// For `twinstor status`: whether the daemon currently owes an automatic HA
@@ -2524,6 +3693,26 @@ fn disarm_trap_decision(
 /// from "HA is off with nothing pending".
 pub(crate) fn ha_rearm_obligation_pending() -> bool {
     std::path::Path::new(&ha_rearm_obligation_path()).exists()
+}
+
+/// For `twinstor status`: the re-arm obligation's state and what it means,
+/// in one line (`None` when none stands).
+pub(crate) fn ha_rearm_status_line() -> Option<String> {
+    ha_obligation_state().map(|st| rearm_state_text(st, unix_now_secs()))
+}
+
+fn rearm_state_text(state: ObligationState, now_unix: u64) -> String {
+    match state {
+        ObligationState::Pending { until } => format!(
+            "pending: TwinStor issued a pool HA disable and has not seen it take; it waits up \
+             to {}s more, then owes a re-arm if HA is off, or drops the record",
+            until.saturating_sub(now_unix)
+        ),
+        ObligationState::Owed => "owed: TwinStor turned pool HA off and restores it".to_string(),
+        ObligationState::Enabled => {
+            "enabled: TwinStor re-enabled pool HA; the record goes once HA has settled".to_string()
+        }
+    }
 }
 
 /// A Fulfilled read is trusted only this long (seconds) after the last
@@ -2548,10 +3737,10 @@ const REARM_TS_THROTTLE_SECS: u64 = 600;
 /// throttle.
 fn ha_rearm_ts_path() -> String {
     std::env::var("TWINSTOR_HA_REARM_TS")
-        .unwrap_or_else(|_| "/var/lib/twinstor/ha-rearm-ts".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/ha-rearm-ts"))
 }
-fn ha_rearm_ts_read() -> (u32, u64) {
-    std::fs::read_to_string(ha_rearm_ts_path())
+fn ha_rearm_ts_read(path: &str) -> (u32, u64) {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| {
             let mut it = s.split_whitespace();
@@ -2561,15 +3750,13 @@ fn ha_rearm_ts_read() -> (u32, u64) {
         })
         .unwrap_or((0, 0))
 }
-fn ha_rearm_ts_write(count: u32, last_unix: u64) {
-    let p = ha_rearm_ts_path();
-    if let Some(dir) = std::path::Path::new(&p).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&p, format!("{count} {last_unix}"));
+/// Write the escalation's count atomically (temporary file and rename, as
+/// the other state files); whether it was written.
+fn ha_rearm_ts_write(path: &str, count: u32, last_unix: u64) -> bool {
+    write_file_atomic(path, &format!("{count} {last_unix}")).is_ok()
 }
-fn ha_rearm_ts_clear() {
-    let _ = std::fs::remove_file(ha_rearm_ts_path());
+fn ha_rearm_ts_clear(path: &str) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Escalate a stuck pool-HA re-arm to a toolstack restart only after the light
@@ -2598,37 +3785,379 @@ fn enable_refused_daemon_present(err: &str) -> bool {
         || err.contains("Daemon is (already) present")
 }
 
-fn ha_obligation_write(sr: &str, timeout: u64) {
-    let p = ha_rearm_obligation_path();
-    if let Some(dir) = std::path::Path::new(&p).parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// Whether a re-arm enable's result is this pass's to use: the pass right
+/// after the one that started it (`spawned_pass + 1`), and not older than
+/// twice the retry interval (a stalled tick a few seconds late still counts).
+fn rearm_result_fresh(spawned_pass: u64, pass: u64, age: Duration) -> bool {
+    pass == spawned_pass.wrapping_add(1) && age <= HA_REARM_RETRY_INTERVAL * 2
+}
+
+/// What the re-arm obligation's enable came to, off the tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RearmEnable {
+    /// `pool-ha-enable` returned, or did not return in time but pool HA then
+    /// read on (the next pass judges the settled state).
+    Returned,
+    /// Refused DAEMON_IS_PRESENT: the local xhad was stopped and the enable
+    /// run once more (whatever it returned, the next pass judges it).
+    DaemonPresentRetried,
+    /// A re-read fire-time gate failed before an enable; nothing ran.
+    Withheld(String),
+    /// Failed for another reason: counts toward the toolstack escalation on
+    /// the master.
+    Failed(String),
+}
+
+/// The re-arm obligation's enable, off the tick: `pool-ha-enable` bounded by
+/// `HA_CMD_TIMEOUT`, its fire-time gates read again right before. A refusal
+/// with DAEMON_IS_PRESENT (an orphan xhad blocks the master-local
+/// `ha_set_pool_state init`) stops the local xhad and enables once more, after
+/// the gates again. An enable that did not return but left pool HA on counts
+/// as returned, never as a failure.
+async fn rearm_enable(ops: &dyn HaOps, sr: &str, timeout: u64) -> RearmEnable {
+    // Gates, then the owed re-read, then the call with nothing awaited in
+    // between: only an owed obligation (TwinStor's own disable seen to
+    // take, and no enable since) may issue an enable.
+    if let Some(why) = ops.gates().await {
+        log_cycle_withheld("ha_rearm", "enable", &why);
+        return RearmEnable::Withheld(why);
     }
-    let _ = std::fs::write(&p, format!("{sr} {timeout}"));
+    if !enable_still_owed(ops, "ha_rearm", "enable") {
+        return RearmEnable::Withheld("no owed re-arm (pending, enabled or none)".into());
+    }
+    ops.touch_attempt();
+    let err = match ops.enable(sr, timeout).await {
+        HaCmd::Done => {
+            ops.set_obligation_state(ObligationState::Enabled);
+            return RearmEnable::Returned;
+        }
+        HaCmd::TimedOut => "pool-ha-enable timed out".to_string(),
+        HaCmd::Refused(e) | HaCmd::NotRun(e) => e,
+    };
+    if enable_refused_daemon_present(&err) {
+        // The stop is an HA action too: the gates and the owed re-read just
+        // before it, as before the enable that follows.
+        if let Some(why) = ops.gates().await {
+            log_cycle_withheld("ha_rearm", "xhad_stop", &why);
+            return RearmEnable::Withheld(why);
+        }
+        if !enable_still_owed(ops, "ha_rearm", "xhad_stop") {
+            return RearmEnable::Withheld("the re-arm obligation is no longer owed".into());
+        }
+        warn!(
+            heal_event = "xha_orphan_reconcile_fast",
+            "pool-ha-enable was refused DAEMON_IS_PRESENT (Xha_error 15); stopping the local \
+             xhad and re-enabling immediately"
+        );
+        ops.stop_local_xhad().await;
+        if let Some(why) = ops.gates().await {
+            log_cycle_withheld("ha_rearm", "enable_after_xhad_stop", &why);
+            return RearmEnable::Withheld(why);
+        }
+        if !enable_still_owed(ops, "ha_rearm", "enable_after_xhad_stop") {
+            return RearmEnable::Withheld("the re-arm obligation is no longer owed".into());
+        }
+        ops.touch_attempt();
+        if ops.enable(sr, timeout).await == HaCmd::Done {
+            ops.set_obligation_state(ObligationState::Enabled);
+        }
+        return RearmEnable::DaemonPresentRetried;
+    }
+    // Pool HA reads on although our call did not return: XAPI shows enabled
+    // while an enable still runs, and back off if it fails. Not a failure for
+    // the escalation, but the obligation stays owed until the watchdog sees
+    // the "on" settle.
+    if ops.pool_ha().await == Some(true) {
+        return RearmEnable::Returned;
+    }
+    RearmEnable::Failed(err)
+}
+
+/// Stop the local xhad (`ha_stop_daemon`), bounded. The cluster-stack
+/// scripts need their own directory on PATH (ha_rc exits 16 "PATH is not
+/// properly setup" otherwise). Shared by the time-based reconcile and the
+/// error-driven fast path of the re-arm enable, so a stuck DAEMON_IS_PRESENT
+/// enable can init cleanly.
+async fn stop_local_xhad_now() {
+    let path_env = format!(
+        "PATH={}:/usr/sbin:/usr/bin:/sbin:/bin",
+        std::path::Path::new(HA_STOP_DAEMON)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+    let _ = tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::cmd::run_cmd("env", &[&path_env, HA_STOP_DAEMON]),
+    )
+    .await;
+    // Verify the reap. `ha_stop_daemon` reaps even a joined xhad cleanly;
+    // this path exists so the next `ha_set_pool_state init` is not refused
+    // DAEMON_IS_PRESENT.
+    //
+    // If an xhad survives the graceful stop, do not escalate to SIGKILL.
+    // `ha_stop_daemon` disarms the host watchdog before the process exits;
+    // `pkill -9` stops the watchdog petting without disarming, so this node
+    // hard-reboots (self-fences) once the statefile or hypervisor watchdog
+    // expires. A DAEMON_IS_PRESENT orphan is an Online/Joined liveset
+    // member, still armed, even though xapi's ha-enabled flag reads off.
+    // Killing it would trade a benign failure (HA stuck off, which the
+    // re-arm toolstack-restart backstop recovers without a reboot) for a
+    // self-fence of the pool master. So only warn; the backstop recovers.
+    if xhad_present_now().await {
+        warn!(
+            heal_event = "xha_orphan_stop_failed",
+            "ha_stop_daemon did not reap the local xhad; not force-killing it (a \
+               SIGKILL skips the watchdog disarm and would self-fence this master); \
+               holding for the re-arm toolstack-restart backstop to recover"
+        );
+    }
+}
+
+/// Whether a process named `xhad` is running. `pgrep -x xhad` exits 0 iff
+/// one exists; a timeout or spawn error reads as "not confirmed present".
+async fn xhad_present_now() -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::cmd::run_cmd("pgrep", &["-x", "xhad"]),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+// The re-arm obligation file: `<sr> <timeout> [<attempt stamp>]
+// [state=pending until=<unix> | state=owed | state=enabled]`. The first
+// three fields are what 0.7.4 reads (it ignores the rest), so a rollback keeps
+// working. A file without a state (written by an earlier build) reads as
+// `owed`, as those builds meant it. Other `key=value` tokens are ignored.
+
+/// What TwinStor knows about the pool HA-off its obligation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObligationState {
+    /// TwinStor issued its disable; whether it took is not known yet (the
+    /// call got no answer and pool HA still read on, or was unreadable).
+    /// Pool HA read off before `until` (unix seconds): it took (`Owed`). Past
+    /// `until` with HA on: it never took; the obligation goes. Past `until`
+    /// with HA off: not TwinStor's.
+    Pending { until: u64 },
+    /// Pool HA was read off after TwinStor's own effective disable: the only
+    /// state an enable may be issued from.
+    Owed,
+    /// TwinStor's enable returned, or pool HA was read on after the
+    /// disable: any later HA-off is not TwinStor's.
+    Enabled,
+}
+
+/// How long a `Pending` obligation waits for TwinStor's disable to land: as
+/// long as the watchdog still takes a pending task as TwinStor's own
+/// (`OWN_TASK_STALE_AFTER`, after which it cancels it), plus a minute. While
+/// TwinStor's own task is still seen pending, the window is extended (see
+/// `pending_ha_task_holds`).
+const OBLIGATION_PENDING_FOR: u64 = OWN_TASK_STALE_AFTER + 60;
+
+/// The obligation file's fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObligationFile {
+    sr: String,
+    timeout: u64,
+    attempt: Option<u64>,
+    state: ObligationState,
+    /// The routine that wrote it and when (`<who>:<unix>`, the `by=` token;
+    /// 0.7.4 reads only the first fields and ignores it; absent on records
+    /// written before it or by a write that names no routine).
+    owner: Option<String>,
+}
+
+fn obligation_parse(text: &str) -> Option<ObligationFile> {
+    let mut it = text.split_whitespace();
+    let sr = it.next()?.to_string();
+    let timeout = it.next()?.parse().ok()?;
+    let (mut attempt, mut state, mut until, mut owner) = (None, None, None, None);
+    for tok in it {
+        match tok.split_once('=') {
+            Some(("state", v)) => state = Some(v.to_string()),
+            Some(("until", v)) => until = v.parse::<u64>().ok(),
+            Some(("by", v)) => owner = Some(v.to_string()),
+            Some(_) => {}
+            None if attempt.is_none() => attempt = tok.parse().ok(),
+            None => {}
+        }
+    }
+    let state = match state.as_deref() {
+        Some("pending") => ObligationState::Pending { until: until.unwrap_or(0) },
+        Some("enabled") => ObligationState::Enabled,
+        _ => ObligationState::Owed,
+    };
+    Some(ObligationFile { sr, timeout, attempt, state, owner })
+}
+
+fn obligation_render(f: &ObligationFile) -> String {
+    let mut line = format!("{} {}", f.sr, f.timeout);
+    if let Some(a) = f.attempt {
+        line.push_str(&format!(" {a}"));
+    }
+    match f.state {
+        ObligationState::Pending { until } => line.push_str(&format!(" state=pending until={until}")),
+        ObligationState::Owed => line.push_str(" state=owed"),
+        ObligationState::Enabled => line.push_str(" state=enabled"),
+    }
+    if let Some(o) = &f.owner {
+        line.push_str(&format!(" by={o}"));
+    }
+    line
+}
+
+fn ha_obligation_file_at(p: &str) -> Option<ObligationFile> {
+    obligation_parse(&std::fs::read_to_string(p).ok()?)
+}
+
+fn ha_obligation_store(p: &str, f: &ObligationFile) {
+    if let Err(e) = write_file_atomic(p, &obligation_render(f)) {
+        warn!(error = %e, path = p, "could not write the pool HA re-arm obligation");
+    }
+}
+
+/// Write the obligation in `state`: the one way every routine writes it. An
+/// obligation already standing keeps its attempt stamp (a routine in flight
+/// may have just stamped it).
+fn ha_obligation_write(sr: &str, timeout: u64, state: ObligationState) {
+    ha_obligation_write_at(&ha_rearm_obligation_path(), sr, timeout, state);
+}
+
+fn ha_obligation_write_at(p: &str, sr: &str, timeout: u64, state: ObligationState) {
+    let _w = obligation_writer();
+    let attempt = ha_obligation_file_at(p).and_then(|f| f.attempt);
+    ha_obligation_store(p, &ObligationFile { sr: sr.to_string(), timeout, attempt, state, owner: None });
+}
+
+/// `ha_obligation_write_at` naming the routine that writes it (`by=`).
+fn ha_obligation_write_owned_at(p: &str, sr: &str, timeout: u64, state: ObligationState, owner: &str) {
+    let _w = obligation_writer();
+    let attempt = ha_obligation_file_at(p).and_then(|f| f.attempt);
+    let owner = Some(owner.to_string());
+    ha_obligation_store(p, &ObligationFile { sr: sr.to_string(), timeout, attempt, state, owner });
+}
+
+/// Move a standing obligation to `state` (nothing when none stands).
+fn ha_obligation_set_state_at(p: &str, state: ObligationState) {
+    let _w = obligation_writer();
+    if let Some(mut f) = ha_obligation_file_at(p) {
+        f.state = state;
+        ha_obligation_store(p, &f);
+    }
+}
+
+/// One writer of the obligation file at a time in this process (the tick
+/// and routines running off it, on several threads): each read-modify-write
+/// holds this lock.
+fn obligation_writer() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Replace `p` atomically: write a temporary file in the same directory,
+/// then rename it over `p`, so a reader never sees a half-written file and
+/// two writers never interleave within one.
+fn write_file_atomic(p: &str, content: &str) -> std::io::Result<()> {
+    let path = std::path::Path::new(p);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = format!(
+        "{p}.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    std::fs::write(&tmp, content)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+}
+
+/// The obligation file's SR, timeout and attempt stamp.
+fn ha_obligation_fields_at(p: &str) -> Option<(String, u64, Option<u64>)> {
+    ha_obligation_file_at(p).map(|f| (f.sr, f.timeout, f.attempt))
 }
 
 /// Stamp "an enable was just attempted" into the obligation (any caller,
 /// including the free-fn routines that hold no daemon state).
 fn ha_obligation_touch_attempt() {
-    if let Some((sr, timeout, _)) = ha_obligation_read() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = std::fs::write(ha_rearm_obligation_path(), format!("{sr} {timeout} {now}"));
+    ha_obligation_touch_attempt_at(&ha_rearm_obligation_path());
+}
+
+fn ha_obligation_touch_attempt_at(p: &str) {
+    let _w = obligation_writer();
+    if let Some(mut f) = ha_obligation_file_at(p) {
+        f.attempt = Some(unix_now_secs());
+        ha_obligation_store(p, &f);
     }
 }
 
 fn ha_obligation_read() -> Option<(String, u64, Option<u64>)> {
-    let text = std::fs::read_to_string(ha_rearm_obligation_path()).ok()?;
-    let mut it = text.split_whitespace();
-    let sr = it.next()?.to_string();
-    let timeout = it.next()?.parse().ok()?;
-    let attempt = it.next().and_then(|s| s.parse().ok());
-    Some((sr, timeout, attempt))
+    ha_obligation_fields_at(&ha_rearm_obligation_path())
+}
+
+fn ha_obligation_state() -> Option<ObligationState> {
+    ha_obligation_file_at(&ha_rearm_obligation_path()).map(|f| f.state)
 }
 
 fn ha_obligation_clear() {
+    let _w = obligation_writer();
     let _ = std::fs::remove_file(ha_rearm_obligation_path());
+}
+
+/// Whether pool HA's reading can be trusted: the last enable attempt (the
+/// obligation's stamp) is at least `HA_REARM_SETTLE` old, or none was made.
+/// The caller has seen no pool HA task pending.
+fn obligation_settled(attempt: Option<u64>, now_unix: u64) -> bool {
+    attempt.is_none_or(|t| now_unix.saturating_sub(t) >= HA_REARM_SETTLE)
+}
+
+/// What a pool HA reading means for a standing obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObligationVerdict {
+    /// Nothing changes; the obligation's normal path goes on.
+    Keep,
+    /// TwinStor's disable has not been seen to land yet, and may still:
+    /// neither enable nor clear now.
+    Wait,
+    /// TwinStor's disable landed: now owed.
+    BecomeOwed,
+    /// Pool HA is on again after TwinStor's own disable: enabled.
+    BecomeEnabled,
+    /// TwinStor's disable never took (its window passed with HA on): the
+    /// obligation goes, nothing owed.
+    Expired,
+    /// Pool HA is off and it is not TwinStor's off: the obligation goes, no
+    /// enable, `ha_off_not_by_twinstor`.
+    NotOurs,
+}
+
+/// `settled`: pool HA's "on" is trusted (the last enable attempt is at least
+/// `HA_REARM_SETTLE` old and no pool HA task is pending). XAPI reads enabled
+/// while an enable is still running and back off if it fails, so an owed
+/// obligation becomes enabled on an "on" only once it has settled.
+fn obligation_verdict(
+    state: ObligationState,
+    ha: Option<bool>,
+    now_unix: u64,
+    settled: bool,
+) -> ObligationVerdict {
+    use ObligationVerdict::*;
+    match (state, ha) {
+        (ObligationState::Pending { until }, Some(false)) if now_unix <= until => BecomeOwed,
+        (ObligationState::Pending { .. }, Some(false)) => NotOurs,
+        (ObligationState::Pending { until }, Some(true)) if now_unix > until => Expired,
+        (ObligationState::Pending { .. }, _) => Wait,
+        (ObligationState::Owed, Some(true)) if settled => BecomeEnabled,
+        (ObligationState::Owed, _) => Keep,
+        (ObligationState::Enabled, Some(false)) => NotOurs,
+        (ObligationState::Enabled, _) => Keep,
+    }
 }
 
 /// Re-arm the local host's HA after a stand-down or whole-switch disarm:
@@ -2654,22 +4183,277 @@ async fn rearm_local_ha_now() {
         .await;
 }
 
-/// The pre-storage gate for the re-arm-after-fence catch-all. Re-arm only when
-/// the peer just rejoined, pool HA is off, no obligation is pending (the
-/// normal re-arm path owns those), and HA was on before the peer left. The
-/// last term tells a fence (HA armed, then the peer fenced and HA dropped)
-/// from an operator `pool-ha-disable` (HA turned off while the peer was
-/// alive); without it, any peer reboot would undo a deliberate operator
-/// disable. `None` or `Some(false)` for `ha_before_peer_left` (operator
-/// disable, or unknown at startup) fails closed: HA stays as the operator
-/// left it.
-fn rearm_after_fence_gate(
+/// What a peer rejoin with pool HA off calls for, on the master. Nothing
+/// unless the peer just rejoined, pool HA reads off and no TwinStor record
+/// stands (an owed re-arm or a local-disarm record: their own paths own it).
+/// Otherwise the outcome says only what was observed about HA while the peer
+/// was last live. None of them re-arms anything: only a record that TwinStor
+/// caused the disable creates a re-arm obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejoinHaOff {
+    Nothing,
+    /// HA was seen off while the peer was live: it was disabled before the
+    /// peer left (an operator's choice). Logged only.
+    OffBeforePeerLeft,
+    /// HA was seen on while the peer was live: it went off while the peer was
+    /// away, and not by TwinStor. Alert.
+    OffWhilePeerAway,
+    /// HA was never sampled while the peer was live (this host became master
+    /// or started its daemon since): unknown whether it was on before. Alert,
+    /// with no claim about before.
+    OffBeforeUnknown,
+    /// This pool-HA-off episode was already reported: nothing more (one
+    /// neutral, paced log line).
+    AlreadyReported,
+}
+
+fn rejoin_ha_off(
     rejoined: bool,
     ha: Option<bool>,
-    obligation_present: bool,
+    record_present: bool,
     ha_before_peer_left: Option<bool>,
-) -> bool {
-    rejoined && ha == Some(false) && !obligation_present && ha_before_peer_left == Some(true)
+) -> RejoinHaOff {
+    if !rejoined || ha != Some(false) || record_present {
+        return RejoinHaOff::Nothing;
+    }
+    match ha_before_peer_left {
+        Some(false) => RejoinHaOff::OffBeforePeerLeft,
+        Some(true) => RejoinHaOff::OffWhilePeerAway,
+        None => RejoinHaOff::OffBeforeUnknown,
+    }
+}
+
+/// The peer's liveness for the rejoin watch: XAPI's host-metrics-live, but
+/// not live while this host's partition view shows the peer away (XAPI can
+/// still read a cut-off peer live before it declares it dead).
+fn rejoin_peer_live(xapi_live: Option<bool>, view_away: bool) -> Option<bool> {
+    if view_away { Some(false) } else { xapi_live }
+}
+
+/// The HA state remembered "while the peer was live", after this check's
+/// decision: every sample with the peer live and HA read counts (the rejoin
+/// sample too, once its decision is made); an unread HA keeps the last value.
+fn ha_at_peer_alive_next(
+    current: Option<bool>,
+    peer_live: Option<bool>,
+    ha: Option<bool>,
+) -> Option<bool> {
+    if peer_live == Some(true) && ha.is_some() {
+        ha
+    } else {
+        current
+    }
+}
+
+/// The master's watch for a peer rejoin with pool HA off, one sample per HA
+/// check: the peer's host-metrics-live from the last sample (the rejoin edge
+/// is not live to live), and pool HA as last seen while the peer was live
+/// (`None`: never seen in this term as master). Both describe this host's
+/// current term as master only: a host that is not master forgets them, so a
+/// sample from an earlier term never answers for a term in which nothing was
+/// sampled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RejoinWatch {
+    peer_live_last: Option<bool>,
+    ha_at_peer_alive: Option<bool>,
+    /// When the sample behind `ha_at_peer_alive` was taken (unix; 0: no
+    /// time), to tell whether it preceded an absence the view showed.
+    ha_sample_at: u64,
+    /// The current pool-HA-off episode was already reported (alerted or
+    /// logged): later samples of it say nothing more. Ends when pool HA
+    /// reads on.
+    reported: bool,
+}
+
+impl RejoinWatch {
+    /// This check's mastership read: only a positive "not master" forgets
+    /// the term's samples (a master move); an unanswered read keeps them and
+    /// skips this sample. Returns whether to sample now (this host is master).
+    fn role(&mut self, master: Option<bool>) -> bool {
+        match master {
+            Some(true) => true,
+            Some(false) => {
+                *self = Self::default();
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// The partition view showed the peer away since the last sample (gone,
+    /// parked, or cut off from its clients): the peer's last state reads not
+    /// live, so its return at this sample is a rejoin edge even when the
+    /// 10-minute samples never saw it not live.
+    /// `since`: when the view first showed the absence (unix). A "while the
+    /// peer was live" sample taken at or after it may have read a stale live
+    /// flag during the absence, so it is not evidence of HA before the peer
+    /// left: forgotten (unknown).
+    fn peer_was_away(&mut self, since: u64) {
+        self.peer_live_last = Some(false);
+        if self.ha_sample_at >= since {
+            self.ha_at_peer_alive = None;
+        }
+    }
+
+    /// One sample as master: the outcome for this sample, decided on the
+    /// memory from before it; the sample is folded in afterwards.
+    #[cfg(test)]
+    fn observe(&mut self, peer_live: Option<bool>, ha: Option<bool>, record_present: bool) -> RejoinHaOff {
+        self.observe_at(peer_live, ha, record_present, 0)
+    }
+
+    /// [`RejoinWatch::observe`] at `now_unix`. One report per pool-HA-off
+    /// episode: once an outcome was reported, later ones of the same episode
+    /// read `AlreadyReported`.
+    fn observe_at(
+        &mut self,
+        peer_live: Option<bool>,
+        ha: Option<bool>,
+        record_present: bool,
+        now_unix: u64,
+    ) -> RejoinHaOff {
+        let rejoined = self.peer_live_last == Some(false) && peer_live == Some(true);
+        let mut outcome = rejoin_ha_off(rejoined, ha, record_present, self.ha_at_peer_alive);
+        if ha == Some(true) {
+            self.reported = false;
+        }
+        if outcome != RejoinHaOff::Nothing {
+            if self.reported {
+                outcome = RejoinHaOff::AlreadyReported;
+            } else {
+                self.reported = true;
+            }
+        }
+        let next = ha_at_peer_alive_next(self.ha_at_peer_alive, peer_live, ha);
+        if peer_live == Some(true) && ha.is_some() {
+            self.ha_sample_at = now_unix;
+        }
+        self.ha_at_peer_alive = next;
+        self.peer_live_last = peer_live;
+        outcome
+    }
+}
+
+/// The lone-survivor masterless path's own retry of its pool HA enable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MasterlessRetry {
+    sr: String,
+    timeout: u64,
+    /// The count of issued re-arm enables when the retry began (only issued
+    /// enables count toward the cap; one withheld at its gates does not).
+    issued_base: u64,
+    started: std::time::Instant,
+    next_at: std::time::Instant,
+}
+
+/// Retry cadence, cap and window of the lone-survivor masterless enable:
+/// every 2 minutes (the re-arm cadence), at most 5 enables actually issued,
+/// and no retry past 30 minutes however many were withheld at their gates.
+const MASTERLESS_RETRY_EVERY: Duration = Duration::from_secs(120);
+const MASTERLESS_RETRY_CAP: u64 = 5;
+const MASTERLESS_RETRY_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// What one due retry sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MasterlessRetryFacts {
+    pool_ha: Option<bool>,
+    /// The standing obligation's state (`None`: none stands).
+    obligation: Option<ObligationState>,
+    inflight: bool,
+    /// Enables issued since the retry began.
+    issued: u64,
+    elapsed: Duration,
+    /// This host's copy serves (Primary, UpToDate).
+    storage_serving: bool,
+    /// The peer's xapi answers as master.
+    peer_master: bool,
+    /// The peer is back (its management address answers): the normal
+    /// re-arm path takes over.
+    peer_back: bool,
+}
+
+/// One step of that retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterlessRetryStep {
+    /// Pool HA reads on, or nothing is owed any more: stop.
+    Done,
+    /// The peer is back: stop here; the obligation stays for the normal
+    /// re-arm path.
+    HandOver,
+    /// Another pool HA routine is in flight, or the premise does not hold
+    /// right now (storage not serving, the peer answering as master).
+    Wait,
+    /// Try the enable again (its gates are read again in the routine).
+    Retry,
+    /// The cap or the window is reached: stop; the obligation stays for the
+    /// normal re-arm once the peer is back.
+    GiveUp,
+}
+
+fn masterless_retry_step(f: MasterlessRetryFacts) -> MasterlessRetryStep {
+    if f.pool_ha == Some(true)
+        || matches!(f.obligation, None | Some(ObligationState::Enabled))
+    {
+        return MasterlessRetryStep::Done;
+    }
+    if f.peer_back {
+        return MasterlessRetryStep::HandOver;
+    }
+    if f.issued >= MASTERLESS_RETRY_CAP || f.elapsed > MASTERLESS_RETRY_WINDOW {
+        return MasterlessRetryStep::GiveUp;
+    }
+    // Pending: TwinStor's evidence is not in yet; wait for the watchdog to
+    // make it owed or clear it.
+    if f.inflight
+        || !f.storage_serving
+        || f.peer_master
+        || matches!(f.obligation, Some(ObligationState::Pending { .. }))
+    {
+        return MasterlessRetryStep::Wait;
+    }
+    MasterlessRetryStep::Retry
+}
+
+/// The obligation the masterless chain writes after its transition, from
+/// pool HA as read then (see the chain).
+fn masterless_obligation(pool_ha: Option<bool>, now_unix: u64) -> Option<ObligationState> {
+    match pool_ha {
+        Some(false) => Some(ObligationState::Owed),
+        None => Some(ObligationState::Pending { until: now_unix + OBLIGATION_PENDING_FOR }),
+        Some(true) => None,
+    }
+}
+
+/// What the masterless chain writes, given the record standing and what it
+/// owes: nothing over a record another routine holds owed, or pending and
+/// still inside its window (the chain proceeds under it); otherwise what it
+/// owes. A pending record past its window (no master read pool HA while the
+/// pool was masterless) is replaced: the chain's evidence is its own
+/// transition, and left in place it would be cleared as not TwinStor's.
+fn masterless_record_write(
+    standing: Option<ObligationState>,
+    owed: Option<ObligationState>,
+    now_unix: u64,
+) -> Option<ObligationState> {
+    match standing {
+        Some(ObligationState::Owed) => None,
+        Some(ObligationState::Pending { until }) if until > now_unix => None,
+        _ => owed,
+    }
+}
+
+/// The management-predicate gate of the masterless chain's enable: the same
+/// trigger as its start on the paths that need the peer's management address
+/// (positive evidence), none on the lone-survivor path (`require_peer_dead`),
+/// whose premise is a peer gone.
+fn masterless_enable_trigger(require_peer_dead: bool) -> Option<crate::mgmt_reach::Trigger> {
+    (!require_peer_dead).then_some(crate::mgmt_reach::Trigger::Positive)
+}
+
+/// Whether the masterless chain owes pool HA back: only when this host was
+/// locally armed before the chain's own disarm (read before it).
+fn masterless_rearm_owed(armed_before: Option<bool>) -> bool {
+    armed_before == Some(true)
 }
 
 /// What the HA watchdog should do about a pending re-arm obligation.
@@ -2740,6 +4524,95 @@ fn ha_rearm_decision(
             _ => HaRearmAction::Hold,
         },
         _ => HaRearmAction::Hold,
+    }
+}
+
+/// The first input holding an owed re-arm, for `twinstor status`.
+#[allow(clippy::too_many_arguments)]
+fn rearm_hold_reason(
+    ha: Option<bool>,
+    master: Option<bool>,
+    this_host_enabled: bool,
+    storage_healthy: bool,
+    peer_reachable: bool,
+    peer_mgmt_reachable: bool,
+    operator_maintenance: bool,
+    settled: bool,
+) -> &'static str {
+    if ha.is_none() {
+        "pool HA state unreadable (XAPI did not answer)"
+    } else if !settled {
+        "an enable was just attempted; waiting for it to settle"
+    } else if ha == Some(true) {
+        "pool HA reads armed; confirming"
+    } else if operator_maintenance {
+        "a host is in maintenance mode, or the toolstack did not answer"
+    } else if !storage_healthy {
+        "the copies are not both UpToDate and Connected"
+    } else if !peer_reachable {
+        "the peer does not answer on replication"
+    } else if !peer_mgmt_reachable {
+        "the peer's management address does not answer, or the peer is not shown present"
+    } else if master != Some(true) && !this_host_enabled {
+        "this host is not the master and is not enabled"
+    } else {
+        "waiting for the pool master"
+    }
+}
+
+/// A TwinStor HA command (enable or disable) is created within this many
+/// seconds of the attempt stamp written just before it.
+const OWN_TASK_STAMP_TOLERANCE: u64 = 10;
+/// An own pending pool HA task is stale this long after its attempt stamp:
+/// the command's own bound (`HA_CMD_TIMEOUT`, the longest any TwinStor HA
+/// command waits) plus twice that again after it returned.
+const OWN_TASK_STALE_AFTER: u64 = 3 * HA_CMD_TIMEOUT.as_secs();
+
+/// What to do about the pending pool HA tasks that hold an owed re-arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingTaskAction {
+    /// None pending.
+    None,
+    /// TwinStor's own, not stale yet (or P false): wait.
+    Wait,
+    /// TwinStor's own and stale, P holding: cancel it.
+    Cancel(xapi::PendingHaTask),
+    /// Not provably TwinStor's: report it, never touch it.
+    Foreign(xapi::PendingHaTask),
+}
+
+/// A pending pool HA task is TwinStor's own when it was created within
+/// `OWN_TASK_STAMP_TOLERANCE` of the attempt stamp in the obligation file; an
+/// own task is cancelled once `OWN_TASK_STALE_AFTER` has passed since that
+/// stamp, with P holding. Any other task is someone else's.
+///
+/// Known limit: ownership is by time proximity only, comparing the task's
+/// creation time (the master's clock) with the stamp (the clock of the host
+/// that wrote it). XAPI offers nothing better: its task list names no
+/// creating session or host, and `xe` returns no task reference for a
+/// synchronous call. An operator's pool HA operation started within the
+/// tolerance of TwinStor's attempt reads as TwinStor's.
+fn pending_task_decision(
+    tasks: &[xapi::PendingHaTask],
+    attempt_stamp: Option<u64>,
+    now_unix: u64,
+    p_matured: bool,
+) -> PendingTaskAction {
+    let own = |t: &xapi::PendingHaTask| {
+        matches!((t.created_unix, attempt_stamp), (Some(c), Some(a))
+            if c.abs_diff(a) <= OWN_TASK_STAMP_TOLERANCE)
+    };
+    if let Some(t) = tasks.iter().find(|t| !own(t)) {
+        return PendingTaskAction::Foreign(t.clone());
+    }
+    let Some(t) = tasks.first() else {
+        return PendingTaskAction::None;
+    };
+    let stale = attempt_stamp.is_some_and(|a| now_unix.saturating_sub(a) >= OWN_TASK_STALE_AFTER);
+    if stale && p_matured {
+        PendingTaskAction::Cancel(t.clone())
+    } else {
+        PendingTaskAction::Wait
     }
 }
 
@@ -2904,6 +4777,19 @@ const PROTECTED_VM_RETRY_MAX: Duration = Duration::from_secs(1800);
 struct LogPace(std::collections::HashMap<&'static str, std::time::Instant>);
 
 impl LogPace {
+    /// Whether `key` is due, without marking it: for an alert, marked with
+    /// [`LogPace::mark`] only once delivered, so an undelivered one is
+    /// raised again on the next pass rather than a pacing interval later.
+    fn is_due(&self, key: &'static str, every: Duration) -> bool {
+        self.0
+            .get(key)
+            .is_none_or(|t| t.elapsed() >= every)
+    }
+
+    fn mark(&mut self, key: &'static str) {
+        self.0.insert(key, std::time::Instant::now());
+    }
+
     fn due(&mut self, key: &'static str, every: Duration) -> bool {
         let now = std::time::Instant::now();
         match self.0.get(key) {
@@ -2914,6 +4800,105 @@ impl LogPace {
             }
         }
     }
+}
+
+/// Alert for pool HA found off with no TwinStor record of turning it off,
+/// with the configured HA timeout.
+fn ha_off_not_by_twinstor() -> String {
+    format!(
+        "TwinStor: pool HA is off and TwinStor did not turn it off; re-enable it when you want \
+         failover (xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={}).",
+        crate::setup::configured_ha_timeout()
+    )
+}
+
+/// Heal-stage texts of a standing whole-switch hold.
+const WHOLE_SWITCH_HOLD_SUMMARY: &str = "whole-switch outage: both hosts isolated; holding \
+     with VMs running (no failover: the peer is equally unreachable)";
+const WHOLE_SWITCH_HOLD_NEXT: &str = "restore the client/switch network; HA is then re-armed by \
+     one pool HA cycle, by TwinStor unless auto_resolve_peer_emergency is off (an alert then \
+     asks for it)";
+
+/// Manual text of the recorded-disarm re-arm, when it does not run or fails.
+fn recorded_rearm_manual(me: &str, master: &str, t: u32) -> String {
+    format!(
+        "TwinStor on {me}: this host is locally disarmed under the armed pool after TwinStor's \
+         own disarm (a whole-switch hold or a stand-down): HA does not protect it, and if xapi \
+         restarts on it (a reboot or a toolstack restart) while it stays disarmed, XAPI turns \
+         pool HA off. The automatic pool HA cycle did not run or did not complete. On the pool \
+         master {master} run 'xe pool-ha-disable', then 'xe pool-ha-enable \
+         heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'."
+    )
+}
+
+/// A host demoted from a second pool master while locally disarmed, not by
+/// TwinStor: the manual pool HA cycle on the real master (the peer).
+fn demoted_disarmed_alert(me: &str, master: &str, t: u32) -> String {
+    format!(
+        "TwinStor on {me}: this host was demoted from a second pool master while it is locally \
+         HA-disarmed, and TwinStor did not disarm it. It is not re-armed automatically. When you \
+         want HA to protect it again, cycle pool HA once while both hosts are up: on the pool \
+         master {master} run 'xe pool-ha-disable', then 'xe pool-ha-enable \
+         heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'."
+    )
+}
+
+/// The toolstack restart script (not on the daemon's systemd PATH).
+const XE_TOOLSTACK_RESTART: &str = "/opt/xensource/bin/xe-toolstack-restart";
+
+/// How long the isolated-master check reuses a "local xapi answers as master"
+/// read: it runs every tick, and the isolation windows are minutes long.
+const LOCAL_MASTER_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// Test seam for the HA checks driven through their real call sites: what
+/// the local host and the peer answer, and the actions and alerts they
+/// produced (recorded instead of run).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestHa {
+    /// Pool HA reads to return first, in order (then `pool_ha`).
+    pool_ha_next: std::sync::Mutex<std::collections::VecDeque<Option<bool>>>,
+    conf_master: Option<bool>,
+    local_armed: Option<bool>,
+    xapi_master: Option<bool>,
+    vms: Option<u32>,
+    liveset: Option<LivesetMasters>,
+    /// `None`: gethoststate did not answer.
+    xhad: Option<XhaHostState>,
+    beacon_ok: bool,
+    drbd_connected: bool,
+    addr_answers: bool,
+    pool_ha: Option<bool>,
+    master_resilient: Option<bool>,
+    agent_live: Option<bool>,
+    pending_tasks: Vec<xapi::PendingHaTask>,
+    /// The task list could not be read.
+    pending_unreadable: bool,
+    /// This host's copy is Primary and UpToDate (serving).
+    local_serving: Option<bool>,
+    /// A task cancel fails.
+    cancel_fails: bool,
+    /// Alerts are recorded but reported undelivered.
+    alerts_fail: bool,
+    /// pool.conf's `slave:<addr>`.
+    slave_of: Option<String>,
+    /// The local liveset's verdict on the peer (`peer_dead_via_liveset`).
+    peer_dead_liveset: Option<bool>,
+    /// VMs running on the peer per the pool database (`None`: unread).
+    peer_vms: Option<u32>,
+    /// The local emergency HA disable fails with this text.
+    emergency_disable_err: Option<String>,
+    /// The mastership read just before the first-sighting alert's send
+    /// (`None`: `master_resilient`).
+    master_at_send: Option<Option<bool>>,
+    actions: Vec<String>,
+}
+
+/// The last HA action a fire-time gate withheld (see `ha_gate`), for status.
+#[derive(Debug, Clone)]
+struct Withheld {
+    action: &'static str,
+    reason: String,
 }
 
 /// What the watchdog does with one halted VM that has the restart priority.
@@ -3020,11 +5005,6 @@ fn cap_protected_vm_starts(
     let deferred = to_start.len().saturating_sub(cap);
     to_start.truncate(cap);
     deferred
-}
-
-/// The pool's `ha-host-failures-to-tolerate` as `xe` prints it.
-fn parse_ntol(v: &str) -> Option<u32> {
-    v.trim().parse().ok()
 }
 
 /// Failed starts of one VM before the one alert naming it (about 15 minutes
@@ -3165,8 +5145,12 @@ fn halt_is_incident_orphan(
 
 /// Whether this host may restart the halted protected VMs. It must have a
 /// serveable local copy (UpToDate, not user-suspended) and one of two grounds:
-///   - the liveset ground: pool HA is on and the local xhad is Online, so XHA
-///     already spent its one restart attempt (`ha_on && xhad_online`); or
+///   - the liveset ground: pool HA is on, the local xhad is Online, so XHA
+///     already spent its one restart attempt, and this host holds the master
+///     lock in its own liveset (`ha_on && xhad_online && own_lock`). Only one
+///     host can hold that lock, so a second master that XAPI let start for a
+///     moment (or that a heartbeat-first heal left standing) never starts
+///     VMs on this ground; or
 ///   - the incident ground: the peer is a known non-serving copy (stood down,
 ///     Secondary) and the daemon has an open heal episode
 ///     (`peer_nonserving && incident_open`). A sole serving master whose peer
@@ -3185,8 +5169,10 @@ fn protected_vm_can_serve(
     incident_open: bool,
     ha_on: bool,
     xhad_online: bool,
+    own_lock: bool,
 ) -> bool {
-    local_serveable && ((peer_nonserving && incident_open) || (ha_on && xhad_online))
+    local_serveable
+        && ((peer_nonserving && incident_open) || (ha_on && xhad_online && own_lock))
 }
 
 /// Which "ghost" protected VMs are safe to reconcile (`vm-reset-powerstate` to
@@ -3340,68 +5326,575 @@ fn armed_mismatch_decision(
 }
 
 /// Peer-emergency resolver (the armed-mismatch sentinel's recovery step,
-/// behind a config flag): a slave that rebooted into the xapi HA-armed
-/// mismatch trap is wedged for good (emergency mode, xe unusable there,
-/// pool-ha-enable cannot recruit it). The exit is pool-level: pool-ha-disable
-/// removes the disagreement, then the obligation machinery re-enables. The
-/// signature, seen from the master: pool HA enabled, peer metrics-live
-/// false, and the peer daemon alive over replication.
-const PEER_EMERGENCY_AFTER: Duration = Duration::from_secs(600);
-const PEER_EMERGENCY_COOLDOWN: Duration = Duration::from_secs(3600);
+/// behind a config flag): a slave whose xapi restarted while it was locally
+/// disarmed under the armed pool is wedged for good (emergency mode, xe
+/// unusable there, pool-ha-enable cannot recruit it). The exit is pool-level:
+/// pool-ha-disable removes the disagreement, then the obligation machinery
+/// re-enables. The trigger, seen from the master: the peer's xapi answers
+/// HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED (see `peer_emergency_decision`).
+/// The trigger is positive evidence confirmed twice; what keeps it from
+/// looping is a budget, the demote guard's shape: at most
+/// `PEER_EMERGENCY_BUDGET` resets within `PEER_EMERGENCY_BUDGET_WINDOW`, at
+/// least `PEER_EMERGENCY_SPACING` apart (a reset and its confirmation take
+/// under 8 minutes).
+const PEER_EMERGENCY_BUDGET: usize = 3;
+
+/// The reset budget's rules for texts: (resets, window, spacing, after a
+/// futile reset), seconds.
+pub(crate) fn peer_emergency_budget_rules() -> (usize, u64, u64, u64) {
+    (
+        PEER_EMERGENCY_BUDGET,
+        PEER_EMERGENCY_BUDGET_WINDOW,
+        PEER_EMERGENCY_SPACING,
+        PEER_EMERGENCY_AFTER_FUTILE,
+    )
+}
+const PEER_EMERGENCY_BUDGET_WINDOW: u64 = 6 * 3600;
+const PEER_EMERGENCY_SPACING: u64 = 600;
+/// After a reset that did not free the peer, the next waits this long: a
+/// futile pool-wide cycle leaves the pool unprotected while it runs.
+const PEER_EMERGENCY_AFTER_FUTILE: u64 = 3600;
+/// A peer judged freed that answers locally disarmed again within this long
+/// of that verdict is the same wedge: the earlier reset was futile after all.
+const PEER_EMERGENCY_RELAPSE_WITHIN: u64 = 1800;
 /// Retry pace of a peer-emergency reset that was not issued (an HA operation
-/// still pending in XAPI, or the disable failed): the cooldown is kept for
-/// resets that ran.
+/// still pending in XAPI, or the disable failed); it spends no budget.
 const PEER_EMERGENCY_RETRY: Duration = Duration::from_secs(600);
-/// Fast-path maturity when a local signal confirms the peer is wedged. Once
-/// the peer has rejoined this host's own xhad liveset (`query_liveset`
-/// peer_live) yet the emergency signature still holds, the wedge is no longer
-/// a guess: the peer is in the liveset but the pool cannot recruit it (the
-/// armed mismatch). Resolve after this short grace instead of the blind
-/// `PEER_EMERGENCY_AFTER`, which only exists to avoid acting while the peer is
-/// still rejoining (peer_live=false). A normal readmission clears the
-/// signature (the peer's metrics come live) well within this window. The
-/// liveset read is a local xhad socket call and, unlike the master-forwarded
-/// metrics probe, does not flap, so it can gate a fast action. Sized for at
-/// least two check samples (the check runs about once a minute).
-const PEER_EMERGENCY_WEDGE_CONFIRMED_AFTER: Duration = Duration::from_secs(120);
-/// Reduced maturity for the blind (peer not yet in the liveset) resolve path
-/// when storage is safe to cycle HA through. The blind `PEER_EMERGENCY_AFTER`
-/// is sized to avoid disrupting the pool on a transient peer blip; but when
-/// the pair is fully redundant (Connected, both sides UpToDate) a pool-HA
-/// disable and enable is low risk (protection re-arms and no data is at risk
-/// during the cycle), so a signature that has held this long is far more
-/// likely a real armed-mismatch wedge than a blip. Longer than
-/// `PEER_EMERGENCY_FLAP_TOLERANCE` (180 s) so a single debounced flap cannot
-/// mature it. With degraded or split storage the full blind maturity applies,
-/// since cycling HA there carries more risk.
-///
-/// Set a margin above `SELF_UNWEDGE_AFTER`: the returning node's local
-/// self-clear (`check_ha_self_unwedge`, which fires at `SELF_UNWEDGE_AFTER`
-/// on the same healthy-storage gate) works the same wedge and is the
-/// preferred actor. The master's pool-wide HA cycle is the backstop for when
-/// the returning node cannot self-clear (for example its xhad is down rather
-/// than cycling). Keeping the master strictly later means the two never fire
-/// in the same tick and pull the pool-HA target away from a node in the
-/// middle of rejoining. Defined from `SELF_UNWEDGE_AFTER` so the ordering
-/// holds if either constant is retuned.
-const PEER_EMERGENCY_FAST_AFTER: Duration = Duration::from_secs(SELF_UNWEDGE_AFTER.as_secs() + 120);
-/// How long (behind `ha.readmission_flap_debounce`) the peer-emergency
-/// signature may drop (the peer briefly reads live) while an emergency is
-/// tracked before it counts as a recovery and resets the 600 s maturity
-/// clock. During a readmission wedge `peer_agent_responsive` flaps for tens of
-/// minutes, and resetting the clock on each blip would delay the recovery by
-/// up to an hour or more. A real recovery keeps the peer live for many
-/// samples (the check runs about once a minute), so bridging a couple of
-/// blips tells a flap from a recovery without weakening the maturity guard.
-const PEER_EMERGENCY_FLAP_TOLERANCE: Duration = Duration::from_secs(180);
-/// After a pool-level HA reset is issued, how long to wait for the peer to
-/// actually come back live (its agent responsive over replication) before
-/// declaring the resolve a failure. Long enough for xhad to restart and rejoin
-/// the liveset after `pool-ha-enable` (Tenable ~150 s), plus margin. Until
-/// then the resolve is "confirming", not "resolved"; past it with the peer
-/// still not live, the master stops claiming success and escalates. The
-/// peer's xhad could not be recruited (it needs a local emergency disable),
-/// and latching "resolved" for the whole cooldown would leave it wedged.
+
+/// How long after the reset's cycle returned any waiting phase of its
+/// verdict (whether the disable took, pool HA back on, no HA task pending)
+/// may last, whatever the reads were, before the reset counts futile.
+const PEER_EMERGENCY_HA_WAIT: u64 = 30 * 60;
+
+/// How long after a reset is spawned its verdict may still come: the cycle
+/// (a disable, the wait for XAPI's task, an enable, each bounded by
+/// `HA_CMD_TIMEOUT`) and the verdict's own time.
+const PEER_EMERGENCY_VERDICT_BOUND: Duration =
+    Duration::from_secs(3 * HA_CMD_TIMEOUT.as_secs() + PEER_EMERGENCY_CONFIRM_AFTER.as_secs());
+
+/// Why a reset is counted futile, for its log line and alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutileWhy {
+    /// The peer's xapi still answers locally disarmed after the cycle.
+    Still,
+    /// No slave answer within the verdict's time.
+    NoAnswer,
+    /// The verdict was taken up again (a daemon restart, mastership back)
+    /// past its bound: never judged.
+    Unknown,
+    /// Judged freed, the peer answered locally disarmed again soon after.
+    Relapsed,
+    /// Pool HA stayed off with no re-arm owed: never re-enabled, so never
+    /// probed. Logged only; the HA-off alerts cover it.
+    HaOff,
+    /// A waiting phase (whether the disable took, pool HA back on, no HA
+    /// task pending) reached `PEER_EMERGENCY_HA_WAIT` from the cycle's
+    /// return; the last successful reads, for a text that says only them.
+    Waited { last_ha: Option<bool>, task_since: u64, task_read_failed: bool },
+}
+
+/// The budget's verdict on a reset, from the evidence that triggered it
+/// (the peer's own xapi answer), not from the peer's agent, which answers
+/// throughout an armed-mismatch wedge. `since` is when its phase began;
+/// `returned` (unix seconds) when the reset's cycle returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResetVerdict {
+    since: std::time::Instant,
+    normal_in_row: u8,
+    phase: VerdictPhase,
+    returned: u64,
+    /// While waiting: the last pool HA value read, since when (unix) an HA
+    /// task has been seen pending (0: none seen), and whether a task-list
+    /// read was attempted and failed.
+    last_ha: Option<bool>,
+    task_since: u64,
+    task_read_failed: bool,
+    /// While the disable's outcome is unknown: this reset's own record has
+    /// been seen pending in this run.
+    seen_own_pending: bool,
+}
+
+/// Where a reset's verdict stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictPhase {
+    /// The cycle's disable timed out: whether it took is not known yet. The
+    /// re-arm record says: owed or enabled since means it took (the verdict
+    /// goes on); gone while still pending means it did not (no verdict, no
+    /// alert). Either way the reset stays spent.
+    DisableUnknown,
+    /// Waiting for pool HA to read on (no probe runs against a pool with HA
+    /// off).
+    AwaitingHa,
+    /// Probing the peer's xapi answer (`reset_verdict_step`).
+    Probing,
+}
+
+impl VerdictPhase {
+    fn key(self) -> &'static str {
+        match self {
+            Self::DisableUnknown => "disable",
+            Self::AwaitingHa => "ha",
+            Self::Probing => "probe",
+        }
+    }
+
+    fn from_key(k: &str) -> Option<Self> {
+        match k {
+            "disable" => Some(Self::DisableUnknown),
+            "ha" => Some(Self::AwaitingHa),
+            "probe" => Some(Self::Probing),
+            _ => None,
+        }
+    }
+}
+
+impl ResetVerdict {
+    /// Probing from `now` (the tests' and the pure step's form).
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            since: now,
+            normal_in_row: 0,
+            phase: VerdictPhase::Probing,
+            returned: 0,
+            last_ha: None,
+            task_since: 0,
+            task_read_failed: false,
+            seen_own_pending: false,
+        }
+    }
+
+    fn at(phase: VerdictPhase, now: std::time::Instant, returned: u64) -> Self {
+        Self { phase, returned, ..Self::new(now) }
+    }
+}
+
+/// One probe for the verdict: an armed-mismatch answer makes the reset
+/// futile; two slave answers in a row, with none since, free the peer; any
+/// other probed answer breaks the run, a master answer included (the
+/// verdict runs on the master, so a peer answering as master is a second
+/// master, the second-master guard's case, not a freed slave); no verdict
+/// within `PEER_EMERGENCY_CONFIRM_AFTER` is futile. `probed` says whether a
+/// probe was taken this pass. Returns the verdict still pending, and the
+/// verdict when reached (`Some(true)` futile).
+fn reset_verdict_step(
+    v: ResetVerdict,
+    role: &xapi::PeerXapiRole,
+    probed: bool,
+    now: std::time::Instant,
+) -> (Option<ResetVerdict>, Option<bool>) {
+    if probed {
+        if *role == xapi::PeerXapiRole::ArmedMismatch {
+            return (None, Some(true));
+        }
+        if matches!(role, xapi::PeerXapiRole::SlaveOf(_)) {
+            if v.normal_in_row >= 1 {
+                return (None, Some(false));
+            }
+            return (Some(ResetVerdict { normal_in_row: 1, ..v }), None);
+        }
+    }
+    let v = if probed { ResetVerdict { normal_in_row: 0, ..v } } else { v };
+    if now.saturating_duration_since(v.since) >= PEER_EMERGENCY_CONFIRM_AFTER {
+        return (None, Some(true));
+    }
+    (Some(v), None)
+}
+
+fn peer_emergency_budget_path_default() -> String {
+    std::env::var("TWINSTOR_PEER_EMERGENCY_BUDGET")
+        .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/peer-emergency-resets"))
+}
+
+/// The peer-emergency reset budget, kept under /run/twinstor for the boot
+/// like the demote guard's (a daemon restart must not grant a fresh one):
+/// the resets issued (unix seconds) and the end of the last hold alerted
+/// (each long hold is announced once).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PeerEmergencyBudget {
+    resets: Vec<u64>,
+    alerted_until: u64,
+    /// The last reset, when it did not free the peer (0: none, or it did).
+    futile: u64,
+    /// The reset whose verdict is still pending (0: none): a daemon that
+    /// starts with one resumes it, or, past `PEER_EMERGENCY_VERDICT_BOUND`,
+    /// counts that reset futile.
+    pending: u64,
+    /// When the last reset was judged to have freed the peer, and that
+    /// reset (0: none): a relapse within `PEER_EMERGENCY_RELAPSE_WITHIN`
+    /// makes it futile after all.
+    freed_at: u64,
+    freed_reset: u64,
+    /// When the last verdict (freed or futile) came: the spacing runs from
+    /// the later of it and the last reset.
+    verdict_at: u64,
+    /// The pending verdict's phase and when its reset's cycle returned (0:
+    /// not yet), so a restarted daemon resumes it where it stood.
+    pending_phase: String,
+    pending_since: u64,
+    /// The first-sighting alert went out for the current wedge (when it
+    /// started, unix; 0: not), so a restarted daemon does not repeat it.
+    disarm_alerted: u64,
+}
+
+fn peer_emergency_budget_read(path: &str, boot_id: &str) -> PeerEmergencyBudget {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return PeerEmergencyBudget::default();
+    };
+    let get = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .map(str::trim)
+    };
+    if get("boot_id") != Some(boot_id) {
+        return PeerEmergencyBudget::default();
+    }
+    PeerEmergencyBudget {
+        resets: get("resets")
+            .unwrap_or("")
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect(),
+        alerted_until: get("alerted_until").and_then(|v| v.parse().ok()).unwrap_or(0),
+        futile: get("futile").and_then(|v| v.parse().ok()).unwrap_or(0),
+        pending: get("pending").and_then(|v| v.parse().ok()).unwrap_or(0),
+        freed_at: get("freed_at").and_then(|v| v.parse().ok()).unwrap_or(0),
+        freed_reset: get("freed_reset").and_then(|v| v.parse().ok()).unwrap_or(0),
+        verdict_at: get("verdict_at").and_then(|v| v.parse().ok()).unwrap_or(0),
+        pending_phase: get("pending_phase").unwrap_or("").to_string(),
+        pending_since: get("pending_since").and_then(|v| v.parse().ok()).unwrap_or(0),
+        disarm_alerted: get("disarm_alerted").and_then(|v| v.parse().ok()).unwrap_or(0),
+    }
+}
+
+/// Written atomically (a temporary file renamed over it); whether it was.
+fn peer_emergency_budget_write(path: &str, boot_id: &str, b: &PeerEmergencyBudget) -> bool {
+    let resets: Vec<String> = b.resets.iter().map(u64::to_string).collect();
+    write_file_atomic(
+        path,
+        &format!(
+            "boot_id={boot_id}\nresets={}\nalerted_until={}\nfutile={}\npending={}\n\
+             freed_at={}\nfreed_reset={}\nverdict_at={}\npending_phase={}\n\
+             pending_since={}\ndisarm_alerted={}\n",
+            resets.join(","),
+            b.alerted_until,
+            b.futile,
+            b.pending,
+            b.freed_at,
+            b.freed_reset,
+            b.verdict_at,
+            b.pending_phase,
+            b.pending_since,
+            b.disarm_alerted
+        ),
+    )
+    .is_ok()
+}
+
+/// Which budget rule holds a reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetRule {
+    /// The last reset ran less than `PEER_EMERGENCY_SPACING` ago: a short
+    /// hold, logged and shown, not alerted.
+    Spacing,
+    /// `PEER_EMERGENCY_BUDGET` resets within the window: a long hold, alerted.
+    Budget,
+    /// The last reset did not free the peer: the next one waits
+    /// `PEER_EMERGENCY_AFTER_FUTILE`; a long hold, alerted.
+    AfterFutile,
+}
+
+/// A budget hold: the rule, why in words, and until when (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BudgetHold {
+    rule: BudgetRule,
+    why: String,
+    until: u64,
+}
+
+impl BudgetHold {
+    /// Only a long hold is announced by alert; a spacing hold ends within
+    /// minutes and has the withheld log and the status text.
+    fn alerts(&self) -> bool {
+        self.rule != BudgetRule::Spacing
+    }
+}
+
+/// Which rule holds a reset now, why, and until when: the budget spent
+/// within the window, the last reset futile and less than an hour old, or
+/// the last reset too recent; the latest end wins. Resets older than the
+/// window no longer count.
+fn peer_emergency_budget_hold(b: &PeerEmergencyBudget, now_unix: u64) -> Option<BudgetHold> {
+    let futile = (b.futile != 0
+        && now_unix.saturating_sub(b.futile) < PEER_EMERGENCY_AFTER_FUTILE)
+        .then(|| BudgetHold {
+            rule: BudgetRule::AfterFutile,
+            why: format!(
+                "the last reset did not free the peer, so the next one waits {} minutes",
+                PEER_EMERGENCY_AFTER_FUTILE / 60
+            ),
+            until: b.futile + PEER_EMERGENCY_AFTER_FUTILE,
+        });
+    let count = peer_emergency_count_hold(&b.resets, b.verdict_at, now_unix);
+    match (futile, count) {
+        (Some(f), Some(c)) => Some(if c.until > f.until { c } else { f }),
+        (f, c) => f.or(c),
+    }
+}
+
+fn peer_emergency_count_hold(resets: &[u64], verdict_at: u64, now_unix: u64) -> Option<BudgetHold> {
+    let mut recent: Vec<u64> = resets
+        .iter()
+        .copied()
+        .filter(|t| now_unix.saturating_sub(*t) < PEER_EMERGENCY_BUDGET_WINDOW)
+        .collect();
+    recent.sort_unstable();
+    if recent.len() >= PEER_EMERGENCY_BUDGET {
+        let until = recent[recent.len() - PEER_EMERGENCY_BUDGET] + PEER_EMERGENCY_BUDGET_WINDOW;
+        return Some(BudgetHold {
+            rule: BudgetRule::Budget,
+            why: format!(
+                "the budget: {} resets already ran in the last {} hours",
+                recent.len(),
+                PEER_EMERGENCY_BUDGET_WINDOW / 3600
+            ),
+            until,
+        });
+    }
+    // From the later of the last reset and its verdict.
+    let last = (*recent.last()?).max(verdict_at);
+    (now_unix.saturating_sub(last) < PEER_EMERGENCY_SPACING).then(|| BudgetHold {
+        rule: BudgetRule::Spacing,
+        why: format!(
+            "the spacing: the last reset or its verdict was less than {} minutes ago",
+            PEER_EMERGENCY_SPACING / 60
+        ),
+        until: last + PEER_EMERGENCY_SPACING,
+    })
+}
+
+/// While the budget holds a reset: until when and why, for the partition
+/// view's PeerDisarmed text.
+static PEER_EMERGENCY_HOLD: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
+
+/// This host's UTC offset (seconds east), read once at start while the
+/// process is single-threaded (`set_local_utc_offset`), as the log
+/// timestamps are.
+static LOCAL_UTC_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub(crate) fn set_local_utc_offset(secs: i32) {
+    LOCAL_UTC_OFFSET.store(secs, Ordering::Relaxed);
+}
+
+/// A time for an operator: the host's local clock time with its UTC offset
+/// (`02:54 +01:00`).
+fn local_hm_at(unix: u64, offset: i32) -> String {
+    let local = (unix as i64 + i64::from(offset)).rem_euclid(86_400);
+    let sign = if offset < 0 { '-' } else { '+' };
+    let o = offset.unsigned_abs();
+    format!(
+        "{:02}:{:02} {sign}{:02}:{:02}",
+        local / 3600,
+        (local % 3600) / 60,
+        o / 3600,
+        (o % 3600) / 60
+    )
+}
+
+fn local_hm(unix: u64) -> String {
+    refresh_local_utc_offset();
+    local_hm_at(unix, LOCAL_UTC_OFFSET.load(Ordering::Relaxed))
+}
+
+/// When (`mono_secs`) the offset was last read again (0: never).
+static LOCAL_UTC_OFFSET_READ_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the UTC offset again at most once an hour, so a daylight-saving
+/// change does not leave operator times an hour off for the rest of the
+/// daemon's life. `localtime_r` is the C library's reentrant form, safe in a
+/// threaded process (`time` refuses its own read once threads exist).
+fn refresh_local_utc_offset() {
+    let now = mono_secs();
+    let last = LOCAL_UTC_OFFSET_READ_AT.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 3600 {
+        return;
+    }
+    LOCAL_UTC_OFFSET_READ_AT.store(now, Ordering::Relaxed);
+    if let Some(off) = local_utc_offset_now() {
+        LOCAL_UTC_OFFSET.store(off, Ordering::Relaxed);
+    }
+}
+
+fn local_utc_offset_now() -> Option<i32> {
+    // `time_t` is 64-bit on both x86_64 targets (glibc and musl).
+    let t: i64 = unix_now_secs().try_into().ok()?;
+    // SAFETY: `localtime_r` writes only into the `tm` passed in; both
+    // pointers are valid for the call.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::localtime_r(&t, &mut tm) };
+    if r.is_null() {
+        return None;
+    }
+    i32::try_from(tm.tm_gmtoff).ok().filter(|o| o.abs() <= 14 * 3600)
+}
+
+/// How far `unix` is from `now`, in minutes: "in 58 min", "3 min ago",
+/// "now".
+fn relative_minutes(unix: u64, now: u64) -> String {
+    if unix > now {
+        format!("in {} min", (unix - now).div_ceil(60))
+    } else if now - unix < 60 {
+        "now".to_string()
+    } else {
+        format!("{} min ago", (now - unix) / 60)
+    }
+}
+
+/// A time for an operator in an alert: the local time with its offset
+/// (`02:54 +01:00`). No "in N min": an alert can wait in the delivery
+/// queue, where that would go stale, and its text is its identity there.
+fn operator_time(unix: u64) -> String {
+    local_hm(unix)
+}
+
+/// A time for an operator in a status text, read when shown: with how far
+/// it is from now (`02:54 +01:00, in 58 min`).
+fn operator_time_rel(unix: u64) -> String {
+    format!("{}, {}", local_hm(unix), relative_minutes(unix, unix_now_secs()))
+}
+
+/// The PeerDisarmed view's addition while TwinStor's reset is on hold.
+fn peer_emergency_hold_note(now_unix: u64) -> Option<String> {
+    let g = PEER_EMERGENCY_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    hold_note(g.as_ref(), now_unix)
+}
+
+fn hold_note(hold: Option<&(u64, String)>, now_unix: u64) -> Option<String> {
+    let (until, why) = hold.filter(|(u, _)| *u > now_unix)?;
+    Some(format!(
+        "TwinStor's automatic reset is on hold until {} ({why}); until then only a manual pool \
+         HA cycle frees the peer.",
+        operator_time_rel(*until)
+    ))
+}
+
+/// After a reset that did not free the peer (`still`: its xapi still
+/// answers locally disarmed; otherwise no normal answer in time): what
+/// happened, the hold that follows, the risk, and the manual cycle, naming
+/// the hosts. Raised on the pool master (`master`) about `peer`.
+fn futile_reset_alert(
+    why: FutileWhy,
+    h: &BudgetHold,
+    reset: u64,
+    master: &str,
+    peer: &str,
+    t: u32,
+) -> String {
+    let enable = format!(
+        "'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"
+    );
+    if let FutileWhy::Waited { last_ha, task_since, task_read_failed } = why {
+        // Only what was read, and the command only where it applies.
+        let (read, advice) = match (last_ha, task_since) {
+            (Some(false), _) => (
+                "pool HA reads off".to_string(),
+                format!(" To re-enable it: on the pool master {master} run {enable}."),
+            ),
+            (Some(true), 0) if task_read_failed => (
+                "pool HA reads on, but XAPI's task list could not be read".to_string(),
+                String::new(),
+            ),
+            (Some(true), 0) => ("pool HA reads on".to_string(), String::new()),
+            (Some(true), since) => (
+                format!("pool HA reads on, but an HA operation has been pending since {}", operator_time(since)),
+                format!(" Check it on the pool master {master}: 'xe task-list status=pending'."),
+            ),
+            (None, _) => ("pool HA could not be read".to_string(), String::new()),
+        };
+        return format!(
+            "TwinStor: {} minutes after its pool-level HA reset for the peer host {peer} (at {}), \
+             {read}, so TwinStor could not tell whether the reset freed {peer}. TwinStor will \
+             not reset again until {} ({}).{advice}",
+            PEER_EMERGENCY_HA_WAIT / 60,
+            operator_time(reset),
+            operator_time(h.until),
+            h.why
+        );
+    }
+    let after = match why {
+        FutileWhy::Still => {
+            format!("{peer} still reports that it is locally disarmed under the armed pool")
+        }
+        FutileWhy::NoAnswer => format!(
+            "{peer} gave no normal answer within {} seconds",
+            PEER_EMERGENCY_CONFIRM_AFTER.as_secs()
+        ),
+        FutileWhy::Unknown => format!(
+            "TwinStor lost track of it (a daemon restart, or this host was not pool master for a \
+             while) before it could tell whether that freed {peer}"
+        ),
+        FutileWhy::HaOff | FutileWhy::Waited { .. } => {
+            format!("pool HA was not re-enabled, so {peer} was never probed")
+        }
+        FutileWhy::Relapsed => format!(
+            "{peer}, after answering as a slave, again reports that it is locally disarmed under \
+             the armed pool: the same wedge"
+        ),
+    };
+    format!(
+        "TwinStor: the automatic pool-level HA reset for the peer host {peer} ran, but {after}. \
+         TwinStor will not try again until {} ({}). HA does not protect the VMs on {peer}, and \
+         XAPI may restart them on another host while they still run there. To free {peer} \
+         now: on the pool master {master} run 'xe pool-ha-disable'; if the HA daemon on \
+         {peer} still cycles, run 'xe host-emergency-ha-disable --force' on {peer}; then on \
+         {master} run {enable}.",
+        operator_time(h.until),
+        h.why
+    )
+}
+
+/// Whether a re-arm record's owner is this reset's own cycle: written by
+/// `peer_emergency` at or after the reset was spent, within the verdict's
+/// bound.
+fn record_is_resets(owner: Option<&str>, reset: u64) -> bool {
+    let Some((who, at)) = owner.and_then(|o| o.split_once(':')) else {
+        return false;
+    };
+    let Ok(at) = at.parse::<u64>() else {
+        return false;
+    };
+    who == "peer_emergency"
+        && reset != 0
+        && at >= reset
+        && at - reset <= PEER_EMERGENCY_VERDICT_BOUND.as_secs()
+}
+
+/// The key a reset's freed or futile alert is sent and queued under: a
+/// futile verdict (or a relapse) replaces a queued "freed" for that reset.
+fn peer_emergency_verdict_key(reset: u64) -> String {
+    format!("peer-emergency-verdict-{reset}")
+}
+
+/// Raised on the pool master (`master`) about `peer`.
+fn peer_emergency_hold_alert(until: u64, why: &str, master: &str, peer: &str, t: u32) -> String {
+    format!(
+        "TwinStor: the peer host {peer} answers that it is locally disarmed under the armed \
+         pool. HA does not protect its VMs, and XAPI may restart them on another host while \
+         they still run there. TwinStor's automatic pool HA reset is on hold until {} ({why}). \
+         To free {peer} now, on the pool master {master} run 'xe pool-ha-disable', then 'xe \
+         pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'.",
+        operator_time(until)
+    )
+}
+/// Positive trigger: the peer's xapi answers
+/// `HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED` on two probes at least this far
+/// apart. XAPI never leaves that state by itself, so no settle applies.
+const PEER_EMERGENCY_CONFIRM_GAP: Duration = Duration::from_secs(30);
+/// How long the verdict on a pool-level HA reset probes the peer's own xapi
+/// answer, from the first probe after its cycle returned and pool HA reads
+/// on with no HA task pending: two normal answers in a row (none locally
+/// disarmed) within it free the peer; otherwise the reset did not (still
+/// disarmed, or no normal answer). Long enough for xhad to restart and
+/// rejoin the liveset after `pool-ha-enable` (Tenable ~150 s), plus margin.
 const PEER_EMERGENCY_CONFIRM_AFTER: Duration = Duration::from_secs(210);
 /// Wall-clock bound for the `xe pool-ha-{disable,enable}` calls issued by the
 /// peer-emergency resolver and `survivor_ha_reset`. They run in the
@@ -3416,126 +5909,160 @@ enum PeerEmergencyAction {
     None,
     Hold,
     Resolve,
+    /// The reset would fire, but the budget holds it.
+    Withheld,
 }
 
-/// Debounce the flapping `live` (peer_agent_responsive) input so a brief
-/// blip does not reset the peer-emergency maturity clock during a readmission
-/// wedge. Returns the effective `live` to feed the signature, plus the updated
-/// "clear tracking" instant.
-///
-/// - debounce off, no emergency tracked, or really not live: pass `live`
-///   through and clear the tracker.
-/// - `live` moved away from `Some(false)` while an emergency is tracked: hold
-///   the effective value at `Some(false)` (the clock keeps maturing) until the
-///   clear has lasted `tolerance`; only then pass the real value through, so a
-///   sustained recovery resets the clock.
-fn debounce_peer_live(
-    live: Option<bool>,
-    emergency_tracked: bool,
-    clear_since: Option<std::time::Instant>,
-    debounce_enabled: bool,
-    tolerance: Duration,
+/// How far apart two armed-mismatch sightings may be and still confirm.
+const PEER_EMERGENCY_CONFIRM_WINDOW: Duration = Duration::from_secs(300);
+/// How recent the armed-mismatch answer the reset fires on must be.
+const PEER_EMERGENCY_FIRE_FRESH: Duration = Duration::from_secs(35);
+
+/// The armed-mismatch sightings of the positive trigger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MismatchSightings {
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    /// Normal answers (as master or slave) in a row since the last sighting.
+    healthy_in_row: u8,
+    /// When the role was last probed while a sighting was open (paces the
+    /// re-probe).
+    probed: Option<std::time::Instant>,
+    /// That latest probe answered `ArmedMismatch`.
+    latest_mismatch: bool,
+}
+
+impl MismatchSightings {
+    fn open(&self) -> bool {
+        self.first.is_some()
+    }
+
+    /// Confirmed: two sightings at least `PEER_EMERGENCY_CONFIRM_GAP` and at
+    /// most `PEER_EMERGENCY_CONFIRM_WINDOW` apart, and not two normal answers
+    /// in a row since the last one.
+    fn confirmed(&self) -> bool {
+        match (self.first, self.last) {
+            (Some(f), Some(l)) => {
+                let span = l.saturating_duration_since(f);
+                span >= PEER_EMERGENCY_CONFIRM_GAP
+                    && span <= PEER_EMERGENCY_CONFIRM_WINDOW
+                    && self.healthy_in_row < 2
+            }
+            _ => false,
+        }
+    }
+
+    /// The reset may fire now: confirmed, and the most recent probe, taken
+    /// within `PEER_EMERGENCY_FIRE_FRESH`, answered `ArmedMismatch`. A
+    /// normal latest answer (the peer may have just healed while the reset
+    /// was held) waits for the next probe.
+    fn fire_ready(&self, now: std::time::Instant) -> bool {
+        self.confirmed()
+            && self.latest_mismatch
+            && self
+                .probed
+                .is_some_and(|t| now.saturating_duration_since(t) <= PEER_EMERGENCY_FIRE_FRESH)
+    }
+
+    /// A sighting is open but cannot fire yet and the gap has passed since
+    /// the last probe: probe again now rather than at the next minute's check
+    /// (at most one probe per gap, whatever the answers in between).
+    fn reprobe_due(&self, now: std::time::Instant) -> bool {
+        self.open()
+            && !self.fire_ready(now)
+            && self
+                .probed
+                .is_none_or(|t| now.saturating_duration_since(t) >= PEER_EMERGENCY_CONFIRM_GAP)
+    }
+}
+
+/// The positive trigger's confirmation: `ArmedMismatch` on two probes at
+/// least `PEER_EMERGENCY_CONFIRM_GAP` apart within
+/// `PEER_EMERGENCY_CONFIRM_WINDOW`, whatever came in between: the wedged
+/// slave restarts its own xapi, which answers HOST_IS_SLAVE or resets the
+/// connection for a probe or two. Two normal answers (as master or slave) in
+/// a row clear the sightings; so does no sighting for the whole window. A
+/// first sighting older than the window gives way to the latest one. Returns
+/// the sightings to keep and whether the reset may fire now: confirmed, with
+/// this probe itself answering `ArmedMismatch` (`fire_ready`).
+fn armed_mismatch_confirm(
+    mut s: MismatchSightings,
+    role: &xapi::PeerXapiRole,
     now: std::time::Instant,
-) -> (Option<bool>, Option<std::time::Instant>) {
-    if !debounce_enabled || !emergency_tracked || live == Some(false) {
-        return (live, None);
+) -> (MismatchSightings, bool) {
+    use xapi::PeerXapiRole::*;
+    s.latest_mismatch = *role == ArmedMismatch;
+    match role {
+        ArmedMismatch => {
+            s.healthy_in_row = 0;
+            let stale = |t: std::time::Instant| {
+                now.saturating_duration_since(t) > PEER_EMERGENCY_CONFIRM_WINDOW
+            };
+            s.first = match s.first {
+                None => Some(now),
+                Some(f) if stale(f) => s.last.filter(|l| !stale(*l)).or(Some(now)),
+                f => f,
+            };
+            s.last = Some(now);
+        }
+        Master | SlaveOf(_) => {
+            s.healthy_in_row = s.healthy_in_row.saturating_add(1);
+            if s.healthy_in_row >= 2 {
+                s = MismatchSightings::default();
+            }
+        }
+        Unknown | Unreachable => {}
     }
-    let started = clear_since.unwrap_or(now);
-    if now.duration_since(started) >= tolerance {
-        (live, None) // sustained clear: a real recovery, allow the reset
-    } else {
-        (Some(false), Some(started)) // within tolerance: bridge the flap
+    if s
+        .last
+        .is_some_and(|l| now.saturating_duration_since(l) > PEER_EMERGENCY_CONFIRM_WINDOW)
+    {
+        s = MismatchSightings::default();
     }
+    if s.open() {
+        s.probed = Some(now);
+    }
+    let ready = s.fire_ready(now);
+    (s, ready)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The peer-emergency verdict: with pool HA on, P holding, and the peer's
+/// xapi confirmed answering `ArmedMismatch` (`armed_mismatch_confirmed`): the
+/// state a slave reaches when its xapi restarts while it is locally disarmed
+/// under the armed pool, and never leaves by itself. No settle applies.
+///
+/// The older signature (the peer's agent not answering a forwarded
+/// `host-dmesg` while it is alive on replication) is retired with its clock:
+/// the readmission states it was kept for answer HOST_IS_SLAVE or as master,
+/// and serve `host-dmesg`, so it could not match them; their repairs are the
+/// second-master demote and the recorded-disarm re-arm. The liveset fast path
+/// and the storage-safe maturity are gone too: both fired on a healthy pool
+/// during a normal heal and across a management partition.
 fn peer_emergency_decision(
     enabled_flag: bool,
     pool_ha: Option<bool>,
-    peer_metrics_live: Option<bool>,
-    peer_daemon_reachable: bool,
-    peer_in_liveset: bool,
-    storage_safe_to_cycle: bool,
-    since: Option<std::time::Instant>,
-    wedge_since: Option<std::time::Instant>,
-    last_action: Option<std::time::Instant>,
-    now: std::time::Instant,
+    p: &crate::mgmt_reach::PView,
+    armed_mismatch_confirmed: bool,
+    armed_mismatch_seen: bool,
+    retry_paced: bool,
+    budget_held: bool,
 ) -> PeerEmergencyAction {
-    let signature =
-        pool_ha == Some(true) && peer_metrics_live == Some(false) && peer_daemon_reachable;
-    // (param name kept: `peer_metrics_live` now carries agent-responsive)
-    if !signature {
+    if pool_ha != Some(true) || !armed_mismatch_seen {
         return PeerEmergencyAction::None;
     }
-    let Some(since) = since else {
-        return PeerEmergencyAction::Hold;
-    };
     if !enabled_flag {
         return PeerEmergencyAction::Hold; // detection continues; sentinel alerted
     }
-    let cooldown_ok = last_action.is_none_or(|t| now.duration_since(t) >= PEER_EMERGENCY_COOLDOWN);
-    if !cooldown_ok {
+    if retry_paced {
         return PeerEmergencyAction::Hold;
     }
-    // Fast path: the peer has rejoined this host's xhad liveset (a stable
-    // local read) yet the wedge signature still holds: a confirmed armed
-    // mismatch, not a peer still rejoining. Resolve after a short grace rather
-    // than waiting out the blind maturity timer.
-    if peer_in_liveset
-        && wedge_since
-            .is_some_and(|w| now.duration_since(w) >= PEER_EMERGENCY_WEDGE_CONFIRMED_AFTER)
-    {
+    if armed_mismatch_confirmed && p.matured() {
+        if budget_held {
+            return PeerEmergencyAction::Withheld;
+        }
         return PeerEmergencyAction::Resolve;
     }
-    // Slow path: the peer is not (yet) a liveset member, so it may still be
-    // rejoining; wait out the maturity before acting. The reduced
-    // `PEER_EMERGENCY_FAST_AFTER` applies when storage is fully redundant (safe
-    // to cycle HA through), otherwise the full `PEER_EMERGENCY_AFTER`.
-    let maturity = if storage_safe_to_cycle {
-        PEER_EMERGENCY_FAST_AFTER
-    } else {
-        PEER_EMERGENCY_AFTER
-    };
-    if now.duration_since(since) >= maturity {
-        PeerEmergencyAction::Resolve
-    } else {
-        PeerEmergencyAction::Hold
-    }
-}
-
-/// What to do while confirming that a pool-level HA reset recruited the peer.
-/// After `check_peer_emergency` issues the reset it must not latch "resolved"
-/// on its own read of pool HA: that read is master-side and true even when the
-/// peer's xhad is still cycling and never joins. It waits for positive proof
-/// that the peer is back (its agent responsive over replication).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerConfirmAction {
-    /// The peer is live again: the reset worked. Latch resolved, clear state.
-    Confirmed,
-    /// Still within the confirmation window with the peer not yet live: wait.
-    Confirming,
-    /// The window elapsed and the peer is still not live: the reset did not
-    /// recruit it (its xhad needs a local emergency disable). Stop claiming
-    /// success and escalate.
-    Failed,
-}
-
-/// Confirmation decision. `peer_live` is the peer-agent-responsive read
-/// (`Some(true)` back, `Some(false)` or `None` not yet or unknown).
-/// `resolve_at` is when the reset was issued.
-fn peer_emergency_confirm(
-    peer_live: Option<bool>,
-    resolve_at: Option<std::time::Instant>,
-    now: std::time::Instant,
-    confirm_after: Duration,
-) -> PeerConfirmAction {
-    if peer_live == Some(true) {
-        return PeerConfirmAction::Confirmed;
-    }
-    match resolve_at {
-        Some(t) if now.duration_since(t) >= confirm_after => PeerConfirmAction::Failed,
-        _ => PeerConfirmAction::Confirming,
-    }
+    PeerEmergencyAction::Hold
 }
 
 /// Peer-local self-clear. The master-side `peer_emergency` reset cannot recruit
@@ -3608,7 +6135,7 @@ fn ha_self_unwedge_decision(
 /// incident still in progress.
 fn open_episode_marker() -> String {
     std::env::var("TWINSTOR_OPEN_EPISODE_MARKER")
-        .unwrap_or_else(|_| "/var/lib/twinstor/open-episode".to_string())
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/open-episode"))
 }
 
 /// How often the daemon checks whether pool HA is armed.
@@ -3619,6 +6146,10 @@ const HA_CHECK_INTERVAL: Duration = Duration::from_secs(600); // 10 min
 /// the peer returns after a stand-down, the re-arm should land within a couple
 /// of minutes.
 const HA_REARM_RETRY_INTERVAL: Duration = Duration::from_secs(120); // 2 min
+/// How far the pending window is kept open past a pass that saw TwinStor's
+/// own pool HA task pending (or failed to cancel it): two watchdog passes,
+/// so the next pass can still read the disable's landing as TwinStor's.
+const PENDING_WINDOW_EXTENSION: u64 = 2 * HA_REARM_RETRY_INTERVAL.as_secs();
 
 /// How long the bring-up loop may keep failing with hard errors before the
 /// cannot-go-online alert fires. Long enough to ride out a slow boot where
@@ -3729,13 +6260,7 @@ fn fencing_disarm_marker() -> String {
     if let Ok(p) = std::env::var("TWINSTOR_FENCING_MARKER_PATH") {
         return p;
     }
-    if cfg!(test) {
-        return std::env::temp_dir()
-            .join("twinstor-test-fencing-disarmed")
-            .to_string_lossy()
-            .into_owned();
-    }
-    "/var/lib/twinstor/fencing-disarmed".to_string()
+    crate::heal_state::state_path("/var/lib/twinstor/fencing-disarmed")
 }
 
 /// Persisted first-seen stamp of the continuous `Destroyed` attestation
@@ -3744,13 +6269,7 @@ fn cd_since_path() -> String {
     if let Ok(p) = std::env::var("TWINSTOR_CD_SINCE_PATH") {
         return p;
     }
-    if cfg!(test) {
-        return std::env::temp_dir()
-            .join("twinstor-test-cd-destroyed-since")
-            .to_string_lossy()
-            .into_owned();
-    }
-    "/var/lib/twinstor/cd-destroyed-since".to_string()
+    crate::heal_state::state_path("/var/lib/twinstor/cd-destroyed-since")
 }
 
 /// Durable operator breadcrumb written before the sole-survivor force-promote:
@@ -3760,13 +6279,7 @@ fn cd_breadcrumb_path() -> String {
     if let Ok(p) = std::env::var("TWINSTOR_CD_BREADCRUMB_PATH") {
         return p;
     }
-    if cfg!(test) {
-        return std::env::temp_dir()
-            .join("twinstor-test-cd-breadcrumb")
-            .to_string_lossy()
-            .into_owned();
-    }
-    "/var/lib/twinstor/force-promote-breadcrumb".to_string()
+    crate::heal_state::state_path("/var/lib/twinstor/force-promote-breadcrumb")
 }
 
 /// Write an escalation stamp or breadcrumb file, creating the parent directory
@@ -5148,7 +7661,8 @@ const SUSPENDED_PRIMARY_DEMOTE_AFTER: u32 = 3;
 /// the same state comes right back after a reboot, the cause is one a reboot
 /// cannot fix, and the daemon must degrade to alert-and-hold instead of a
 /// reboot loop. Kept outside /run so it survives the reboot.
-const STUCK_PRIMARY_FENCE_STAMP: &str = "/var/lib/twinstor/stuck-primary-fence-at";
+static STUCK_PRIMARY_FENCE_STAMP: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/stuck-primary-fence-at"));
 
 /// Tries at withdrawing a discard offer whose state cannot be read, per
 /// disconnect (see `steered_connect`).
@@ -5156,7 +7670,8 @@ const OFFER_UNKNOWN_TRIES: u32 = 3;
 
 /// Why the daemon last forced a reboot (written just before it): logged and
 /// renamed `.seen` by the next daemon start.
-const FORCED_REBOOT_BREADCRUMB: &str = "/var/lib/twinstor/last-forced-reboot";
+static FORCED_REBOOT_BREADCRUMB: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/last-forced-reboot"));
 
 /// One durable state file, for the startup dump: `-` when absent, else its
 /// first line (bounded).
@@ -5239,7 +7754,8 @@ const HA_RESET_HEAL_TIMEOUT: Duration = Duration::from_secs(480);
 /// Connected, UpToDate cluster member. Kept outside /run so it survives reboot.
 /// The auto-heal compares it to boot time to tell the spurious boot-join loser
 /// (boot is newer than this) from the continuous survivor (boot predates it).
-const LAST_HEALTHY_PATH: &str = "/var/lib/twinstor/last-healthy";
+static LAST_HEALTHY_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/var/lib/twinstor/last-healthy"));
 
 /// How many toolstack restarts the auto-heal will attempt in one wedge episode
 /// before giving up to the fail-safe hold (alert + never discard). A restart
@@ -5267,6 +7783,13 @@ const YIELD_FENCE_AFTER_HOLDS: u32 = 8;
 /// when the spurious master is freshly-booted and VM-less; the alert covers the
 /// cases it cannot (both hosts run VMs, the peer is briefly unreachable, or an old
 /// binary on the peer).
+fn wedge_alert_body(t: u32) -> String {
+    WEDGE_ALERT_BODY.replace(
+        "heartbeat-sr-uuids=<twinstor SR uuid>'",
+        &format!("heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'"),
+    )
+}
+
 const WEDGE_ALERT_BODY: &str = "TwinStor dual-master wedge: both hosts believe they are the pool master \
      after a partition, so DRBD cannot auto-resolve and is stuck StandAlone. Data is not \
      being discarded (safe). To collapse the pool back to one master: identify the \
@@ -5328,6 +7851,711 @@ fn decide_wedge_action(
 /// return, an early return inside `survivor_ha_reset`, or a panic unwind.
 /// Otherwise a panic in the task would leave the flag stuck `true` and block
 /// every later HA-reset attempt until the daemon restarts.
+/// Outcome of one pool HA cycle (`pool_ha_cycle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoolHaCycle {
+    /// Pool HA was disabled (the command returned, or it timed out and pool
+    /// HA then read off).
+    disabled: bool,
+    /// The re-enable returned success.
+    enabled: bool,
+    /// What the disable step saw, for the log and the alert.
+    disable_note: String,
+    /// Pool HA is off, but not by this cycle's disable (already off before
+    /// it, or XAPI answered the disable with an error). Nothing re-enables it
+    /// (the obligation this cycle wrote was cleared).
+    operator_off: bool,
+    /// The cycle issued its `pool-ha-disable` (it did not stop before).
+    disable_issued: bool,
+    /// The disable failed without an answer (it timed out) and may still
+    /// take in XAPI.
+    disable_may_land: bool,
+    /// A fire-time gate failed before a step: which step and why. The
+    /// written re-arm obligation does the enable later under its own gates.
+    withheld: Option<String>,
+}
+
+/// Plug this host's unplugged PBDs of the twinstor SR before a
+/// `pool-ha-enable` (see `StateMachine::ensure_twinstor_pbds_plugged`).
+async fn plug_twinstor_pbds() {
+    let Some(sr) = xapi::twinstor_sr_uuid().await else {
+        return;
+    };
+    let mut args = vec![
+        "pbd-list".to_string(),
+        format!("sr-uuid={sr}"),
+        "currently-attached=false".to_string(),
+        "--minimal".to_string(),
+    ];
+    if let Some(h) = crate::setup::local_host_uuid().await {
+        args.push(format!("host-uuid={h}"));
+    }
+    let listed = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("xe")
+            .args(&args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let Ok(Ok(out)) = listed else { return };
+    if !out.status.success() {
+        return;
+    }
+    let pbds = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    for pbd in pbds.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        info!(pbd = %pbd, heal_event = "ha_rearm_pbd_plug",
+              "plugging the twinstor SR's PBD before pool-ha-enable (it was left \
+               unplugged by a reconnect/readmission; enabling now would fail \
+               'the SR has no attached PBDs')");
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new("xe")
+                .args(["pbd-plug", &format!("uuid={pbd}")])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+    }
+}
+
+/// The outcome of one pool HA command, by how it ended: it returned; its
+/// bound ran out on our side (XAPI may still finish it: no answer); `xe` ran
+/// and answered with an error (XAPI or the CLI refused it); or it could not
+/// be run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HaCmd {
+    Done,
+    TimedOut,
+    Refused(String),
+    NotRun(String),
+}
+
+fn ha_cmd_of(r: anyhow::Result<()>) -> HaCmd {
+    match r {
+        Ok(()) => HaCmd::Done,
+        Err(e) => match crate::cmd::ended(&e) {
+            crate::cmd::Ended::TimedOut => HaCmd::TimedOut,
+            crate::cmd::Ended::Exited(stderr) => HaCmd::Refused(stderr),
+            crate::cmd::Ended::NotRun(why) => HaCmd::NotRun(why),
+        },
+    }
+}
+
+/// A secondary hint, for the log only, of what a refused `pool-ha-disable`
+/// said (the texts `xe` prints; the classification itself is by how the
+/// command ended).
+fn ha_refusal_hint(stderr: &str) -> &'static str {
+    if stderr.contains("HA is not enabled on the Pool") {
+        "pool HA not enabled"
+    } else if stderr.contains("HA disable is in progress") {
+        "another pool HA disable in progress"
+    } else if stderr.contains("Cannot forward messages because the server cannot be contacted") {
+        "the pool master could not be contacted"
+    } else if stderr.contains("Connection refused") {
+        "the local XAPI refused the connection"
+    } else {
+        "other refusal"
+    }
+}
+
+/// The operations of a pool HA cycle and of the re-arm enable, behind one
+/// interface so the spawned bodies run in tests with scripted results.
+#[async_trait::async_trait]
+trait HaOps: Send + Sync {
+    async fn disable(&self) -> HaCmd;
+    async fn enable(&self, sr: &str, timeout: u64) -> HaCmd;
+    async fn pool_ha(&self) -> Option<bool>;
+    async fn pending_tasks(&self) -> Option<Vec<xapi::PendingHaTask>>;
+    async fn plug_pbds(&self);
+    async fn stop_local_xhad(&self);
+    /// The fire-time gates, read again now: `None` when the step may run,
+    /// otherwise why not.
+    async fn gates(&self) -> Option<String>;
+    async fn pause(&self, d: Duration);
+    fn touch_attempt(&self);
+    fn clear_obligation(&self);
+    /// Write the re-arm obligation in `state`, owned by `owner`
+    /// (`<routine>:<unix>`).
+    fn write_obligation(&self, sr: &str, timeout: u64, state: ObligationState, owner: &str);
+    /// The standing obligation's owner, if it names one.
+    fn obligation_owner(&self) -> Option<String>;
+    /// Move a standing obligation to `state`.
+    fn set_obligation_state(&self, state: ObligationState);
+    /// The standing obligation's state, if one stands.
+    fn obligation_state(&self) -> Option<ObligationState>;
+    /// The standing obligation's last enable-attempt stamp.
+    fn obligation_attempt(&self) -> Option<u64>;
+    /// Wall-clock now (unix seconds), for the obligation's pending window.
+    fn now_unix(&self) -> u64;
+    async fn alert(&self, body: &str);
+    /// An alert under the HA-wedge name (`twinstor_ha_wedge`).
+    async fn wedge_alert(&self, body: &str);
+}
+
+/// The real operations. The gates (`ha_step_gates`) are the management
+/// predicate P from a fresh snapshot with the caller's trigger (`None`: a
+/// routine whose premise is a peer gone, which P cannot hold for), this
+/// host's pool role as it was when the operation started, the HA
+/// startup-loop lock, and no host in maintenance (an unanswered read holds,
+/// as for the re-arm).
+struct LiveHaOps {
+    mgmt: crate::mgmt_reach::Shared,
+    trigger: Option<crate::mgmt_reach::Trigger>,
+    expect_master: Option<bool>,
+}
+
+/// The fire-time gates of one step that turns pool HA on, from their reads:
+/// `None` when it may run, otherwise why not.
+fn ha_step_gates(
+    pv: &crate::mgmt_reach::PView,
+    trigger: Option<crate::mgmt_reach::Trigger>,
+    expect_master: Option<bool>,
+    master_now: Option<bool>,
+    local_armed: Option<bool>,
+    xhad_online: bool,
+    maintenance: Option<bool>,
+) -> Option<String> {
+    if let Some(t) = trigger {
+        match crate::mgmt_reach::gate(pv, t) {
+            crate::mgmt_reach::Gate::Pass => {}
+            g => return Some(format!("the peer's management address gate is closed ({g:?})")),
+        }
+    }
+    if let Some(m) = expect_master
+        && master_now != Some(m)
+    {
+        return Some("this host's pool role is no longer the one the operation started with".into());
+    }
+    if crate::mgmt_reach::startup_loop_locked(local_armed, xhad_online, pv.p) {
+        return Some("XAPI holds this host in its HA startup loop".into());
+    }
+    if maintenance != Some(false) {
+        return Some("a host is in maintenance, or XAPI did not say".into());
+    }
+    None
+}
+
+#[async_trait::async_trait]
+impl HaOps for LiveHaOps {
+    async fn disable(&self) -> HaCmd {
+        ha_cmd_of(crate::cmd::run_cmd_for("xe", &["pool-ha-disable"], HA_CMD_TIMEOUT.as_secs()).await)
+    }
+    async fn enable(&self, sr: &str, timeout: u64) -> HaCmd {
+        let sr_arg = format!("heartbeat-sr-uuids={sr}");
+        let to_arg = format!("ha-config:timeout={timeout}");
+        ha_cmd_of(
+            crate::cmd::run_cmd_for(
+                "xe",
+                &["pool-ha-enable", sr_arg.as_str(), to_arg.as_str()],
+                HA_CMD_TIMEOUT.as_secs(),
+            )
+            .await,
+        )
+    }
+    async fn pool_ha(&self) -> Option<bool> {
+        match xapi::is_ha_enabled().await {
+            Some(v) => Some(v),
+            None => xapi::is_ha_enabled().await,
+        }
+    }
+    async fn pending_tasks(&self) -> Option<Vec<xapi::PendingHaTask>> {
+        xapi::pending_pool_ha_tasks().await
+    }
+    async fn plug_pbds(&self) {
+        plug_twinstor_pbds().await;
+    }
+    async fn stop_local_xhad(&self) {
+        stop_local_xhad_now().await;
+    }
+    async fn gates(&self) -> Option<String> {
+        let pv = self
+            .mgmt
+            .lock()
+            .map(|s| s.view(std::time::Instant::now()))
+            .unwrap_or_default();
+        let master_now = if self.expect_master.is_some() {
+            xapi::is_pool_master_resilient().await
+        } else {
+            None
+        };
+        ha_step_gates(
+            &pv,
+            self.trigger,
+            self.expect_master,
+            master_now,
+            xapi::local_ha_armed(),
+            xhad_online_now().await,
+            xapi::any_host_in_maintenance().await,
+        )
+    }
+    async fn pause(&self, d: Duration) {
+        tokio::time::sleep(d).await;
+    }
+    fn touch_attempt(&self) {
+        ha_obligation_touch_attempt();
+    }
+    fn clear_obligation(&self) {
+        ha_obligation_clear();
+    }
+    fn write_obligation(&self, sr: &str, timeout: u64, state: ObligationState, owner: &str) {
+        ha_obligation_write_owned_at(&ha_rearm_obligation_path(), sr, timeout, state, owner);
+    }
+    fn obligation_owner(&self) -> Option<String> {
+        ha_obligation_file_at(&ha_rearm_obligation_path()).and_then(|f| f.owner)
+    }
+    fn set_obligation_state(&self, state: ObligationState) {
+        ha_obligation_set_state_at(&ha_rearm_obligation_path(), state);
+    }
+    fn obligation_state(&self) -> Option<ObligationState> {
+        ha_obligation_state()
+    }
+    fn obligation_attempt(&self) -> Option<u64> {
+        ha_obligation_read().and_then(|o| o.2)
+    }
+    fn now_unix(&self) -> u64 {
+        unix_now_secs()
+    }
+    async fn alert(&self, body: &str) {
+        let _ = xapi::send_xapi_alert(body).await;
+    }
+    async fn wedge_alert(&self, body: &str) {
+        let _ = xapi::send_ha_wedge_alert(body).await;
+    }
+}
+
+/// Whether this host's HA daemon reads Online (`calldaemon gethoststate`).
+async fn xhad_online_now() -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::cmd::cmd_output(CALLDAEMON, &["gethoststate"]),
+        )
+        .await,
+        Ok(Ok(out)) if out.trim() == "Online"
+    )
+}
+
+/// Since when (`mono_secs`, 0: not) some routine has been stopped at its
+/// start by a pending pool HA task; the HA watchdog reports it once it has
+/// lasted `OWN_TASK_STALE_AFTER`.
+static ROUTINE_TASK_HOLD: std::sync::Mutex<TaskHold> =
+    std::sync::Mutex::new(TaskHold { since: 0, task: String::new() });
+
+/// Which pending pool HA task holds the routines, and since when
+/// (`mono_secs`; 0: none). A different task starts the clock afresh; none
+/// pending ends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskHold {
+    since: u64,
+    task: String,
+}
+
+impl TaskHold {
+    fn observe(&mut self, tasks: &[xapi::PendingHaTask], now: u64) {
+        match tasks.first() {
+            None => {
+                self.since = 0;
+                self.task.clear();
+            }
+            Some(t) if t.uuid != self.task || self.since == 0 => {
+                self.since = now;
+                self.task = t.uuid.clone();
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn routine_task_hold_observe(tasks: &[xapi::PendingHaTask]) {
+    if let Ok(mut h) = ROUTINE_TASK_HOLD.lock() {
+        h.observe(tasks, mono_secs());
+    }
+}
+
+/// Whether a TwinStor routine may issue its pool HA disable now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CycleStart {
+    Go,
+    /// Nothing issued, nothing written; why.
+    Stop(String),
+    /// Pool HA already reads off and TwinStor owes no re-arm for it (none
+    /// stands, or it is enabled or expired): someone else turned it off.
+    /// Whether a standing (not owed) obligation is to be cleared.
+    OffNotByUs(String, bool),
+}
+
+/// Before a routine issues its `pool-ha-disable`: its fire-time gates read
+/// again (maintenance included: a disable would leave HA off for the whole
+/// maintenance), pool HA read on, and no pool HA task pending in XAPI (none
+/// can be ours yet, so any pending one is someone else's). Pool HA already off
+/// with an earlier TwinStor re-arm standing (its enable was withheld) only
+/// stops this routine: that obligation re-enables it.
+async fn pool_ha_cycle_start(ops: &dyn HaOps, who: &'static str) -> CycleStart {
+    if let Some(why) = ops.gates().await {
+        log_cycle_withheld(who, "disable", &why);
+        return CycleStart::Stop(format!("disable withheld: {why}"));
+    }
+    let ha = ops.pool_ha().await;
+    let standing = ops.obligation_state();
+    if let Some(st) = standing {
+        match obligation_verdict(st, ha, ops.now_unix(), false) {
+            ObligationVerdict::BecomeOwed => {
+                ops.set_obligation_state(ObligationState::Owed);
+                return CycleStart::Stop(
+                    "an earlier TwinStor disable has landed; its obligation re-enables pool HA"
+                        .into(),
+                );
+            }
+            ObligationVerdict::Wait => {
+                return CycleStart::Stop("an earlier TwinStor disable may still land".into());
+            }
+            _ => {}
+        }
+    }
+    match ha {
+        Some(true) => {}
+        Some(false) if standing == Some(ObligationState::Owed) => {
+            return CycleStart::Stop(
+                "pool HA already reads off after TwinStor's own disable; its owed re-arm \
+                 re-enables it"
+                    .into(),
+            );
+        }
+        Some(false) => {
+            return CycleStart::OffNotByUs(
+                "pool HA already read off before TwinStor's disable, and TwinStor owes no \
+                 re-arm for it"
+                    .into(),
+                standing.is_some(),
+            );
+        }
+        None => return CycleStart::Stop("pool HA unreadable before the disable".into()),
+    }
+    match ops.pending_tasks().await {
+        None => CycleStart::Stop("XAPI's task list unreadable before the disable".into()),
+        Some(t) if !t.is_empty() => {
+            routine_task_hold_observe(&t);
+            CycleStart::Stop(format!(
+                "a pool HA operation is already pending in XAPI ({}); not issuing another",
+                t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ")
+            ))
+        }
+        Some(t) => {
+            routine_task_hold_observe(&t);
+            CycleStart::Go
+        }
+    }
+}
+
+/// What the disable step concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisableStep {
+    /// Pool HA is off by our call: `disable` (it returned), or
+    /// `disable_timed_out_but_effective` (our call got no answer within its
+    /// bound, and pool HA read off once any pending HA task was done).
+    Disabled(&'static str),
+    /// XAPI answered our disable with an error (or it could not be run), and
+    /// pool HA reads off: not taken as ours. The routine stops; nothing
+    /// re-enables.
+    RefusedButOff(String),
+    /// Still on, or unreadable: the routine stops. Whether the disable may
+    /// still land (our call got no answer, or the reading is unknown): the
+    /// obligation then stays `Pending` for its window; otherwise (refused with
+    /// pool HA on) it goes, nothing being owed.
+    Failed(String, bool),
+}
+
+/// `pool-ha-disable` (pool HA read on, nothing pending, just before: see
+/// `pool_ha_cycle_start`), then what is true, by how the call ended, never
+/// by comparing clocks or matching texts. Our disable is taken as effective
+/// only when the call returned, or got no answer within its bound (then the
+/// step waits for any pending pool HA task and reads pool HA: off means it
+/// took effect). Any answer from XAPI that is an error, with pool HA then
+/// reading off, is someone else's doing (or XAPI erred after taking effect):
+/// enabling over an operator's disable is the worse mistake.
+async fn pool_ha_disable_step(ops: &dyn HaOps) -> DisableStep {
+    match ops.disable().await {
+        HaCmd::Done => DisableStep::Disabled("disable"),
+        HaCmd::TimedOut => {
+            match ops.pending_tasks().await {
+                None => {
+                    return DisableStep::Failed(
+                        "pool-ha-disable got no answer in time and XAPI's task list is unreadable"
+                            .into(),
+                        true,
+                    );
+                }
+                Some(t) if !t.is_empty() => {
+                    wait_no_pending_ha_task(ops, HA_CMD_TIMEOUT).await;
+                }
+                Some(_) => {}
+            }
+            match ops.pool_ha().await {
+                Some(false) => DisableStep::Disabled("disable_timed_out_but_effective"),
+                Some(true) => DisableStep::Failed(
+                    "pool-ha-disable got no answer in time; pool HA still reads on".into(),
+                    true,
+                ),
+                None => DisableStep::Failed(
+                    "pool-ha-disable got no answer in time; pool HA unreadable".into(),
+                    true,
+                ),
+            }
+        }
+        HaCmd::Refused(e) | HaCmd::NotRun(e) => match ops.pool_ha().await {
+            Some(false) => DisableStep::RefusedButOff(format!(
+                "pool-ha-disable was answered with an error ({}: {e}) and pool HA reads off",
+                ha_refusal_hint(&e)
+            )),
+            Some(true) => DisableStep::Failed(
+                format!("pool-ha-disable refused ({}: {e}); pool HA still reads on", ha_refusal_hint(&e)),
+                false,
+            ),
+            None => DisableStep::Failed(
+                format!("pool-ha-disable refused ({}: {e}); pool HA unreadable", ha_refusal_hint(&e)),
+                true,
+            ),
+        },
+    }
+}
+
+/// Alert when TwinStor's own disable was answered with an error while pool
+/// HA reads off: true whether someone else turned HA off or XAPI erred after
+/// taking our disable.
+fn ha_off_disable_refused() -> String {
+    format!(
+        "TwinStor: pool HA is off. TwinStor's own pool HA disable was refused by XAPI, so \
+         TwinStor does not take this HA-off as its own and will not re-enable it. Re-enable it \
+         by hand when you want failover: on the pool master run 'xe pool-ha-enable \
+         heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={}'.",
+        crate::setup::configured_ha_timeout()
+    )
+}
+
+/// Pool HA off but not by this routine's disable: no enable, the obligation
+/// this routine wrote (if any) cleared so nothing re-enables later, and the
+/// alert that fits.
+async fn pool_ha_off_not_by_us(
+    ops: &dyn HaOps,
+    who: &'static str,
+    note: &str,
+    wrote_obligation: bool,
+    body: &str,
+) {
+    warn!(heal_event = "ha_off_not_by_twinstor", who, note,
+          "pool HA is off and not by TwinStor's own disable; not re-enabling it");
+    if wrote_obligation {
+        ops.clear_obligation();
+    }
+    ops.alert(body).await;
+}
+
+/// How an operator stops TwinStor from re-enabling pool HA after its own
+/// disable: every alert that mentions it says the same.
+const KEEP_HA_OFF_HOWTO: &str = "To keep pool HA off on purpose, delete \
+     /var/lib/twinstor/ha-rearm-obligation on the host that raised this alert: TwinStor then \
+     issues no further enable for it.";
+
+/// Right before an enable: the re-arm obligation, read from its file now,
+/// must still be owed. Gone (an operator deleted it to keep HA off), pending,
+/// or enabled: no enable.
+fn enable_still_owed(ops: &dyn HaOps, who: &'static str, step: &'static str) -> bool {
+    let why = match ops.obligation_state() {
+        Some(ObligationState::Owed) => return true,
+        None => "the re-arm obligation is gone (deleted, or cleared)",
+        Some(ObligationState::Pending { .. }) => "the re-arm obligation is still pending",
+        Some(ObligationState::Enabled) => "the re-arm obligation is already enabled",
+    };
+    warn!(heal_event = "ha_action_withheld", action = who, step, reason = why,
+          "{who}: {step} withheld: {why}; no enable is issued");
+    false
+}
+
+/// Log a step a re-read fire-time gate withheld.
+fn log_cycle_withheld(who: &'static str, step: &'static str, why: &str) {
+    warn!(heal_event = "ha_action_withheld", action = who, step, reason = why,
+          "{who}: {step} withheld at its firing: {why}; the re-arm obligation enables pool HA \
+           later under its own gates");
+    if !cfg!(test) {
+        crate::arbitration::write_status(
+            crate::arbitration::WITHHELD_PATH.as_str(),
+            &[("action", who), ("reason", &format!("{step}: {why}"))],
+        );
+    }
+}
+
+/// Wait until XAPI lists no pending pool HA task (polled every 5 s, at least
+/// one poll), up to `bound`. `true` when none is pending; an unreadable task
+/// list counts as pending until the bound.
+async fn wait_no_pending_ha_task(ops: &dyn HaOps, bound: Duration) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        ops.pause(Duration::from_secs(5)).await;
+        waited += Duration::from_secs(5);
+        if matches!(ops.pending_tasks().await, Some(t) if t.is_empty()) {
+            return true;
+        }
+        if waited >= bound {
+            return false;
+        }
+    }
+}
+
+/// The HA watchdog's step on a standing obligation (see `obligation_verdict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObligationStep {
+    /// Go on to the re-arm decision (the state is owed or enabled).
+    Proceed,
+    /// Nothing more this pass (waiting, or the obligation went).
+    Stop,
+}
+
+async fn obligation_step(ops: &dyn HaOps, ha: Option<bool>, settled: bool) -> ObligationStep {
+    let Some(state) = ops.obligation_state() else {
+        return ObligationStep::Stop;
+    };
+    match obligation_verdict(state, ha, ops.now_unix(), settled) {
+        ObligationVerdict::Keep => ObligationStep::Proceed,
+        ObligationVerdict::Wait => {
+            info!(heal_event = "ha_rearm_hold", reason = "disable_pending",
+                  "a pool HA disable TwinStor issued has not been seen to land yet; no re-arm \
+                   and no clear until it does or its window passes");
+            ObligationStep::Stop
+        }
+        ObligationVerdict::BecomeOwed => {
+            ops.set_obligation_state(ObligationState::Owed);
+            info!(heal_event = "ha_rearm_owed",
+                  "TwinStor's own pool HA disable has landed; a re-arm is owed");
+            ObligationStep::Proceed
+        }
+        ObligationVerdict::BecomeEnabled => {
+            ops.set_obligation_state(ObligationState::Enabled);
+            info!(heal_event = "ha_rearm_enabled_seen",
+                  "pool HA reads on again after TwinStor's disable; any later HA-off is not \
+                   TwinStor's");
+            ObligationStep::Proceed
+        }
+        ObligationVerdict::Expired => {
+            ops.clear_obligation();
+            info!(heal_event = "ha_rearm_expired",
+                  "TwinStor's pool HA disable never took (its window passed with pool HA on); \
+                   nothing is owed");
+            ObligationStep::Stop
+        }
+        ObligationVerdict::NotOurs => {
+            pool_ha_off_not_by_us(
+                ops,
+                "ha_rearm",
+                "pool HA is off after TwinStor's own enable, or after its disable's window \
+                 passed",
+                true,
+                &ha_off_not_by_twinstor(),
+            )
+            .await;
+            ObligationStep::Stop
+        }
+    }
+}
+
+/// One pool HA cycle: `pool-ha-disable`, then `pool-ha-enable` with the SR
+/// and timeout. Run off the serial tick. Before the disable, its start
+/// checks (`pool_ha_cycle_start`); only then is the re-arm obligation
+/// written, so a cycle that stops first leaves any earlier obligation as it
+/// was. The fire-time gates are read again right before the enable; if one
+/// fails, the enable is left to the obligation.
+async fn pool_ha_cycle(ops: &dyn HaOps, sr: &str, timeout: u32, who: &'static str) -> PoolHaCycle {
+    let mut out = PoolHaCycle {
+        disabled: false,
+        enabled: false,
+        disable_note: String::new(),
+        operator_off: false,
+        disable_issued: false,
+        disable_may_land: false,
+        withheld: None,
+    };
+    match pool_ha_cycle_start(ops, who).await {
+        CycleStart::Go => {}
+        CycleStart::Stop(why) => {
+            info!(heal_event = "pool_ha_cycle", who, step = "not_started", reason = %why,
+                  "pool HA cycle not started: {why}");
+            out.disable_note = why;
+            return out;
+        }
+        CycleStart::OffNotByUs(note, clear) => {
+            pool_ha_off_not_by_us(ops, who, &note, clear, &ha_off_not_by_twinstor()).await;
+            out.operator_off = true;
+            out.disable_note = note;
+            return out;
+        }
+    }
+    // Pending until the disable is seen to take: only then is a re-arm owed.
+    ops.write_obligation(
+        sr,
+        timeout.into(),
+        ObligationState::Pending { until: ops.now_unix() + OBLIGATION_PENDING_FOR },
+        &format!("{who}:{}", ops.now_unix()),
+    );
+    ops.touch_attempt();
+    out.disable_issued = true;
+    match pool_ha_disable_step(ops).await {
+        DisableStep::Disabled(step) => {
+            ops.set_obligation_state(ObligationState::Owed);
+            out.disabled = true;
+            out.disable_note = step.to_string();
+            info!(heal_event = "pool_ha_cycle", who, step, "pool HA cycle: pool HA is off");
+        }
+        DisableStep::RefusedButOff(note) => {
+            pool_ha_off_not_by_us(ops, who, &note, true, &ha_off_disable_refused()).await;
+            out.operator_off = true;
+            out.disable_note = note;
+            return out;
+        }
+        DisableStep::Failed(note, may_land) => {
+            warn!(heal_event = "pool_ha_cycle", who, step = "disable_failed", outcome = %note,
+                  may_land, "pool HA cycle: {note}");
+            if !may_land {
+                ops.clear_obligation();
+            }
+            out.disable_note = note;
+            out.disable_may_land = may_land;
+            return out;
+        }
+    }
+    // Before the enable, the disable must have finished in XAPI: wait (bounded
+    // by `HA_CMD_TIMEOUT`) until no pool HA task is pending, not a fixed
+    // pause. Still pending at the bound: no enable; the re-arm obligation
+    // retries it once XAPI is done.
+    if !wait_no_pending_ha_task(ops, HA_CMD_TIMEOUT).await {
+        info!(heal_event = "pool_ha_cycle", who, step = "enable_deferred",
+              "pool HA cycle: a pool HA task is still pending in XAPI; the enable is left to \
+               the re-arm obligation");
+        return out;
+    }
+    // A returning peer's readmission can leave the heartbeat SR's PBD
+    // transiently unplugged; plug it first so the enable does not fail "the
+    // SR has no attached PBDs".
+    ops.plug_pbds().await;
+    if let Some(why) = ops.gates().await {
+        log_cycle_withheld(who, "enable", &why);
+        out.withheld = Some(format!("enable: {why}"));
+        return out;
+    }
+    if !enable_still_owed(ops, who, "enable") {
+        out.withheld = Some("enable: the re-arm obligation is no longer owed".into());
+        return out;
+    }
+    ops.touch_attempt();
+    out.enabled = matches!(ops.enable(sr, timeout.into()).await, HaCmd::Done);
+    if out.enabled {
+        // From here any later HA-off is not TwinStor's.
+        ops.set_obligation_state(ObligationState::Enabled);
+    }
+    info!(heal_event = "pool_ha_cycle", who, step = "enable", enabled = out.enabled,
+          "pool HA cycle: pool-ha-enable {}", if out.enabled { "returned" } else { "failed" });
+    out
+}
+
 struct InflightGuard(Arc<AtomicBool>);
 impl Drop for InflightGuard {
     fn drop(&mut self) {
@@ -5349,7 +8577,7 @@ fn rebooted_since_healthy() -> Option<bool> {
         .ok()?
         .as_secs();
     let boot_time = now.checked_sub(uptime)?;
-    let stamp = std::fs::read_to_string(LAST_HEALTHY_PATH)
+    let stamp = std::fs::read_to_string(LAST_HEALTHY_PATH.as_str())
         .ok()?
         .trim()
         .parse::<u64>()
@@ -5872,6 +9100,23 @@ fn cannot_go_online_alert_body(err: &str, kernel: &str, minutes: u64) -> String 
     )
 }
 
+/// The peer-daemon check's management clock: `None` (skip the check) while P
+/// is false, which also restarts the clock; otherwise when P last came back
+/// (unix seconds).
+fn peer_daemon_p_clock(back_at: &mut Option<u64>, p: bool, now_unix: u64) -> Option<u64> {
+    if !p {
+        *back_at = None;
+        return None;
+    }
+    Some(*back_at.get_or_insert(now_unix))
+}
+
+/// What the peer's staleness counts from: its last stamp, or when the
+/// management path came back if later (no report could arrive before).
+fn peer_daemon_reference(stamp: Option<u64>, p_back_at: u64) -> Option<u64> {
+    stamp.map(|s| s.max(p_back_at))
+}
+
 /// Whether the peer's daemon should be considered down: its alive-stamp
 /// exists (a peer that never stamped may simply run an older version:
 /// unknown, not down, so rolling upgrades stay quiet) and is stale past the
@@ -5909,6 +9154,130 @@ fn tiebreaker_decision(
     (streak, streak >= TIEBREAKER_UNREACHABLE_CHECKS)
 }
 
+/// Whether the partition view asks this host's own XAPI for the
+/// armed-mismatch answer: only while the host reads locally disarmed out of
+/// the liveset, and not on a pool whose HA was read off in the last few
+/// minutes (by any of the daemon's own reads; no call of its own). After a
+/// pool HA disable every host reads disarmed with its HA daemon stopped for
+/// good, and the xhad config file stays, so without this every such host
+/// would probe once a minute. Unknown (never read, or too old: this host's own
+/// XAPI stopped answering) probes.
+fn own_login_probe_wanted(
+    local_armed: Option<bool>,
+    xhad_online: bool,
+    last_pool_ha: Option<bool>,
+) -> bool {
+    local_armed == Some(false) && !xhad_online && last_pool_ha != Some(false)
+}
+
+/// Whether the peer-emergency check probes the peer's xapi role: at every
+/// check while pool HA is on and P holds, never otherwise.
+fn peer_role_probe_wanted(pool_ha: Option<bool>, p: bool) -> bool {
+    pool_ha == Some(true) && p
+}
+
+/// The partition view's 10-second probe of the fence-peer probe set: how many
+/// probes it ran and how many answered since the daemon started, and when one
+/// last answered (`mono_secs`, 0: never). The 10-minute tiebreaker check reads
+/// them to judge the time between two checks, not only its own ping.
+static TIEBREAKER_PROBES: AtomicU64 = AtomicU64::new(0);
+static TIEBREAKER_ANSWERS: AtomicU64 = AtomicU64::new(0);
+static TIEBREAKER_ANSWERED_MONO: AtomicU64 = AtomicU64::new(0);
+
+/// Seconds on a monotonic clock since the daemon first asked, plus one (so 0
+/// can mean "never"): unaffected by wall-clock steps.
+fn mono_secs() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1
+}
+
+/// Record one view probe of the tiebreaker set (`None`: no target).
+fn note_tiebreaker_probe(answered: Option<bool>) {
+    let Some(answered) = answered else {
+        return;
+    };
+    TIEBREAKER_PROBES.fetch_add(1, Ordering::Relaxed);
+    if answered {
+        TIEBREAKER_ANSWERS.fetch_add(1, Ordering::Relaxed);
+        TIEBREAKER_ANSWERED_MONO.store(mono_secs(), Ordering::Relaxed);
+    }
+}
+
+/// When (`mono_secs`) the peer-emergency probe last saw the peer's XAPI
+/// answer HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED (0: not, or cleared). The
+/// partition view shows `PeerDisarmed` while it is recent.
+static PEER_ARMED_MISMATCH_AT: AtomicU64 = AtomicU64::new(0);
+
+/// How long one sighting keeps `PeerDisarmed` up: the probe runs once a
+/// minute while a sighting stands, and a single other answer (the peer's xapi
+/// restarting) must not drop the view between two sightings.
+const PEER_DISARMED_FRESH_SECS: u64 = 150;
+
+fn peer_disarmed_fresh(seen: u64, now: u64) -> bool {
+    seen > 0 && now.saturating_sub(seen) <= PEER_DISARMED_FRESH_SECS
+}
+
+fn peer_disarmed_recently(now: u64) -> bool {
+    peer_disarmed_fresh(PEER_ARMED_MISMATCH_AT.load(Ordering::Relaxed), now)
+}
+
+/// The failing window of the tiebreaker set: from `since` (monotonic
+/// seconds), the view probes run and answered in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TiebreakerOutage {
+    since: u64,
+    answered: u64,
+    probes: u64,
+}
+
+/// One failed-or-not tiebreaker check. `answered` and `probes` are the view
+/// probe's counts since the previous check, `window_start` that check's time
+/// (or the daemon start). Loss-tolerant like the management predicate: the
+/// streak of failed checks restarts only when the set answered a majority of
+/// the probes since the previous check, so a gateway that answers now and
+/// then still alerts. Returns whether the streak restarts and the window.
+fn tiebreaker_observe(
+    reachable_now: bool,
+    answered: u64,
+    probes: u64,
+    window_start: u64,
+    outage: Option<TiebreakerOutage>,
+    now: u64,
+) -> (bool, Option<TiebreakerOutage>) {
+    if reachable_now {
+        return (false, None);
+    }
+    if probes > 0 && answered.saturating_mul(2) > probes {
+        // Mostly answering until recently: the failing window starts here.
+        return (true, Some(TiebreakerOutage { since: now, answered: 0, probes: 0 }));
+    }
+    let mut o = outage.unwrap_or(TiebreakerOutage { since: window_start, answered: 0, probes: 0 });
+    o.answered += answered;
+    o.probes += probes;
+    (false, Some(o))
+}
+
+/// The measured state for the alert text: how long since the set last
+/// answered, or how little it answered over the failing window.
+fn tiebreaker_outage_text(outage: Option<TiebreakerOutage>, last_answer: u64, now: u64) -> String {
+    let mins = |from: u64| now.saturating_sub(from) / 60;
+    match outage {
+        Some(o) if o.answered > 0 => format!(
+            "answered only {} of {} probes over the last {} minutes",
+            o.answered,
+            o.probes,
+            mins(o.since)
+        ),
+        _ if last_answer > 0 => format!("has not answered for {} minutes", mins(last_answer)),
+        Some(o) => format!(
+            "has not answered for at least {} minutes (no answer seen since this daemon \
+             started)",
+            mins(o.since)
+        ),
+        None => "has not answered at the last checks".to_string(),
+    }
+}
+
 /// Self-heal for the fence-peer leftover suspend (the HA-off freeze): the
 /// handler suspends I/O on a yield but nothing lifts it once the peer is back.
 /// Resume only when the cluster is healthy again (Connected, both UpToDate)
@@ -5922,36 +9291,6 @@ fn should_resume_io(s: &DrbdStatus) -> bool {
         && s.connection == ConnectionState::Connected
         && s.disk == DiskState::UpToDate
         && s.peer_disk == Some(DiskState::UpToDate)
-}
-
-/// Whether the replica pair is fully redundant right now: Connected with both
-/// sides UpToDate. Then a pool-HA disable/enable cycle (the peer-emergency
-/// resolver's remedy) is low-risk: no resync is in flight, neither replica is
-/// behind, and protection re-arms with the data intact. This gates the reduced
-/// `PEER_EMERGENCY_FAST_AFTER` maturity: act sooner on a persistent wedge only
-/// when cycling HA puts no data at risk.
-fn storage_safe_to_cycle_ha(s: &DrbdStatus) -> bool {
-    s.connection == ConnectionState::Connected
-        && s.disk == DiskState::UpToDate
-        && s.peer_disk == Some(DiskState::UpToDate)
-        // A user/fence-handler I/O suspend (e.g. on-no-data-accessible) marks a
-        // pair that just came through a fence or split-brain recovery, which is
-        // when the conservative full maturity is wanted, even though the disks
-        // read UpToDate. Matches the sibling `storage_healthy` gate.
-        && !s.suspended_user
-}
-
-/// Eligibility (peer-liveness half) of the reduced fast maturity. The fast path
-/// may engage only while the emergency signature holds and the raw liveness
-/// reads the peer not live right now. Never on the debounced `live`: the flap
-/// bridge holds it at `Some(false)` for up to `PEER_EMERGENCY_FLAP_TOLERANCE`
-/// past a real recovery, so maturing the ~240 s fast path on it could cycle HA
-/// on a peer that already readmitted. A raw-live (`Some(true)`) or unreadable
-/// (`None`) peer falls back to the full blind maturity. The caller combines
-/// this with the storage-safety read, short-circuited so no `drbdadm status`
-/// runs unless this is true.
-fn fast_maturity_wedge_eligible(signature: bool, live_raw: Option<bool>) -> bool {
-    signature && live_raw == Some(false)
 }
 
 /// Per-sample signature of the dual-reboot mutual-SyncSource limbo as seen from
@@ -6261,6 +9600,23 @@ struct XhaLogSignals {
     /// self-clear keys on this signal, accumulated on a rolling window like the
     /// others.
     invalid_state: bool,
+    /// Whether the latest HA daemon start seen in the window ended with
+    /// "Invalid pool state (1906)" (`None`: no start or exit seen yet). xhad
+    /// exits that way when pool HA is disabled under it.
+    last_start_invalid_pool: Option<bool>,
+    /// "Invalid pool state (1906)" exits seen in the window.
+    invalid_pool_exits: u32,
+}
+
+impl XhaLogSignals {
+    /// Positive local evidence that pool HA is off: the latest HA daemon
+    /// start in the window ended with "Invalid pool state" (1906), the only
+    /// such exit in the window, and nothing started it again. A repeating
+    /// 1906 means something keeps restarting the daemon, which XAPI does only
+    /// while it sees pool HA on (the invalid-state wedge the self-clear owns).
+    fn pool_ha_off_seen(&self) -> bool {
+        self.last_start_invalid_pool == Some(true) && self.invalid_pool_exits == 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6339,6 +9695,164 @@ fn readmission_decision(
     ReadmissionAction::Schedule
 }
 
+/// This host's own checks before phase 1 (local reads only; no check of
+/// the peer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DancePhase1 {
+    /// Disarm now.
+    Go,
+    /// Not now; the next pass checks again (`why`).
+    Hold(&'static str),
+    /// Cancel the dance (`why`).
+    Cancel(&'static str),
+}
+
+/// Phase 1's own checks: pool HA must read on and no pool HA operation may
+/// be pending. An unreadable task list holds phase 1 for the next pass only
+/// while the time left before the sync point (`time_left`, seconds) still
+/// exceeds phase 1's normal lead (`lead`: the HA timeout plus a minute, at
+/// least 120 s), so a held phase 1 still leaves that quiet period; then it
+/// cancels.
+fn dance_phase1_check(
+    pool_ha: Option<bool>,
+    tasks: Option<&[xapi::PendingHaTask]>,
+    time_left: u64,
+    lead: u64,
+) -> DancePhase1 {
+    if pool_ha != Some(true) {
+        return DancePhase1::Cancel("pool HA does not read on");
+    }
+    match tasks {
+        Some(t) if !t.is_empty() => DancePhase1::Cancel("a pool HA operation is pending in XAPI"),
+        Some(_) => DancePhase1::Go,
+        None if time_left > lead => DancePhase1::Hold("XAPI's task list is unreadable"),
+        None => DancePhase1::Cancel(
+            "XAPI's task list stayed unreadable until too close to the sync point",
+        ),
+    }
+}
+
+/// How long after the dance's sync point a host its phase 1 disarmed waits
+/// for the master's pool HA cycle (a disable and an enable, each bounded by
+/// `HA_CMD_TIMEOUT`) before it alerts about itself.
+const DANCE_REARM_WAIT: u64 = 2 * HA_CMD_TIMEOUT.as_secs() + 60;
+
+/// The alert for a host the dance's phase 1 disarmed and no pool HA cycle
+/// re-armed; `what` says what happened.
+fn dance_disarmed_alert(host: &str, master: &str, what: &str, t: u32) -> String {
+    format!(
+        "TwinStor on {host}: the XHA re-admission recovery disarmed this host locally (its \
+         phase 1), but {what}. This host stays locally \
+         disarmed under the armed pool, where HA does not protect it; TwinStor does not retry. \
+         To re-arm: on the pool master {master} run 'xe pool-ha-disable', then 'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR \
+         uuid> ha-config:timeout={t}'."
+    )
+}
+
+/// The re-admission check waits while the dance's own pool HA cycle runs.
+fn readmission_cycle_holds(pending: bool, inflight: bool) -> bool {
+    pending && inflight
+}
+
+/// Apply the configuration keys to a readmission verdict computed with the
+/// automation allowed: `readmission_assist` governs only the dance (Schedule),
+/// `rejoin_assist` the dead-xhad revive. A disabled action falls back to the
+/// manual-runbook alert, as the decision does for a disabled assist.
+fn readmission_keys(
+    action: ReadmissionAction,
+    readmission_assist: bool,
+    rejoin_assist: bool,
+) -> ReadmissionAction {
+    match action {
+        ReadmissionAction::Schedule if !readmission_assist => ReadmissionAction::AlertManual,
+        ReadmissionAction::Revive if !rejoin_assist => ReadmissionAction::AlertManual,
+        a => a,
+    }
+}
+
+/// The local revive and the manual-runbook alert (with the HA-deadlock exit
+/// behind it), never on a pool whose HA reads off, nor on a host XAPI holds
+/// in its HA startup loop: with pool HA off a stopped xhad is correct, and a
+/// host held in the startup loop is XAPI's to release. An unknown pool HA
+/// proceeds: in a real join deadlock the slave's forwarded xe times out, and
+/// that must not blind the escalation or the exit written for it. Returns
+/// the action and, when held, why. The dance (`Schedule`) keeps its own
+/// fire-time gates.
+fn readmission_scope(
+    action: ReadmissionAction,
+    scope: ReadmissionScope,
+) -> (ReadmissionAction, Option<&'static str>) {
+    let ReadmissionScope { pool_ha, startup_loop, cut_from_master, pool_ha_off_seen } = scope;
+    if !matches!(action, ReadmissionAction::Revive | ReadmissionAction::AlertManual) {
+        return (action, None);
+    }
+    if startup_loop {
+        return (
+            ReadmissionAction::Wait,
+            Some("XAPI holds this host in its HA startup loop (armed, not in the liveset, the \
+                  peer's management address silent)"),
+        );
+    }
+    if cut_from_master {
+        return (
+            ReadmissionAction::Wait,
+            Some("this slave is cut off from the pool master's management address while the \
+                  peer is alive on replication: the runbook's commands run on the master, and \
+                  this host's HA daemon cannot join until the management network is back"),
+        );
+    }
+    if pool_ha_off_seen {
+        return (
+            ReadmissionAction::Wait,
+            Some("this host's HA daemon last exited with 'Invalid pool state (1906)', which it \
+                  logs when pool HA is disabled, and nothing restarted it: pool HA is off as far \
+                  as this host can tell"),
+        );
+    }
+    if pool_ha == Some(false) {
+        return (ReadmissionAction::Wait, Some("pool HA is off"));
+    }
+    (action, None)
+}
+
+/// What the revive and the runbook alert are scoped by (see
+/// `readmission_scope`).
+#[derive(Debug, Clone, Copy, Default)]
+struct ReadmissionScope {
+    /// The pool HA read (`None`: unreadable, which proceeds).
+    pool_ha: Option<bool>,
+    /// XAPI holds this host in its HA startup loop.
+    startup_loop: bool,
+    /// A slave cut off from its master's management address (P false) while
+    /// the peer is alive on replication, armed or not.
+    cut_from_master: bool,
+    /// Positive local evidence that pool HA is off (the HA daemon's own
+    /// 1906 exit, see `XhaLogSignals::pool_ha_off_seen`).
+    pool_ha_off_seen: bool,
+}
+
+/// A slave cut off from its master: P false, the peer alive on replication,
+/// and pool.conf names a master (this host is not it).
+fn readmission_cut_from_master(p: bool, peer_alive: bool, local_pool_role: Option<bool>) -> bool {
+    !p && peer_alive && local_pool_role == Some(false)
+}
+
+/// What the re-admission check does with the decision: the operator keys
+/// (`readmission_keys`), then the scope (`readmission_scope`).
+fn readmission_plan(
+    decision: ReadmissionAction,
+    ha: &crate::config::HaConfig,
+    scope: ReadmissionScope,
+) -> (ReadmissionAction, Option<&'static str>) {
+    readmission_scope(readmission_keys(decision, ha.readmission_assist, ha.rejoin_assist), scope)
+}
+
+/// A whole-switch verdict holds: the tick's hold, or the fast guard's
+/// (which disarms ahead of the tick and may be all there is).
+fn whole_switch_in_force(tick_hold: bool, guard: bool) -> bool {
+    tick_hold || guard
+}
+
 /// The deterministic sync point both daemons independently agree on: the
 /// next multiple of 300s (UNIX time) at least 150s away. Clock skew between
 /// pool hosts is NTP-bounded to seconds; the join windows tolerate far more.
@@ -6374,8 +9888,18 @@ fn scan_xha_log(path: &str, offset: u64) -> (XhaLogSignals, u64) {
         || buf.contains("(1610)")
         || buf.contains("(1508)")
         || buf.contains("(1607)");
+    sig.invalid_pool_exits = buf.matches("Invalid pool state (1906)").count() as u32;
+    let last_start = buf.rfind(XHAD_START_LINE);
+    let last_exit = buf.rfind("Invalid pool state (1906)");
+    sig.last_start_invalid_pool = match (last_start, last_exit) {
+        (None, None) => None,
+        (s, e) => Some(e > s),
+    };
     (sig, start + buf.len() as u64)
 }
+
+/// The line xhad logs at each start.
+const XHAD_START_LINE: &str = "HA daemon started - built at";
 
 /// Verdict of the Init-side StandAlone heal for the current tick:
 /// `Hold` means the heal owns the tick (bring-up must not proceed to the
@@ -6490,6 +10014,8 @@ pub struct StateMachine {
     connected_verdict_len: u64,
     // `<run dir>/fence-verdict` (the handler's verdict lines).
     verdict_path: String,
+    // `<run dir>/fence-peer.lock`, held by a fence-peer run while it decides.
+    fence_lock_path: String,
     // A yield marker on a disconnected Primary whose I/O is not frozen by the
     // yield's own suspend: since when, and whether it was logged.
     yield_unfrozen_since: Option<std::time::Instant>,
@@ -6532,6 +10058,9 @@ pub struct StateMachine {
     // StandAlone), and whether we have already raised the wedge alert. Both
     // reset when resolution succeeds or the episode ends.
     sb_keepdata_stuck: u32,
+    /// The survivor reset's announcement went out for this stuck episode
+    /// (cleared with `sb_keepdata_stuck`).
+    survivor_reset_announced: bool,
     sb_wedge_alerted: bool,
     // Dual-master auto-heal: how many toolstack restarts we have fired this
     // wedge episode, and how many wedge re-confirmations have elapsed since the
@@ -6658,6 +10187,9 @@ pub struct StateMachine {
     // freshens; re-raised daily while stale).
     last_alive_stamp: Option<std::time::Instant>,
     last_peer_daemon_check: Option<std::time::Instant>,
+    /// When the peer's management address last started answering (unix),
+    /// for the peer-daemon staleness (see `peer_daemon_p_clock`).
+    peer_daemon_p_back_at: Option<u64>,
     last_peer_freeze_check: Option<std::time::Instant>,
     io_frozen_read: Option<(std::time::Instant, bool, bool)>,
     serving_claim_check_at: Option<std::time::Instant>,
@@ -6672,6 +10204,11 @@ pub struct StateMachine {
     last_tiebreaker_check: Option<std::time::Instant>,
     tiebreaker_bad_streak: u32,
     tiebreaker_alert_at: Option<std::time::Instant>,
+    // Monotonic time of the last check, the view probe's (answered, probes)
+    // counters then, and the failing window (see `tiebreaker_observe`).
+    tiebreaker_last_check: u64,
+    tiebreaker_counts_at_check: (u64, u64),
+    tiebreaker_outage: Option<TiebreakerOutage>,
     // Degraded bookkeeping: tick counter for the throttled re-attach
     // attempts, and when the degraded alert was last raised (for the
     // periodic reminder).
@@ -6967,6 +10504,8 @@ pub struct StateMachine {
     // runbook. `_alerted_at` throttles re-alerts.
     readmission_flap_since: Option<std::time::Instant>,
     readmission_flap_alerted_at: Option<std::time::Instant>,
+    /// The flap alert is due and not yet delivered.
+    readmission_flap_alert_owed: bool,
     // XHA re-admission watchdog. Suspicion window start, the xha.log
     // scan offset for the current window, accumulated signals, the planned
     // wall-clock dance point (UNIX secs) with its phase-1 done flag, the
@@ -6981,6 +10520,9 @@ pub struct StateMachine {
     // join-deadlock recovery complete.
     readmission_confirm_since: Option<std::time::Instant>,
     readmission_disabled_done: bool,
+    /// After this host's dance phase 1: from when (unix seconds) a host still
+    /// locally disarmed under the armed pool alerts once about itself.
+    dance_disarm_watch: Option<u64>,
     // HA re-arm self-heal escalation: failed-attempt counter for this
     // incident. Reset when the obligation clears (HA armed, no incident).
     rearm_attempt: u32,
@@ -7070,9 +10612,15 @@ pub struct StateMachine {
     /// ISOLATED_MASTER_CLEAR_GRACE, so a transient xe-alive flip (e.g. a sibling
     /// toolstack restart) cannot starve the operator alert. Reset when xe_dead.
     isolated_master_recovered_since: Option<std::time::Instant>,
+    /// While the connected side's isolation clock runs: the last change in
+    /// what this host sees of XHA's inputs (see `XhaReachClock`).
+    xha_reach: XhaReachClock,
     // Observability-only throttle for the isolated_master_clock_held re-log (see const).
     last_clock_held_log_at: Option<std::time::Instant>,
     master_isolated_since: Option<std::time::Instant>,
+    /// The connected side's isolated-master alert was withdrawn from the
+    /// queue (the master answers again).
+    isolated_master_alert_withdrawn: bool,
     master_isolated_alerted_at: Option<std::time::Instant>,
     // Throttles the re-alert when an isolated master is eligible to stand down
     // but pool HA is off, so the stand-down is suppressed (there is no XHA to
@@ -7173,22 +10721,67 @@ pub struct StateMachine {
     vdi_lock_prev: Option<(std::time::Instant, Vec<String>)>,
     // HA-armed mismatch sentinel.
     armed_mismatch_alerted: bool,
-    // Peer-emergency resolver (phase 2, config-gated).
-    peer_emergency_since: Option<std::time::Instant>,
-    peer_emergency_last_action: Option<std::time::Instant>,
-    // when the peer-emergency signature first dropped while `since` was active
-    // (debounce tracker; bridges flaps so the maturity clock isn't starved).
-    peer_emergency_clear_since: Option<std::time::Instant>,
-    // when the wedge became locally confirmed: the signature held and the peer is
-    // a member of this host's xhad liveset. Gates the fast-path resolve so the
-    // pool-HA cycle fires shortly after the peer rejoins the liveset instead of
-    // waiting out the blind maturity timer. Reset whenever either term drops.
-    peer_liveset_wedge_since: Option<std::time::Instant>,
+    // Peer-emergency resolver (phase 2, config-gated): the last reset that
+    // could not be issued (retry pace; the budget counts issued resets).
+    peer_emergency_unissued_at: Option<std::time::Instant>,
+    peer_emergency_budget_path: String,
+    /// The budget's verdict on the last reset, while it is pending.
+    peer_emergency_verdict: Option<ResetVerdict>,
+    /// The budget as this daemon last changed it, while its file write
+    /// fails, and whether that was alerted.
+    pe_budget_unwritten: Option<PeerEmergencyBudget>,
+    /// When the unwritable-budget alert was last sent.
+    pe_budget_alerted_at: Option<std::time::Instant>,
+    /// The budget's hold on the reset now: until when, and why.
+    peer_emergency_hold: Option<(u64, String)>,
+    /// When a TwinStor hold (whole-switch, stand-down) last released.
+    twinstor_hold_released_at: Option<std::time::Instant>,
+    /// The first-sighting alert went out for the current wedge, and how many
+    /// normal answers in a row the peer has given since (two end the wedge).
+    peer_disarm_alerted: bool,
+    peer_normal_in_row: u8,
+    /// A first-sighting alert sent off the tick and delivered: the long
+    /// hold it named, if any (to mark that hold alerted).
+    peer_disarm_alert_result: Arc<std::sync::Mutex<Option<FirstAlertOutcome>>>,
+    /// This host's last known mastership, as the peer-emergency check read
+    /// it: a change either way ends the first-sighting alert's per-wedge
+    /// mark (a daemon start, `None`, does not).
+    pe_last_master: Option<bool>,
+    /// The disarmed-host-with-VMs alert of the self-unwedge check, paced.
+    self_unwedge_vm_alerted_at: Option<std::time::Instant>,
+    /// The self-clear ran and its report is not delivered yet.
+    self_unwedge_report: Option<String>,
+    /// The disarmed host's last alert, withdrawn from the queue once this
+    /// host reads armed again.
+    self_unwedge_vm_alert_raised: bool,
+    // The first probe of the current run that found the peer's xapi answering
+    // HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED (the positive trigger, see
+    // `armed_mismatch_confirm`).
+    peer_mismatch: MismatchSightings,
+    /// The result of a pool HA cycle running off the tick, and which repair
+    /// started it (`peer_emergency` or `recorded_rearm`).
+    ha_cycle_result: Arc<std::sync::Mutex<Vec<(&'static str, PoolHaCycle)>>>,
+    // The result of the re-arm obligation's last enable, run off the tick
+    // (`spawn_rearm_enable`), for the next re-arm pass.
+    rearm_enable_result: Arc<std::sync::Mutex<Option<(RearmEnable, std::time::Instant, u64)>>>,
+    // Re-arm passes that reached the result read (tags each enable's result
+    // with the pass that started it).
+    rearm_pass: u64,
+    // Re-arm enables actually issued (results other than withheld).
+    rearm_enables_issued: Arc<AtomicU64>,
+    // The lone-survivor masterless path's own enable retry, while it runs.
+    masterless_retry: Option<MasterlessRetry>,
+    rearm_enable_from_slave: bool,
+    /// The re-arm toolstack escalation's persisted count (see
+    /// `ha_rearm_ts_path`).
+    rearm_ts_path: String,
+    // The dance's phase-2 pool HA cycle was started and its outcome is not
+    // read yet.
+    readmission_cycle_pending: bool,
     // When the last pool-level HA reset was issued, if a resolve is currently
     // being confirmed. While `Some`, the resolver watches for the peer
     // to actually come back live instead of latching "resolved" blindly.
     peer_emergency_resolve_at: Option<std::time::Instant>,
-    peer_emergency_confirm_alerted_at: Option<std::time::Instant>,
     // Peer-local self-clear of the invalid-pool-state wedge.
     self_unwedge_since: Option<std::time::Instant>,
     self_unwedge_last_action: Option<std::time::Instant>,
@@ -7269,16 +10862,10 @@ pub struct StateMachine {
     slave_rejoin_healthy_since: Option<std::time::Instant>,
     // PBD-plug watchdog throttle.
     last_pbd_check: Option<std::time::Instant>,
-    // Peer host-metrics-live from the master's view, to detect the rejoin edge
-    // (not live to live) that triggers the post-fence HA re-arm.
-    peer_live_last: Option<bool>,
-    // The pool-HA state last observed while the peer was steadily live (both
-    // this tick and last). On a peer rejoin, this is the HA state from before
-    // the peer left: Some(true) means HA was armed then (a fence disabled it, so
-    // re-arm); Some(false) means the operator had already run pool-ha-disable
-    // while the peer was alive (respect it, do not re-arm on the reboot). Keeps
-    // a peer reboot from silently undoing an operator's disable.
-    ha_at_peer_alive: Option<bool>,
+    // The master's watch of the peer's rejoin edge and of pool HA while the
+    // peer was live, for the "pool HA is off and TwinStor did not turn it
+    // off" alert (see `RejoinWatch`). Reset whenever this host is not master.
+    rejoin_watch: RejoinWatch,
     // Wrongly-demoted-survivor auto-heal: debounce timer, last re-assert stamp,
     // bounded attempt counter (the survivor demoted below a stale ex-master).
     demoted_survivor_since: Option<std::time::Instant>,
@@ -7377,6 +10964,63 @@ pub struct StateMachine {
     // own yield, and when they were last read (`note_guest_arrivals_while_frozen`).
     frozen_domains: Option<std::collections::HashSet<u32>>,
     frozen_arrival_check_at: Option<std::time::Instant>,
+    /// Peer management reachability (the predicate P and its settle clock),
+    /// written by the prober task (`mgmt_reach::spawn_prober`), read at fire
+    /// time by every gated HA action.
+    mgmt: crate::mgmt_reach::Shared,
+    /// Test seam: a fixed P snapshot instead of the prober's.
+    #[cfg(test)]
+    test_p: Option<crate::mgmt_reach::PView>,
+    /// A stale P snapshot was logged (logged once per change).
+    p_stale_logged: AtomicBool,
+    /// Test seam: what the peer's xapi answers (`peer_role_probe`), and how
+    /// many times it was probed.
+    #[cfg(test)]
+    test_peer_role: xapi::PeerXapiRole,
+    #[cfg(test)]
+    test_role_probes: std::sync::atomic::AtomicU32,
+    /// Test seam: scripted pool HA operations for the off-tick routines
+    /// (`None`: they are not started in tests).
+    #[cfg(test)]
+    test_ha_ops: Option<Arc<dyn HaOps>>,
+    /// The last HA action a fire-time gate withheld, and why.
+    ha_withheld: Option<Withheld>,
+    /// Mirror of `whole_switch_held` for the partition-view task.
+    hold_view_flag: Arc<AtomicBool>,
+    /// Since when the forwarded-xe housekeeping has been skipped.
+    fwd_skip_since: Option<std::time::Instant>,
+    /// Returning-slave reconnect: how long the local xapi has stayed silent
+    /// with one process ID since P became true.
+    slave_xapi_stuck: crate::mgmt_reach::StuckXapi,
+    /// The isolated-master check's last "the local xapi answers as master"
+    /// read (when, answer), reused for `LOCAL_MASTER_CACHE_TTL`.
+    local_master_cache: Option<(std::time::Instant, bool)>,
+    /// The last probed answer of the peer's xapi (`peer_role_probe_cached`).
+    peer_role_cache: Option<(std::time::Instant, xapi::PeerXapiRole)>,
+    /// Second-master demote guard: last check, first read of evidence (a),
+    /// whether this host was seen parked (armed, cut off) this daemon life,
+    /// the last demote and the demotes of this episode, and the last alert.
+    second_master_checked_at: Option<std::time::Instant>,
+    second_master_a_since: Option<std::time::Instant>,
+    /// A confirmed park (failed join while armed and cut off), and XAPI's
+    /// release from it by an invalid pool state, from xha.log read from
+    /// `park_log_offset` (see `scan_park_signals`).
+    seen_parked: bool,
+    released_by_pool: bool,
+    park_log_offset: Option<u64>,
+    xha_log_path: String,
+    /// The persisted demote budget (`DemoteBudget`).
+    second_master_budget_path: String,
+    /// Test seam: local and peer facts for the HA checks driven through their
+    /// real call sites, and the actions they took (see `TestHa`).
+    #[cfg(test)]
+    test_ha: Option<TestHa>,
+    /// Recorded-disarm re-arm: its last check, and since when this host's
+    /// own liveset has shown both hosts live (see
+    /// `check_recorded_disarm_rearm`). The record's path, a field for tests.
+    recorded_rearm_checked_at: Option<std::time::Instant>,
+    recorded_rearm_liveset_since: Option<std::time::Instant>,
+    disarm_record_path: String,
 }
 
 impl StateMachine {
@@ -7432,6 +11076,13 @@ impl StateMachine {
                     .to_string_lossy()
                     .to_string(),
             ),
+            fence_lock_path: test_private_path(
+                "fence-peer-lock",
+                std::path::Path::new(&fence_yield_marker())
+                    .with_file_name("fence-peer.lock")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
             yield_unfrozen_since: None,
             yield_unfrozen_logged: false,
             landed_unarmed_streak: 0,
@@ -7447,6 +11098,7 @@ impl StateMachine {
             sb_resolved_alerted: false,
             sb_discard_alert_body: None,
             sb_keepdata_stuck: 0,
+            survivor_reset_announced: false,
             sb_wedge_alerted: false,
             auto_heal_restarts: 0,
             auto_heal_holds: 0,
@@ -7457,7 +11109,7 @@ impl StateMachine {
             offer_path: discard_offer_marker(),
             win_path: if cfg!(test) {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                std::env::temp_dir()
+                crate::heal_state::test_tmp_dir()
                     .join(format!(
                         "twinstor-test-win-claim-{}-{}",
                         std::process::id(),
@@ -7470,7 +11122,7 @@ impl StateMachine {
             },
             yield_guests_path: if cfg!(test) {
                 static G: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                std::env::temp_dir()
+                crate::heal_state::test_tmp_dir()
                     .join(format!(
                         "twinstor-test-yield-guests-{}-{}",
                         std::process::id(),
@@ -7490,7 +11142,7 @@ impl StateMachine {
             path_check_at: None,
             sb_marker_seen_at: None,
             steer_pending_path: if cfg!(test) {
-                std::env::temp_dir()
+                crate::heal_state::test_tmp_dir()
                     .join(format!(
                         "twinstor-test-steer-pending-{}",
                         std::process::id()
@@ -7536,6 +11188,7 @@ impl StateMachine {
             cannot_online_alert_at: None,
             last_alive_stamp: None,
             last_peer_daemon_check: None,
+            peer_daemon_p_back_at: None,
             last_peer_freeze_check: None,
             io_frozen_read: None,
             serving_claim_check_at: None,
@@ -7550,6 +11203,9 @@ impl StateMachine {
             last_tiebreaker_check: None,
             tiebreaker_bad_streak: 0,
             tiebreaker_alert_at: None,
+            tiebreaker_last_check: 0,
+            tiebreaker_counts_at_check: (0, 0),
+            tiebreaker_outage: None,
             degraded_ticks: 0,
             diskless_peer_lost_at: None,
             diskless_target_stopped: false,
@@ -7597,7 +11253,7 @@ impl StateMachine {
             split_guests_path: test_private_path("split-guests", split_guests_marker()),
             peer_portal_release: false,
             peer_portal_marker: if cfg!(test) {
-                std::env::temp_dir()
+                crate::heal_state::test_tmp_dir()
                     .join(format!("twinstor-test-peer-portal-{}", std::process::id()))
                     .to_string_lossy()
                     .to_string()
@@ -7644,8 +11300,7 @@ impl StateMachine {
             slave_rejoin_restart_at: None,
             slave_rejoin_restarts: 0,
             last_pbd_check: None,
-            peer_live_last: None,
-            ha_at_peer_alive: None,
+            rejoin_watch: RejoinWatch::default(),
             demoted_survivor_since: None,
             demoted_survivor_action_at: None,
             demoted_survivor_attempts: 0,
@@ -7678,7 +11333,7 @@ impl StateMachine {
             arb_keep_path: test_private_path(
                 "arb-keep",
                 std::env::var("TWINSTOR_ARB_KEEP_MARKER")
-                    .unwrap_or_else(|_| "/run/twinstor/arb-mutual-keep".to_string()),
+                    .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/arb-mutual-keep")),
             ),
             arb_keep_retry_at: None,
             own_target_cut_at: None,
@@ -7687,14 +11342,14 @@ impl StateMachine {
             take_intent_path: test_private_path(
                 "take-intent",
                 std::env::var("TWINSTOR_TAKE_INTENT_MARKER")
-                    .unwrap_or_else(|_| "/run/twinstor/mutual-take-intent".to_string()),
+                    .unwrap_or_else(|_| crate::heal_state::state_path("/run/twinstor/mutual-take-intent")),
             ),
             // Durable: a reboot of this node during the episode must not forget
             // that the peer froze with guests (cleared at the episode end).
             peer_guests_path: test_private_path(
                 "peer-guests",
                 std::env::var("TWINSTOR_PEER_GUESTS_MARKER")
-                    .unwrap_or_else(|_| "/var/lib/twinstor/peer-had-guests".to_string()),
+                    .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/peer-had-guests")),
             ),
             claim_publish: std::sync::Arc::new(std::sync::Mutex::new(())),
             arb_yield_hold_alerted: false,
@@ -7742,6 +11397,7 @@ impl StateMachine {
             xha_liveset_member: false,
             readmission_flap_since: None,
             readmission_flap_alerted_at: None,
+            readmission_flap_alert_owed: false,
             readmission_ticks: 0,
             readmission_suspect_since: None,
             readmission_log_offset: 0,
@@ -7751,6 +11407,7 @@ impl StateMachine {
             readmission_dance_t: None,
             readmission_confirm_since: None,
             readmission_disabled_done: false,
+            dance_disarm_watch: None,
             readmission_last_dance: None,
             readmission_last_revive: None,
             readmission_last_activity: None,
@@ -7802,9 +11459,11 @@ impl StateMachine {
             mutual_slave_alerted: false,
             isolated_master_since: None,
             isolated_master_recovered_since: None,
+            xha_reach: XhaReachClock::default(),
             last_clock_held_log_at: None,
             isolated_master_alerted_at: None,
             master_isolated_since: None,
+            isolated_master_alert_withdrawn: false,
             master_isolated_alerted_at: None,
             standdown_ha_off_alerted_at: None,
             standdown_guest_stop_alerted_at: None,
@@ -7838,12 +11497,58 @@ impl StateMachine {
             ha_deadlock_action_at: None,
             vdi_lock_prev: None,
             armed_mismatch_alerted: false,
-            peer_emergency_since: None,
-            peer_liveset_wedge_since: None,
-            peer_emergency_last_action: None,
-            peer_emergency_clear_since: None,
+            mgmt: Default::default(),
+            #[cfg(test)]
+            test_p: None,
+            p_stale_logged: AtomicBool::new(false),
+            #[cfg(test)]
+            test_peer_role: xapi::PeerXapiRole::Unreachable,
+            #[cfg(test)]
+            test_role_probes: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            test_ha_ops: None,
+            ha_withheld: None,
+            hold_view_flag: Default::default(),
+            fwd_skip_since: None,
+            slave_xapi_stuck: Default::default(),
+            local_master_cache: None,
+            peer_role_cache: None,
+            second_master_checked_at: None,
+            second_master_a_since: None,
+            seen_parked: false,
+            released_by_pool: false,
+            park_log_offset: None,
+            xha_log_path: XHA_LOG.to_string(),
+            second_master_budget_path: second_master_budget_path_default(),
+            #[cfg(test)]
+            test_ha: None,
+            recorded_rearm_checked_at: None,
+            recorded_rearm_liveset_since: None,
+            disarm_record_path: ha_local_disarm_path(),
+            peer_mismatch: MismatchSightings::default(),
+            ha_cycle_result: Default::default(),
+            rearm_enable_result: Default::default(),
+            rearm_pass: 0,
+            rearm_enables_issued: Default::default(),
+            masterless_retry: None,
+            rearm_enable_from_slave: false,
+            rearm_ts_path: ha_rearm_ts_path(),
+            readmission_cycle_pending: false,
+            peer_emergency_unissued_at: None,
+            peer_emergency_budget_path: peer_emergency_budget_path_default(),
+            peer_emergency_hold: None,
+            peer_emergency_verdict: None,
+            pe_budget_unwritten: None,
+            pe_budget_alerted_at: None,
+            self_unwedge_vm_alerted_at: None,
+            self_unwedge_report: None,
+            self_unwedge_vm_alert_raised: false,
+            twinstor_hold_released_at: None,
+            peer_disarm_alerted: false,
+            peer_normal_in_row: 0,
+            peer_disarm_alert_result: Arc::new(std::sync::Mutex::new(None)),
+            pe_last_master: None,
             peer_emergency_resolve_at: None,
-            peer_emergency_confirm_alerted_at: None,
             self_unwedge_since: None,
             self_unwedge_last_action: None,
             self_unwedge_miss_alerted_at: None,
@@ -7919,13 +11624,13 @@ impl StateMachine {
     /// shows which paths a restart resumes.
     fn log_startup_state(&self) {
         if !cfg!(test)
-            && let Ok(c) = std::fs::read_to_string(FORCED_REBOOT_BREADCRUMB)
+            && let Ok(c) = std::fs::read_to_string(FORCED_REBOOT_BREADCRUMB.as_str())
         {
             warn!(heal_event = "previous_forced_reboot", breadcrumb = %c.trim(),
                   "the previous daemon life forced a reboot (unix time, version, episode, reason)");
             let _ = std::fs::rename(
-                FORCED_REBOOT_BREADCRUMB,
-                format!("{FORCED_REBOOT_BREADCRUMB}.seen"),
+                FORCED_REBOOT_BREADCRUMB.as_str(),
+                format!("{}.seen", FORCED_REBOOT_BREADCRUMB.as_str()),
             );
         }
         info!(heal_event = "startup_state",
@@ -7948,7 +11653,7 @@ impl StateMachine {
               peer_fs_freeze = %file_brief(&self.peer_fs_freeze_path),
               fs_freeze_flag = %file_brief(&self.fs_freeze_flag_path),
               open_episode = %file_brief(&self.episode_path),
-              stuck_fence_stamp = %file_brief(STUCK_PRIMARY_FENCE_STAMP),
+              stuck_fence_stamp = %file_brief(STUCK_PRIMARY_FENCE_STAMP.as_str()),
               ha_rearm_obligation = %file_brief(&ha_rearm_obligation_path()),
               "durable state found at startup (\"-\" = absent)");
         // Every state file there, whatever reads it (including later additions).
@@ -8188,6 +11893,23 @@ impl StateMachine {
                 }
             });
         }
+        // Peer management reachability (P): a TCP connect to the peer's
+        // management address on port 443 every 10 s, off the serial tick, so
+        // a lost probe never stalls it. Every gated HA action reads the
+        // snapshot at the moment it fires.
+        if !cfg!(test) {
+            crate::mgmt_reach::spawn_prober(
+                self.mgmt.clone(),
+                self.config.node.peer.clone(),
+                self.arbitrated,
+            );
+            spawn_partition_view(
+                self.config.clone(),
+                self.mgmt.clone(),
+                self.whole_switch_guard.clone(),
+                self.hold_view_flag.clone(),
+            );
+        }
         // Direct-link gateway beacon (arbitrated only). Serve our own gateway_ok
         // over the direct link so an isolated peer can tell single-host isolation
         // from a whole-switch outage. A background updater keeps the value fresh;
@@ -8425,6 +12147,9 @@ impl StateMachine {
             // one) and stamp our liveness into XAPI. A stood-down node is still alive
             // and must say so.
             crate::sd_notify::watchdog();
+            // Held alerts past their age are dropped on time, in every
+            // state, not at the next send.
+            xapi::expire_held_alerts();
             // A resume of a latched yield cut short by a daemon restart: the
             // latch follows it before anything reads it, in every state
             // (bring-up's latched hold and the beacon included). A marker stat
@@ -8474,10 +12199,40 @@ impl StateMachine {
             let quiet = self.xapi_quiet().await;
             // The XAPI-bound alerts in the state body wait for the same window.
             self.tick_quiet = sb_fresh || quiet;
-            if !sb_fresh && !self.xapi_quiet().await {
+            // On a slave whose master (the peer) does not answer on its
+            // management address, every `xe` call is forwarded into the cut and
+            // waits out its bound: the XAPI-bound housekeeping steps below are
+            // skipped then (none can act without the master).
+            let fwd = !self.forwarded_xapi_dead();
+            // A skip that lasts while replication is Connected (a prober that
+            // stalled, or a master answering nothing on 443 though alive) is
+            // not silent.
+            if fwd {
+                self.fwd_skip_since = None;
+            } else {
+                let since = *self
+                    .fwd_skip_since
+                    .get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(300)
+                    && self.connected_since.is_some()
+                    && self
+                        .log_pace
+                        .due("forwarded_xapi_skip_long", Duration::from_secs(600))
+                {
+                    warn!(
+                        heal_event = "xapi_housekeeping_skipped",
+                        secs = since.elapsed().as_secs(),
+                        "the pool master's management address has not answered for over 5 \
+                         minutes while replication is Connected: this slave's XAPI housekeeping \
+                         (liveness stamp, advertisement, HA watchdog and the like) stays skipped; \
+                         check the management network and `twinstor status` (mgmt reach)"
+                    );
+                }
+            }
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "stamp_alive", self.stamp_alive().await);
             }
-            if !sb_pending && !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_pending && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "advertise_storage",
@@ -8500,8 +12255,9 @@ impl StateMachine {
 
             // Pool-wide HA arming check, throttled internally to every 10 min.
             // Runs in every (non-parked) state: HA being disarmed is a pool fact.
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "check_ha_armed", self.check_ha_armed().await);
+                step!(self, "masterless_rearm_retry", self.drive_masterless_rearm_retry().await);
             }
 
             // Repeated split-brain episodes mean one flapping link; escalate instead of
@@ -8518,7 +12274,7 @@ impl StateMachine {
                 self.enforce_write_cache().await
             );
 
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "check_peer_daemon", self.check_peer_daemon().await);
             }
             if !sb_pending && !sb_fresh && !self.xapi_quiet().await {
@@ -8531,7 +12287,7 @@ impl StateMachine {
                     self.check_tiebreaker_health().await
                 );
             }
-            if !sb_pending && !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_pending && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "check_capacity", self.check_capacity().await);
                 step!(
                     self,
@@ -8546,7 +12302,7 @@ impl StateMachine {
                     self.check_resync_progress().await
                 );
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_hostname_drift",
@@ -8576,6 +12332,8 @@ impl StateMachine {
                 "check_whole_switch_hold",
                 self.check_whole_switch_hold().await
             );
+            self.hold_view_flag
+                .store(self.whole_switch_held, Ordering::Relaxed);
             // Never stands down on a fate-shared pool (alerts only). On an
             // arbitrated pool it waits out the quiet window of a node frozen
             // by its own yield (`arb_yield_quiet`): standing down would demote
@@ -8592,24 +12350,24 @@ impl StateMachine {
                 "check_isolated_slave_standdown",
                 self.check_isolated_slave_standdown().await
             );
-            if !sb_pending && !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_pending && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "check_host_enabled", self.check_host_enabled().await);
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_protected_vms",
                     self.check_protected_vms().await
                 );
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_autostart_completion",
                     self.check_autostart_completion().await
                 );
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_internal_shutdown_policy",
@@ -8621,28 +12379,36 @@ impl StateMachine {
                 "check_boundary_restarts",
                 self.check_boundary_restarts().await
             );
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(self, "check_vdi_locks", self.check_vdi_locks().await);
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_armed_mismatch",
                     self.check_armed_mismatch().await
                 );
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_peer_emergency",
                     self.check_peer_emergency().await
                 );
             }
-            if !sb_fresh && !self.xapi_quiet().await {
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
                 step!(
                     self,
                     "check_ha_self_unwedge",
                     self.check_ha_self_unwedge().await
+                );
+            }
+            if !sb_fresh && !self.xapi_quiet().await {
+                step!(self, "check_second_master", self.check_second_master().await);
+                step!(
+                    self,
+                    "check_recorded_disarm_rearm",
+                    self.check_recorded_disarm_rearm().await
                 );
             }
 
@@ -8843,7 +12609,12 @@ impl StateMachine {
             .is_none_or(|t| hb_now.duration_since(t) >= hb_interval)
         {
             self.last_heartbeat_at = Some(hb_now);
+            let pv = self.p_view();
             info!(
+                mgmt_p = pv.p,
+                mgmt_answered = pv.answered,
+                mgmt_settled_secs = ?pv.true_for.map(|d| d.as_secs()),
+                last_withheld = ?self.ha_withheld.as_ref().map(|w| (w.action, w.reason.as_str())),
                 state = %self.state,
                 drbd_conn = ?status.connection,
                 disk = ?status.disk,
@@ -8960,8 +12731,18 @@ impl StateMachine {
         // right mid-episode.
         let rejoin_quiet = self.tick_quiet
             || (self.fs_freeze() && (status.suspended_user || status.suspended_fencing));
+        // No live read where it can only time out: on a slave while the
+        // peer's management address is silent (the read is forwarded to the
+        // master), or on a host XAPI parks in its HA startup loop (its own
+        // xapi refuses every call). pool.conf answers then, as the resilient
+        // read's fallback would after its timeout.
+        let local_read_futile = !self.p_view().p
+            && (xapi::local_pool_role() == Some(false)
+                || (xapi::local_ha_armed() == Some(true) && !self.xha_liveset_member));
         let (master_verdict, master_from_live) = if rejoin_quiet {
             (None, true)
+        } else if local_read_futile {
+            (xapi::local_pool_role(), false)
         } else {
             xapi::is_pool_master_resilient_sourced().await
         };
@@ -9116,7 +12897,7 @@ impl StateMachine {
             self.sb_undecidable_alerted = false;
             self.sb_resolved_alerted = false;
             self.sb_discard_alert_body = None;
-            self.sb_keepdata_stuck = 0;
+            self.survivor_episode_end();
             self.sb_wedge_alerted = false;
             self.auto_heal_restarts = 0;
             self.auto_heal_holds = 0;
@@ -9180,6 +12961,13 @@ impl StateMachine {
             HEAL_STATE_REAP_AFTER_SECS,
             episode_domain_ok,
         ) {
+            // A stage whose condition still holds is refreshed, never reaped.
+            ReapOutcome::ForgetHealState { .. }
+                if crate::heal_state::read()
+                    .is_some_and(|h| self.heal_stage_still_live(&h.stage)) =>
+            {
+                self.refresh_live_hold_stage();
+            }
             ReapOutcome::ForgetHealState { close_episode } => {
                 info!(
                     stale_secs = heal_age.unwrap_or(0),
@@ -10106,6 +13894,11 @@ impl StateMachine {
             RedundancyAction::Clear => {
                 if self.peer_lost_since.is_some() {
                     info!("peer is a healthy redundant copy again; redundancy restored");
+                    // A "serving without redundancy" still held undelivered
+                    // is no longer true: never delivered late.
+                    if !cfg!(test) {
+                        let _ = xapi::drop_held_alert("twinstor_degraded", REDUNDANCY_LOST_ALERT);
+                    }
                 }
                 // A latched loser that came back Primary through a plain
                 // reconnect (nothing diverged) holds no more.
@@ -10140,13 +13933,7 @@ impl StateMachine {
                 // ALERT_RETRY_EVERY cadence, gated in the decision fn) is what
                 // gets the alert to the operator once the election settles.
                 self.redundancy_alert_attempt_at = Some(now);
-                if xapi::send_xapi_alert(
-                    "twinstor: this node is serving without redundancy: the peer is down or not \
-                     a healthy replica, so the pool is running on a single copy. VMs are \
-                     unaffected, but a single further failure now loses data. Bring the peer back \
-                     (it resyncs automatically on return) or investigate why it is not connecting.",
-                )
-                .await
+                if xapi::send_xapi_alert(REDUNDANCY_LOST_ALERT).await
                 {
                     self.redundancy_alert_at = Some(now);
                 }
@@ -10564,6 +14351,23 @@ impl StateMachine {
             }
             action = StrandedAction::Idle;
         }
+        // Fire-time gates of the yield and the forced reset: the peer's
+        // management address must have answered for the settle (XAPI often
+        // demotes a returning ex-master by itself within it), the peer's xapi
+        // must answer as the master, and the forced reset (a local disarm then
+        // reset-master) also honours the startup-loop lock. Mapping to Idle
+        // keeps the collapse timer and the attempt budget untouched.
+        if matches!(action, StrandedAction::Restart | StrandedAction::ForceReset) {
+            let force = action == StrandedAction::ForceReset;
+            let name = if force {
+                "stranded_force_reset"
+            } else {
+                "stranded_yield"
+            };
+            if !self.stranded_gate(name, force).await {
+                action = StrandedAction::Idle;
+            }
+        }
         match action {
             StrandedAction::Clear => {
                 info!("stranded-master strand cleared: xapi rejoined the pool");
@@ -10773,9 +14577,8 @@ impl StateMachine {
             if let Some((_, is_master)) = cached {
                 is_master
             } else {
-                let peer_addr = self.config.network.peer_address.to_string();
                 let is_master = matches!(
-                    xapi::peer_xapi_role(&peer_addr).await,
+                    self.peer_role_probe().await,
                     xapi::PeerXapiRole::Master
                 );
                 self.peer_master_probe = Some((now, is_master));
@@ -10835,6 +14638,46 @@ impl StateMachine {
             SLAVE_REJOIN_RESTART_CAP,
             SLAVE_REJOIN_CLEAR_GRACE,
         );
+        // The stuck-xapi test: since P became true, the local xapi has stayed
+        // silent with one process ID for `STUCK_XAPI_AFTER`. A running slave
+        // reconnects through a backoff of up to 256 s, and a slave whose
+        // database sync fails restarts its own xapi (a new process ID); a
+        // toolstack restart in either window only duplicates what xapi is
+        // already doing. Sampled only while the wedge shape holds.
+        let xapi_stuck = if wedge_shape {
+            let pid = if cfg!(test) {
+                String::new()
+            } else {
+                xapi_pid_bounded().await
+            };
+            let pv = self.p_view();
+            self.slave_xapi_stuck
+                .observe(xapi_live_readable, &pid, pv.p, pv.true_for.is_some(), now)
+        } else {
+            self.slave_xapi_stuck = Default::default();
+            false
+        };
+        if matches!(action, StrandedAction::Restart) {
+            let name = "slave_rejoin_reconnect";
+            let allowed = self.rejoin_assist_allows(name)
+                && self.ha_gate(name, crate::mgmt_reach::Trigger::Positive)
+                && (xapi_stuck || {
+                    let silent = self.slave_xapi_stuck.silent_for(now).unwrap_or_default();
+                    self.note_withheld(
+                        name,
+                        format!(
+                            "the local xapi has been silent with one process ID for {}s of \
+                             the {}s required since the peer's management address answered",
+                            silent.as_secs(),
+                            crate::mgmt_reach::STUCK_XAPI_AFTER.as_secs()
+                        ),
+                    );
+                    false
+                });
+            if !allowed {
+                action = StrandedAction::Idle;
+            }
+        }
         // Same attach-gate as the stranded path: hold the returning-slave toolstack
         // restart while an iSCSI/PBD attach is in flight (timer preserved).
         if attach_in_flight && matches!(action, StrandedAction::Restart) {
@@ -10921,6 +14764,10 @@ impl StateMachine {
     /// unplugged while Online and healthy. `spawn_plug_and_multipath` is
     /// single-flight and idempotent, so a redundant call is a no-op.
     async fn check_pbd_plugged(&mut self, redundant: bool) {
+        #[cfg(test)]
+        if self.test_ha.is_none() {
+            return;
+        }
         let now = std::time::Instant::now();
         if let Some(last) = self.last_pbd_check
             && now.duration_since(last) < PBD_RECHECK_INTERVAL
@@ -10932,11 +14779,29 @@ impl StateMachine {
         if self.state != NodeState::Online || !redundant {
             return;
         }
+        // No management-plane call while the peer's management address is
+        // silent: on a slave the PBD list is forwarded to the master and
+        // can only time out (15 s, every minute, in the tick).
+        if pbd_check_futile(self.p_view().p, self.h_conf_master()) {
+            return;
+        }
+        if self.h_pbd_unplugged().await == Some(true) {
+            warn!(
+                heal_event = "pbd_replug",
+                "a twinstor PBD is unplugged while Online and healthy; re-running plug_and_multipath"
+            );
+            self.spawn_plug_and_multipath();
+        }
+    }
+
+    /// Whether this host's twinstor PBD reads unplugged (`None`: no answer).
+    async fn h_pbd_unplugged(&mut self) -> Option<bool> {
+        if self.h_record("pbd-list".to_string()) {
+            return Some(false);
+        }
         // Resolve the SR by its immutable uuid (a renamed SR must not slip past
         // this check). If it can't be resolved, skip the re-plug this tick.
-        let Some(sr) = xapi::twinstor_sr_uuid().await else {
-            return;
-        };
+        let sr = xapi::twinstor_sr_uuid().await?;
         // Only our host's PBD: the offline peer's PBD is naturally unplugged while
         // it is down, and a pbd-plug of it loops forever on HOST_OFFLINE (plugging
         // it is the peer's job when it returns). Without this filter a returning
@@ -10959,14 +14824,11 @@ impl StateMachine {
                 .output(),
         )
         .await;
-        let any_unplugged = matches!(&out, Ok(Ok(o)) if o.status.success()
-            && !String::from_utf8_lossy(&o.stdout).trim().is_empty());
-        if any_unplugged {
-            warn!(
-                heal_event = "pbd_replug",
-                "a twinstor PBD is unplugged while Online and healthy; re-running plug_and_multipath"
-            );
-            self.spawn_plug_and_multipath();
+        match &out {
+            Ok(Ok(o)) if o.status.success() => {
+                Some(!String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            }
+            _ => None,
         }
     }
 
@@ -11005,7 +14867,7 @@ impl StateMachine {
         );
         self.demoted_survivor_last_done = mark;
         let actively_resolving =
-            resync_progressing || std::path::Path::new(ISOLATED_STANDDOWN_MARKER).exists();
+            resync_progressing || std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists();
         // Cheap gate: am I a slave of my peer (pool.conf `slave:<peer>`)? Only then
         // do the disk signals matter, and only then pay the reachability ping.
         let peer_addr = self.config.network.peer_address.to_string();
@@ -11117,78 +14979,7 @@ impl StateMachine {
                 );
                 self.demoted_survivor_since = Some(now);
             }
-            StrandedAction::Restart => {
-                // Local reads only (xhad socket, `xl list`): a stale or wedged
-                // master's database must not be able to report "no guests here".
-                let (peer_dead, local_guests) = if cfg!(test) {
-                    (Some(true), Some(0))
-                } else {
-                    (
-                        self.peer_dead_via_liveset().await,
-                        self.running_vm_count().await,
-                    )
-                };
-                if !demoted_survivor_reassert_safe(peer_dead, local_guests) {
-                    // Retry later on the normal cadence, without spending an attempt.
-                    self.demoted_survivor_action_at = Some(now);
-                    if self
-                        .demoted_survivor_blocked_alert_at
-                        .is_some_and(|t| now.duration_since(t) < DEGRADED_REALERT_AFTER)
-                    {
-                        return;
-                    }
-                    self.demoted_survivor_blocked_alert_at = Some(now);
-                    self.heal_state_update(
-                        "demoted_survivor_blocked",
-                        "slave of a peer whose disk is stale, with guests here (or their count unreadable): not taking mastership automatically",
-                        Some("check the peer; see the alert for the manual re-assert"),
-                    );
-                    warn!(
-                        heal_event = "demoted_survivor_reassert_blocked",
-                        ?peer_dead,
-                        ?local_guests,
-                        "not re-asserting pool mastership: this host runs guests (or the count \
-                         is unreadable) and the peer is not confirmed gone from the HA liveset; \
-                         the takeover's HA disable would let the peer's XHA restart them while \
-                         they still run here"
-                    );
-                    let _ = xapi::send_ha_wedge_alert(
-                        "TwinStor: this host holds the only UpToDate copy and is a slave of a peer \
-                         whose disk is stale, but it runs VMs while the peer is live in HA, so it \
-                         does not take pool mastership automatically (the peer's HA would restart \
-                         those VMs while they still run here). Check the peer; to re-assert by \
-                         hand, first stop or migrate this host's VMs, then on this host run 'xe \
-                         pool-emergency-transition-to-master' and 'xe pool-recover-slaves', and \
-                         re-arm HA.",
-                    )
-                    .await;
-                    return;
-                }
-                self.demoted_survivor_attempts = self.demoted_survivor_attempts.saturating_add(1);
-                self.demoted_survivor_action_at = Some(now);
-                warn!(
-                    attempt = self.demoted_survivor_attempts,
-                    heal_event = "demoted_survivor_reassert",
-                    "re-asserting pool mastership: this host holds the only UpToDate copy but was \
-                     demoted below a stale (Inconsistent or Outdated) master; running the emergency-transition \
-                     chain so the good copy serves and the stale peer resyncs as slave"
-                );
-                let _ = xapi::send_ha_wedge_alert(
-                    "TwinStor wrongly-demoted survivor: this host holds the only UpToDate storage \
-                     copy but XHA demoted it to slave of a peer whose disk is stale (Inconsistent or Outdated) \
-                     after that peer rebooted as master. Re-asserting pool mastership so the good \
-                     copy serves and the stale peer resyncs as a slave. If it does not stick, on \
-                     this host run 'xe pool-emergency-transition-to-master' then 'xe \
-                     pool-recover-slaves', and re-arm HA.",
-                )
-                .await;
-                if !cfg!(test) {
-                    // The full chain (emergency-transition, recover-slaves, HA re-arm); it
-                    // rewrites the XHA statefile so it sticks instead of flapping.
-                    self.run_masterless_recovery_for(MasterlessFlavor::DemotedSurvivor, false)
-                        .await;
-                }
-            }
+            StrandedAction::Restart => self.demoted_survivor_reassert(now).await,
             StrandedAction::GiveUp => {
                 if self
                     .demoted_survivor_action_at
@@ -11208,6 +14999,90 @@ impl StateMachine {
                     self.demoted_survivor_action_at = Some(now);
                 }
             }
+        }
+    }
+
+    /// The wrongly-demoted survivor's re-assert (the decision's Restart).
+    /// Everything that can withhold it (the double-run guard, the masterless
+    /// chain's gates) is checked before an attempt, a stamp or an alert is
+    /// spent.
+    async fn demoted_survivor_reassert(&mut self, now: std::time::Instant) {
+        // Local reads only (xhad socket, `xl list`): a stale or wedged
+        // master's database must not be able to report "no guests here".
+        let (peer_dead, local_guests) = if cfg!(test) {
+            (Some(true), Some(0))
+        } else {
+            (
+                self.peer_dead_via_liveset().await,
+                self.running_vm_count().await,
+            )
+        };
+        if !demoted_survivor_reassert_safe(peer_dead, local_guests) {
+            // Retry later on the normal cadence, without spending an attempt.
+            self.demoted_survivor_action_at = Some(now);
+            if self
+                .demoted_survivor_blocked_alert_at
+                .is_some_and(|t| now.duration_since(t) < DEGRADED_REALERT_AFTER)
+            {
+                return;
+            }
+            self.demoted_survivor_blocked_alert_at = Some(now);
+            self.heal_state_update(
+                "demoted_survivor_blocked",
+                "slave of a peer whose disk is stale, with guests here (or their count unreadable): not taking mastership automatically",
+                Some("check the peer; see the alert for the manual re-assert"),
+            );
+            warn!(
+                heal_event = "demoted_survivor_reassert_blocked",
+                ?peer_dead,
+                ?local_guests,
+                "not re-asserting pool mastership: this host runs guests (or the count \
+                 is unreadable) and the peer is not confirmed gone from the HA liveset; \
+                 the takeover's HA disable would let the peer's XHA restart them while \
+                 they still run here"
+            );
+            let _ = xapi::send_ha_wedge_alert(
+                "TwinStor: this host holds the only UpToDate copy and is a slave of a peer \
+                 whose disk is stale, but it runs VMs (or their count is unreadable) and its \
+                 own HA liveset does not show the peer gone, so it does not take pool \
+                 mastership automatically (the peer's HA could restart those VMs while they \
+                 still run here). Check the peer; to re-assert by \
+                 hand, first stop or migrate this host's VMs, then on this host run 'xe \
+                 pool-emergency-transition-to-master' and 'xe pool-recover-slaves', and \
+                 re-arm HA.",
+            )
+            .await;
+            return;
+        }
+        // Gated before any attempt, stamp or alert is spent: a
+        // withheld re-assert retries on the next pass with its budget.
+        if !self.masterless_chain_allowed(false).await {
+            return;
+        }
+        self.demoted_survivor_attempts = self.demoted_survivor_attempts.saturating_add(1);
+        self.demoted_survivor_action_at = Some(now);
+        warn!(
+            attempt = self.demoted_survivor_attempts,
+            heal_event = "demoted_survivor_reassert",
+            "re-asserting pool mastership: this host holds the only UpToDate copy but was \
+             demoted below a stale (Inconsistent or Outdated) master; running the emergency-transition \
+             chain so the good copy serves and the stale peer resyncs as slave"
+        );
+        let _ = self.h_record("alert: demoted-survivor reassert".to_string())
+            || xapi::send_ha_wedge_alert(
+            "TwinStor wrongly-demoted survivor: this host holds the only UpToDate storage \
+             copy but XHA demoted it to slave of a peer whose disk is stale (Inconsistent or Outdated) \
+             after that peer rebooted as master. Re-asserting pool mastership so the good \
+             copy serves and the stale peer resyncs as a slave. If it does not stick, on \
+             this host run 'xe pool-emergency-transition-to-master' then 'xe \
+             pool-recover-slaves', and re-arm HA.",
+        )
+        .await;
+        if !cfg!(test) {
+            // The full chain (emergency-transition, recover-slaves, HA re-arm); it
+            // rewrites the XHA statefile so it sticks instead of flapping.
+            self.run_masterless_recovery_for(MasterlessFlavor::DemotedSurvivor, false)
+                .await;
         }
     }
 
@@ -11921,8 +15796,49 @@ impl StateMachine {
             };
         // Freeze mode needs no record: a peer that synced from this frozen
         // copy took it.
-        let entitled =
-            self.fs_freeze() || matches!(read_fork_record(&self.win_path), Some(Some(_)));
+        //
+        // Arbitrated mode, the copy this node's own fence-peer froze
+        // (`isolated_yield`, the yield marker) and DRBD's reconnect handshake
+        // has now made the source, with the peer behind: the XHA winner
+        // whose peer was fenced and came back Outdated. Without this, DRBD
+        // waits for the frozen writes to drain before it sends the bitmap
+        // (WFBitMapS), and nothing else lifts the freeze before the HA
+        // statefile watchdog resets this host.
+        //
+        // Why the handshake's verdict is safe to act on. A Connected
+        // SyncSource/WFBitMap toward a peer that is behind arises in two ways:
+        // - equal generations (the current UUIDs differ at most in bit 0, the
+        //   was-Primary flag): nobody wrote alone, and DRBD picks the
+        //   direction by its rules (on the rig: source-if-both-failed by
+        //   lost-quorum, then source-use-bitmap by the disk states
+        //   UpToDate/Consistent). The bits the peer has set are writes in
+        //   flight at the disconnect or activity-log blocks, never
+        //   acknowledged to a guest: the accepted crashed-Primary semantics
+        //   under protocol C;
+        // - this copy strictly newer: the peer's generation is in its history.
+        // A real split-brain is never resolved silently: the template sets
+        // every after-sb policy to disconnect, which leaves StandAlone and the
+        // split-brain marker, and the marker blocks this lift. A Primary also
+        // refuses the sync-target role (DRBD's rr-conflict default), so this
+        // Primary cannot be made a target behind it here. The one pre-existing
+        // exception is a stale discard-my-data offer of this node, which the
+        // offer machinery withdraws on its own.
+        //
+        // Not while the split-brain resolver owns the episode (its marker),
+        // while this copy is latched as the loser of its current fork (a latch
+        // from an earlier fork does not count), or while a fence-peer run is
+        // still deciding; only on a Primary.
+        let arbitrated_source = self.arbitrated
+            && s.role == Role::Primary
+            && std::path::Path::new(&self.yield_path).exists()
+            && !std::path::Path::new(&self.marker_path).exists()
+            && !latch_blocks(
+                read_fork_record(&self.latch_path),
+                self.drbd.local_current_uuid().await,
+            )
+            && !fence_run_in_flight(&self.fence_lock_path);
+        let win_record = matches!(read_fork_record(&self.win_path), Some(Some(_)));
+        let entitled = self.fs_freeze() || win_record || arbitrated_source;
         // Freeze mode resumes a sync source suspended without its yield
         // marker too: that state is proof enough that this copy is kept, and
         // a copy left frozen past the multipath queue hands its guests I/O
@@ -11954,10 +15870,19 @@ impl StateMachine {
             return;
         }
         self.release_streak = 0;
-        warn!(
-            heal_event = "winner_resume_io",
-            "split-brain: the peer accepted the discard; resuming this kept copy's frozen I/O"
-        );
+        if arbitrated_source && !win_record {
+            warn!(
+                heal_event = "arb_source_resume_io",
+                "arbitrated: DRBD made this copy, frozen by its own fence-peer yield, the \
+                 resync source of a peer that is behind; resuming its frozen I/O so the resync \
+                 can start"
+            );
+        } else {
+            warn!(
+                heal_event = "winner_resume_io",
+                "split-brain: the peer accepted the discard; resuming this kept copy's frozen I/O"
+            );
+        }
         if self.resume_io_while_connected("winner_resume").await {
             let _ = std::fs::remove_file(&self.yield_path);
         }
@@ -15236,13 +19161,21 @@ impl StateMachine {
             return;
         }
         self.last_peer_daemon_check = Some(now);
+        // The peer's stamp reaches the pool only over the management
+        // network: while the peer's management address is silent, no report
+        // can arrive, and that time is not counted. Once it answers again,
+        // the staleness counts from then.
+        let unix_now = unix_now_secs();
+        let p = self.p_view().p;
+        let Some(p_back_at) = peer_daemon_p_clock(&mut self.peer_daemon_p_back_at, p, unix_now) else {
+            return;
+        };
 
         let (stamp, host_live, peer_version) =
             xapi::peer_daemon_alive(&self.config.node.peer).await;
         // Version-skew check runs regardless of the liveness verdict below.
         self.evaluate_version_skew(peer_version.as_deref(), now)
             .await;
-        let unix_now = unix_now_secs();
         // The latch clears only on a stamp known to be fresh: an XAPI hiccup
         // (None answers) must not reset the episode, or every xapi restart
         // during a long outage would re-fire the alert.
@@ -15254,8 +19187,9 @@ impl StateMachine {
             }
             return;
         }
+        let reference = peer_daemon_reference(stamp, p_back_at);
         if !peer_daemon_down(
-            stamp,
+            reference,
             unix_now,
             host_live,
             PEER_DAEMON_STALE_AFTER.as_secs(),
@@ -15269,7 +19203,7 @@ impl StateMachine {
         if !due {
             return;
         }
-        let stale_min = stamp.map(|s| unix_now.saturating_sub(s) / 60).unwrap_or(0);
+        let stale_min = reference.map(|s| unix_now.saturating_sub(s) / 60).unwrap_or(0);
         warn!(
             peer = %self.config.node.peer,
             stale_min,
@@ -15333,11 +19267,31 @@ impl StateMachine {
             }
         }
 
+        // The partition view probes the same set every 10 s: a majority of
+        // answers since the previous check restarts the streak, and the alert
+        // reports what was measured (monotonic time).
+        let now_mono = mono_secs();
+        let counts = (
+            TIEBREAKER_ANSWERS.load(Ordering::Relaxed),
+            TIEBREAKER_PROBES.load(Ordering::Relaxed),
+        );
+        let (restart_streak, outage) = tiebreaker_observe(
+            any_reachable,
+            counts.0.saturating_sub(self.tiebreaker_counts_at_check.0),
+            counts.1.saturating_sub(self.tiebreaker_counts_at_check.1),
+            self.tiebreaker_last_check.max(1),
+            self.tiebreaker_outage,
+            now_mono,
+        );
+        self.tiebreaker_last_check = now_mono;
+        self.tiebreaker_counts_at_check = counts;
+        self.tiebreaker_outage = outage;
+        let last_answer = TIEBREAKER_ANSWERED_MONO.load(Ordering::Relaxed);
         let (streak, fire) = tiebreaker_decision(
             targets.is_empty(),
             self.config.network.allow_no_tiebreaker,
             any_reachable,
-            self.tiebreaker_bad_streak,
+            if restart_streak { 0 } else { self.tiebreaker_bad_streak },
         );
         self.tiebreaker_bad_streak = streak;
         if any_reachable {
@@ -15366,15 +19320,17 @@ impl StateMachine {
                 .to_string()
         } else {
             format!(
-                "TwinStor: every fence-peer tiebreaker target ({}) has been unreachable \
-                 for ~30 minutes. If a partition happens while this persists, this node \
-                 will freeze its storage instead of serving alone. Check the gateway / \
-                 the targets in /etc/twinstor/ping-targets (was the router replaced or \
-                 renumbered?).",
-                targets.join(", ")
+                "TwinStor: every fence-peer tiebreaker target ({}) {}. If a partition \
+                 happens while this persists, this node will freeze its storage instead of \
+                 serving alone. Check the gateway / the targets in /etc/twinstor/ping-targets \
+                 (was the router replaced or renumbered?).",
+                targets.join(", "),
+                tiebreaker_outage_text(self.tiebreaker_outage, last_answer, now_mono)
             )
         };
-        warn!(targets = ?targets, "fence-peer tiebreaker unhealthy; alerting");
+        warn!(targets = ?targets,
+              window_secs = ?self.tiebreaker_outage.map(|o| now_mono.saturating_sub(o.since)),
+              "fence-peer tiebreaker unhealthy; alerting");
         if xapi::send_no_tiebreaker_alert(&body).await {
             self.tiebreaker_alert_at = Some(now);
         }
@@ -15478,6 +19434,12 @@ impl StateMachine {
             HA_DEADLOCK_RETRY,
         ) {
             HaDeadlockAction::Hold => {}
+            HaDeadlockAction::Act
+                if !self.rejoin_assist_allows("ha_deadlock_exit")
+                    || !self.ha_gate("ha_deadlock_exit", crate::mgmt_reach::Trigger::Absence) =>
+            {
+                // Withheld at fire time; the retry timer is not consumed.
+            }
             HaDeadlockAction::Act => {
                 self.ha_deadlock_action_at = Some(now);
                 warn!(
@@ -15495,7 +19457,7 @@ impl StateMachine {
                      automatically once the pool is single-master. No data was at risk.",
                 )
                 .await;
-                let _ = std::fs::remove_file(ISOLATED_STANDDOWN_MARKER);
+                let _ = std::fs::remove_file(ISOLATED_STANDDOWN_MARKER.as_str());
                 let _ = tokio::process::Command::new("sh")
                     .args([
                         "-c",
@@ -15529,12 +19491,30 @@ impl StateMachine {
         if !std::path::Path::new(XHAD_CONF).exists() {
             return; // HA never configured on this host
         }
+        // The dance's pool HA cycle runs off the tick: nothing else here acts
+        // (pool HA reads off and xhad is down meanwhile, by design) until it
+        // has returned and its outcome is read.
+        if readmission_cycle_holds(self.readmission_cycle_pending, self.ha_reset_inflight.load(Ordering::SeqCst)) {
+            return;
+        }
+        self.dance_disarm_watch_pass(crate::heal_state::unix_now()).await;
+        if self.readmission_cycle_pending {
+            self.readmission_cycle_pending = false;
+            let r = self.take_ha_cycle_result("readmission_dance");
+            self.finish_readmission_dance(r).await;
+            return;
+        }
         // xhad.conf persists across pool-ha-disable, so an HA-off pool would
         // otherwise read as "xhad stuck non-Online" forever and raise false
         // alarms. With pool HA explicitly disabled a stopped xhad is correct,
         // so stand down. An unreadable answer (None) proceeds: a real embrace
         // makes xe unhealthy, and that must not blind us.
-        if xapi::is_ha_enabled().await == Some(false) {
+        let pool_ha = if self.forwarded_xapi_dead() {
+            None
+        } else {
+            xapi::is_ha_enabled().await
+        };
+        if pool_ha == Some(false) {
             self.readmission_suspect_since = None;
             self.readmission_signals = XhaLogSignals::default();
             self.readmission_alerted_at = None;
@@ -15570,7 +19550,7 @@ impl StateMachine {
             // the reaper could close the readmission episode mid-confirmation.
             self.last_xha_online = Some(false);
             self.xha_liveset_member = false;
-            let peer_live = xapi::peer_agent_responsive(&self.config.node.peer).await;
+            let peer_live = self.peer_agent_probe().await;
             if peer_live == Some(true) {
                 self.readmission_confirm_since = None;
                 self.readmission_suspect_since = None;
@@ -15601,15 +19581,20 @@ impl StateMachine {
                     heal_event = "readmission_recover_unconfirmed",
                     "the synchronized HA restart re-armed pool HA but the peer \
                        did not rejoin the liveset within the confirmation window; \
-                       escalating (the peer likely needs a local emergency-disable)"
+                       escalating (a pool HA cycle, then the peer's own emergency disable \
+                       if its HA daemon still cycles)"
                 );
-                let _ = xapi::send_xapi_alert(
-                    "TwinStor: the automated XHA join-deadlock recovery re-armed \
-                     pool HA, but the peer host did not rejoin the liveset. Recover \
-                     it on the peer host: 'xe host-emergency-ha-disable --force', \
-                     after which it rejoins and HA re-arms. Storage is healthy and \
-                     VMs are unaffected.",
-                )
+                let what = format!(
+                    "the automated XHA join-deadlock recovery re-armed pool HA, but the peer \
+                     host {} did not rejoin the liveset",
+                    self.config.node.peer
+                );
+                let _ = xapi::send_xapi_alert_advising_ha_disable(&peer_not_recruited_alert(
+                    &what,
+                    &self.config.node.name,
+                    &self.config.node.peer,
+                    self.ha_timeout_now(),
+                ))
                 .await;
             }
             return; // within the window and the peer not live yet: hold this tick
@@ -15644,6 +19629,16 @@ impl StateMachine {
             self.readmission_alerted_at = None;
             return;
         }
+        // While a TwinStor hold keeps the HA daemon down on purpose, that time
+        // is not a join failure: no suspicion window (it starts afresh at
+        // the release).
+        if self.whole_switch_held
+            || self.whole_switch_guard.load(Ordering::Relaxed)
+            || self.whole_switch_guard_ever_disarmed.load(Ordering::Relaxed)
+        {
+            self.readmission_suspect_since = None;
+            return;
+        }
         // xhad not Online while configured: open or extend the suspicion window
         // and accumulate log signals from the window's start.
         if self.readmission_suspect_since.is_none() {
@@ -15662,6 +19657,10 @@ impl StateMachine {
         self.readmission_signals.embrace |= sig.embrace;
         self.readmission_signals.storm |= sig.storm;
         self.readmission_signals.invalid_state |= sig.invalid_state;
+        self.readmission_signals.invalid_pool_exits += sig.invalid_pool_exits;
+        if sig.last_start_invalid_pool.is_some() {
+            self.readmission_signals.last_start_invalid_pool = sig.last_start_invalid_pool;
+        }
 
         let storage_healthy = matches!(
             self.drbd.status().await,
@@ -15672,17 +19671,38 @@ impl StateMachine {
         );
         let peer_reachable = self.peer_replication_reachable().await;
 
-        match readmission_decision(
-            self.config.ha.readmission_assist,
-            host_state,
-            self.readmission_signals,
-            storage_healthy,
-            peer_reachable,
-            self.readmission_suspect_since,
-            self.readmission_last_dance,
-            self.readmission_last_revive,
-            now,
-        ) {
+        let action = readmission_decision(
+                true,
+                host_state,
+                self.readmission_signals,
+                storage_healthy,
+                peer_reachable,
+                self.readmission_suspect_since,
+                self.readmission_last_dance,
+                self.readmission_last_revive,
+                now,
+            );
+        // Not Online here, so the startup loop is armed and P false.
+        let p = self.p_view().p;
+        let startup_loop = crate::mgmt_reach::startup_loop_locked(xapi::local_ha_armed(), false, p);
+        let scope = ReadmissionScope {
+            pool_ha,
+            startup_loop,
+            cut_from_master: readmission_cut_from_master(p, peer_reachable, xapi::local_pool_role()),
+            pool_ha_off_seen: self.readmission_signals.pool_ha_off_seen(),
+        };
+        let (action, held) = readmission_plan(action, &self.config.ha, scope);
+        if let Some(why) = held
+            && self.log_pace.due("readmission_scope_held", Duration::from_secs(600))
+        {
+            info!(
+                heal_event = "ha_readmission_held",
+                reason = why,
+                "XHA re-admission looks stuck, but {why}: no local HA daemon restart and no \
+                 manual-runbook alert"
+            );
+        }
+        match action {
             ReadmissionAction::Clear => {
                 self.episode_close("readmission-cleared");
             }
@@ -15715,24 +19735,21 @@ impl StateMachine {
                     embrace = self.readmission_signals.embrace,
                     "XHA re-admission stuck; automated recovery unavailable \
                      (disabled, capped, or preconditions failed); manual \
-                     runbook: stop xhad on both hosts for 90s, then re-arm"
+                     runbook: pool HA disable on the master, then re-arm"
                 );
-                self.readmission_alert(
-                    "TwinStor: the XHA daemon has been unable to rejoin the \
-                     liveset for over 5 minutes. If it is simply not running \
-                     (calldaemon gethoststate reports nothing), restart it \
-                     first: 'systemctl restart attach-static-vdis' then \
-                     'PATH=/usr/libexec/xapi/cluster-stack/xhad:$PATH \
-                     ha_start_daemon'. For the join \
-                     deadlock (the post-fence-storm embrace): on both hosts run \
-                     'xe host-emergency-ha-disable --force', wait 90 seconds, \
-                     then on the master: 'xe pool-ha-disable' and re-arm with \
-                     'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
-                     ha-config:timeout=<120 fate-shared | 90 arbitrated>'. Storage is unaffected; VMs \
-                     keep running.",
-                    now,
-                )
-                .await;
+                // The master: this host if pool.conf says so, else the peer.
+                let master = if xapi::local_pool_role() == Some(true) {
+                    &self.config.node.name
+                } else {
+                    &self.config.node.peer
+                };
+                let runbook = join_deadlock_runbook_alert(
+                    &self.config.node.name,
+                    &self.config.node.peer,
+                    master,
+                    self.ha_timeout_now(),
+                );
+                self.readmission_alert_advice(&runbook, now).await;
                 // The isolated-master dual-master HA deadlock surfaces at
                 // this readmission dead end. Try the guarded HA-deadlock exit
                 // (yield as the returned node so the pool un-forks and HA
@@ -15750,15 +19767,33 @@ impl StateMachine {
                 // hold's release owns the single re-arm; a second start joins
                 // a second xhad and XHA self-fences.
             }
+            // A host XAPI holds in its HA startup loop is left alone: starting
+            // its HA daemon while it is cut off is never the revive's case.
+            ReadmissionAction::Revive if self.startup_loop_locked("readmission_revive").await => {}
             ReadmissionAction::Revive => {
                 self.episode_open("readmission");
-                warn!(
-                    heal_event = "ha_readmission_revive",
-                    "XHA daemon is dead with nothing retrying it (xha.log silent \
-                     all window) while storage is healthy (the boot-time \
-                     statefile-race signature); restarting it locally"
+                let cause = revive_cause(
+                    self.h_local_armed(),
+                    pool_ha,
+                    std::fs::read_to_string(&self.disarm_record_path)
+                        .is_ok_and(|r| disarm_record_this_boot(&r, &current_boot_id())),
                 );
-                self.run_xha_revive().await;
+                match cause {
+                    ReviveCause::BootRace => warn!(
+                        heal_event = "ha_readmission_revive",
+                        "XHA daemon is dead with nothing retrying it (xha.log silent \
+                         all window) while storage is healthy (the boot-time \
+                         statefile-race signature); restarting it locally"
+                    ),
+                    ReviveCause::LocallyDisarmed { by_twinstor } => warn!(
+                        heal_event = "ha_readmission_revive", locally_disarmed = true, by_twinstor,
+                        "the HA daemon is not running on this host, which is locally disarmed \
+                         under the armed pool, and nothing restarts it: restarting it so the \
+                         host is back in the liveset; it stays locally disarmed until pool HA \
+                         is cycled"
+                    ),
+                }
+                self.run_xha_revive(cause).await;
             }
             ReadmissionAction::Schedule => {
                 self.episode_open("readmission");
@@ -15791,39 +19826,99 @@ impl StateMachine {
     /// other, and that synchronized start lets both bootstrap a fresh liveset
     /// together.
     async fn drive_readmission_dance(&mut self, t: u64) {
+        // The trigger is gone when this host's HA daemon is back in the
+        // liveset (a healthy rejoin): the dance ends at once, whatever the
+        // settle says, so it can never disarm a host that has rejoined.
+        if self.xha_host_state_explicit().await == Some(XhaHostState::Online) {
+            info!(
+                heal_event = "ha_readmission_dance_cancelled",
+                reason = "rejoined",
+                "re-admission dance cancelled: this host's HA daemon is back in the liveset, so \
+                 the join deadlock it was scheduled for is gone"
+            );
+            self.readmission_dance_t = None;
+            self.readmission_disabled_done = false;
+            return;
+        }
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // Phase 1 must leave a quiet period longer than T2 (the HA timeout)
         // before phase 2: at least 120 s, and the timeout plus a minute.
-        let ha_timeout = crate::setup::effective_xha_timeout()
-            .unwrap_or_else(|| crate::setup::ha_timeout_secs(self.arbitrated));
+        let ha_timeout = self.ha_timeout_now();
         let lead = u64::from(ha_timeout).saturating_add(60).max(120);
         if !self.readmission_disabled_done && now_unix >= t.saturating_sub(lead) {
+            // Gated at the firing, not only at scheduling: the peer's
+            // management address must have answered for the settle, and the
+            // startup-loop lock must not hold. Otherwise the dance is
+            // cancelled; detection reschedules it once the pool is reachable.
+            let why = if !self.ha_gate(
+                "readmission_dance_phase1",
+                crate::mgmt_reach::Trigger::Absence,
+            ) {
+                Some("the peer's management address does not answer, or has not answered long enough")
+            } else if self.startup_loop_locked("readmission_dance_phase1").await {
+                Some("XAPI holds this host in its HA startup loop")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                warn!(
+                    heal_event = "ha_readmission_dance_cancelled",
+                    phase = 1,
+                    reason = why,
+                    "re-admission dance cancelled before its local HA disable: {why}"
+                );
+                self.readmission_dance_t = None;
+                return;
+            }
+            // Phase 1 disarms this host only if its own checks pass now
+            // (pool HA on, no pool HA task pending, the list readable); each
+            // host decides for itself, with no word from the peer.
+            let pool_ha = self.h_pool_ha().await;
+            let tasks = self.h_pending_ha_tasks().await;
+            match dance_phase1_check(
+                pool_ha,
+                tasks.as_deref(),
+                t.saturating_sub(now_unix),
+                lead,
+            ) {
+                DancePhase1::Go => {}
+                DancePhase1::Hold(why) => {
+                    if self.log_pace.due("dance_phase1_held", Duration::from_secs(60)) {
+                        info!(heal_event = "ha_readmission_dance_held", phase = 1, reason = why,
+                              "re-admission dance phase 1 waits: {why}; checked again next pass");
+                    }
+                    return;
+                }
+                DancePhase1::Cancel(why) => {
+                    warn!(
+                        heal_event = "ha_readmission_dance_cancelled",
+                        phase = 1,
+                        reason = why,
+                        "re-admission dance cancelled before its local HA disable: {why}"
+                    );
+                    self.readmission_dance_t = None;
+                    return;
+                }
+            }
             warn!(
                 heal_event = "ha_readmission_quiesce",
                 "re-admission dance phase 1: local emergency HA disable (quiescence)"
             );
-            let _ = crate::cmd::run_cmd("xe", &["host-emergency-ha-disable", "--force"]).await;
-            self.readmission_disabled_done = true;
-            // Persist the re-arm obligation at the disable, not only in phase 2.
-            // Phase 2's re-arm bails when this node is not cleanly pool master
-            // (`is_pool_master_resilient`), which is the dual-master
-            // state this dance runs in, so it can leave HA disabled with
-            // nothing to re-arm it. With the obligation written here,
-            // `fulfil_ha_rearm_obligation` retries the enable by itself as soon
-            // as the peer is re-admitted (its `peer_host_enabled` gate already
-            // blocks a doomed enable during isolation), so the re-arm does not
-            // depend on phase 2 completing or on the `ha_rearm_after_fence`
-            // catch-all noticing.
-            if let Some(sr) = xapi::twinstor_sr_uuid().await {
-                let arbitrated = std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists();
-                let ha_timeout = xapi::pool_ha_timeout()
-                    .await
-                    .unwrap_or_else(|| crate::setup::ha_timeout_secs(arbitrated));
-                ha_obligation_write(&sr, ha_timeout.into());
+            note_local_ha_disarm();
+            if !self.h_record("readmission_dance_phase1".to_string()) {
+                let _ = crate::cmd::run_cmd("xe", &["host-emergency-ha-disable", "--force"]).await;
             }
+            self.readmission_disabled_done = true;
+            // No pool re-arm is owed for phase 1: it disarms this host only,
+            // and pool HA stays on. The master's phase-2 pool HA cycle re-arms
+            // both hosts; if the master's phase 2 cannot start, it alerts at
+            // once (`dance_phase2_stopped`), and a host still disarmed once
+            // the cycle's time has passed alerts about itself
+            // (`dance_disarm_watch_pass`). Nothing re-arms it automatically.
+            self.dance_disarm_watch = Some(t.saturating_add(DANCE_REARM_WAIT));
         }
         if now_unix < t {
             return;
@@ -15833,44 +19928,130 @@ impl StateMachine {
         self.readmission_dance_t = None;
         self.readmission_last_dance = Some(std::time::Instant::now());
         self.readmission_suspect_since = None;
-        if xapi::is_pool_master_resilient().await != Some(true) {
+        if self.h_master_resilient().await != Some(true) {
             info!("re-admission dance: not the pool master; the master's daemon re-arms");
             return;
         }
-        let Some(sr) = xapi::twinstor_sr_uuid().await else {
-            warn!(
-                "re-admission dance: cannot resolve the heartbeat SR uuid; not \
-                   re-arming blindly; manual re-arm needed"
-            );
-            let _ = xapi::send_xapi_alert(
-                "TwinStor: the automated XHA recovery quiesced both HA daemons but \
-                 could not resolve the heartbeat SR uuid to re-arm. Re-arm manually: \
-                 xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
-                 ha-config:timeout=<120 fate-shared | 90 arbitrated>.",
+        // The pool-level disable is gated at its own firing too.
+        if !self.ha_gate(
+            "readmission_dance_phase2",
+            crate::mgmt_reach::Trigger::Absence,
+        ) {
+            self.dance_phase2_stopped(
+                "the peer's management address does not answer, or has not answered long enough",
             )
             .await;
+            return;
+        }
+        if self.h_record("readmission_dance_phase2".to_string()) {
+            return;
+        }
+        let Some(sr) = xapi::twinstor_sr_uuid().await else {
+            self.dance_phase2_stopped("the heartbeat SR uuid cannot be resolved").await;
             return;
         };
         let arbitrated = std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists();
         let ha_timeout = xapi::pool_ha_timeout()
             .await
-            .unwrap_or_else(|| crate::setup::ha_timeout_secs(arbitrated));
-        ha_obligation_write(&sr, ha_timeout.into());
-        let _ = crate::cmd::run_cmd("xe", &["pool-ha-disable"]).await;
-        ha_obligation_touch_attempt();
-        let enable_args = [
-            "pool-ha-enable".to_string(),
-            format!("heartbeat-sr-uuids={sr}"),
-            format!("ha-config:timeout={ha_timeout}"),
-        ];
-        let args: Vec<&str> = enable_args.iter().map(|s| s.as_str()).collect();
-        let _ = crate::cmd::run_cmd("xe", &args).await;
-        let mut armed = xapi::is_ha_enabled().await == Some(true);
-        if !armed {
-            warn!("re-admission dance: HA not confirmed enabled after re-arm; retrying once");
-            let _ = crate::cmd::run_cmd("xe", &args).await;
-            armed = xapi::is_ha_enabled().await == Some(true);
+            .unwrap_or_else(|| crate::setup::configured_ha_timeout_for(arbitrated));
+        // The disable and the enable each wait up to `HA_CMD_TIMEOUT`: they run
+        // off the tick as one pool HA cycle under the shared in-flight flag.
+        // The cycle checks, before its disable, that pool HA is on and no HA
+        // operation is pending, and only then writes the re-arm obligation.
+        // The re-admission check holds until it returns, then reads the pool's
+        // HA state (`finish_readmission_dance`).
+        if self.spawn_pool_ha_cycle(
+            "readmission_dance",
+            sr,
+            ha_timeout,
+            crate::mgmt_reach::Trigger::Absence,
+            Some(true),
+        ) {
+            self.readmission_cycle_pending = true;
+        } else {
+            self.dance_phase2_stopped("another pool HA operation is in flight").await;
         }
+    }
+
+    /// Phase 2 did not cycle pool HA after phase 1 disarmed this host: one
+    /// alert, at once, saying so (no retry, no coordination with the peer).
+    async fn dance_phase2_stopped(&mut self, why: &str) {
+        warn!(heal_event = "ha_readmission_dance_cancelled", phase = 2, reason = why,
+              "re-admission dance phase 2 did not cycle pool HA: {why}; this host stays locally \
+               disarmed under the armed pool; alerting");
+        if !self.readmission_disabled_done {
+            return;
+        }
+        let what = format!("its pool HA cycle did not start ({why})");
+        // Raised by the master's phase 2: this host is the master.
+        let body = dance_disarmed_alert(
+            &self.config.node.name,
+            &self.config.node.name,
+            &what,
+            self.ha_timeout_now(),
+        );
+        let _ = self.h_alert_advice(&body).await;
+        self.dance_disarm_watch = None;
+    }
+
+    /// A host the dance's phase 1 disarmed that is still locally disarmed
+    /// under the armed pool once the master's cycle has had its time: one
+    /// alert about itself (the slave learns nothing from the master). Re-armed,
+    /// or pool HA off, ends the watch silently; an unreadable answer waits.
+    async fn dance_disarm_watch_pass(&mut self, now_unix: u64) {
+        let Some(at) = self.dance_disarm_watch else {
+            return;
+        };
+        if now_unix < at || self.readmission_cycle_pending {
+            return;
+        }
+        match (self.h_local_armed(), self.h_pool_ha().await) {
+            (Some(true), _) | (_, Some(false)) => self.dance_disarm_watch = None,
+            (Some(false), Some(true)) => {
+                self.dance_disarm_watch = None;
+                warn!(heal_event = "ha_readmission_dance_not_rearmed",
+                      "this host is still locally disarmed under the armed pool after the \
+                       re-admission dance; alerting");
+                let what = format!(
+                    "no pool HA cycle re-armed it within {} minutes of the dance's sync point",
+                    DANCE_REARM_WAIT / 60
+                );
+                // The master: this host if pool.conf says so, else the peer.
+                let master = if xapi::local_pool_role() == Some(true) {
+                    &self.config.node.name
+                } else {
+                    &self.config.node.peer
+                };
+                let body =
+                    dance_disarmed_alert(&self.config.node.name, master, &what, self.ha_timeout_now());
+                let _ = self.h_alert_advice(&body).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// After the dance's pool HA cycle has returned: enter the confirmation
+    /// phase if pool HA reads armed, otherwise alert (the re-arm obligation
+    /// written before the disable keeps retrying the enable).
+    async fn finish_readmission_dance(&mut self, r: Option<PoolHaCycle>) {
+        if let Some(r) = &r {
+            info!(heal_event = "readmission_dance_cycle", disabled = r.disabled,
+                  enabled = r.enabled, disable = %r.disable_note, withheld = ?r.withheld,
+                  "re-admission dance phase 2: pool HA cycle returned");
+            if r.operator_off {
+                // Someone else turned pool HA off: not re-enabled, and no
+                // "keeps retrying" alert (the cycle dropped the obligation).
+                return;
+            }
+            if !r.disable_issued {
+                // Stopped before its disable (pool HA not on, an HA task
+                // pending, a gate): nothing was cycled.
+                let why = r.disable_note.clone();
+                self.dance_phase2_stopped(&why).await;
+                return;
+            }
+        }
+        let armed = xapi::is_ha_enabled().await == Some(true);
         if armed {
             // Do not declare pool-wide recovery from the local pool-HA flag.
             // This dance runs because the peer's xhad could not join the
@@ -15888,12 +20069,11 @@ impl StateMachine {
                    the peer rejoined the liveset before declaring recovery"
             );
         } else {
-            let _ = xapi::send_xapi_alert(
+            let _ = xapi::send_xapi_alert(&format!(
                 "TwinStor: the automated XHA recovery ran but HA could not be \
                  confirmed re-armed yet. TwinStor keeps retrying automatically \
-                 every few minutes until it succeeds; to intentionally keep HA \
-                 off instead, remove /var/lib/twinstor/ha-rearm-obligation.",
-            )
+                 every few minutes until it succeeds. {KEEP_HA_OFF_HOWTO}"
+            ))
             .await;
         }
     }
@@ -15902,7 +20082,7 @@ impl StateMachine {
     /// race left their links broken, then restart the HA daemon. Local only:
     /// no peer coordination and no quiescence. A failure leaves us where we
     /// were (the alert path), and the hourly cap stops retry churn.
-    async fn run_xha_revive(&mut self) {
+    async fn run_xha_revive(&mut self, cause: ReviveCause) {
         let now = std::time::Instant::now();
         self.readmission_last_revive = Some(now);
         if !static_vdi_links_ok(STATIC_VDIS_DIR) {
@@ -15932,16 +20112,38 @@ impl StateMachine {
         if self.xha_host_state().await == XhaHostState::Online {
             info!(
                 heal_event = "ha_readmission_revived",
-                "XHA daemon restarted and rejoined the liveset; HA protection \
-                 restored"
+                locally_disarmed = matches!(cause, ReviveCause::LocallyDisarmed { .. }),
+                "XHA daemon restarted and rejoined the liveset"
             );
-            let _ = xapi::send_xapi_alert(
-                "TwinStor: the XHA daemon on this host had died during boot \
-                 (storage was not yet reachable when it started) and has been \
-                 restarted automatically. It rejoined the liveset; HA \
-                 protection is restored. No action needed.",
-            )
-            .await;
+            match cause {
+                ReviveCause::BootRace => {
+                    let _ = xapi::send_xapi_alert(
+                        "TwinStor: the XHA daemon on this host had died during boot \
+                         (storage was not yet reachable when it started) and has been \
+                         restarted automatically. It rejoined the liveset; HA \
+                         protection is restored. No action needed.",
+                    )
+                    .await;
+                }
+                ReviveCause::LocallyDisarmed { by_twinstor } => {
+                    let master = if xapi::local_pool_role() == Some(true) {
+                        self.config.node.name.clone()
+                    } else {
+                        self.config.node.peer.clone()
+                    };
+                    // Pool HA read again now: it may have been turned off
+                    // while the daemon started.
+                    let pool_off = xapi::is_ha_enabled().await == Some(false);
+                    let body = revived_disarmed_alert(
+                        &self.config.node.name,
+                        &master,
+                        by_twinstor,
+                        self.ha_timeout_now(),
+                        pool_off,
+                    );
+                    let _ = xapi::send_xapi_alert_advising_ha_disable(&body).await;
+                }
+            }
             self.episode_close("readmission-revived");
             self.readmission_suspect_since = None;
             self.readmission_signals = XhaLogSignals::default();
@@ -15951,17 +20153,7 @@ impl StateMachine {
                 "XHA daemon restart did not reach Online; leaving the manual \
                  runbook alert armed (next automatic attempt in an hour)"
             );
-            self.readmission_alert(
-                "TwinStor: the XHA daemon on this host is dead and an automatic \
-                 restart did not bring it back Online. Investigate \
-                 /var/log/xha.log; to retry manually run 'systemctl restart \
-                 attach-static-vdis' then 'PATH=/usr/libexec/xapi/\
-                 cluster-stack/xhad:$PATH ha_start_daemon' (the script needs \
-                 its own directory on PATH). Storage is unaffected; VMs keep \
-                 running.",
-                now,
-            )
-            .await;
+            self.readmission_alert(REVIVE_FAILED_ALERT, now).await;
         }
     }
 
@@ -15973,6 +20165,17 @@ impl StateMachine {
             Some(at) => now.duration_since(at) >= DEGRADED_REALERT_AFTER,
         };
         if due && xapi::send_xapi_alert(body).await {
+            self.readmission_alerted_at = Some(now);
+        }
+    }
+
+    /// `readmission_alert` for a body whose remedy is an HA disable.
+    async fn readmission_alert_advice(&mut self, body: &str, now: std::time::Instant) {
+        let due = match self.readmission_alerted_at {
+            None => true,
+            Some(at) => now.duration_since(at) >= DEGRADED_REALERT_AFTER,
+        };
+        if due && xapi::send_xapi_alert_advising_ha_disable(body).await {
             self.readmission_alerted_at = Some(now);
         }
     }
@@ -16064,6 +20267,21 @@ impl StateMachine {
         parse_peer_liveset(&xml).map(|ls| ls.peer_live)
     }
 
+    /// The peer's membership in this host's own liveset, `None` unless this
+    /// host's xhad is Online in it (see `own_liveset_peer_membership`). For
+    /// claims made to the operator about the liveset.
+    async fn peer_liveset_read(&self) -> Option<PeerLiveset> {
+        let Ok(Ok(xml)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::cmd::cmd_output(CALLDAEMON, &["query_liveset"]),
+        )
+        .await
+        else {
+            return None;
+        };
+        parse_peer_liveset(&xml)
+    }
+
     /// Make this node's storage unavailable as a client: stop its target, log
     /// out its initiator sessions, demote to Secondary. After this the node
     /// cannot write the shared LUN by any path (neither its own target nor,
@@ -16108,7 +20326,7 @@ impl StateMachine {
     ///     post-fence boot ha-disables (see `isolation_standdown_gate`, keyed on
     ///     boot_id) to avoid a re-fence loop; see `slave_fence_needs_ha_disable`.
     async fn execute_isolated_standdown(&mut self, fence_to_failover: bool) {
-        if std::path::Path::new(ISOLATED_STANDDOWN_MARKER).exists() {
+        if std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists() {
             return;
         }
         // Hard-stop local guests before committing to the stand-down. If they
@@ -16178,7 +20396,7 @@ impl StateMachine {
                  network returns."
             );
         }
-        if let Some(dir) = std::path::Path::new(ISOLATED_STANDDOWN_MARKER).parent() {
+        if let Some(dir) = std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         // The slave-fence marker stamps this boot's boot_id so the gate can tell a
@@ -16193,7 +20411,7 @@ impl StateMachine {
             "isolated-master storage stand-down; parked until the client network returns\n"
                 .to_string()
         };
-        let _ = std::fs::write(ISOLATED_STANDDOWN_MARKER, marker_body);
+        let _ = std::fs::write(ISOLATED_STANDDOWN_MARKER.as_str(), marker_body);
         // Master: leave HA cleanly before tearing the storage down.
         // quiesce_storage logs the iSCSI initiator out, which removes this
         // node's only path to the HA statefile (an LV on the twinstor SR).
@@ -16214,6 +20432,17 @@ impl StateMachine {
         if !fence_to_failover {
             self.ha_disable_local().await;
         }
+        // DESIGN-QUESTION: the design has the master stand-down also demote
+        // its own xapi here (pool.conf to the peer, xapi restart), so two
+        // masters do not answer through the whole hold. The demote primitive
+        // only points pool.conf at a peer management address that answers on
+        // 443 when it fires, and an isolated master stands down precisely
+        // because it cannot reach the peer over that network: the condition
+        // cannot hold here. Conservative reading: no demote at the stand-down.
+        // After the release, the second-master guard demotes the host on its
+        // own liveset evidence (the peer holds the master lock) once the
+        // address answers, and the recorded-disarm re-arm or the master's
+        // peer-emergency reset then re-arms it.
         self.quiesce_storage().await;
         self.heal_state_update(
             "isolated_standdown",
@@ -16329,7 +20558,7 @@ impl StateMachine {
     /// on boot, the marker plus continued isolation keeps storage down, so
     /// XHA cannot start VMs here.
     async fn isolation_standdown_gate(&mut self) -> bool {
-        if cfg!(test) || !std::path::Path::new(ISOLATED_STANDDOWN_MARKER).exists() {
+        if cfg!(test) || !std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists() {
             return false;
         }
         let gateway_ok = ping_default_gateway().await;
@@ -16343,8 +20572,14 @@ impl StateMachine {
             // reboot, disable the armed xhad so it does not re-fence in a loop
             // against the intentionally unavailable statefile. A boot_id change
             // marks the post-fence boot; master-path markers never match.
-            if let Ok(content) = std::fs::read_to_string(ISOLATED_STANDDOWN_MARKER)
+            // Not while XAPI holds this host in its HA startup loop cut off from
+            // the peer's management address (the startup-loop lock): an
+            // unjoined xhad without its statefile loops harmlessly there, and
+            // the disarm is what later leaves the armed-mismatch wedge.
+            if let Ok(content) = std::fs::read_to_string(ISOLATED_STANDDOWN_MARKER.as_str())
                 && slave_fence_needs_ha_disable(&content, &current_boot_id())
+                && !self.ha_cycle_in_flight("slave_post_fence_disarm")
+                && !self.startup_loop_locked("slave_post_fence_disarm").await
             {
                 self.ha_disable_local().await;
             }
@@ -16414,7 +20649,10 @@ impl StateMachine {
         // reboot, so re-arm HA now that storage is back and this node rejoins
         // the liveset (see rearm_local_ha_after_standdown).
         self.rearm_local_ha_after_standdown().await;
-        let _ = std::fs::remove_file(ISOLATED_STANDDOWN_MARKER);
+        // As at a whole-switch release: the suspicion window starts here.
+        self.readmission_suspect_since = None;
+        self.twinstor_hold_released_at = Some(std::time::Instant::now());
+        let _ = std::fs::remove_file(ISOLATED_STANDDOWN_MARKER.as_str());
         // Clear the parked heal state ("isolated_standdown" or its "_hold"
         // variant): the node has rejoined and is serving again. While parked,
         // only this gate runs (guard at the top of the loop), so the current
@@ -16423,6 +20661,7 @@ impl StateMachine {
         self.heal_state_clear();
         self.master_isolated_since = None;
         self.master_isolated_alerted_at = None;
+        self.withdraw_isolation_alerts();
         self.standdown_hold_alert_at = None;
         self.standdown_gateway_back_since = None;
         // Mark us as the returned, forked node so the HA-deadlock exit knows
@@ -16662,6 +20901,11 @@ impl StateMachine {
                 WHOLE_SWITCH_CONFIRM
             },
         );
+        // A standing hold refreshes its heal stage, so the stale-indicator
+        // reaper never removes it while the hold is on.
+        if action == WholeSwitchAction::None && self.whole_switch_held {
+            self.refresh_live_hold_stage();
+        }
         if action != WholeSwitchAction::Release {
             // A deferral is measured, logged and alerted from the release it
             // delays, not from an earlier one the hold came back after.
@@ -16698,9 +20942,8 @@ impl StateMachine {
                 self.isolated_slave_since = None;
                 self.heal_state_update(
                     "whole_switch_hold",
-                    "whole-switch outage: both hosts isolated; holding with VMs running \
-                     (no failover: the peer is equally unreachable)",
-                    Some("restore the client/switch network; HA re-arms automatically"),
+                    WHOLE_SWITCH_HOLD_SUMMARY,
+                    Some(WHOLE_SWITCH_HOLD_NEXT),
                 );
             }
             WholeSwitchAction::Release => {
@@ -16812,12 +21055,15 @@ impl StateMachine {
                              does not answer, so its HA stays disarmed. Check that the 'disk' \
                              links under /etc/xensource/static-vdis/ exist ('systemctl restart \
                              attach-static-vdis' recreates them) and 'twinstor status' on this \
-                             host; HA re-arms automatically once the statefile answers."
+                             host. Once the statefile answers, HA is re-armed by one pool HA \
+                             cycle, by TwinStor unless auto_resolve_peer_emergency is off (an \
+                             alert then asks for it)."
                         } else {
                             "TwinStor: the network outage is over, but this host's storage I/O is \
-                             still frozen (or its state is unreadable), so its HA stays disarmed; \
-                             it re-arms automatically once storage I/O runs. Check 'twinstor \
-                             status' on this host."
+                             still frozen (or its state is unreadable), so its HA stays disarmed. \
+                             Once storage I/O runs, HA is re-armed by one pool HA cycle, by \
+                             TwinStor unless auto_resolve_peer_emergency is off (an alert then \
+                             asks for it). Check 'twinstor status' on this host."
                         };
                         let _ = xapi::send_xapi_alert(body).await;
                         self.whole_switch_release_alerted_at = Some(now);
@@ -16835,6 +21081,13 @@ impl StateMachine {
                     "client network restored after a whole-switch hold; re-arming local HA"
                 );
                 self.rearm_local_ha_after_standdown().await;
+                // The suspicion window starts at the release.
+                self.readmission_suspect_since = None;
+                self.twinstor_hold_released_at = Some(std::time::Instant::now());
+                // The release restarts xhad but cannot re-arm this host
+                // locally (only a pool HA enable does): the recorded-disarm
+                // re-arm (`check_recorded_disarm_rearm`) repairs that once the
+                // host is back in the liveset.
                 self.whole_switch_held = false;
                 self.whole_switch_since = None;
                 self.whole_switch_probe_misses = 0;
@@ -16871,7 +21124,7 @@ impl StateMachine {
             || !self.arbitrated
             || !self.config.ha.self_standdown_isolated_master
             || self.whole_switch_held
-            || std::path::Path::new(ISOLATED_STANDDOWN_MARKER).exists()
+            || std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists()
         {
             return;
         }
@@ -17014,26 +21267,54 @@ impl StateMachine {
             return;
         }
         // While parked in a whole-switch hold, do not stand down: both hosts
-        // are isolated, so keep VMs running where they are.
-        if self.whole_switch_held {
+        // are isolated, so keep VMs running where they are. And no
+        // isolated-master alert: it would tell the operator to fix this
+        // host's cable when both hosts are cut; the hold's own text says so.
+        if whole_switch_in_force(
+            self.whole_switch_held,
+            self.whole_switch_guard.load(Ordering::Relaxed),
+        ) {
             return;
         }
         let now = std::time::Instant::now();
         let pc = xapi::local_slave_master_addr();
-        let i_am_master = pc.is_none()
+        let conf_master = pc.is_none()
             && std::fs::read_to_string("/etc/xensource/pool.conf")
                 .map(|c| c.trim() == "master")
                 .unwrap_or(false);
+        // "I am the master" means the local xapi answers as the master, never
+        // pool.conf alone: a host XAPI parks in its HA startup loop keeps
+        // `master` in pool.conf while refusing every call, and must not match.
+        // An unanswered read leaves the clocks as they are (a slow xapi on a
+        // real isolated master must not reset its window).
+        let i_am_master = if conf_master {
+            match self.local_xapi_master_cached(now).await {
+                Some(m) => m,
+                None => {
+                    if self.log_pace.due("isolated_master_xapi_silent", Duration::from_secs(600)) {
+                        info!(
+                            heal_event = "isolated_master_check_held",
+                            "pool.conf says master but the local xapi does not answer as \
+                             master; the isolated-master check waits"
+                        );
+                    }
+                    return;
+                }
+            }
+        } else {
+            false
+        };
         let gateway_ok = ping_default_gateway().await;
         let peer_alive = self.peer_replication_reachable().await;
         // Data-safety guard for the stand-down: only hand off to a peer that
         // holds a good copy. Read once here so the pure decision stays testable.
-        let peer_uptodate = self
-            .drbd
-            .status()
-            .await
-            .map(|s| s.peer_disk == Some(DiskState::UpToDate))
-            .unwrap_or(false);
+        let drbd_status = self.drbd.status().await.ok();
+        let peer_uptodate = drbd_status
+            .as_ref()
+            .is_some_and(|s| s.peer_disk == Some(DiskState::UpToDate));
+        let drbd_connected = drbd_status
+            .as_ref()
+            .is_some_and(|s| s.connection == ConnectionState::Connected);
         // Arbitrated mode only: the stand-down needs a replication path
         // separate from the client network to tell "just this master lost its
         // switch" from "the whole segment is down". Fate-shared mode (single
@@ -17110,20 +21391,7 @@ impl StateMachine {
                 self.master_isolated_alerted_at,
                 now,
             ) {
-                IsolationAction::None => {
-                    // Isolation is over (gateway back, peer gone, or the peer
-                    // answers over the switch: a router outage). Clear the
-                    // master-isolated heal state and alert we raised, or status
-                    // stays on a stale "master isolated / auto-heal N min" after
-                    // a reconnection that came before the stand-down.
-                    if self.master_isolated_alerted_at.take().is_some() {
-                        self.clear_heal_state_if_stage("master_isolated");
-                    }
-                    if self.standdown_ha_off_alerted_at.take().is_some() {
-                        self.clear_heal_state_if_stage("standdown_suppressed_ha_off");
-                    }
-                    self.master_isolated_since = None;
-                }
+                IsolationAction::None => self.master_isolation_ended(),
                 IsolationAction::Hold => {}
                 IsolationAction::StandDown => {
                     // The isolated-master stand-down demotes our storage so XHA
@@ -17142,7 +21410,13 @@ impl StateMachine {
                     // a VM-less wrongful master up as a second writer. Otherwise
                     // keep the HA-armed guard.
                     let nothing_to_strand = vms == Some(0);
-                    if nothing_to_strand || standdown_allowed_ha(ha) {
+                    if (nothing_to_strand || standdown_allowed_ha(ha))
+                        && (self.ha_cycle_in_flight("isolated_master_standdown")
+                            || self.startup_loop_locked("isolated_master_standdown").await)
+                    {
+                        // Held by the startup-loop lock: no disarm, no storage
+                        // withdrawal on a host XAPI keeps out of the pool.
+                    } else if nothing_to_strand || standdown_allowed_ha(ha) {
                         self.execute_isolated_standdown(false).await;
                     } else {
                         let realert = match self.standdown_ha_off_alerted_at {
@@ -17156,15 +21430,7 @@ impl StateMachine {
                                    there is nothing to fail the VMs over; demoting would only \
                                    strand them). Keeping storage up. Enable pool HA for failover.");
                             self.standdown_ha_off_alerted_at = Some(now);
-                            let _ = xapi::send_xapi_alert(
-                                "TwinStor: this pool master is isolated from the client network, \
-                                 but pool HA is disabled. TwinStor did not stand its storage down \
-                                 (with HA off, that would strand its VMs rather than fail them \
-                                 over). Storage keeps replicating over the direct link and no data \
-                                 is at risk. Enable pool HA so an isolated master can fail its VMs \
-                                 over to the peer.",
-                            )
-                            .await;
+                            let _ = xapi::send_xapi_alert(MASTER_ISOLATED_HA_OFF_ALERT).await;
                         }
                         self.heal_state_update(
                             "standdown_suppressed_ha_off",
@@ -17185,27 +21451,21 @@ impl StateMachine {
                            likely unreachable to clients. Reconnect this host's \
                            network, or transition mastership on the peer and migrate"
                     );
-                    self.heal_state_update(
-                        "master_isolated",
-                        "master cut off from the client network; VMs here likely unreachable",
-                        Some("reconnect this host's network (preferred), or recover on the peer"),
-                    );
-                    let _ = xapi::send_xapi_alert(
-                        "TwinStor: this pool master is isolated from the client \
-                         network while storage replication continues over the direct \
-                         link. VMs running here are likely unreachable to clients. \
-                         Reconnect this host's network cable/switch port; the pool \
-                         reunifies on its own. (If this alert reached you, the \
-                         partition has already healed - review VM placement.)",
-                    )
-                    .await;
+                    // The status line comes from the partition view (this
+                    // host's ClientIsolated or IsolatedSurvivor), which
+                    // follows the condition and clears with it; an older
+                    // daemon's stage is cleared here.
+                    self.clear_heal_state_if_stage("master_isolated");
+                    let _ = xapi::send_xapi_alert(MASTER_ISOLATED_ALERT).await;
                 }
             }
             return;
         }
 
         // Connected side: only meaningful when we follow the peer.
-        self.master_isolated_since = None;
+        self.master_isolation_ended_not_master();
+        let p = self.p_view().p;
+        self.isolated_master_answers_again(p);
         let peer_addr = self.config.network.peer_address.to_string();
         let i_follow_peer = pc.as_deref() == Some(peer_addr.as_str());
         // Corroborate the wedge with the master's own client-gateway beacon,
@@ -17231,8 +21491,11 @@ impl StateMachine {
         } else {
             false
         };
-        let xe_dead =
-            i_follow_peer && master_client_isolated && xapi::is_ha_enabled().await.is_none();
+        // The forwarded read is not sent while P is false: it would only time
+        // out, which is what `xe_dead` already means.
+        let xe_dead = i_follow_peer
+            && master_client_isolated
+            && (!self.p_view().p || xapi::is_ha_enabled().await.is_none());
         // The stable core (follows the peer, xe dead) owns the maturity clock.
         // Gateway, peer and probe readings are point-in-time and must never
         // reset it on a transient miss; it clears only when the core is gone.
@@ -17255,18 +21518,7 @@ impl StateMachine {
             // Nothing to manage (no clock armed, no alert outstanding): a
             // healthy follower, so no state change and no log.
             IsolatedMasterReset::Idle => {}
-            IsolatedMasterReset::Clear => {
-                // Topology change, or xe answered continuously past the grace:
-                // clear the isolated_master heal state and alert we raised, or
-                // the connected node's status stays stuck the same way the
-                // master's would.
-                if self.isolated_master_alerted_at.take().is_some() {
-                    self.clear_heal_state_if_stage("isolated_master");
-                }
-                self.isolated_master_since = None;
-                self.isolated_master_recovered_since = None;
-                self.last_clock_held_log_at = None; // episode ended; the next one logs afresh
-            }
+            IsolatedMasterReset::Clear => self.isolated_master_cleared(),
             IsolatedMasterReset::ArmDebounce => {
                 // xe answered again while we still follow the peer, possibly a
                 // transient flip (a sibling toolstack restart). Hold the maturity
@@ -17301,11 +21553,34 @@ impl StateMachine {
                 }
             }
         }
+        // While the isolation clock runs, follow what this host sees of
+        // XHA's inputs, so the in-liveset claim waits for XHA from the last
+        // change as well as from the clock's start.
+        let mut membership_now = None;
+        if self.isolated_master_since.is_some() {
+            let ls = self.peer_liveset_read().await;
+            membership_now = own_liveset_peer_membership(ls);
+            let (moved, off) = scan_xha_log_deciding(&self.xha_log_path, self.xha_reach.log_offset);
+            self.xha_reach.log_offset = off;
+            self.xha_reach.observe(
+                XhaReach {
+                    p: self.p_view().p,
+                    peer_alive,
+                    drbd_connected,
+                    peer_live: ls.map(|l| l.peer_live),
+                    peer_statefile: ls.map(|l| l.peer_statefile_access),
+                },
+                moved,
+                now,
+            );
+        } else {
+            self.xha_reach = XhaReachClock::default();
+        }
         let matured = self
             .isolated_master_since
             .is_some_and(|t| now.duration_since(t) >= ISOLATED_MASTER_AFTER);
         let peer_claims_slave = if matured {
-            Some(xapi::peer_claims_slave_of(&peer_addr).await.is_some())
+            Some(self.peer_claims_slave_probe(&peer_addr).await.is_some())
         } else {
             None
         };
@@ -17327,29 +21602,149 @@ impl StateMachine {
             // decision fn never returns it.
             IsolationAction::StandDown => {}
             IsolationAction::Alert => {
+                if let Some(why) = isolated_master_alert_held(self.p_view().p) {
+                    // Not alerted: the next pass decides again.
+                    if self.log_pace.due("isolated_master_alert_held", Duration::from_secs(600)) {
+                        info!(heal_event = "isolated_master_alert_held", reason = why,
+                              "no isolated-master alert: {why}");
+                    }
+                    return;
+                }
                 self.isolated_master_alerted_at = Some(now);
-                warn!(
-                    heal_event = "isolated_master",
-                    "the pool master is unreachable on the client network but its \
-                       daemon is alive on the replication link: it has likely kept \
-                       (or taken) the VMs while clients cannot reach them. Reconnect \
-                       its network; storage stays safe throughout"
-                );
-                self.heal_state_update(
-                    "isolated_master",
-                    "pool master network-isolated but alive; VMs on it likely unreachable",
-                    Some("reconnect the master's switch path; emergency-transition here only if it cannot be revived"),
-                );
-                let _ = xapi::send_xapi_alert(
-                    "TwinStor: the pool master is isolated from the client network \
-                     (its daemon is alive on the replication link, storage is safe). \
-                     VMs it runs are likely unreachable to clients. Reconnect its \
-                     network; the pool reunifies on its own. To fail service over \
-                     instead: xe pool-emergency-transition-to-master on this node, \
-                     then migrate when the old master returns.",
-                )
-                .await;
+                self.isolated_master_alert_withdrawn = false;
+                // A master that has left this host's own liveset was removed
+                // by XHA (fenced, or held out of the pool): it runs nothing,
+                // and the partition view says so. Only a master still in the
+                // liveset may be keeping VMs clients cannot reach. Only a
+                // liveset this host is Online in counts: a host parked or
+                // still joining has none, and its alert claims nothing about
+                // the liveset.
+                let t_hb = std::fs::read_to_string(XHAD_CONF)
+                    .ok()
+                    .and_then(|c| crate::mgmt_reach::heartbeat_timeout(&c))
+                    .unwrap_or_else(|| crate::setup::ha_timeout_secs(arbitrated));
+                // Measured from the later of the isolation clock's start and
+                // the last change this host saw in XHA's inputs: the clock is
+                // debounced and can start before the cut (a master's xapi
+                // restart), and XHA keeps deciding after a fence or a
+                // heartbeat change.
+                match isolated_master_claim(
+                    membership_now,
+                    self.xha_reach.quiet_for(self.isolated_master_since, now),
+                    self.isolated_master_since.map(|t| now.saturating_duration_since(t)),
+                    xha_decision_window(t_hb),
+                ) {
+                    IsolatedMasterClaim::XhaDeciding => {
+                        // Not alerted: the next pass decides again.
+                        self.isolated_master_alerted_at = None;
+                        if self.log_pace.due("isolated_master_xha_deciding", Duration::from_secs(300)) {
+                            info!(
+                                heal_event = "isolated_master_wait_xha",
+                                "the pool master's management address is silent and it is still \
+                                 in this host's HA liveset, but XHA may still be deciding (the \
+                                 isolation is younger than three heartbeat timeouts plus a \
+                                 minute); no isolated-master alert yet"
+                            );
+                        }
+                    }
+                    IsolatedMasterClaim::Removed => {
+                        info!(
+                            heal_event = "isolated_master_removed",
+                            "the pool master's management address is silent and it has left \
+                             this host's HA liveset: XHA removed it; no isolated-master alert"
+                        );
+                    }
+                    IsolatedMasterClaim::InLiveset => {
+                        warn!(
+                            heal_event = "isolated_master",
+                            liveset = "member",
+                            "the pool master is unreachable on the client network but its \
+                               daemon is alive on the replication link and it is still in the \
+                               HA liveset: the VMs it runs are likely unreachable to clients. \
+                               Reconnect its network; storage stays safe throughout"
+                        );
+                        self.clear_heal_state_if_stage("isolated_master");
+                        let _ = xapi::send_xapi_alert(ISOLATED_MASTER_IN_LIVESET_ALERT).await;
+                    }
+                    IsolatedMasterClaim::LivesetUnknown => {
+                        let ha_off = xapi::last_known_pool_ha() == Some(false);
+                        let body = isolated_master_unknown_liveset_alert(ha_off);
+                        warn!(
+                            heal_event = "isolated_master",
+                            liveset = "unknown",
+                            pool_ha_off = ha_off,
+                            "{body}"
+                        );
+                        self.clear_heal_state_if_stage("isolated_master");
+                        let _ = xapi::send_xapi_alert(body).await;
+                    }
+                }
             }
+        }
+    }
+
+    /// Master side: isolation is over (gateway back, peer gone, or the peer
+    /// answers over the switch: a router outage). Clear the master-isolated
+    /// heal state and alert we raised, or status stays on a stale "master
+    /// isolated / auto-heal N min" after a reconnection that came before the
+    /// stand-down; a queued alert of the episode is withdrawn.
+    fn master_isolation_ended(&mut self) {
+        if self.master_isolated_alerted_at.take().is_some() {
+            self.clear_heal_state_if_stage("master_isolated");
+        }
+        if self.standdown_ha_off_alerted_at.take().is_some() {
+            self.clear_heal_state_if_stage("standdown_suppressed_ha_off");
+        }
+        if self.master_isolated_since.take().is_some() {
+            self.withdraw_isolation_alerts();
+        }
+    }
+
+    /// This host is no longer the master: its master-side isolation clock
+    /// ends, and a queued alert of that episode is withdrawn.
+    fn master_isolation_ended_not_master(&mut self) {
+        if self.master_isolated_since.take().is_some() {
+            self.withdraw_isolation_alerts();
+        }
+    }
+
+    /// Connected side: the master's management address answers again (P),
+    /// so a queued alert saying it does not is withdrawn at once, not when
+    /// the isolation clock clears after its recovery debounce (by then the
+    /// alert would have been delivered late or aged out). Once per alert.
+    fn isolated_master_answers_again(&mut self, p: bool) {
+        if p && self.isolated_master_alerted_at.is_some() && !self.isolated_master_alert_withdrawn {
+            self.isolated_master_alert_withdrawn = true;
+            self.withdraw_isolation_alerts();
+        }
+    }
+
+    /// Connected side: topology change, or xe answered continuously past
+    /// the grace: clear the isolated_master heal state and alert we raised,
+    /// or the connected node's status stays stuck the same way the master's
+    /// would; a queued alert of the episode is withdrawn.
+    fn isolated_master_cleared(&mut self) {
+        if self.isolated_master_alerted_at.take().is_some() {
+            self.clear_heal_state_if_stage("isolated_master");
+        }
+        self.withdraw_isolation_alerts();
+        self.isolated_master_since = None;
+        self.isolated_master_recovered_since = None;
+        self.last_clock_held_log_at = None; // episode ended; the next one logs afresh
+    }
+
+    /// The isolation clock cleared: the isolated-master alerts of both
+    /// sides, if still queued, no longer hold (each is sent unkeyed, so its
+    /// body is its key).
+    fn withdraw_isolation_alerts(&mut self) {
+        for body in [
+            MASTER_ISOLATED_ALERT,
+            MASTER_ISOLATED_HA_OFF_ALERT,
+            ISOLATED_MASTER_IN_LIVESET_ALERT,
+            isolated_master_unknown_liveset_alert(false),
+            isolated_master_unknown_liveset_alert(true),
+        ] {
+            self.h_forget_held_alert(body);
         }
     }
 
@@ -17453,7 +21848,9 @@ impl StateMachine {
             self.mutual_slave_alerted = false;
             return;
         }
-        let xe_dead = xapi::is_ha_enabled().await.is_none();
+        // Forwarded to the peer (the master this node follows): not sent while
+        // P is false, where it could only time out (xe dead).
+        let xe_dead = !self.p_view().p || xapi::is_ha_enabled().await.is_none();
         let now = std::time::Instant::now();
         if xe_dead && self.mutual_slave_since.is_none() {
             self.mutual_slave_since = Some(now);
@@ -17481,7 +21878,7 @@ impl StateMachine {
             .mutual_slave_since
             .is_some_and(|t| now.duration_since(t) >= MASTERLESS_ALERT_AFTER);
         let peer_follows_me = if matured {
-            match xapi::peer_claims_slave_of(&peer_addr).await {
+            match self.peer_claims_slave_probe(&peer_addr).await {
                 Some(claimed) => Some(addr_is_local(&claimed)),
                 None => Some(false),
             }
@@ -17517,6 +21914,8 @@ impl StateMachine {
                        Automatic recovery follows if the state persists"
                 );
             }
+            // Gated before the hourly cooldown is taken.
+            MasterlessAction::Recover if !self.masterless_chain_allowed(false).await => {}
             MasterlessAction::Recover => {
                 warn!(
                     scenario = "masterless_pool",
@@ -17574,17 +21973,26 @@ impl StateMachine {
         // promoted in seconds instead of waiting out the 300 s masterless
         // recovery. When replication is up the peer is alive, so there is
         // nothing to confirm and we skip the probe (and its python shell).
-        // The three answers (Master, SlaveOf, Unreachable) tell a live
-        // surviving master (defer) from a dead master (take over).
+        // The answers tell a live surviving master (Master: defer) from a dead
+        // master (Unreachable: take over); a peer answering otherwise
+        // (ArmedMismatch, Unknown) withholds the transition.
         let matured = self
             .masterless_since
             .is_some_and(|t| now.duration_since(t) >= MASTERLESS_ALERT_AFTER);
         let peer_role = if self_slave && (matured || !peer_ok) {
-            Some(xapi::peer_xapi_role(&self.config.network.peer_address.to_string()).await)
+            Some(self.peer_role_probe().await)
         } else {
             None
         };
         let peer_is_live_master = matches!(peer_role, Some(xapi::PeerXapiRole::Master));
+        // A peer that answers, but neither as master nor as a slave (wedged
+        // disarmed, just released from the HA startup loop, parked behind a
+        // TCP reset), is not a dead or absent master: withhold the transition.
+        // Before, those answers read as a live master and deferred.
+        let peer_role_withholds = matches!(
+            peer_role,
+            Some(xapi::PeerXapiRole::Unknown | xapi::PeerXapiRole::ArmedMismatch)
+        );
         // The peer is confirmed dead only when every independent path says
         // so: no DRBD replication (either link), the peer's xapi unreachable
         // on a direct probe, and the local xhad liveset reporting the peer not
@@ -17683,6 +22091,21 @@ impl StateMachine {
                 )
                 .await;
             }
+            MasterlessAction::Recover if peer_role_withholds && !peer_confirmed_dead => {
+                if self
+                    .log_pace
+                    .due("masterless_role_withheld", Duration::from_secs(600))
+                {
+                    info!(
+                        scenario = "masterless_pool",
+                        heal_event = "ha_action_withheld",
+                        action = "masterless_transition",
+                        peer_role = ?peer_role,
+                        "masterless transition withheld: the peer's xapi answers, but \
+                         neither as master nor as a slave; it is not a dead master"
+                    );
+                }
+            }
             MasterlessAction::Recover => {
                 // require_peer_dead re-checks the liveset before the destructive
                 // transition only when this Recover came from the confirmed-dead
@@ -17734,6 +22157,15 @@ impl StateMachine {
                     StrandedAction::StartTimer => {
                         self.masterless_defer_since = Some(now);
                     }
+                    StrandedAction::Restart
+                        if !self.rejoin_assist_allows("masterless_defer_rejoin")
+                            || !self.ha_gate(
+                                "masterless_defer_rejoin",
+                                crate::mgmt_reach::Trigger::Absence,
+                            ) =>
+                    {
+                        // Withheld at fire time; the attempt budget is kept.
+                    }
                     StrandedAction::Restart => {
                         self.masterless_defer_rejoins =
                             self.masterless_defer_rejoins.saturating_add(1);
@@ -17771,7 +22203,7 @@ impl StateMachine {
                                 "slave-of-self did not rejoin after repeated \
                                    repoints; operator intervention needed"
                             );
-                            let _ = xapi::send_xapi_alert(
+                            let _ = xapi::send_xapi_alert_advising_ha_disable(
                                 "TwinStor: a returning node is stuck following itself \
                                  while the peer is the live master, and automatic \
                                  rejoin did not take. On the stuck host, set \
@@ -17814,15 +22246,21 @@ impl StateMachine {
         if self.not_starting("masterless recovery") {
             return;
         }
+        // Fire-time gates (see `masterless_chain_allowed`), before the
+        // cooldown is taken.
+        if !self.masterless_chain_allowed(require_peer_dead).await {
+            return;
+        }
         self.masterless_last_recover = Some(std::time::Instant::now());
         // Re-verify at the moment of action: an operator or xapi may have
         // fixed the role while we waited out the guard window.
         let still = match flavor {
-            MasterlessFlavor::SlaveOfSelf => xapi::local_slave_master_addr()
+            MasterlessFlavor::SlaveOfSelf => self
+                .h_slave_master_addr()
                 .map(|a| addr_is_local(&a))
                 .unwrap_or(false),
             MasterlessFlavor::MutualSlave | MasterlessFlavor::DemotedSurvivor => {
-                xapi::local_slave_master_addr()
+                self.h_slave_master_addr()
                     .map(|a| a == self.config.network.peer_address.to_string())
                     .unwrap_or(false)
             }
@@ -17842,16 +22280,18 @@ impl StateMachine {
         // to SlaveOfSelf.
         if matches!(flavor, MasterlessFlavor::SlaveOfSelf)
             && matches!(
-                xapi::peer_xapi_role(&self.config.network.peer_address.to_string()).await,
+                self.peer_role_probe().await,
                 xapi::PeerXapiRole::Master
+                    | xapi::PeerXapiRole::Unknown
+                    | xapi::PeerXapiRole::ArmedMismatch
             )
         {
             info!(
                 scenario = "masterless_pool",
                 heal_event = "masterless_defer_to_master",
-                "masterless recovery: the peer is a live master at the moment \
-                   of action; standing down and rejoining as its slave instead \
-                   of transitioning (no second master)"
+                "masterless recovery: the peer's xapi answers at the moment of \
+                   action (as the master, or neither as master nor as a slave); \
+                   standing down instead of transitioning (no second master)"
             );
             return;
         }
@@ -17866,7 +22306,7 @@ impl StateMachine {
         // unless the peer still reads confirmed dead. Only the confirmed-dead
         // path sets require_peer_dead; the normal peer-reachable recovery is
         // unaffected.
-        if require_peer_dead && self.peer_dead_via_liveset().await != Some(true) {
+        if require_peer_dead && self.h_peer_dead_via_liveset().await != Some(true) {
             info!(
                 scenario = "masterless_pool",
                 heal_event = "masterless_defer_peer_returned",
@@ -17882,6 +22322,15 @@ impl StateMachine {
             "starting the emergency master transition (HA emergency \
                disable, transition-to-master, recover-slaves, HA re-arm)"
         );
+        // Whether this host was locally armed before the chain's own disarm:
+        // only then does the chain owe pool HA back. A host whose HA was
+        // already off (an operator's disable, or HA never enabled) is never
+        // re-armed by this recovery.
+        let armed_before = masterless_rearm_owed(self.h_local_armed());
+        if self.h_record(format!("masterless_transition rearm_owed={armed_before}")) {
+            return;
+        }
+        note_local_ha_disarm();
         let _ = crate::cmd::run_cmd("xe", &["host-emergency-ha-disable", "--force"]).await;
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = crate::cmd::run_cmd("xe", &["pool-emergency-transition-to-master"]).await;
@@ -17902,13 +22351,15 @@ impl StateMachine {
                 "pool.conf did not flip to master within the window; \
                    manual recovery needed (see the masterless alert)"
             );
-            let _ = xapi::send_xapi_alert(
+            let _ = xapi::send_xapi_alert_advising_ha_disable(&format!(
                 "TwinStor: the automatic emergency master transition did not \
-                 complete. Recover manually on this host: \
+                 complete. Only if no host answers as pool master from either host: \
+                 recover manually on {}: \
                  xe host-emergency-ha-disable --force; \
                  xe pool-emergency-transition-to-master; \
                  xe pool-recover-slaves; then re-arm HA.",
-            )
+                self.config.node.name
+            ))
             .await;
             return;
         }
@@ -17922,35 +22373,79 @@ impl StateMachine {
                 break;
             }
         }
-        // HA: the emergency disable is part of this chain, so the obligation
-        // is written unconditionally once xe can resolve the SR. Reading
-        // is_ha_enabled right after the transition is unreliable: it can
-        // still say enabled while the emergency disable takes effect, and a
-        // conditional write would then skip the obligation and leave the pool
-        // HA-off with nothing to reconcile it. A fulfilled obligation clears
-        // harmlessly on the watchdog's next pass.
-        if let Some(sr) = xapi::twinstor_sr_uuid().await {
+        // HA: the obligation is written, and pool HA enabled, only when this
+        // host was locally armed before the chain's disarm (read before it,
+        // not from is_ha_enabled after the transition, which can still say
+        // enabled while the emergency disable takes effect). A fulfilled
+        // obligation clears harmlessly on the watchdog's next pass.
+        if !armed_before {
+            info!(
+                scenario = "masterless_pool",
+                heal_event = "masterless_no_rearm",
+                "masterless recovery: this host was not locally HA-armed before the \
+                   transition, so no HA re-arm is owed"
+            );
+        } else if self.ha_reset_inflight.load(Ordering::SeqCst) {
+            // A pool HA routine is in flight: it owns the obligation; this
+            // chain writes none over it. The chain's local disarm record
+            // carries the re-arm (as below).
+            info!(
+                scenario = "masterless_pool",
+                heal_event = "masterless_rearm_deferred",
+                "masterless recovery: another pool HA operation is in flight; no obligation \
+                   written now (the chain's local disarm record carries the re-arm)"
+            );
+        } else if let Some(sr) = xapi::twinstor_sr_uuid().await {
             let arbitrated = std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists();
             let timeout = xapi::pool_ha_timeout()
                 .await
-                .unwrap_or_else(|| crate::setup::ha_timeout_secs(arbitrated));
-            ha_obligation_write(&sr, timeout.into());
+                .unwrap_or_else(|| crate::setup::configured_ha_timeout_for(arbitrated));
+            // What the chain owes, from its own evidence: this host was
+            // locally armed before the chain's own emergency disable, and the
+            // chain's transition restarted xapi here while it was disarmed,
+            // which makes the new master's xapi turn pool HA off. Off now:
+            // owed. Not readable yet: pending for the usual window (owed if it
+            // reads off within it). On: nothing owed at pool level (the local
+            // disarm record re-arms this host).
+            self.masterless_write_record(&sr, timeout).await;
             self.ensure_twinstor_pbds_plugged().await;
-            ha_obligation_touch_attempt();
-            let _ = crate::cmd::run_cmd(
-                "xe",
-                &[
-                    "pool-ha-enable",
-                    &format!("heartbeat-sr-uuids={sr}"),
-                    &format!("ha-config:timeout={timeout}"),
-                ],
-            )
-            .await;
-            // No self-clear: the HA watchdog's settled read owns the verdict.
+            // The enable runs off the tick through the shared operations,
+            // its gates read again just before it: this host's role (master
+            // now), the HA startup-loop lock and maintenance always; P only
+            // on the paths that started with the peer's management address
+            // answering (the lone-survivor path's premise is a peer gone).
+            // Withheld or refused, the obligation enables later under its own
+            // gates. No self-clear: the HA watchdog's settled read owns the
+            // verdict.
+            let trigger = masterless_enable_trigger(require_peer_dead);
+            self.rearm_enable_from_slave = false;
+            let spawned = self.spawn_rearm_enable(sr.clone(), timeout.into(), true, trigger);
+            if require_peer_dead {
+                // The lone survivor: the re-arm obligation's own decision
+                // needs the peer back, so a withheld or refused enable here
+                // gets this path's own bounded retry (same gates).
+                let now = std::time::Instant::now();
+                self.masterless_retry = Some(MasterlessRetry {
+                    sr,
+                    timeout: timeout.into(),
+                    issued_base: self.rearm_enables_issued.load(Ordering::SeqCst),
+                    started: now,
+                    next_at: now + MASTERLESS_RETRY_EVERY,
+                });
+            }
+            if !spawned {
+                info!(
+                    scenario = "masterless_pool",
+                    heal_event = "masterless_rearm_deferred",
+                    "masterless recovery: another pool HA operation is in flight; the enable is \
+                     retried later"
+                );
+            }
         } else {
             warn!(
-                "masterless recovery: cannot resolve the heartbeat SR yet; \
-                   the HA watchdog inherits the re-arm via the disarmed alert"
+                "masterless recovery: cannot resolve the heartbeat SR yet; the \
+                   chain's own disarm record carries the re-arm (xapi's restart \
+                   under the transition turns it into an obligation)"
             );
         }
         // Confirm the peer is no longer a competing master before declaring a
@@ -17962,10 +22457,7 @@ impl StateMachine {
         // stranded rejoin to resolve. For the slave-of-self and mutual-slave
         // flavors the peer is dead or known to be a slave, so this probe only
         // matters for the demoted-survivor case.
-        if matches!(
-            xapi::peer_xapi_role(&self.config.network.peer_address.to_string()).await,
-            xapi::PeerXapiRole::Master
-        ) {
+        if matches!(self.peer_role_probe().await, xapi::PeerXapiRole::Master) {
             warn!(
                 scenario = "masterless_pool",
                 heal_event = "masterless_recover_unconfirmed",
@@ -18278,12 +22770,19 @@ impl StateMachine {
         let local_serveable = matches!(&st,
             Ok(s) if s.role == Role::Primary && s.disk == DiskState::UpToDate && !s.suspended_user);
         let xhad_online = self.xha_host_state().await == XhaHostState::Online;
+        // This host holds the statefile master lock in its own liveset.
+        let own_lock = xhad_online
+            && self
+                .liveset_masters()
+                .await
+                .is_some_and(|l| l.local_online && l.local_master);
         let can_serve = protected_vm_can_serve(
             local_serveable,
             peer_nonserving,
             incident_open,
             ha_on,
             xhad_online,
+            own_lock,
         );
         if halted.is_empty() {
             self.protected_vm_seen.clear();
@@ -19070,22 +23569,13 @@ impl StateMachine {
                     "this host is locally HA-disarmed while pool HA is \
                        enabled; its next reboot springs an xapi trap"
                 );
-                let body = if master {
-                    "TwinStor: this host (the pool master) is locally \
-                     HA-disarmed while pool HA is enabled. At its next \
-                     reboot, xapi will silently disable pool HA (upstream \
-                     behavior). Re-align now: xe pool-ha-disable, then \
-                     xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR> \
-                     ha-config:timeout=<120 fate-shared | 90 arbitrated>."
-                } else {
-                    "TwinStor: this host is locally HA-disarmed while pool \
-                     HA is enabled. At its next reboot, xapi will wedge it \
-                     in emergency mode (xe unusable, storage attach blocked; \
-                     upstream behavior). Re-align now: on the master run \
-                     xe pool-ha-disable, then xe pool-ha-enable \
-                     heartbeat-sr-uuids=<twinstor SR> ha-config:timeout=<120 fate-shared | 90 arbitrated>."
-                };
-                let _ = xapi::send_xapi_alert(body).await;
+                let body = armed_mismatch_alert(
+                    master,
+                    &self.config.node.name,
+                    &self.config.node.peer,
+                    self.ha_timeout_now(),
+                );
+                let _ = xapi::send_xapi_alert_advising_ha_disable(&body).await;
             }
         }
     }
@@ -19104,6 +23594,7 @@ impl StateMachine {
         if !readmitting {
             self.readmission_flap_since = None;
             self.readmission_flap_alerted_at = None;
+            self.readmission_flap_alert_owed = false;
             return;
         }
         let now = std::time::Instant::now();
@@ -19124,24 +23615,31 @@ impl StateMachine {
                    are held (they would only abort the readmission); a pool-HA cycle is \
                    needed to clear it"
             );
-            let _ = xapi::send_xapi_alert(
-                "TwinStor: a returning host rejoined the XHA liveset but has not \
-                 completed readmission: it stays locally HA-disarmed while its \
-                 slave->master XAPI intermittently fails, and it will not clear on its \
-                 own. Storage is safe (dual-Primary, UpToDate) and VMs are unaffected, \
-                 but pool HA will not fully protect this node until it readmits. \
-                 Re-align it: on the pool master run 'xe pool-ha-disable', then \
-                 'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> \
-                 ha-config:timeout=<120 fate-shared | 90 arbitrated>'.",
-            )
-            .await;
+            self.readmission_flap_alert_owed = true;
+        }
+        self.readmission_flap_alert_send().await;
+    }
+
+    /// The re-admission flap alert, owed until delivered: raised again on
+    /// every pass while the flap lasts, not a day later.
+    async fn readmission_flap_alert_send(&mut self) {
+        if !self.readmission_flap_alert_owed {
+            return;
+        }
+        // An unread count is taken as VMs present (the risk sentence then
+        // names the restart risk).
+        let vms = self.h_vm_count().await.unwrap_or(1);
+        let body = readmission_flap_alert_text(vms, self.ha_timeout_now());
+        if self.h_alert_advice_unqueued(&body).await {
+            self.readmission_flap_alert_owed = false;
         }
     }
 
     /// Peer-emergency resolver (see const block). Master-side, config-gated
     /// action; detection/tracking always on.
     async fn check_peer_emergency(&mut self) {
-        if cfg!(test) {
+        #[cfg(test)]
+        if self.test_ha.is_none() {
             return;
         }
         // A stood-down isolated master (parked) must not run pool-HA management.
@@ -19152,188 +23650,502 @@ impl StateMachine {
         // running `pool-ha-disable` inline and freezing its own rejoin. While
         // the stand-down marker exists the only job is the rejoin gate
         // (`isolation_standdown_gate`); skip all peer-HA action here.
-        if std::path::Path::new(ISOLATED_STANDDOWN_MARKER).exists() {
-            self.peer_emergency_since = None;
-            self.peer_emergency_clear_since = None;
-            self.peer_liveset_wedge_since = None;
+        if std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists() {
+            PEER_ARMED_MISMATCH_AT.store(0, Ordering::Relaxed);
+            self.peer_mismatch = MismatchSightings::default();
             self.peer_emergency_resolve_at = None;
-            self.peer_emergency_confirm_alerted_at = None;
+            self.peer_emergency_verdict = None;
             return;
         }
-        if !self.host_enable_ticks.is_multiple_of(60) {
+        // Once a minute; and, while a sighting waits for its confirmation,
+        // again as soon as the gap since it has passed (confirmation then
+        // lands 30-40 s after the first sighting, not a minute or more).
+        if !self.host_enable_ticks.is_multiple_of(60)
+            && !self.peer_mismatch.reprobe_due(std::time::Instant::now())
+        {
             return;
         }
-        if xapi::is_pool_master_resilient().await != Some(true) {
+        let master = self.h_master_resilient().await;
+        if matches!(
+            (self.pe_last_master, master),
+            (Some(true), Some(false)) | (Some(false), Some(true))
+        ) {
+            // Mastership changed: a wedge seen before is not this one.
+            self.peer_disarm_mark_clear();
+        }
+        if master.is_some() {
+            self.pe_last_master = master;
+        }
+        if master != Some(true) {
             // No longer master: abandon any in-flight confirmation too, so a
             // later re-promotion cannot resume with a stale resolve_at and fire
-            // a spurious "resolve failed".
-            self.peer_emergency_since = None;
-            self.peer_emergency_clear_since = None;
-            self.peer_liveset_wedge_since = None;
+            // a spurious "resolve failed". A verdict still pending stays in
+            // the budget file and is taken up when this host is master again.
+            PEER_ARMED_MISMATCH_AT.store(0, Ordering::Relaxed);
+            self.peer_mismatch = MismatchSightings::default();
             self.peer_emergency_resolve_at = None;
-            self.peer_emergency_confirm_alerted_at = None;
+            self.peer_emergency_verdict = None;
             return;
         }
-        let pool_ha = xapi::is_ha_enabled().await;
-        let live_raw = xapi::peer_agent_responsive(&self.config.node.peer).await;
-        let peer_ok = self.peer_replication_reachable().await;
+        self.pe_budget_retry_write().await;
+        let pool_ha = self.h_pool_ha().await;
+        let p = self.p_view();
         let now = std::time::Instant::now();
-        // Bridge brief flaps of `live` so a readmission wedge cannot starve the
-        // 600 s maturity clock. With the debounce off this is the identity
-        // (`live == live_raw`, the clear tracker stays None).
-        let (live, clear_since) = debounce_peer_live(
-            live_raw,
-            self.peer_emergency_since.is_some(),
-            self.peer_emergency_clear_since,
-            self.config.ha.readmission_flap_debounce,
-            PEER_EMERGENCY_FLAP_TOLERANCE,
-            now,
-        );
-        self.peer_emergency_clear_since = clear_since;
-
-        // A pool-level HA reset is in its confirmation phase. Do not run fresh
-        // detection or resolve: the master's own pool-HA read looks re-armed
-        // even while the peer's xhad is still cycling and never joins, so wait
-        // for positive proof that the peer is live again.
-        if self.peer_emergency_resolve_at.is_some() {
-            match peer_emergency_confirm(
-                live_raw, // confirm on raw liveness (positive proof), not debounced
-                self.peer_emergency_resolve_at,
-                now,
-                PEER_EMERGENCY_CONFIRM_AFTER,
-            ) {
-                PeerConfirmAction::Confirming => {}
-                PeerConfirmAction::Confirmed => {
-                    info!(
-                        scenario = "peer_emergency",
-                        heal_event = "peer_emergency_resolved",
-                        "peer is live again after the pool-level HA reset; \
-                           the emergency-mode wedge is cleared"
-                    );
-                    self.peer_emergency_resolve_at = None;
-                    self.peer_emergency_since = None;
-                    self.peer_emergency_clear_since = None;
-                    self.peer_liveset_wedge_since = None;
-                    self.peer_emergency_confirm_alerted_at = None;
-                    let _ = xapi::send_xapi_alert(
-                        "TwinStor: the peer host was wedged in xapi emergency \
-                         mode (HA-armed mismatch after a reboot); an automatic \
-                         pool-level HA reset freed it and the peer has \
-                         rejoined. No action needed.",
-                    )
-                    .await;
-                }
-                PeerConfirmAction::Failed => {
-                    warn!(
-                        scenario = "peer_emergency",
-                        heal_event = "peer_emergency_resolve_failed",
-                        "the automatic pool-level HA reset did not bring the \
-                           peer back: its xhad could not rejoin the liveset. \
-                           It needs a local 'xe host-emergency-ha-disable \
-                           --force' on the peer host. Holding for the cooldown \
-                           rather than re-cycling pool HA (which cannot recruit \
-                           a cycling xhad)."
-                    );
-                    self.peer_emergency_resolve_at = None;
-                    if self
-                        .peer_emergency_confirm_alerted_at
-                        .is_none_or(|t| now.duration_since(t) >= DEGRADED_REALERT_AFTER)
-                    {
-                        self.peer_emergency_confirm_alerted_at = Some(now);
-                        let _ = xapi::send_xapi_alert(
-                            "TwinStor: a peer host is stuck in xapi HA \
-                             emergency mode and the automatic pool-level HA \
-                             reset did not recruit it (its xhad keeps cycling). \
-                             Recover it on the peer host: 'xe \
-                             host-emergency-ha-disable --force'; it will then \
-                             rejoin and HA re-arms on its own. Storage is \
-                             healthy and VMs are unaffected.",
-                        )
-                        .await;
-                    }
-                }
-            }
-            return;
+        // The peer's agent (a forwarded `host-dmesg`), for the reset's log
+        // line only: it answers throughout an armed-mismatch wedge, so it
+        // proves nothing about one. Not probed while P is false: it is
+        // forwarded over the management network and would only time out.
+        let live_raw = if p.p { self.h_agent_live().await } else { None };
+        // Positive trigger: the peer's own xapi answer, probed at every
+        // check while pool HA is on and P holds (one login a minute; never
+        // while P is false: `peer_role_probe` answers `Unreachable` at once).
+        // A peer disarmed under the armed pool in a quiet pool shows nothing
+        // else: XAPI's own HA may restart its VMs elsewhere within minutes,
+        // so the first sighting must not wait.
+        let role = if peer_role_probe_wanted(pool_ha, p.p) {
+            self.peer_role_probe().await
+        } else {
+            xapi::PeerXapiRole::Unreachable
+        };
+        // Published for the partition view: a sighting stands for a short
+        // while; pool HA not on (the reset's own disable included) ends it.
+        if role == xapi::PeerXapiRole::ArmedMismatch {
+            PEER_ARMED_MISMATCH_AT.store(mono_secs(), Ordering::Relaxed);
+        } else if pool_ha != Some(true) {
+            PEER_ARMED_MISMATCH_AT.store(0, Ordering::Relaxed);
         }
-
-        let signature = pool_ha == Some(true) && live == Some(false) && peer_ok;
-        if signature && self.peer_emergency_since.is_none() {
-            self.peer_emergency_since = Some(now);
+        // P false: the sightings say nothing about now; start afresh.
+        if !p.p {
+            self.peer_mismatch = MismatchSightings::default();
+        }
+        let (sightings, armed_mismatch_confirmed) =
+            armed_mismatch_confirm(self.peer_mismatch, &role, now);
+        let first_sighting = sightings.open() && !self.peer_mismatch.open();
+        if first_sighting {
             warn!(
                 scenario = "peer_emergency",
-                heal_event = "peer_emergency_suspect",
-                "peer xapi reports not-live while its daemon answers on the \
-                   replication network and pool HA is armed: suspected \
-                   HA-armed-mismatch emergency wedge on the peer"
+                heal_event = "peer_emergency_armed_mismatch_seen",
+                "the peer's xapi answers HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED (locally \
+                 disarmed under the armed pool); confirming on a second probe"
             );
         }
-        // Local, stable confirmation that the wedge is real: the peer has
-        // rejoined this host's xhad liveset while the signature still holds (it
-        // is present but the pool cannot recruit it). Latch when both first
-        // hold so the fast path can resolve shortly after the rejoin instead of
-        // waiting out the blind maturity timer; reset as soon as either drops.
-        // The latch is gated on raw liveness, not the debounced `live`: the
-        // debounce bridges `live=Some(false)` for up to
-        // PEER_EMERGENCY_FLAP_TOLERANCE (180 s) after the peer's xapi recovers,
-        // longer than the fast-path grace (120 s), so latching on the debounced
-        // value could resolve a recovered peer. Requiring
-        // `live_raw == Some(false)` disarms as soon as the peer answers or its
-        // liveness is unreadable, while the debounce still protects the slow
-        // 600 s clock from flap starvation. Fail closed: only a positive
-        // Some(true) liveset membership arms the fast path; an unreadable
-        // liveset falls back to the blind 600 s path.
-        let peer_in_liveset = self.peer_in_liveset().await == Some(true);
-        // Storage-safety gate for the reduced blind maturity. Both conditions
-        // are required, and they are only computed while the signature is
-        // active (no `drbdadm status` call when there is nothing to resolve):
-        //   1. Raw not-live, not the debounced `live`. The debounce holds `live`
-        //      at Some(false) for up to PEER_EMERGENCY_FLAP_TOLERANCE (180 s)
-        //      after the peer's xapi recovers; the reduced maturity (240 s) is
-        //      close to that window, so maturing on the debounced value could
-        //      fire a spurious pool-HA cycle on a peer that already readmitted.
-        //      Requiring raw not-live now means the fast path acts only while
-        //      the wedge is currently observed; a recovered or unreadable peer
-        //      falls back to the full maturity, where the debounce clears it.
-        //   2. The replica pair is fully redundant (safe to cycle HA through).
-        //      A failed status read counts as not safe.
-        let storage_safe_to_cycle = fast_maturity_wedge_eligible(signature, live_raw)
-            && matches!(self.drbd.status().await, Ok(ref s) if storage_safe_to_cycle_ha(s));
-        if signature && peer_in_liveset && live_raw == Some(false) {
-            if self.peer_liveset_wedge_since.is_none() {
-                self.peer_liveset_wedge_since = Some(now);
+        self.peer_mismatch = sightings;
+        // The per-wedge pacing of the first-sighting alert ends once the
+        // peer answers normally twice in a row.
+        if role.answers_normally() {
+            self.peer_normal_in_row = self.peer_normal_in_row.saturating_add(1);
+            if self.peer_normal_in_row >= 2 {
+                self.peer_disarm_mark_clear();
+            }
+        } else if role == xapi::PeerXapiRole::ArmedMismatch {
+            self.peer_normal_in_row = 0;
+        }
+        // A first-sighting alert sent off the tick: mark its hold alerted
+        // once it was delivered (never rolling back a newer hold's mark);
+        // not sent, the next sighting tries again.
+        let outcome = self.peer_disarm_alert_result.lock().ok().and_then(|mut r| r.take());
+        match outcome {
+            Some(FirstAlertOutcome::Delivered(Some(until))) => {
+                let mut b = self.pe_budget();
+                if until > b.alerted_until {
+                    b.alerted_until = until;
+                    self.pe_budget_store(b);
+                }
+            }
+            Some(FirstAlertOutcome::Dropped) => self.peer_disarm_mark_clear(),
+            _ => {}
+        }
+        // Every sighting, not only the first: one explained by a TwinStor
+        // flow is looked at again once the explanation ends.
+        if role == xapi::PeerXapiRole::ArmedMismatch
+            && sightings.open()
+            && !self.peer_disarm_alerted
+            && self.pe_budget().disarm_alerted == 0
+            && pool_ha == Some(true)
+        {
+            // A sighting needs P (the role probe runs only while P holds),
+            // and the reset's gate is P itself (positive evidence, no
+            // settle): "waiting for the management view" cannot apply here.
+            self.peer_disarm_first_alert().await;
+        }
+        // A pool-level HA reset is in its confirmation phase. Do not run fresh
+        // detection or resolve: the master's own pool-HA read looks re-armed,
+        // and the peer's agent answers throughout an armed-mismatch wedge, so
+        // the verdict comes from the evidence that triggered the reset, the
+        // peer's own xapi answer (`reset_verdict_step`).
+        // A reset whose verdict is still pending in the budget file with no
+        // confirmation running here (a daemon restart, or a mastership lost
+        // and regained): resumed, or past its bound counted futile.
+        if self.peer_emergency_resolve_at.is_none() {
+            let b = self.pe_budget();
+            if b.pending != 0 {
+                let now_unix = crate::heal_state::unix_now();
+                let age = now_unix.saturating_sub(b.pending);
+                let phase = VerdictPhase::from_key(&b.pending_phase);
+                // A cycle that had returned resumes where it stood (its own
+                // bounds apply from its return); one that had not is judged
+                // by the cycle's own bound.
+                // Resumed past the waiting bound from the cycle's return: no
+                // probe and no "freed" from it; futile (Unknown), the hold
+                // from now, no relapse window.
+                let resume = match phase {
+                    Some(_)
+                        if b.pending_since != 0
+                            && now_unix.saturating_sub(b.pending_since) >= PEER_EMERGENCY_HA_WAIT =>
+                    {
+                        None
+                    }
+                    Some(ph) if b.pending_since != 0 => Some((ph, b.pending_since)),
+                    _ if age < PEER_EMERGENCY_VERDICT_BOUND.as_secs() => {
+                        Some((VerdictPhase::AwaitingHa, now_unix))
+                    }
+                    _ => None,
+                };
+                let Some((phase, returned)) = resume else {
+                    self.peer_emergency_futile(b.pending, FutileWhy::Unknown).await;
+                    return;
+                };
+                // A probe interrupted resumes from the wait for pool HA.
+                let phase = if phase == VerdictPhase::Probing { VerdictPhase::AwaitingHa } else { phase };
+                info!(scenario = "peer_emergency", heal_event = "peer_emergency_verdict_resumed",
+                      reset_age_secs = age, phase = phase.key(),
+                      "resuming the verdict on a pool HA reset issued {age}s ago");
+                self.peer_emergency_resolve_at = Some(now);
+                self.pe_verdict_set(ResetVerdict::at(phase, now, returned));
+                return;
+            }
+        }
+        if self.peer_emergency_resolve_at.is_some() {
+            // The waiting bound first: another routine in flight must not
+            // delay it.
+            if let Some(v) = self.peer_emergency_verdict
+                && v.phase != VerdictPhase::Probing
+                && crate::heal_state::unix_now().saturating_sub(v.returned) >= PEER_EMERGENCY_HA_WAIT
+            {
+                let reset = self.pe_budget().pending;
+                let why = FutileWhy::Waited {
+                    last_ha: v.last_ha,
+                    task_since: v.task_since,
+                    task_read_failed: v.task_read_failed,
+                };
+                self.peer_emergency_futile(reset, why).await;
+                return;
+            }
+            // The cycle still runs off the tick: the confirmation window
+            // starts once it has returned.
+            if self.ha_reset_inflight.load(Ordering::SeqCst) {
+                self.peer_emergency_resolve_at = Some(now);
+                return;
+            }
+            if let Some(r) = self.take_ha_cycle_result("peer_emergency") {
+                if r.operator_off {
+                    // Someone else turned pool HA off under the reset: it is
+                    // not re-enabled (the cycle already said so); nothing to
+                    // confirm, and no disable of TwinStor's took: the budget
+                    // gets the reset back.
+                    self.peer_emergency_resolve_at = None;
+                    self.peer_emergency_budget_unspend();
+                    return;
+                }
+                if !r.disabled && r.disable_issued && r.disable_may_land {
+                    // The disable timed out and may still take: the reset is
+                    // judged once that is known (`VerdictPhase::DisableUnknown`).
+                    warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve",
+                          step = "disable_unknown", outcome = %r.disable_note,
+                          "peer emergency resolve: pool-ha-disable {}; it may still take: \
+                           watching whether pool HA goes off before judging this reset",
+                          r.disable_note);
+                    self.pe_verdict_set(ResetVerdict::at(
+                        VerdictPhase::DisableUnknown,
+                        now,
+                        crate::heal_state::unix_now(),
+                    ));
+                    return;
+                }
+                if !r.disabled {
+                    // No reset took: no confirmation, the budget gets it back
+                    // (the disable was refused or never issued), and a retry
+                    // pace (the obligation stays).
+                    warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve",
+                          step = "disable_failed", outcome = %r.disable_note,
+                          "peer emergency resolve: pool-ha-disable {}; no reset issued (the re-arm \
+                           obligation stays; retried later)", r.disable_note);
+                    self.peer_emergency_resolve_at = None;
+                    self.peer_emergency_budget_unspend();
+                    self.peer_emergency_unissued_at = Some(now);
+                    return;
+                }
+                if !r.enabled {
+                    warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve",
+                          step = "enable_pending", disable = %r.disable_note,
+                          "peer emergency resolve: the cycle's pool-ha-enable did not run or \
+                           failed; the re-enable is pending under the re-arm record (the HA \
+                           watchdog retries it), and the verdict on this reset waits for pool HA \
+                           to read on");
+                }
+                info!(scenario = "peer_emergency", heal_event = "peer_emergency_reset_issued",
+                      disable = %r.disable_note,
+                      "pool-level HA reset done; confirming from the peer's xapi answer before \
+                       declaring it resolved");
+                self.peer_emergency_resolve_at = Some(now);
+                // The probe of this pass may predate the cycle's return: the
+                // verdict counts from the next one.
+                // Probing starts once pool HA reads on with no HA task
+                // pending, whether the cycle's enable returned or not.
+                let returned = crate::heal_state::unix_now();
+                self.pe_verdict_set(ResetVerdict::at(VerdictPhase::AwaitingHa, now, returned));
+                return;
+            }
+            // A reset whose cycle result was not seen still gets a verdict,
+            // once pool HA reads on.
+            let v = match self.peer_emergency_verdict {
+                Some(v) => v,
+                None => {
+                    let v = ResetVerdict::at(VerdictPhase::AwaitingHa, now, crate::heal_state::unix_now());
+                    self.pe_verdict_set(v);
+                    v
+                }
+            };
+            // The reads a waiting phase keeps, for the bound's alert (the
+            // bound itself is checked at the top of this block).
+            let mut v = v;
+            if v.phase != VerdictPhase::Probing && pool_ha.is_some() {
+                v.last_ha = pool_ha;
+                self.peer_emergency_verdict = Some(v);
+            }
+            if v.phase == VerdictPhase::DisableUnknown {
+                // Decided from the re-arm record, which the watchdog moves on
+                // every pass, not from sampled pool HA reads (an enable can
+                // follow the disable within a minute). The reset stays spent
+                // either way: a timed-out disable is never given back.
+                // Only this reset's own record counts: written by its cycle
+                // (`peer_emergency`, at or after the reset was spent).
+                let ops = self.ha_ops(None, None);
+                let reset = self.pe_budget().pending;
+                let ours = record_is_resets(ops.obligation_owner().as_deref(), reset);
+                match (ops.obligation_state(), ours) {
+                    (Some(ObligationState::Owed | ObligationState::Enabled), true) => {
+                        info!(scenario = "peer_emergency", heal_event = "peer_emergency_disable_took",
+                              "the timed-out pool HA disable took (its re-arm record became owed or \
+                               enabled); the verdict goes on");
+                        self.pe_verdict_set(ResetVerdict::at(VerdictPhase::AwaitingHa, now, v.returned));
+                    }
+                    (Some(ObligationState::Pending { .. }), true) => {
+                        if !v.seen_own_pending {
+                            self.peer_emergency_verdict = Some(ResetVerdict { seen_own_pending: true, ..v });
+                        }
+                    }
+                    // Ended while seen pending in this run (fulfilled and
+                    // cleared would have shown owed or enabled first).
+                    (None, _) if v.seen_own_pending => {
+                        info!(scenario = "peer_emergency", heal_event = "peer_emergency_disable_did_not_take",
+                              "the timed-out pool HA disable did not take (its re-arm record ended \
+                               while still pending): no verdict on this reset, which stays spent");
+                        self.peer_emergency_resolve_at = None;
+                        self.peer_emergency_verdict = None;
+                        self.peer_emergency_budget_clear_pending();
+                    }
+                    // Not this reset's record, or gone without being seen
+                    // pending here (fulfilled and cleared while this host was
+                    // not master, or replaced): unknown.
+                    _ => self.peer_emergency_futile(reset, FutileWhy::Unknown).await,
+                }
+                return;
+            }
+            if v.phase == VerdictPhase::AwaitingHa {
+                // XAPI shows pool HA on while an enable still runs: the
+                // verdict starts only with no pool HA task pending (an
+                // unreadable task list keeps waiting, within the bound), on
+                // the next probe, against an armed pool.
+                if pool_ha == Some(true) {
+                    match self.h_pending_ha_tasks().await {
+                        Some(t) if t.is_empty() => {
+                            self.pe_verdict_set(ResetVerdict::at(VerdictPhase::Probing, now, v.returned));
+                        }
+                        Some(t) if v.task_since == 0 => {
+                            let first = t.iter().filter_map(|x| x.created_unix).min();
+                            v.task_since = first.unwrap_or_else(crate::heal_state::unix_now);
+                            self.peer_emergency_verdict = Some(v);
+                        }
+                        Some(_) => {}
+                        None => {
+                            v.task_read_failed = true;
+                            self.peer_emergency_verdict = Some(v);
+                        }
+                    }
+                    return;
+                }
+                // The wait lasts as long as the re-arm record that owes the
+                // enable; with it gone and pool HA off, nothing re-enables
+                // it (the HA-off alerts cover that): the reset did not free
+                // the peer, said in the log only. The record is read first
+                // and pool HA again after it: an enable landing between the
+                // two reads (the record then goes) is not taken for HA left
+                // off.
+                if pool_ha == Some(false)
+                    && self.ha_ops(None, None).obligation_state().is_none()
+                    && self.h_pool_ha().await == Some(false)
+                {
+                    let reset = self.pe_budget().pending;
+                    self.peer_emergency_futile(reset, FutileWhy::HaOff).await;
+                }
+                return;
+            }
+            // Pool HA turned off while probing, and not by TwinStor (its
+            // re-arm record is enabled or gone): the peer is no longer
+            // probed, so the verdict cannot be reached. It ends as
+            // interrupted: no futile verdict, no hold beyond the spacing, no
+            // alert (the HA-off alert already tells the operator). As in the
+            // wait phase, pool HA is read again after the record.
+            if pool_ha == Some(false)
+                && matches!(
+                    self.ha_ops(None, None).obligation_state(),
+                    None | Some(ObligationState::Enabled)
+                )
+                && self.h_pool_ha().await == Some(false)
+            {
+                warn!(scenario = "peer_emergency", heal_event = "peer_emergency_verdict_interrupted",
+                      "pool HA was turned off while the verdict on TwinStor's reset was probing the \
+                       peer, and not by TwinStor: no verdict on this reset (no hold beyond the \
+                       usual spacing, no alert)");
+                self.peer_emergency_resolve_at = None;
+                self.peer_emergency_verdict = None;
+                self.peer_emergency_budget_clear_pending();
+                return;
+            }
+            let probed = peer_role_probe_wanted(pool_ha, p.p);
+            let (next, verdict) = reset_verdict_step(v, &role, probed, now);
+            self.peer_emergency_verdict = next;
+            let Some(futile) = verdict else {
+                return;
+            };
+            self.peer_emergency_resolve_at = None;
+            let reset = self.pe_budget().pending;
+            if !futile {
+                self.peer_emergency_budget_mark(reset, false);
+                PEER_ARMED_MISMATCH_AT.store(0, Ordering::Relaxed);
                 info!(
                     scenario = "peer_emergency",
-                    heal_event = "peer_emergency_wedge_confirmed",
-                    "peer rejoined this host's xhad liveset while the HA-armed-mismatch \
-                       signature persists (peer xapi raw-not-live); arming the fast-path \
-                       resolve on the short confirm grace instead of the blind timer"
+                    heal_event = "peer_emergency_resolved",
+                    "the peer's xapi answers normally again after the pool-level HA reset \
+                     (twice, with no locally-disarmed answer since); the emergency-mode wedge \
+                     is cleared"
                 );
+                self.peer_mismatch = MismatchSightings::default();
+                // Keyed by its reset: undelivered, XAPI's alert queue keeps
+                // it, and a futile verdict on the same reset replaces it.
+                let body = freed_alert(&self.config.node.peer);
+                let _ = self
+                    .h_alert_keyed(&peer_emergency_verdict_key(reset), &body, false)
+                    .await;
+                return;
             }
-        } else {
-            self.peer_liveset_wedge_since = None;
+            let why = if probed && role == xapi::PeerXapiRole::ArmedMismatch {
+                FutileWhy::Still
+            } else {
+                FutileWhy::NoAnswer
+            };
+            self.peer_emergency_futile(reset, why).await;
+            return;
         }
-        match peer_emergency_decision(
+        // A relapse: the peer judged freed answers locally disarmed again
+        // within half an hour of that verdict, confirmed as a reset's trigger
+        // is (two sightings). The earlier reset was futile after all (the
+        // hour's hold, one alert), rather than a new wedge reset 10 minutes on.
+        if armed_mismatch_confirmed {
+            let b = self.pe_budget();
+            if b.freed_at != 0
+                && crate::heal_state::unix_now().saturating_sub(b.freed_at)
+                    < PEER_EMERGENCY_RELAPSE_WITHIN
+            {
+                self.peer_emergency_futile(b.freed_reset, FutileWhy::Relapsed).await;
+            }
+        }
+        if armed_mismatch_confirmed && !p.matured() {
+            self.note_withheld(
+                "peer_emergency_resolve",
+                "the peer answers as locally disarmed under the armed pool, but its \
+                 management address does not answer reliably"
+                    .to_string(),
+            );
+        }
+        let now_unix = crate::heal_state::unix_now();
+        let mut budget = self.pe_budget();
+        let hold = peer_emergency_budget_hold(&budget, now_unix);
+        let action = peer_emergency_decision(
             self.config.ha.auto_resolve_peer_emergency,
             pool_ha,
-            live,
-            peer_ok,
-            peer_in_liveset,
-            storage_safe_to_cycle,
-            self.peer_emergency_since,
-            self.peer_liveset_wedge_since,
-            self.peer_emergency_last_action,
-            now,
-        ) {
+            &p,
+            armed_mismatch_confirmed,
+            self.peer_mismatch.open(),
+            self.peer_emergency_unissued_at
+                .is_some_and(|t| now.duration_since(t) < PEER_EMERGENCY_RETRY),
+            hold.is_some(),
+        );
+        if action != PeerEmergencyAction::Withheld {
+            self.set_peer_emergency_hold(None);
+        }
+        match action {
             PeerEmergencyAction::None => {
-                self.peer_emergency_since = None;
-                self.peer_emergency_clear_since = None;
-                self.peer_liveset_wedge_since = None;
-                self.peer_emergency_confirm_alerted_at = None;
+                self.peer_mismatch = MismatchSightings::default();
             }
             PeerEmergencyAction::Hold => {}
+            PeerEmergencyAction::Withheld => {
+                let Some(h) = hold else { return };
+                let (why, until) = (h.why.clone(), h.until);
+                self.note_withheld(
+                    "peer_emergency_resolve",
+                    format!(
+                        "the peer answers as locally disarmed under the armed pool, but the reset \
+                         budget holds the pool HA reset until {}: {why}",
+                        operator_time_rel(until)
+                    ),
+                );
+                self.set_peer_emergency_hold(Some((until, why.clone())));
+                // One alert per long hold (across restarts); a spacing hold
+                // is not alerted and does not use up the long hold's alert.
+                // Keyed by the hold (its end), not by its text.
+                let body = peer_emergency_hold_alert(
+                    until,
+                    &why,
+                    &self.config.node.name,
+                    &self.config.node.peer,
+                    self.ha_timeout_now(),
+                );
+                if h.alerts()
+                    && budget.alerted_until != until
+                    && self
+                        .h_alert_keyed(&peer_emergency_hold_key(until), &body, true)
+                        .await
+                {
+                    budget.alerted_until = until;
+                    self.pe_budget_store(budget.clone());
+                }
+            }
+            // Another pool HA cycle (or the survivor reset) is running: wait,
+            // spending no budget and starting no confirmation.
+            PeerEmergencyAction::Resolve if self.ha_cycle_in_flight("peer_emergency_resolve") => {}
             PeerEmergencyAction::Resolve => {
+                // The reset is spent, its verdict pending, before it runs: a
+                // budget that cannot be written runs no reset (fail closed).
+                budget.resets.push(now_unix);
+                budget.pending = now_unix;
+                if !self.pe_budget_spend(&budget) {
+                    warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve",
+                          step = "budget_unwritable", path = %self.peer_emergency_budget_path,
+                          "peer emergency resolve: the reset budget cannot be written; no pool HA \
+                           reset is run without it (retried next pass)");
+                    self.pe_budget_unwritable_alert(true).await;
+                    return;
+                }
+                // Under the test seam the reset is recorded instead of run.
+                if self.h_record("peer_emergency_reset".to_string()) {
+                    self.peer_emergency_resolve_at = Some(now);
+                    return;
+                }
                 let Some(sr) = xapi::twinstor_sr_uuid().await else {
-                    // No reset issued: the cooldown is not consumed, the next
+                    self.peer_emergency_budget_unspend();
+                    // No reset issued: the budget is not spent, the next
                     // pass retries (logged once per 10 minutes).
                     if self
                         .log_pace
@@ -19368,89 +24180,408 @@ impl StateMachine {
                              on the pool master."
                         )).await;
                     }
-                    self.peer_emergency_last_action = Some(
-                        now.checked_sub(PEER_EMERGENCY_COOLDOWN - PEER_EMERGENCY_RETRY)
-                            .unwrap_or(now),
-                    );
+                    self.peer_emergency_budget_unspend();
+                    self.peer_emergency_unissued_at = Some(now);
                     return;
                 }
                 warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve",
-                      signature_secs = ?self.peer_emergency_since.map(|t| now.duration_since(t).as_secs()),
-                      liveset_wedge_secs = ?self.peer_liveset_wedge_since.map(|t| now.duration_since(t).as_secs()),
-                      storage_safe_to_cycle, peer_in_liveset, peer_live = ?live, peer_live_raw = ?live_raw,
-                      pool_ha = ?pool_ha, peer_replication_ok = peer_ok,
+                      armed_mismatch_secs = ?self.peer_mismatch.first.map(|t| now.duration_since(t).as_secs()),
+                      armed_mismatch_confirmed, peer_role = ?role, peer_live_raw = ?live_raw,
+                      pool_ha = ?pool_ha,
+                      mgmt_answered = p.answered, mgmt_settled_secs = ?p.true_for.map(|d| d.as_secs()),
                       "resolving the peer's emergency-mode wedge: pool-level \
                        HA reset (disable dissolves the disagreement; the \
                        re-arm obligation restores protection)");
-                {
-                    let arbitrated = std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists();
-                    let timeout = xapi::pool_ha_timeout()
-                        .await
-                        .unwrap_or_else(|| crate::setup::ha_timeout_secs(arbitrated));
-                    ha_obligation_write(&sr, timeout.into());
-                    // Stamped: HA reads armed until the disable lands, and the
-                    // watchdog must not clear the obligation meanwhile.
-                    ha_obligation_touch_attempt();
-                    if let Err(e) = crate::cmd::run_cmd_for(
-                        "xe",
-                        &["pool-ha-disable"],
-                        HA_CMD_TIMEOUT.as_secs(),
-                    )
+                let timeout = xapi::pool_ha_timeout()
                     .await
-                    {
-                        // Outcome unknown (it may still land later): the
-                        // obligation stays and the HA watchdog re-arms if it
-                        // does. No reset was issued: the cooldown is not taken,
-                        // only a short retry pace.
-                        warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve", step = "disable_failed",
-                              error = %e,
-                              "peer emergency resolve: pool-ha-disable failed or timed out; no reset \
-                               issued (the re-arm obligation stays; retried later)");
-                        self.peer_emergency_last_action = Some(
-                            now.checked_sub(PEER_EMERGENCY_COOLDOWN - PEER_EMERGENCY_RETRY)
-                                .unwrap_or(now),
-                        );
-                        return;
-                    }
-                    self.peer_emergency_last_action = Some(now);
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-                    // A returning peer's readmission can leave the heartbeat SR's PBD
-                    // transiently unplugged; plug it first so the enable does not fail
-                    // "the SR has no attached PBDs" and lose a re-arm cycle.
-                    self.ensure_twinstor_pbds_plugged().await;
-                    ha_obligation_touch_attempt();
-                    if let Err(e) = crate::cmd::run_cmd_for(
-                        "xe",
-                        &[
-                            "pool-ha-enable",
-                            &format!("heartbeat-sr-uuids={sr}"),
-                            &format!("ha-config:timeout={timeout}"),
-                        ],
-                        HA_CMD_TIMEOUT.as_secs(),
-                    )
-                    .await
-                    {
-                        warn!(scenario = "peer_emergency", heal_event = "peer_emergency_resolve", step = "enable_failed",
-                              error = %e,
-                              "peer emergency resolve: pool-ha-enable failed; the re-arm obligation \
-                               stays and the HA watchdog retries it");
-                    }
-                    // Do not latch "resolved" here: the pool-ha-enable above
-                    // re-arms from this host's view but does not prove the
-                    // peer's xhad rejoined. Enter the confirmation phase; the
-                    // branch at the top of the next ticks verifies the peer is
-                    // live before declaring success, and escalates (the peer
-                    // needs a local emergency-disable) if not.
-                    self.peer_emergency_resolve_at = Some(std::time::Instant::now());
-                    self.peer_emergency_confirm_alerted_at = None;
-                    info!(
-                        scenario = "peer_emergency",
-                        heal_event = "peer_emergency_reset_issued",
-                        "pool-level HA reset issued; confirming the peer \
-                           rejoins the liveset before declaring it resolved"
-                    );
+                    .unwrap_or_else(|| crate::setup::configured_ha_timeout_for(self.arbitrated));
+                // The cycle writes (and stamps) the re-arm obligation once its
+                // start checks pass. The disable and enable each wait up to
+                // `HA_CMD_TIMEOUT`: run
+                // them off the serial tick. The in-flight flag holds the re-arm
+                // loop and the confirmation until the cycle has returned. The
+                // budget is spent and the confirmation starts only once it runs.
+                if self.spawn_pool_ha_cycle(
+                    "peer_emergency",
+                    sr,
+                    timeout,
+                    crate::mgmt_reach::Trigger::Positive,
+                    Some(true),
+                ) {
+                    self.peer_emergency_resolve_at = Some(now);
+                } else {
+                    self.peer_emergency_budget_unspend();
                 }
             }
+        }
+    }
+
+    /// The pool's HA timeout as configured (xhad.conf), else the mode's.
+    fn ha_timeout_now(&self) -> u32 {
+        crate::setup::configured_ha_timeout_for(self.arbitrated)
+    }
+
+    /// The masterless chain's re-arm record (see `masterless_record_write`),
+    /// written through the shared operations.
+    async fn masterless_write_record(&mut self, sr: &str, timeout: u32) {
+        let ops = self.ha_ops(None, None);
+        let standing = ops.obligation_state();
+        let now_unix = ops.now_unix();
+        let owed = masterless_obligation(self.h_pool_ha().await, now_unix);
+        match masterless_record_write(standing, owed, now_unix) {
+            None if owed.is_some() => {
+                info!(scenario = "masterless_pool", heal_event = "masterless_rearm_under_record",
+                      standing = ?standing,
+                      "masterless recovery: a re-arm record another routine holds stands; \
+                       proceeding under it, not replacing it");
+            }
+            Some(state) => {
+                ops.write_obligation(sr, timeout.into(), state, &format!("masterless:{now_unix}"));
+            }
+            None => info!(
+                scenario = "masterless_pool",
+                heal_event = "masterless_no_rearm",
+                "masterless recovery: pool HA still reads on after the transition; no pool \
+                   re-arm owed"
+            ),
+        }
+    }
+
+    /// Keep the budget's hold for the partition view (published to the view
+    /// task; under test only on this machine).
+    fn set_peer_emergency_hold(&mut self, hold: Option<(u64, String)>) {
+        // A hold that ended (or was replaced): its alert, if still queued,
+        // no longer holds.
+        if let Some((until, _)) = &self.peer_emergency_hold
+            && hold.as_ref().is_none_or(|(u, _)| u != until)
+        {
+            let key = peer_emergency_hold_key(*until);
+            self.h_forget_held_advice(&key);
+        }
+        if !cfg!(test) {
+            *PEER_EMERGENCY_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = hold.clone();
+        }
+        self.peer_emergency_hold = hold;
+    }
+
+    /// Set the pending verdict, its phase and cycle return kept with the
+    /// budget for a restarted daemon.
+    fn pe_verdict_set(&mut self, v: ResetVerdict) {
+        self.peer_emergency_verdict = Some(v);
+        let mut b = self.pe_budget();
+        if b.pending != 0 {
+            b.pending_phase = v.phase.key().to_string();
+            b.pending_since = v.returned;
+            self.pe_budget_store(b);
+        }
+    }
+
+    /// The reset budget: what this daemon could not write yet, else the file.
+    fn pe_budget(&self) -> PeerEmergencyBudget {
+        match &self.pe_budget_unwritten {
+            Some(b) => b.clone(),
+            None => peer_emergency_budget_read(&self.peer_emergency_budget_path, &current_boot_id()),
+        }
+    }
+
+    /// Store the budget after a reset ran: a write that fails keeps it in
+    /// memory (the next pass retries the write and alerts once), so the
+    /// file's stale state never drives a decision.
+    fn pe_budget_store(&mut self, b: PeerEmergencyBudget) {
+        if peer_emergency_budget_write(&self.peer_emergency_budget_path, &current_boot_id(), &b) {
+            self.pe_budget_unwritten = None;
+        } else {
+            self.pe_budget_unwritten = Some(b);
+        }
+    }
+
+    /// Spend a reset before it runs: only on a write that lands (fail
+    /// closed), with nothing left unwritten from before.
+    fn pe_budget_spend(&mut self, b: &PeerEmergencyBudget) -> bool {
+        let ok = peer_emergency_budget_write(&self.peer_emergency_budget_path, &current_boot_id(), b);
+        if ok {
+            self.pe_budget_unwritten = None;
+        }
+        ok
+    }
+
+    /// Retry a budget write that failed; alerted while it keeps failing.
+    async fn pe_budget_retry_write(&mut self) {
+        let Some(b) = self.pe_budget_unwritten.clone() else {
+            return;
+        };
+        self.pe_budget_store(b);
+        if self.pe_budget_unwritten.is_some() {
+            warn!(scenario = "peer_emergency", heal_event = "peer_emergency_budget_unwritable",
+                  path = %self.peer_emergency_budget_path,
+                  "the peer-emergency reset budget cannot be written; kept in memory, retried \
+                   each pass; no new reset runs until it is written");
+            self.pe_budget_unwritable_alert(false).await;
+        }
+    }
+
+    /// The one alert for a reset budget that cannot be written, whether a
+    /// change after a reset could not be kept or a confirmed reset was
+    /// refused for it (`refused`): paced, re-sent after a day while it lasts.
+    async fn pe_budget_unwritable_alert(&mut self, refused: bool) {
+        let now = std::time::Instant::now();
+        if self
+            .pe_budget_alerted_at
+            .is_some_and(|t| now.duration_since(t) < DEGRADED_REALERT_AFTER)
+        {
+            return;
+        }
+        let refused = if refused {
+            format!(" A confirmed reset for the peer host {} was refused for it.", self.config.node.peer)
+        } else {
+            String::new()
+        };
+        let body = format!(
+            "TwinStor on {me}: it cannot write its pool HA reset budget ({path}), so it runs no \
+             automatic pool HA reset until it can.{refused} While the peer host {peer} reports \
+             that it is locally disarmed under the armed pool, HA does not protect its VMs, and \
+             XAPI may restart them on another host while they still run there. To free {peer}: \
+             on the pool master {me} run 'xe pool-ha-disable', then 'xe pool-ha-enable \
+             heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout={t}'. Check that /run is \
+             writable and not full.",
+            me = self.config.node.name,
+            peer = self.config.node.peer,
+            path = self.peer_emergency_budget_path,
+            t = self.ha_timeout_now()
+        );
+        if self.h_alert_advice(&body).await {
+            self.pe_budget_alerted_at = Some(now);
+        }
+    }
+
+    /// The last reset freed the peer, or did not (`futile`): a futile one
+    /// makes the next wait `PEER_EMERGENCY_AFTER_FUTILE`.
+    fn peer_emergency_budget_mark(&mut self, reset: u64, futile: bool) {
+        let mut b = self.pe_budget();
+        let now_unix = crate::heal_state::unix_now();
+        // The after-futile hold runs from the later of the reset and this
+        // verdict: a verdict that comes late (a long wait for pool HA, a
+        // relapse) still holds the next reset for the full hour.
+        b.futile = if futile { reset.max(now_unix) } else { 0 };
+        b.pending = 0;
+        b.pending_phase.clear();
+        b.pending_since = 0;
+        b.verdict_at = now_unix;
+        (b.freed_at, b.freed_reset) = if futile { (0, 0) } else { (now_unix, reset) };
+        self.pe_budget_store(b.clone());
+    }
+
+    /// On the first sighting of the peer reporting itself locally disarmed
+    /// under the armed pool: one alert from this master, through its own
+    /// xapi (the disarmed peer's xapi refuses calls when it was restarted, so
+    /// its own alert cannot go out). One per wedge, kept in the budget file
+    /// across a restart. Not when TwinStor's own doing explains the peer's
+    /// state with a repair due, nor inside a freed reset's relapse window
+    /// (the relapse alert speaks for that wedge). The VM count and the send
+    /// run off the tick, so the confirming probe is not delayed; with no VM
+    /// running on the peer per the pool database, a log line only.
+    async fn peer_disarm_first_alert(&mut self) {
+        if let Some(why) = self.peer_disarm_explained() {
+            // Not latched: a later sighting is looked at again.
+            if self.log_pace.due("peer_disarmed_explained", Duration::from_secs(600)) {
+                info!(scenario = "peer_emergency", heal_event = "peer_disarmed_seen", reason = why,
+                      "the peer reports itself locally disarmed under the armed pool; no alert \
+                       for now: {why}");
+            }
+            return;
+        }
+        let now_unix = unix_now_secs();
+        let hold = peer_emergency_budget_hold(&self.pe_budget(), now_unix);
+        let next = match &hold {
+            Some(h) => PeerDisarmNext::OnHold(h.until, h.why.clone()),
+            None if !self.config.ha.auto_resolve_peer_emergency => PeerDisarmNext::Disabled,
+            None => PeerDisarmNext::Expected,
+        };
+        let long_hold = hold.as_ref().filter(|h| h.alerts()).map(|h| h.until);
+        self.peer_disarm_alerted = true;
+        let mut b = self.pe_budget();
+        b.disarm_alerted = now_unix;
+        self.pe_budget_store(b);
+        let master = self.config.node.name.clone();
+        let peer = self.config.node.peer.clone();
+        let t = self.ha_timeout_now();
+        let key = peer_disarm_first_key(now_unix);
+        let result = self.peer_disarm_alert_result.clone();
+        let report = move |o: FirstAlertOutcome| {
+            if let Ok(mut r) = result.lock() {
+                *r = Some(o);
+            }
+        };
+        // Under the test seam: inline, recorded.
+        #[cfg(test)]
+        if let Some((vms, master_at_send)) = self
+            .test_ha
+            .as_ref()
+            .map(|t| (t.peer_vms, t.master_at_send.unwrap_or(t.master_resilient)))
+        {
+            if vms == Some(0) {
+                return report(FirstAlertOutcome::Kept);
+            }
+            if master_at_send != Some(true) {
+                return report(FirstAlertOutcome::Dropped);
+            }
+            let body = peer_disarm_first_alert_text(&master, &peer, vms, &next, t);
+            let delivered = self.h_alert_keyed(&key, &body, true).await;
+            return report(if delivered {
+                FirstAlertOutcome::Delivered(long_hold)
+            } else {
+                FirstAlertOutcome::Kept
+            });
+        }
+        tokio::spawn(async move {
+            let vms = xapi::running_vms_on(&peer).await;
+            if vms == Some(0) {
+                info!(scenario = "peer_emergency", heal_event = "peer_disarmed_seen", vms = 0,
+                      "the peer reports itself locally disarmed under the armed pool and runs no VM \
+                       per the pool database; no alert");
+                return report(FirstAlertOutcome::Kept);
+            }
+            // Still master, read right before the send: otherwise not this
+            // host's alert to send.
+            if xapi::is_pool_master_resilient().await != Some(true) {
+                info!(scenario = "peer_emergency", heal_event = "peer_disarmed_seen",
+                      "no longer pool master; the first-sighting alert is not sent");
+                return report(FirstAlertOutcome::Dropped);
+            }
+            let body = peer_disarm_first_alert_text(&master, &peer, vms, &next, t);
+            // Advises a pool HA disable: routed as such advice (held only
+            // while a host is parked); undelivered, it is queued.
+            let delivered = xapi::send_xapi_alert_advising_ha_disable_keyed(&key, &body).await;
+            report(if delivered {
+                FirstAlertOutcome::Delivered(long_hold)
+            } else {
+                FirstAlertOutcome::Kept
+            });
+        });
+    }
+
+    /// The first-sighting alert's per-wedge mark ends (the peer answered
+    /// normally twice, this host's mastership changed, or a send was
+    /// dropped): the next sighting is a new wedge's.
+    fn peer_disarm_mark_clear(&mut self) {
+        self.peer_disarm_alerted = false;
+        let b = self.pe_budget();
+        if b.disarm_alerted != 0 {
+            // The wedge ended: its alert, if still queued, no longer holds.
+            self.h_forget_held_advice(&peer_disarm_first_key(b.disarm_alerted));
+            let mut b = b;
+            b.disarm_alerted = 0;
+            self.pe_budget_store(b);
+        }
+    }
+
+    /// What this master knows that explains the peer's disarm as TwinStor's
+    /// own doing with a repair due, or a wedge another alert speaks for.
+    fn peer_disarm_explained(&self) -> Option<&'static str> {
+        let b = self.pe_budget();
+        if b.freed_at != 0 && unix_now_secs().saturating_sub(b.freed_at) < PEER_EMERGENCY_RELAPSE_WITHIN {
+            return Some("a reset freed this peer less than 30 minutes ago; a confirmed relapse is alerted");
+        }
+        if self.peer_emergency_resolve_at.is_some() || b.pending != 0 {
+            return Some("TwinStor's own pool HA reset for this peer is under way");
+        }
+        if b.futile != 0
+            && unix_now_secs().saturating_sub(b.verdict_at) < PEER_EMERGENCY_AFTER_FUTILE
+        {
+            return Some("TwinStor's last reset did not free this peer; its alert speaks for the wedge");
+        }
+        if self.ha_reset_inflight.load(Ordering::SeqCst) {
+            return Some("a TwinStor pool HA cycle is in flight");
+        }
+        if self.whole_switch_held
+            || self.whole_switch_guard.load(Ordering::Relaxed)
+            || self.whole_switch_guard_ever_disarmed.load(Ordering::Relaxed)
+        {
+            return Some("a whole-switch hold disarmed both hosts and owns their re-arm");
+        }
+        if self.twinstor_hold_released_at.is_some_and(|t| {
+            t.elapsed() < RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER + READMISSION_SUSPECT_AFTER
+        }) {
+            return Some("a TwinStor hold released recently; its recorded-disarm repair is due");
+        }
+        if crate::arbitration::current() == crate::arbitration::PartitionView::PeerStoodDown {
+            return Some("the peer stood itself down and rejoins by itself");
+        }
+        if self.readmission_dance_t.is_some() || self.dance_disarm_watch.is_some() {
+            return Some("the re-admission recovery disarmed the hosts and owns their re-arm");
+        }
+        None
+    }
+
+    /// A reset that did not free the peer: counted futile (the next waits
+    /// `PEER_EMERGENCY_AFTER_FUTILE` from it), logged, and one alert saying
+    /// so, which also stands for the hold that follows.
+    async fn peer_emergency_futile(&mut self, reset: u64, why: FutileWhy) {
+        self.peer_emergency_resolve_at = None;
+        self.peer_emergency_verdict = None;
+        // `reset` is the real reset time, the one its freed alert (if any)
+        // was keyed with, so the key below is the same.
+        self.peer_emergency_budget_mark(reset, true);
+        let budget = self.pe_budget();
+        let hold = peer_emergency_budget_hold(&budget, crate::heal_state::unix_now());
+        warn!(
+            scenario = "peer_emergency",
+            heal_event = "peer_emergency_resolve_failed",
+            why = ?why,
+            hold_until = ?hold.as_ref().map(|h| h.until),
+            "the automatic pool-level HA reset did not free the peer ({why:?}); the next reset \
+             waits for the budget ({})",
+            hold.as_ref().map(|h| h.why.as_str()).unwrap_or("")
+        );
+        if let Some(h) = hold.filter(|_| why != FutileWhy::HaOff) {
+            let body = futile_reset_alert(
+                why,
+                &h,
+                reset,
+                &self.config.node.name,
+                &self.config.node.peer,
+                self.ha_timeout_now(),
+            );
+            // One hold, one alert: this one stands for the hold, which is not
+            // alerted again, delivered now or later from XAPI's alert queue.
+            let mut b = self.pe_budget();
+            b.alerted_until = h.until;
+            self.pe_budget_store(b);
+            // Only the texts that advise a pool HA disable are held while a
+            // host is parked.
+            let advice = matches!(why, FutileWhy::Still | FutileWhy::NoAnswer | FutileWhy::Relapsed);
+            // A "freed" for this reset still queued undelivered (a relapse
+            // after it) must not go out after this: dropped. A plain alert
+            // under the same key replaces it in the queue anyway; an advice
+            // is queued under its own key, hence the explicit drop.
+            let key = peer_emergency_verdict_key(reset);
+            self.h_forget_held_alert(&key);
+            let _ = self.h_alert_keyed(&key, &body, advice).await;
+        }
+    }
+
+    /// A reset that gets no verdict (its timed-out disable did not take):
+    /// the pending mark goes, the reset stays spent, and the decision's time
+    /// counts as the verdict's, so the spacing runs from the later of the
+    /// two as for every other outcome.
+    fn peer_emergency_budget_clear_pending(&mut self) {
+        let mut b = self.pe_budget();
+        b.verdict_at = crate::heal_state::unix_now();
+        b.pending = 0;
+        b.pending_phase.clear();
+        b.pending_since = 0;
+        self.pe_budget_store(b);
+    }
+
+    /// A spawned reset whose disable was refused or never issued was no
+    /// reset: the budget gets it back.
+    fn peer_emergency_budget_unspend(&mut self) {
+        let mut b = self.pe_budget();
+        if b.resets.pop().is_some() || b.pending != 0 {
+            b.pending = 0;
+            b.pending_phase.clear();
+            b.pending_since = 0;
+            self.pe_budget_store(b.clone());
         }
     }
 
@@ -19469,9 +24600,31 @@ impl StateMachine {
             self.self_unwedge_since = None;
             return; // HA never configured here
         }
+        // A "cleared" report not delivered yet: raised again each pass.
+        self.self_unwedge_cleared_send().await;
         let now = std::time::Instant::now();
         let local_armed = xapi::local_ha_armed();
-        let pool_ha = xapi::is_ha_enabled().await;
+        self.self_unwedge_episode_reset(local_armed);
+        // No management-plane read on the tick while the peer's management
+        // address is silent: the pool read is forwarded to the master and the
+        // local login waits on it, so both could only time out (5 s and 15 s
+        // a minute on a slave whose master was cut). Nothing here can hold
+        // without P either: the self-clear needs the peer's agent (forwarded)
+        // and its gate needs P, and the alert needs the peer's own answer as
+        // master, which is not probed without P.
+        if self_unwedge_reads_futile(self.p_view().p) {
+            self.self_unwedge_since = None;
+            return;
+        }
+        // The pool read drives any action, as it always did. On a slave
+        // disarmed whose xapi restarted, the local xapi refuses every call
+        // (HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED), so that read fails; the
+        // refusal (read only then) and the peer's own login answer are
+        // evidence for the alert only: the refusal can be stale if pool HA
+        // was turned off since this xapi started.
+        let pool_read = xapi::is_ha_enabled().await;
+        let local_refusal = pool_read.is_none()
+            && xapi::local_xapi_role().await == xapi::PeerXapiRole::ArmedMismatch;
         let xhad_online = self.xha_host_state().await == XhaHostState::Online;
         let storage_healthy = matches!(
             self.drbd.status().await,
@@ -19483,8 +24636,19 @@ impl StateMachine {
         // I am the returning slave and the peer is a live master. In a 2-node
         // pool the master is necessarily the peer, so only the wedged slave
         // ever self-clears; the master runs `check_peer_emergency` instead.
-        let peer_is_live_master = xapi::is_pool_master_resilient().await == Some(false)
-            && xapi::peer_agent_responsive(&self.config.node.peer).await == Some(true);
+        let slave_of_peer = xapi::is_pool_master_resilient().await == Some(false);
+        let peer_agent_master = slave_of_peer && self.peer_agent_probe().await == Some(true);
+        let peer_login_master = !peer_agent_master
+            && slave_of_peer
+            && self.peer_role_probe_cached().await == xapi::PeerXapiRole::Master;
+        let evidence = SelfUnwedgeEvidence {
+            pool_read,
+            local_refusal,
+            peer_agent_master,
+            peer_login_master,
+        };
+        let (pool_ha, peer_is_live_master) = evidence.for_action();
+        let (pool_ha_alert, peer_is_master_alert) = evidence.for_alert();
         // The acting signature comes from the readmission subsystem's rolling
         // xha.log scan (accumulated while xhad is not Online), so a genuine line
         // is caught when it appears and cannot rotate out of a fixed window. The
@@ -19502,28 +24666,64 @@ impl StateMachine {
             && storage_healthy
             && peer_is_live_master;
         let gates_hold = core_wedge && invalid_state;
+        // The same state as seen for the alert (local evidence allowed).
+        let core_wedge_alert = local_armed == Some(false)
+            && pool_ha_alert == Some(true)
+            && !xhad_online
+            && storage_healthy
+            && peer_is_master_alert;
 
         if !gates_hold {
             self.self_unwedge_since = None; // any gate false resets the clock
-            if core_wedge && !invalid_state {
+            if core_wedge_alert {
                 // Suspected wedge, but the acting signature did not match (a
                 // rotated log, an unknown code, or the embrace which the dance
-                // owns). We cannot safely self-clear, so log the near-miss
-                // instead of silently doing nothing.
-                if self
-                    .self_unwedge_miss_alerted_at
-                    .is_none_or(|t| now.duration_since(t) >= DEGRADED_REALERT_AFTER)
+                // owns), or only local evidence shows it. No self-clear, so
+                // log the near-miss instead of silently doing nothing.
+                if !invalid_state
+                    && self
+                        .self_unwedge_miss_alerted_at
+                        .is_none_or(|t| now.duration_since(t) >= DEGRADED_REALERT_AFTER)
                 {
                     self.self_unwedge_miss_alerted_at = Some(now);
+                    let vms = xapi::local_running_domu_count().await;
                     warn!(
                         scenario = "local_emergency_wedge",
                         heal_event = "self_unwedge_signature_miss",
-                        "the core wedge holds (disarmed, xhad not joined, \
-                           storage healthy, peer is master) but no invalid-state \
-                           signature matched, so the self-clear cannot act; if \
-                           this persists the peer may need a manual 'xe \
-                           host-emergency-ha-disable --force'"
+                        running_vms = vms,
+                        "the core wedge holds (disarmed, xhad not joined, storage healthy, peer \
+                         is master) but no invalid-state signature matched, so the self-clear \
+                         cannot act. {}",
+                        disarmed_host_risk(vms)
                     );
+                }
+                // The same, as an XAPI alert, when VMs run here and the disarm
+                // is not TwinStor's own recorded one (those have their own
+                // re-arm).
+                let own_disarm = std::fs::read_to_string(ha_local_disarm_path())
+                    .is_ok_and(|r| disarm_record_this_boot(&r, &current_boot_id()));
+                if !own_disarm
+                    && self
+                        .self_unwedge_vm_alerted_at
+                        .is_none_or(|t| now.duration_since(t) >= DEGRADED_REALERT_AFTER)
+                {
+                    let vms = xapi::local_running_domu_count().await;
+                    if vms > 0 {
+                        let body = disarmed_host_vms_alert(
+                            &self.config.node.name,
+                            &self.config.node.peer,
+                            vms,
+                            self.ha_timeout_now(),
+                        );
+                        // Keyed by host: a re-send with another VM count
+                        // replaces its queued version, and the key withdraws
+                        // it once this host reads armed again.
+                        let key = disarmed_host_alert_key(&self.config.node.name);
+                        if self.h_alert_keyed(&key, &body, true).await {
+                            self.self_unwedge_vm_alerted_at = Some(now);
+                        }
+                        self.self_unwedge_vm_alert_raised = true;
+                    }
                 }
             }
         } else if self.self_unwedge_since.is_none() {
@@ -19550,6 +24750,11 @@ impl StateMachine {
             now,
         ) {
             SelfUnwedgeAction::Hold => {}
+            // Positive local evidence (this host disarmed under an armed pool):
+            // no settle, but the peer's management address must answer.
+            SelfUnwedgeAction::Clear
+                if !self.rejoin_assist_allows("self_unwedge")
+                    || !self.ha_gate("self_unwedge", crate::mgmt_reach::Trigger::Positive) => {}
             SelfUnwedgeAction::Clear => {
                 self.self_unwedge_last_action = Some(now);
                 self.self_unwedge_since = None;
@@ -19559,24 +24764,615 @@ impl StateMachine {
                     "breaking my own HA emergency wedge: the peer's \
                        pool-level reset cannot recruit a cycling xhad, so \
                        clearing local HA state with 'host-emergency-ha-disable \
-                       --force'; the re-arm path rejoins me afterwards"
+                       --force'; only a pool HA cycle re-arms me afterwards"
                 );
-                note_local_ha_disarm();
-                let _ = crate::cmd::run_cmd_for(
-                    "xe",
-                    &["host-emergency-ha-disable", "--force"],
-                    HA_CMD_TIMEOUT.as_secs(),
-                )
-                .await;
-                let _ = xapi::send_xapi_alert(
-                    "TwinStor: this host was stuck in xapi HA emergency mode \
-                     (its xhad could not rejoin the liveset after the \
-                     pool-level reset). It cleared its own local HA state \
-                     automatically; HA re-arms on rejoin. Storage was healthy \
-                     throughout and VMs were unaffected.",
-                )
-                .await;
+                self.self_unwedge_clear().await;
             }
+        }
+    }
+
+    /// The self-clear's action: the emergency HA disable on this host, and
+    /// its report from the command's result (owed until delivered).
+    async fn self_unwedge_clear(&mut self) {
+        let result = self.h_emergency_disable_local().await;
+        match &result {
+            Ok(()) => info!(scenario = "local_emergency_wedge", heal_event = "self_unwedge_clear",
+                            outcome = "ok", "host-emergency-ha-disable --force returned success"),
+            Err(e) => warn!(scenario = "local_emergency_wedge", heal_event = "self_unwedge_clear",
+                            outcome = "failed", error = %e, "host-emergency-ha-disable --force failed"),
+        }
+        self.self_unwedge_report = Some(self_unwedge_report_text(
+            &self.config.node.name,
+            &self.config.node.peer,
+            result.as_ref().err().map(String::as_str),
+            self.ha_timeout_now(),
+        ));
+        self.self_unwedge_cleared_send().await;
+    }
+
+    async fn h_emergency_disable_local(&mut self) -> Result<(), String> {
+        if self.h_record("emergency-disable-local".to_string()) {
+            #[cfg(test)]
+            if let Some(e) = self.test_ha.as_ref().and_then(|t| t.emergency_disable_err.clone()) {
+                return Err(e);
+            }
+            return Ok(());
+        }
+        note_local_ha_disarm();
+        crate::cmd::run_cmd_for(
+            "xe",
+            &["host-emergency-ha-disable", "--force"],
+            HA_CMD_TIMEOUT.as_secs(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// The self-clear's report, owed until delivered: its caller acts once
+    /// and would not send it again. Advice (it names the manual pool HA
+    /// cycle), sent unqueued: this pass is the retry.
+    async fn self_unwedge_cleared_send(&mut self) {
+        let Some(body) = self.self_unwedge_report.clone() else {
+            return;
+        };
+        if self.h_alert_advice_unqueued(&body).await {
+            self.self_unwedge_report = None;
+        }
+    }
+
+    /// The disarmed host's log line and alert are paced per disarm episode,
+    /// not per daemon lifetime: once this host reads armed again, the next
+    /// disarm gets them again (a 24-hour pace across episodes left a second
+    /// wedge within the day without its alert).
+    fn self_unwedge_episode_reset(&mut self, local_armed: Option<bool>) {
+        if local_armed == Some(true) {
+            self.self_unwedge_miss_alerted_at = None;
+            self.self_unwedge_vm_alerted_at = None;
+            if std::mem::take(&mut self.self_unwedge_vm_alert_raised) {
+                let key = disarmed_host_alert_key(&self.config.node.name);
+                self.h_forget_held_advice(&key);
+            }
+        }
+    }
+
+    /// This host's own liveset master flags (local socket call, bounded).
+    async fn liveset_masters(&self) -> Option<LivesetMasters> {
+        #[cfg(test)]
+        {
+            self.test_ha.as_ref().and_then(|t| t.liveset)
+        }
+        #[cfg(not(test))]
+        {
+            let xml = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::cmd::cmd_output(CALLDAEMON, &["query_liveset"]),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            parse_liveset_masters(&xml)
+        }
+    }
+
+    /// The second-master demote guard (see `second_master_decision`), and the
+    /// whole-switch rejoin alert. Local evidence only: pool.conf, local.db,
+    /// the local xhad socket, the local xapi, the beacon line and DRBD.
+    async fn check_second_master(&mut self) {
+        #[cfg(test)]
+        if self.test_ha.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .second_master_checked_at
+            .is_some_and(|t| now.duration_since(t) < SECOND_MASTER_CHECK_EVERY)
+        {
+            return;
+        }
+        self.second_master_checked_at = Some(now);
+        let conf_master = self.h_conf_master() == Some(true);
+        let local_armed = self.h_local_armed();
+        let p = self.p_view().p;
+        self.track_park(conf_master, local_armed, p).await;
+        if !conf_master {
+            self.second_master_a_since = None;
+            return;
+        }
+        // Cheap local reads first (the liveset whatever the local armed flag
+        // says: a host disarmed locally can still have its xhad in the
+        // liveset); the local xapi read and the VM count only when one of the
+        // two shapes can hold.
+        let liveset = self.liveset_masters().await;
+        let a_shape = second_master_evidence_a(liveset, true);
+        let b_shape = self.seen_parked && self.released_by_pool && local_armed == Some(false) && !p;
+        let now_unix = crate::heal_state::unix_now();
+        let boot_id = current_boot_id();
+        let path = self.second_master_budget_path.clone();
+        if !a_shape && !b_shape {
+            self.second_master_a_since = None;
+            let b = demote_budget_read(&path, &boot_id);
+            let aged = demote_budget_age(b, false, now_unix);
+            if aged != b {
+                demote_budget_write(&path, &boot_id, &aged);
+            }
+            return;
+        }
+        let local_xapi_master = self.h_xapi_master(now).await == Some(true);
+        let evidence_a = second_master_evidence_a(liveset, local_xapi_master);
+        if evidence_a {
+            self.second_master_a_since.get_or_insert(now);
+        } else {
+            self.second_master_a_since = None;
+        }
+        let vms = self.h_vm_count().await;
+        // A disarm TwinStor made itself (the whole-switch hold and its guard,
+        // a stand-down, any recorded emergency disarm) is not a release by
+        // XAPI.
+        let twinstor_disarmed = self.whole_switch_held
+            || self
+                .whole_switch_guard_ever_disarmed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || std::path::Path::new(&ha_local_disarm_path()).exists();
+        let evidence_b = !evidence_a
+            && !twinstor_disarmed
+            && released_while_cut(
+                self.seen_parked,
+                self.released_by_pool,
+                local_armed,
+                conf_master,
+                local_xapi_master,
+                p,
+                vms,
+            );
+        let mut budget = demote_budget_age(
+            demote_budget_read(&path, &boot_id),
+            evidence_a || evidence_b,
+            now_unix,
+        );
+        if !evidence_a && !evidence_b {
+            demote_budget_write(&path, &boot_id, &budget);
+            return;
+        }
+        let peer_shown_alive =
+            evidence_b && (self.peer_beacon_line_ok().await || self.h_drbd_connected().await);
+        let peer_addr = self.peer_mgmt_addr();
+        if demote_paced(&budget, now_unix) && budget.count < SECOND_MASTER_DEMOTE_CAP {
+            // The last demote's xapi restart may still be landing.
+            demote_budget_write(&path, &boot_id, &budget);
+            return;
+        }
+        let may_act = self.config.ha.rejoin_assist
+            && peer_addr.is_some()
+            && demote_budget_allows(&budget, now_unix);
+        let mut action = second_master_decision(
+            evidence_a,
+            self.second_master_a_since,
+            evidence_b,
+            peer_shown_alive,
+            may_act,
+            now,
+        );
+        // Never point pool.conf at an address that does not answer: the
+        // demoted host would follow nobody. Checked when the demote fires.
+        let mut addr_silent = false;
+        if action == SecondMasterAction::Demote
+            && !self.h_addr_answers(peer_addr.as_deref().unwrap_or("")).await
+        {
+            addr_silent = true;
+            action = SecondMasterAction::AlertOnly;
+        }
+        let which = if evidence_a {
+            "its own HA liveset names the peer as the pool master"
+        } else {
+            "XAPI released it from its HA startup loop (the pool's HA was disabled) while it \
+             was cut off from the peer's management network"
+        };
+        let vms_text = vms.map_or("an unknown number of".to_string(), |n| n.to_string());
+        match action {
+            SecondMasterAction::None | SecondMasterAction::Watch => {}
+            // Every HA actuator waits for a pool HA cycle in flight; the
+            // next pass decides again.
+            SecondMasterAction::Demote if self.ha_cycle_in_flight("second_master_demote") => {
+                demote_budget_write(&path, &boot_id, &budget);
+            }
+            SecondMasterAction::Demote => {
+                let addr = peer_addr.unwrap_or_default();
+                // For diagnosis only (the demote never waits on it): what the
+                // peer's xapi answers, when its management address answers.
+                if p {
+                    let role = self.peer_role_probe().await;
+                    info!(heal_event = "second_master_peer_role", peer_role = ?role,
+                          "the peer's xapi answer at the second-master demote");
+                }
+                budget.count = budget.count.saturating_add(1);
+                budget.last_demote = now_unix;
+                demote_budget_write(&path, &boot_id, &budget);
+                // The demote restarts xapi on a host that may be locally
+                // disarmed: keep a disarm record for this boot so the repair
+                // of "disarmed under the armed pool" knows TwinStor caused it.
+                self.note_demote_while_disarmed().await;
+                warn!(
+                    heal_event = "second_master_demote",
+                    evidence = if evidence_a { "liveset" } else { "released_while_cut" },
+                    running_vms = %vms_text,
+                    peer = %addr,
+                    attempt = budget.count,
+                    "this host's xapi answers as pool master, but {which}: demoting it to \
+                     slave of the peer (pool.conf slave:<peer>, xapi restart; never asserts \
+                     master)"
+                );
+                let _ = self
+                    .h_alert(&format!(
+                        "TwinStor: this host was running as a second pool master: its xapi \
+                         answered as master, but {which}. It is demoting itself to a slave of \
+                         the peer ({addr}) by rewriting pool.conf and restarting xapi. It runs \
+                         {vms_text} VM(s); a restart of xapi does not stop them, and the real \
+                         master reconciles them."
+                    ))
+                    .await;
+                if self.h_record(format!("demote: slave:{addr}")) {
+                    return;
+                }
+                if let Err(e) = xapi::repoint_pool_conf_to_slave(&addr) {
+                    warn!("second-master demote: could not rewrite pool.conf: {e}");
+                    return;
+                }
+                let _ = tokio::process::Command::new("sh")
+                    .args(["-c", &format!("({XE_TOOLSTACK_RESTART}) >/dev/null 2>&1 &")])
+                    .status()
+                    .await;
+            }
+            SecondMasterAction::AlertOnly => {
+                if budget.last_alert != 0
+                    && now_unix.saturating_sub(budget.last_alert) < DEGRADED_REALERT_AFTER.as_secs()
+                {
+                    demote_budget_write(&path, &boot_id, &budget);
+                    return;
+                }
+                let body = if evidence_b && !peer_shown_alive {
+                    format!(
+                        "TwinStor: XAPI released this host from its HA startup loop while it was \
+                         cut off, and it still says master (it runs {vms_text} VM(s)). It must not \
+                         start VMs. It demotes itself to a slave of the peer as soon as it sees \
+                         the peer alive and the peer's management address answers."
+                    )
+                } else if addr_silent {
+                    format!(
+                        "TwinStor: this host answers as a second pool master ({which}; it runs \
+                         {vms_text} VM(s)) but the peer's management address does not answer, \
+                         so it does not point pool.conf at it yet. It demotes itself once that \
+                         address answers."
+                    )
+                } else {
+                    format!(
+                        "TwinStor: this host answers as a second pool master ({which}; it runs \
+                         {vms_text} VM(s)) and is not demoting itself automatically ([ha] \
+                         rejoin_assist off, no known peer management address, or the demote \
+                         budget for this incident is spent). On this host run 'xe \
+                         pool-emergency-reset-master master-address=<peer management \
+                         address>'."
+                    )
+                };
+                if self.log_pace.due("second_master_alert", Duration::from_secs(600)) {
+                    warn!(heal_event = "second_master_alert", running_vms = %vms_text, "{body}");
+                }
+                // Paced from its delivery: sent unqueued and raised again on
+                // the next check until delivered (a queued copy could go
+                // stale, or out after a later re-send).
+                if self.h_alert_unqueued(&body).await {
+                    budget.last_alert = now_unix;
+                }
+                demote_budget_write(&path, &boot_id, &budget);
+            }
+        }
+    }
+
+    /// The recorded-disarm re-arm (see `recorded_disarm_rearm_decision`):
+    /// one pool HA cycle, from the host holding TwinStor's own disarm record,
+    /// once per record. Switched off with `[ha] auto_resolve_peer_emergency`,
+    /// the key of the other pool-HA-cycle repair of the same state.
+    async fn check_recorded_disarm_rearm(&mut self) {
+        #[cfg(test)]
+        if self.test_ha.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .recorded_rearm_checked_at
+            .is_some_and(|t| now.duration_since(t) < RECORDED_REARM_CHECK_EVERY)
+        {
+            return;
+        }
+        self.recorded_rearm_checked_at = Some(now);
+        self.recorded_rearm_outcome().await;
+        let Ok(record) = std::fs::read_to_string(&self.disarm_record_path) else {
+            self.recorded_rearm_liveset_since = None;
+            return;
+        };
+        if !disarm_record_usable(&record, &current_boot_id()) {
+            self.recorded_rearm_liveset_since = None;
+            return;
+        }
+        let local_armed = self.h_local_armed();
+        if local_armed != Some(false) {
+            self.recorded_rearm_liveset_since = None;
+            return;
+        }
+        let both_live = self
+            .liveset_masters()
+            .await
+            .is_some_and(|l| l.local_online && l.peer_live);
+        if !both_live {
+            self.recorded_rearm_liveset_since = None;
+            return;
+        }
+        self.recorded_rearm_liveset_since.get_or_insert(now);
+        let pool_ha = self.h_pool_ha().await;
+        let p = self.p_view();
+        let i_am_master = self.h_xapi_master(now).await;
+        let peer_role = self.peer_role_probe_cached().await;
+        let hold = self.whole_switch_held
+            || self
+                .whole_switch_guard
+                .load(std::sync::atomic::Ordering::Relaxed);
+        // An unreadable task list is unknown: wait, as for a pending one.
+        let task_pending = self.h_pending_ha_tasks().await.is_none_or(|t| !t.is_empty());
+        let decision = recorded_disarm_rearm_decision(
+            true,
+            pool_ha,
+            local_armed,
+            self.recorded_rearm_liveset_since.map(|t| now.duration_since(t)),
+            p.matured(),
+            i_am_master,
+            &peer_role,
+            hold,
+            task_pending,
+        );
+        match decision {
+            RecordedRearm::None => {}
+            RecordedRearm::Wait(why) => {
+                if self
+                    .log_pace
+                    .due("recorded_rearm_wait", Duration::from_secs(600))
+                {
+                    info!(heal_event = "recorded_rearm_wait", reason = why, peer_role = ?peer_role,
+                          i_am_master = ?i_am_master,
+                          "this host is locally disarmed under the armed pool after its own \
+                           recorded disarm; the pool HA cycle that re-arms it waits: {why}");
+                }
+            }
+            RecordedRearm::Cycle if !self.config.ha.auto_resolve_peer_emergency => {
+                if self
+                    .log_pace
+                    .is_due("recorded_rearm_disabled", DEGRADED_REALERT_AFTER)
+                    && self.h_alert_advice_unqueued(&self.recorded_rearm_manual_now()).await
+                {
+                    self.log_pace.mark("recorded_rearm_disabled");
+                }
+            }
+            RecordedRearm::Cycle => self.run_recorded_rearm_cycle(&record, i_am_master).await,
+        }
+    }
+
+    /// The recorded-disarm re-arm's one pool HA cycle. The record is marked
+    /// used first, so the cycle can never repeat for it, and the re-arm
+    /// obligation is written before the disable, so a failed enable is
+    /// retried by the re-arm loop.
+    async fn run_recorded_rearm_cycle(&mut self, record: &str, i_am_master: Option<bool>) {
+        // Another pool HA cycle (or the survivor reset) is running: wait,
+        // with the record unused.
+        if self.ha_reset_inflight.load(Ordering::SeqCst) {
+            if self.log_pace.due("recorded_rearm_wait", Duration::from_secs(600)) {
+                info!(heal_event = "recorded_rearm_wait", reason = "cycle in flight",
+                      "the recorded-disarm re-arm waits: another pool HA cycle is in flight");
+            }
+            return;
+        }
+        if self.h_record("recorded_rearm_cycle".to_string()) {
+            let _ = std::fs::write(&self.disarm_record_path, format!("{record}cycled=1\n"));
+            return;
+        }
+        warn!(
+            heal_event = "recorded_rearm_cycle",
+            "this host is locally disarmed under the armed pool after TwinStor's own disarm \
+             (a whole-switch hold or a stand-down) and is back in the liveset: running one pool \
+             HA cycle (disable, then enable) to re-arm both hosts"
+        );
+        let Some(sr) = xapi::twinstor_sr_uuid().await else {
+            if self.log_pace.is_due("recorded_rearm_no_sr", DEGRADED_REALERT_AFTER)
+                && self.h_alert_advice_unqueued(&self.recorded_rearm_manual_now()).await
+            {
+                self.log_pace.mark("recorded_rearm_no_sr");
+            }
+            return;
+        };
+        let timeout = xapi::pool_ha_timeout()
+            .await
+            .unwrap_or_else(|| crate::setup::configured_ha_timeout_for(self.arbitrated));
+        // Off the serial tick; its outcome is alerted when it returns
+        // (`recorded_rearm_outcome`). The cycle writes the re-arm obligation
+        // once its start checks pass. The record is used only once the cycle
+        // has really issued its disable (`recorded_rearm_outcome`).
+        if self.spawn_pool_ha_cycle(
+            "recorded_rearm",
+            sr,
+            timeout,
+            crate::mgmt_reach::Trigger::Positive,
+            i_am_master,
+        ) {
+            info!(heal_event = "recorded_rearm_started", "pool HA cycle started off the tick");
+        }
+    }
+
+    /// Alert the outcome of a recorded-disarm re-arm cycle that has returned.
+    async fn recorded_rearm_outcome(&mut self) {
+        let Some(r) = self.take_ha_cycle_result("recorded_rearm") else {
+            return;
+        };
+        // The record is used once the cycle has issued its disable; one that
+        // stopped before (gates, pool HA not on or unreadable, an HA task
+        // pending) leaves it for the next try.
+        if r.disable_issued {
+            mark_disarm_record_cycled(&self.disarm_record_path);
+        } else {
+            info!(heal_event = "recorded_rearm_not_started", reason = %r.disable_note,
+                  "the recorded-disarm re-arm's pool HA cycle stopped before any disable: \
+                   {}; it is tried again later", r.disable_note);
+            return;
+        }
+        if r.operator_off {
+            // Already reported by the cycle (`ha_off_not_by_twinstor`).
+            return;
+        }
+        if let Some(why) = &r.withheld {
+            info!(heal_event = "recorded_rearm_withheld", step = %why,
+                  "the pool HA cycle's enable was withheld at its firing; the re-arm obligation \
+                   enables pool HA under its own gates");
+            return;
+        }
+        if r.disabled && r.enabled {
+            info!(heal_event = "recorded_rearm_done", disable = %r.disable_note,
+                  "pool HA cycled; both hosts re-armed");
+            let _ = xapi::send_xapi_alert(
+                "TwinStor: after its own disarm (a whole-switch hold or a stand-down) this host \
+                 had rejoined the HA liveset locally disarmed under the armed pool, where HA \
+                 protects nothing. It ran one pool HA cycle (disable, then enable), which re-arms \
+                 both hosts. No action needed.",
+            )
+            .await;
+        } else if r.disabled {
+            warn!(heal_event = "recorded_rearm_failed", disable = %r.disable_note, enabled = r.enabled,
+                  "the pool HA cycle disabled pool HA but its enable did not return; the re-arm \
+                   obligation retries the enable");
+            let _ = xapi::send_xapi_alert_advising_ha_disable(&self.recorded_rearm_manual_now()).await;
+        } else {
+            warn!(heal_event = "recorded_rearm_failed", disable = %r.disable_note,
+                  "the pool HA cycle's disable was not seen to take ({}); if it may still land \
+                   (no answer), the pending re-arm record re-enables pool HA once it does, \
+                   otherwise nothing is owed", r.disable_note);
+            let _ = xapi::send_xapi_alert_advising_ha_disable(&self.recorded_rearm_manual_now()).await;
+        }
+    }
+
+    /// `recorded_rearm_manual` for this host, the pool master as pool.conf
+    /// names it, and the configured HA timeout.
+    fn recorded_rearm_manual_now(&self) -> String {
+        recorded_rearm_manual(&self.config.node.name, &self.pool_master_name(), self.ha_timeout_now())
+    }
+
+    /// The pool master's host name as pool.conf says (this host or the
+    /// peer); "the pool master" when pool.conf cannot be read.
+    fn pool_master_name(&self) -> String {
+        match self.h_conf_master() {
+            Some(true) => self.config.node.name.clone(),
+            Some(false) => self.config.node.peer.clone(),
+            None => "the pool master".to_string(),
+        }
+    }
+
+    /// Record, for this boot, that TwinStor restarts xapi on a host that is
+    /// locally disarmed (the second-master demote). Two repairs own what
+    /// follows, never both: when the restarted xapi comes back wedged
+    /// (answering HA_POOL_IS_ENABLED_BUT_HOST_IS_DISABLED, its own xapi
+    /// unusable) only the master's peer-emergency reset can act; when it comes
+    /// back a normal slave (answering HOST_IS_SLAVE) only this record's
+    /// recorded-disarm re-arm can (the peer-emergency trigger needs the
+    /// mismatch answer). A record already standing for this boot is kept.
+    /// A new one is written only with evidence that TwinStor disarmed this
+    /// host in this boot (its stand-down marker, the whole-switch hold or its
+    /// guard's latch, the dance's phase 1): a host an operator disarmed on
+    /// purpose is never re-armed by a pool HA cycle; it gets an alert.
+    async fn note_demote_while_disarmed(&mut self) {
+        if self.h_local_armed() != Some(false) {
+            return;
+        }
+        let boot = current_boot_id();
+        let standing = std::fs::read_to_string(&self.disarm_record_path)
+            .ok()
+            .is_some_and(|r| {
+                r.lines()
+                    .find_map(|l| l.trim().strip_prefix("boot_id="))
+                    .is_some_and(|b| b.trim() == boot)
+            });
+        if standing || boot.is_empty() {
+            return;
+        }
+        let twinstor_disarmed = std::path::Path::new(ISOLATED_STANDDOWN_MARKER.as_str()).exists()
+            || self.whole_switch_held
+            || self
+                .whole_switch_guard_ever_disarmed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.readmission_disabled_done;
+        if !twinstor_disarmed {
+            warn!(
+                heal_event = "demote_disarmed_not_by_twinstor",
+                "the second-master demote restarts xapi on a host that is locally HA-disarmed, \
+                 and TwinStor did not disarm it in this boot: no automatic re-arm"
+            );
+            let body = demoted_disarmed_alert(
+                &self.config.node.name,
+                &self.config.node.peer,
+                self.ha_timeout_now(),
+            );
+            // Advises a pool HA disable: routed as such advice.
+            let _ = self.h_alert_advice(&body).await;
+            return;
+        }
+        if let Some(dir) = std::path::Path::new(&self.disarm_record_path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(
+            &self.disarm_record_path,
+            format!("boot_id={boot}\nxapi_pid={}\nreason=second_master_demote\n", xapi_pid()),
+        );
+    }
+
+    /// Track a confirmed park and XAPI's release from it (evidence (b) of the
+    /// demote guard). A park is confirmed only by a failed join in xha.log
+    /// while this host is master in pool.conf, locally armed, cut off (P
+    /// false) and its xhad answers "not Online": an unanswered `gethoststate`
+    /// or a normal boot (whose join succeeds) never confirms one. The release
+    /// is the invalid pool state xhad logs once the pool's HA was disabled.
+    /// Both reset when P returns or pool.conf stops saying master.
+    async fn track_park(&mut self, conf_master: bool, local_armed: Option<bool>, p: bool) {
+        if p || !conf_master {
+            self.seen_parked = false;
+            self.released_by_pool = false;
+            self.park_log_offset = None;
+            return;
+        }
+        let candidate = local_armed == Some(true)
+            && matches!(self.xha_host_state_explicit().await, Some(s) if s != XhaHostState::Online);
+        if candidate && self.park_log_offset.is_none() {
+            self.park_log_offset = Some(
+                std::fs::metadata(&self.xha_log_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            );
+        }
+        if !candidate && !self.seen_parked {
+            self.park_log_offset = None;
+            return;
+        }
+        let Some(offset) = self.park_log_offset else {
+            return;
+        };
+        let (join_failed, invalid_pool, next) = scan_park_signals(&self.xha_log_path, offset);
+        self.park_log_offset = Some(next);
+        if candidate && join_failed && !self.seen_parked {
+            self.seen_parked = true;
+            info!(
+                heal_event = "second_master_park_seen",
+                "this host is parked by XAPI (a failed HA join while armed and cut off)"
+            );
+        }
+        if self.seen_parked && invalid_pool && !self.released_by_pool {
+            self.released_by_pool = true;
+            warn!(
+                heal_event = "second_master_released",
+                "XAPI released this parked host from its HA startup loop: xhad read an invalid \
+                 pool state (the pool's HA was disabled)"
+            );
         }
     }
 
@@ -19613,48 +25409,7 @@ impl StateMachine {
     /// enable is still covered by the obligation retry. Bounded, and a no-op on
     /// an already-plugged SR.
     async fn ensure_twinstor_pbds_plugged(&self) {
-        let Some(sr) = xapi::twinstor_sr_uuid().await else {
-            return;
-        };
-        // Only this host's PBD: a node can only plug its own, and plugging the
-        // offline peer's PBD fails forever with HOST_OFFLINE (the peer plugs it
-        // when it returns). Unfiltered only if the local uuid is unreadable.
-        let mut args = vec![
-            "pbd-list".to_string(),
-            format!("sr-uuid={sr}"),
-            "currently-attached=false".to_string(),
-            "--minimal".to_string(),
-        ];
-        if let Some(h) = crate::setup::local_host_uuid().await {
-            args.push(format!("host-uuid={h}"));
-        }
-        let listed = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::process::Command::new("xe")
-                .args(&args)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        let Ok(Ok(out)) = listed else { return };
-        if !out.status.success() {
-            return;
-        }
-        let pbds = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        for pbd in pbds.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            info!(pbd = %pbd, heal_event = "ha_rearm_pbd_plug",
-                  "plugging the twinstor SR's PBD before pool-ha-enable (it was left \
-                   unplugged by a reconnect/readmission; enabling now would fail \
-                   'the SR has no attached PBDs')");
-            let _ = tokio::time::timeout(
-                Duration::from_secs(60),
-                tokio::process::Command::new("xe")
-                    .args(["pbd-plug", &format!("uuid={pbd}")])
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await;
-        }
+        plug_twinstor_pbds().await;
     }
 
     /// Retry a persisted daemon-initiated HA re-arm until it sticks. Runs on
@@ -19683,22 +25438,16 @@ impl StateMachine {
                 }
                 return;
             }
-            // A pool HA enable or disable XAPI still holds pending: HA reads as
-            // before it until that lands (a disable that timed out for the
-            // caller can land many minutes later), so neither "armed" nor
-            // "off" is settled yet: hold, keeping the obligation.
-            if let Some(task) = xapi::pending_pool_ha_task().await {
-                if self
-                    .log_pace
-                    .due("ha_rearm_task_pending", Duration::from_secs(600))
-                {
-                    info!(heal_event = "ha_rearm_hold", reason = "ha_task_pending", task = %task,
-                          "a pool-HA re-arm is owed and a pool HA operation is still pending in \
-                           XAPI; holding until it lands");
-                }
-                return;
-            }
         }
+        // The last re-arm enable's result is read by this pass, the first
+        // after it returned, or never: a result older than one retry interval,
+        // or one this pass does not use, is dropped (logged), so a stale
+        // failure never pushes the escalation hours later.
+        let mut last_enable = self.take_fresh_rearm_result(std::time::Instant::now());
+        if obligation.is_some() && self.obligation_watch(ha).await == ObligationStep::Stop {
+            return;
+        }
+        let obligation = ha_obligation_read();
         let (
             storage_healthy,
             peer_ok,
@@ -19711,8 +25460,12 @@ impl StateMachine {
             None => {
                 // No incident pending: clear the escalation state so the next
                 // incident starts fresh (never inherit a stale toolstack count).
+                let _ = std::fs::remove_file(crate::arbitration::REARM_HOLD_PATH.as_str());
                 self.rearm_attempt = 0;
-                ha_rearm_ts_clear();
+                ha_rearm_ts_clear(&self.rearm_ts_path);
+                // A routine held by a pending HA task with no obligation
+                // standing still gets the stuck-task rule and its alert.
+                self.check_routine_task_hold().await;
                 return;
             }
             Some(_) => {
@@ -19723,16 +25476,14 @@ impl StateMachine {
                         && s.peer_disk == Some(DiskState::UpToDate)
                 );
                 peer_ok = self.peer_replication_reachable().await;
-                // Management-plane readiness: the peer must be a fully
-                // re-admitted pool member for pool-ha-enable to succeed. Use
-                // `enabled`, not `host-metrics-live`: in arbitrated mode the
-                // peer keeps writing the statefile over the direct link, so it
-                // reads live=true even while its management network is
-                // switch-isolated, whereas `enabled` stays false through the
-                // isolation and rejoin. This stops a doomed enable during
-                // isolation from wedging the pipeline ("HA enable is in
-                // progress").
-                peer_mgmt_ok = xapi::peer_host_enabled(&self.config.node.peer).await == Some(true);
+                // Management-plane readiness: the peer's management address
+                // answers (P), and the peer is shown present by its
+                // identity-checked beacon line or its xapi answering as master
+                // or slave. A doomed enable during a management partition
+                // wedges the pipeline ("HA enable is in progress"); P is false
+                // across one. The liveset is never read here: it is empty while
+                // HA is off.
+                peer_mgmt_ok = self.peer_rearm_ready().await;
                 master = xapi::is_pool_master_resilient().await;
                 this_host_enabled = xapi::is_host_enabled().await == Some(true);
                 // Defer the re-arm while any host is in operator maintenance (RPU /
@@ -19787,6 +25538,24 @@ impl StateMachine {
         ) {
             HaRearmAction::None => {}
             HaRearmAction::Hold => {
+                if !cfg!(test) {
+                    crate::arbitration::write_status(
+                        crate::arbitration::REARM_HOLD_PATH.as_str(),
+                        &[(
+                            "reason",
+                            rearm_hold_reason(
+                                ha,
+                                master,
+                                this_host_enabled,
+                                storage_healthy,
+                                peer_ok,
+                                peer_mgmt_ok,
+                                operator_maintenance,
+                                settled,
+                            ),
+                        )],
+                    );
+                }
                 // Why pool HA stays off while a re-arm is owed: logged when the
                 // reason changes, else every 10 minutes.
                 let why = (
@@ -19802,23 +25571,25 @@ impl StateMachine {
                 if self.ha_rearm_hold_logged != Some(why)
                     || self.log_pace.due("ha_rearm_hold", Duration::from_secs(600))
                 {
+                    let record = self.ha_ops(None, None).obligation_state();
                     info!(heal_event = "ha_rearm_hold", pool_ha = ?ha, is_master, master = ?master,
                           this_host_enabled, storage_healthy,
-                          peer_replication_ok = peer_ok, peer_enabled_in_pool = peer_mgmt_ok,
+                          peer_replication_ok = peer_ok, peer_management_ok = peer_mgmt_ok,
                           operator_maintenance, settled_after_last_attempt = settled,
-                          "a pool-HA re-arm is owed but not attempted yet (every input listed; all \
-                           must hold)");
+                          record = ?record,
+                          "{} (every input listed; all must hold)", rearm_hold_line(record));
                     self.ha_rearm_hold_logged = Some(why);
                 }
             }
             HaRearmAction::Fulfilled => {
+                let _ = std::fs::remove_file(crate::arbitration::REARM_HOLD_PATH.as_str());
                 info!(
                     heal_event = "ha_rearm_fulfilled",
                     "pool HA is armed and settled; clearing the re-arm obligation"
                 );
                 ha_obligation_clear();
                 self.rearm_attempt = 0;
-                ha_rearm_ts_clear();
+                ha_rearm_ts_clear(&self.rearm_ts_path);
                 let _ = xapi::send_xapi_alert(
                     "TwinStor: pool HA is armed again after a daemon-initiated \
                      recovery disable. No action needed.",
@@ -19826,6 +25597,13 @@ impl StateMachine {
                 .await;
             }
             HaRearmAction::AttemptFromSlave => {
+                // A forwarded enable's failure is only logged (no escalation
+                // from a slave).
+                let _ = self.rearm_enable_followup(last_enable.take(), false).await;
+                crate::arbitration::write_status(
+                    crate::arbitration::REARM_HOLD_PATH.as_str(),
+                    &[("reason", "re-arming now (from this host; the master moved)")],
+                );
                 warn!(
                     heal_event = "ha_rearm_retry_from_slave",
                     "pool HA is still off from a daemon-initiated disable and the pool \
@@ -19840,16 +25618,23 @@ impl StateMachine {
                 }
                 self.ensure_twinstor_pbds_plugged().await;
                 ha_obligation_touch_attempt();
-                let sr_arg = format!("heartbeat-sr-uuids={sr}");
-                let to_arg = format!("ha-config:timeout={timeout}");
-                if let Err(e) =
-                    crate::cmd::run_cmd("xe", &["pool-ha-enable", &sr_arg, &to_arg]).await
-                {
-                    warn!(heal_event = "ha_rearm_retry_from_slave_failed", error = %e,
-                          "the forwarded pool-ha-enable failed; retrying on a later cycle");
-                }
+                // The forwarded enable runs off the tick; its result is read
+                // on a later pass (a failure is only logged from a slave).
+                self.rearm_enable_from_slave = true;
+                self.spawn_rearm_enable(sr, timeout, false, Some(crate::mgmt_reach::Trigger::Positive));
             }
             HaRearmAction::Attempt => {
+                // The last enable's failure may call for the toolstack
+                // escalation, read only now: with every input read again and
+                // the decision still Attempt (master, no maintenance, storage
+                // and peer ready, HA still off).
+                if self.rearm_enable_followup(last_enable.take(), true).await {
+                    return;
+                }
+                crate::arbitration::write_status(
+                    crate::arbitration::REARM_HOLD_PATH.as_str(),
+                    &[("reason", "re-arming now")],
+                );
                 self.rearm_attempt = self.rearm_attempt.saturating_add(1);
                 warn!(
                     heal_event = "ha_rearm_retry",
@@ -19873,119 +25658,253 @@ impl StateMachine {
                 // Stamp before the enable so no reader trusts the optimistic
                 // flag window; the next cycle's settled read judges success.
                 ha_obligation_touch_attempt();
-                let sr_arg = format!("heartbeat-sr-uuids={sr}");
-                let to_arg = format!("ha-config:timeout={timeout}");
-                let enable_args = ["pool-ha-enable", sr_arg.as_str(), to_arg.as_str()];
-                let enable_err = crate::cmd::run_cmd("xe", &enable_args)
-                    .await
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default();
+                // The enable waits up to `HA_CMD_TIMEOUT`: it runs off the
+                // tick, under the shared in-flight flag (every HA actuator and
+                // this obligation hold meanwhile). Its result is read on the
+                // next pass (`rearm_enable_followup`).
+                self.rearm_enable_from_slave = false;
+                self.spawn_rearm_enable(sr, timeout, true, Some(crate::mgmt_reach::Trigger::Positive));
+            }
+        }
+        if let Some(r @ RearmEnable::Failed(_)) = last_enable {
+            info!(heal_event = "ha_rearm_result_dropped", result = ?r,
+                  "dropping the last re-arm enable's failure: this pass does not attempt a \
+                   re-arm, so it never counts toward the toolstack escalation");
+        }
+    }
 
-                if enable_refused_daemon_present(&enable_err) {
-                    // Error-driven orphan-xhad reconcile: DAEMON_IS_PRESENT
-                    // (Xha_error 15) means an orphan xhad blocks the master-local
-                    // `ha_set_pool_state init`. The Attempt gate already holds
-                    // (master, storage healthy, peer re-admitted) and the failed
-                    // enable proves the orphan, so stop the local xhad and
-                    // re-enable in this cycle, without the 120 s maturity wait
-                    // (`reconcile_stuck_xhad` stays as the backstop). A toolstack
-                    // restart cannot clear it: xhad just respawns.
-                    warn!(
-                        heal_event = "xha_orphan_reconcile_fast",
-                        "pool-ha-enable was refused DAEMON_IS_PRESENT (Xha_error 15); \
-                           stopping the local xhad and re-enabling immediately"
-                    );
-                    self.stop_local_xhad().await;
-                    ha_obligation_touch_attempt();
-                    let _ = crate::cmd::run_cmd("xe", &enable_args).await;
+    /// The lone-survivor masterless path's bounded enable retry (see
+    /// `masterless_retry_step`), every `MASTERLESS_RETRY_EVERY`, through the
+    /// same off-tick enable and gates (no management-predicate gate: the peer
+    /// is gone). Before each try its premise is read again: this host's copy
+    /// serving, the peer not answering as master, the peer not back.
+    async fn drive_masterless_rearm_retry(&mut self) {
+        let Some(mut st) = self.masterless_retry.clone() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now < st.next_at {
+            return;
+        }
+        let facts = MasterlessRetryFacts {
+            pool_ha: self.h_pool_ha().await,
+            obligation: self.ha_ops(None, Some(true)).obligation_state(),
+            inflight: self.ha_reset_inflight.load(Ordering::SeqCst),
+            issued: self
+                .rearm_enables_issued
+                .load(Ordering::SeqCst)
+                .saturating_sub(st.issued_base),
+            elapsed: now.saturating_duration_since(st.started),
+            storage_serving: self.h_local_serving().await,
+            peer_master: self.peer_role_probe().await == xapi::PeerXapiRole::Master,
+            peer_back: self.p_view().p,
+        };
+        match masterless_retry_step(facts) {
+            MasterlessRetryStep::Done => {
+                let why = if facts.pool_ha == Some(true) {
+                    "pool HA reads on"
+                } else if facts.obligation == Some(ObligationState::Enabled) {
+                    "TwinStor's enable has returned"
                 } else {
-                    // Heavy last resort: after the light self-heal has failed
-                    // REARM_TS_AFTER times, a stuck "HA … in progress" lock likely
-                    // needs a toolstack restart. The cap must be as durable as the
-                    // on-disk obligation: a per-process cap would let every twinstor
-                    // restart grant fresh restarts and loop the master toolstack, so
-                    // the count and last stamp are persisted (`ha_rearm_ts_*`).
-                    let (ts_count, ts_last) = ha_rearm_ts_read();
-                    let ts_settled = now_unix.saturating_sub(ts_last) >= REARM_TS_THROTTLE_SECS;
-                    if rearm_should_toolstack(
-                        self.rearm_attempt,
-                        ts_count,
-                        ts_settled,
-                        REARM_TS_AFTER,
-                        REARM_TS_CAP,
-                    ) {
-                        warn!(
-                            heal_event = "ha_rearm_toolstack_reset",
-                            ts_attempts = ts_count,
-                            "pool HA re-arm keeps failing after the light self-heal; \
-                               restarting the local toolstack to clear a stuck \
-                               'HA … in progress' lock, then the next cycle re-enables"
-                        );
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(90),
-                            crate::cmd::run_cmd("xe-toolstack-restart", &[]),
-                        )
-                        .await;
-                        ha_rearm_ts_write(ts_count.saturating_add(1), now_unix);
-                    }
+                    "the re-arm obligation is gone (cleared, or deleted to keep HA off)"
+                };
+                info!(heal_event = "masterless_rearm_retry_done", issued = facts.issued, reason = why,
+                      "masterless recovery: retry ended: {why}");
+                self.masterless_retry = None;
+            }
+            MasterlessRetryStep::HandOver => {
+                info!(heal_event = "masterless_rearm_retry_handover",
+                      "masterless recovery: the peer is back; the normal re-arm path takes over");
+                self.masterless_retry = None;
+            }
+            MasterlessRetryStep::GiveUp => {
+                warn!(heal_event = "masterless_rearm_retry_exhausted", issued = facts.issued,
+                      elapsed_secs = facts.elapsed.as_secs(),
+                      "masterless recovery: pool HA enable still not done after its retries; the \
+                       re-arm obligation stays and re-enables pool HA once the peer is back");
+                self.masterless_retry = None;
+            }
+            MasterlessRetryStep::Wait => {
+                st.next_at = now + MASTERLESS_RETRY_EVERY;
+                self.masterless_retry = Some(st);
+            }
+            MasterlessRetryStep::Retry => {
+                self.rearm_enable_from_slave = false;
+                if self.spawn_rearm_enable(st.sr.clone(), st.timeout, true, None) {
+                    info!(heal_event = "masterless_rearm_retry", issued_so_far = facts.issued,
+                          "masterless recovery: retrying the pool HA enable");
                 }
+                st.next_at = now + MASTERLESS_RETRY_EVERY;
+                self.masterless_retry = Some(st);
             }
         }
     }
 
-    /// Stop the local xhad (`ha_stop_daemon`), bounded. The cluster-stack
-    /// scripts need their own directory on PATH (ha_rc exits 16 "PATH is not
-    /// properly setup" otherwise). Shared by the time-based
-    /// `reconcile_stuck_xhad` and the error-driven fast path in the re-arm
-    /// loop, so a stuck DAEMON_IS_PRESENT enable can init cleanly.
-    async fn stop_local_xhad(&self) {
-        let path_env = format!(
-            "PATH={}:/usr/sbin:/usr/bin:/sbin:/bin",
-            std::path::Path::new(HA_STOP_DAEMON)
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        );
-        let _ = tokio::time::timeout(
-            Duration::from_secs(60),
-            crate::cmd::run_cmd("env", &[&path_env, HA_STOP_DAEMON]),
-        )
-        .await;
-        // Verify the reap. `ha_stop_daemon` reaps even a joined xhad cleanly;
-        // this path exists so the next `ha_set_pool_state init` is not refused
-        // DAEMON_IS_PRESENT.
-        //
-        // If an xhad survives the graceful stop, do not escalate to SIGKILL.
-        // `ha_stop_daemon` disarms the host watchdog before the process exits;
-        // `pkill -9` stops the watchdog petting without disarming, so this node
-        // hard-reboots (self-fences) once the statefile or hypervisor watchdog
-        // expires. A DAEMON_IS_PRESENT orphan is an Online/Joined liveset
-        // member, still armed, even though xapi's ha-enabled flag reads off.
-        // Killing it would trade a benign failure (HA stuck off, which the
-        // re-arm toolstack-restart backstop recovers without a reboot) for a
-        // self-fence of the pool master. So only warn; the backstop recovers.
-        if self.xhad_present().await {
-            warn!(
-                heal_event = "xha_orphan_stop_failed",
-                "ha_stop_daemon did not reap the local xhad; not force-killing it (a \
-                   SIGKILL skips the watchdog disarm and would self-fence this master); \
-                   holding for the re-arm toolstack-restart backstop to recover"
-            );
+    /// The watchdog's pass over a standing obligation, before its re-arm
+    /// decision. A pool HA enable or disable XAPI still holds pending: HA
+    /// reads as before it until that lands (a disable that timed out for the
+    /// caller can land many minutes later), so neither "armed" nor "off" is
+    /// settled yet: hold, keeping the obligation. Otherwise the HA reading is
+    /// applied to the obligation's state (`obligation_step`), with "on"
+    /// trusted once the last attempt has settled.
+    async fn obligation_watch(&mut self, ha: Option<bool>) -> ObligationStep {
+        let ops = self.ha_ops(None, None);
+        let stamp = ops.obligation_attempt();
+        if self.pending_ha_task_holds(stamp).await {
+            return ObligationStep::Stop;
         }
+        let settled = obligation_settled(stamp, ops.now_unix());
+        obligation_step(ops.as_ref(), ha, settled).await
     }
 
-    /// Whether a process named `xhad` is running. `pgrep -x xhad` exits 0 iff
-    /// one exists; a timeout or spawn error reads as "not confirmed present".
-    async fn xhad_present(&self) -> bool {
-        matches!(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                crate::cmd::run_cmd("pgrep", &["-x", "xhad"]),
-            )
-            .await,
-            Ok(Ok(_))
+    /// Start the re-arm obligation's enable off the tick (`rearm_enable`),
+    /// under the shared in-flight flag. `false` when another pool HA operation
+    /// already runs (nothing started).
+    fn spawn_rearm_enable(
+        &self,
+        sr: String,
+        timeout: u64,
+        expect_master: bool,
+        trigger: Option<crate::mgmt_reach::Trigger>,
+    ) -> bool {
+        if self.ha_reset_inflight.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if self.off_tick_disabled_in_test() {
+            self.ha_reset_inflight.store(false, Ordering::SeqCst);
+            return true;
+        }
+        let flag = self.ha_reset_inflight.clone();
+        let slot = self.rearm_enable_result.clone();
+        let ops = self.ha_ops(trigger, Some(expect_master));
+        let pass = self.rearm_pass;
+        let issued = self.rearm_enables_issued.clone();
+        tokio::spawn(async move {
+            let _guard = InflightGuard(flag);
+            let r = rearm_enable(ops.as_ref(), &sr, timeout).await;
+            if !matches!(r, RearmEnable::Withheld(_)) {
+                issued.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Ok(mut s) = slot.lock() {
+                *s = Some((r, std::time::Instant::now(), pass));
+            }
+        });
+        true
+    }
+
+    /// Count this re-arm pass and take the last re-arm enable's result for
+    /// it: `None` when there is none, or when it is not this pass's (it was
+    /// started on another than the previous pass, or is older than twice the
+    /// retry interval: dropped, logged). A result is used by the first pass
+    /// after it, or never.
+    fn take_fresh_rearm_result(&mut self, now: std::time::Instant) -> Option<RearmEnable> {
+        self.rearm_pass = self.rearm_pass.wrapping_add(1);
+        let (r, at, spawned) = self.rearm_enable_result.lock().ok().and_then(|mut s| s.take())?;
+        let age = now.saturating_duration_since(at);
+        if rearm_result_fresh(spawned, self.rearm_pass, age) {
+            return Some(r);
+        }
+        info!(heal_event = "ha_rearm_result_dropped", result = ?r, age_secs = age.as_secs(),
+              "dropping the last re-arm enable's result: not the pass right after it, or too \
+               old; it never counts toward the toolstack escalation");
+        None
+    }
+
+    /// Act on the last re-arm enable's result, once it has returned. Called
+    /// only when the re-arm decision, on inputs read again in this pass, is
+    /// still Attempt (this host the master, no host in maintenance, HA still
+    /// off): a failure there may call for the toolstack escalation (a stuck
+    /// "HA ... in progress" lock), after which this pass ends and the next
+    /// one re-enables. An enable found effective was reported as returned, a
+    /// withheld one ran nothing: neither counts. Returns whether the pass
+    /// must end here.
+    async fn rearm_enable_followup(&mut self, last: Option<RearmEnable>, as_master: bool) -> bool {
+        let Some(r) = last else {
+            return false;
+        };
+        let RearmEnable::Failed(err) = r else {
+            return false;
+        };
+        if self.rearm_enable_from_slave || !as_master {
+            warn!(heal_event = "ha_rearm_retry_from_slave_failed", error = %err,
+                  "the last re-arm pool-ha-enable failed; retried on a later cycle (no toolstack \
+                   escalation from a host that is not acting as master)");
+            return false;
+        }
+        // Heavy last resort: after the light self-heal has failed
+        // REARM_TS_AFTER times, a stuck "HA … in progress" lock likely needs
+        // a toolstack restart. The cap must be as durable as the on-disk
+        // obligation: a per-process cap would let every twinstor restart grant
+        // fresh restarts and loop the master toolstack, so the count and last
+        // stamp are persisted (`ha_rearm_ts_*`).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (ts_count, ts_last) = ha_rearm_ts_read(&self.rearm_ts_path);
+        let ts_settled = now_unix.saturating_sub(ts_last) >= REARM_TS_THROTTLE_SECS;
+        if rearm_should_toolstack(
+            self.rearm_attempt,
+            ts_count,
+            ts_settled,
+            REARM_TS_AFTER,
+            REARM_TS_CAP,
+        ) && self.ha_gate(
+            "ha_rearm_toolstack_reset",
+            crate::mgmt_reach::Trigger::Positive,
+        ) {
+            warn!(
+                heal_event = "ha_rearm_toolstack_reset",
+                ts_attempts = ts_count,
+                error = %err,
+                "pool HA re-arm keeps failing after the light self-heal; restarting the \
+                 local toolstack to clear a stuck 'HA … in progress' lock, then the next \
+                 cycle re-enables"
+            );
+            // Counted before the restart: a daemon killed by it, or a restart
+            // that hangs, still uses up one of the capped restarts. A count
+            // that cannot be written leaves the cap unenforceable: no
+            // restart then.
+            if !ha_rearm_ts_write(&self.rearm_ts_path, ts_count.saturating_add(1), now_unix) {
+                warn!(heal_event = "ha_rearm_toolstack_unavailable", path = %self.rearm_ts_path,
+                      "the re-arm's toolstack escalation is unavailable: its restart count \
+                       cannot be written, so its cap could not be kept; no restart");
+                if self
+                    .log_pace
+                    .is_due("rearm_ts_unwritable", DEGRADED_REALERT_AFTER)
+                    && self.h_alert_unqueued(&format!(
+                        "TwinStor on {}: pool HA's re-arm keeps failing, and its last-resort \
+                         toolstack restart is unavailable because its restart count cannot be \
+                         written ({}); check that /var/lib/twinstor is writable. The re-arm \
+                         itself keeps retrying.",
+                        self.config.node.name, self.rearm_ts_path
+                    ))
+                    .await
+                {
+                    self.log_pace.mark("rearm_ts_unwritable");
+                }
+                return false;
+            }
+            self.h_rearm_toolstack_restart().await;
+            return true;
+        }
+        false
+    }
+
+    /// The re-arm escalation's toolstack restart (recorded under the seam,
+    /// with the persisted count it sees).
+    async fn h_rearm_toolstack_restart(&mut self) {
+        let seen = ha_rearm_ts_read(&self.rearm_ts_path).0;
+        if self.h_record(format!("toolstack-restart count={seen}")) {
+            return;
+        }
+        // Full path: unlike `xe`, the script is only in /opt/xensource/bin,
+        // not on the daemon's PATH.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(90),
+            crate::cmd::run_cmd(XE_TOOLSTACK_RESTART, &[]),
         )
+        .await;
     }
 
     /// Reconcile a stuck or orphan xhad. When the pool flag says HA is off but
@@ -20053,7 +25972,7 @@ impl StateMachine {
         // stopping xhad would just strip HA for nothing).
         let rearm_attemptable = ha_obligation_read().is_some()
             && xapi::is_pool_master_resilient().await == Some(true)
-            && xapi::peer_host_enabled(&self.config.node.peer).await == Some(true);
+            && self.peer_rearm_ready().await;
         match orphan_xhad_decision(
             self.config.ha.reconcile_stuck_xhad,
             ha,
@@ -20067,22 +25986,39 @@ impl StateMachine {
             STUCK_XHAD_RETRY,
         ) {
             XhadReconcileAction::None => {}
-            XhadReconcileAction::StopLocalXhad => {
-                warn!(
-                    heal_event = "xha_orphan_reconcile",
-                    "pool HA reads off but the local xhad is still present; pool-ha-enable \
-                     would fail with DAEMON_IS_PRESENT (Xha_error 15). Stopping the local \
-                     xhad so the re-arm can init cleanly"
-                );
-                self.stop_local_xhad().await;
-                self.stuck_xhad_action_at = Some(now);
-                // The stop clears xhad; restart the mismatch clock so that if
-                // the enable starts xhad again and still fails, a fresh settle
-                // window applies before another stop (never chase a
-                // legitimately re-arming daemon).
-                self.xhad_mismatch_since = None;
-            }
+            // Every HA actuator waits for a pool HA cycle in flight; the
+            // next pass decides again.
+            XhadReconcileAction::StopLocalXhad if self.ha_cycle_in_flight("reconcile_stuck_xhad") => {}
+            XhadReconcileAction::StopLocalXhad => self.reconcile_xhad_stop(now).await,
         }
+    }
+
+    /// The stuck-xhad stop, with the same reads right before it as the stop
+    /// in `rearm_enable`: the fire-time gates, and a re-arm record that is
+    /// owed (TwinStor's own disable seen to take, no enable since), not one
+    /// merely present in any state.
+    async fn reconcile_xhad_stop(&mut self, now: std::time::Instant) {
+        let ops = self.ha_ops(Some(crate::mgmt_reach::Trigger::Positive), Some(true));
+        if let Some(why) = ops.gates().await {
+            log_cycle_withheld("reconcile_stuck_xhad", "xhad_stop", &why);
+            return;
+        }
+        if !enable_still_owed(ops.as_ref(), "reconcile_stuck_xhad", "xhad_stop") {
+            return;
+        }
+        warn!(
+            heal_event = "xha_orphan_reconcile",
+            "pool HA reads off but the local xhad is still present; pool-ha-enable \
+             would fail with DAEMON_IS_PRESENT (Xha_error 15). Stopping the local \
+             xhad so the re-arm can init cleanly"
+        );
+        ops.stop_local_xhad().await;
+        self.stuck_xhad_action_at = Some(now);
+        // The stop clears xhad; restart the mismatch clock so that if the
+        // enable starts xhad again and still fails, a fresh settle window
+        // applies before another stop (never chase a legitimately re-arming
+        // daemon).
+        self.xhad_mismatch_since = None;
     }
 
     /// Periodically check that pool HA is armed, and alert once if it has been
@@ -20177,109 +26113,127 @@ impl StateMachine {
     /// still decide when (healthy dual copy, peer back in the pool, no
     /// maintenance, no pending HA task).
     async fn check_disarm_trap(&mut self, ha: Option<bool>) {
-        let Ok(record) = std::fs::read_to_string(ha_local_disarm_path()) else {
+        let Ok(record) = std::fs::read_to_string(&self.disarm_record_path) else {
             return;
         };
-        let is_master = ha == Some(false) && xapi::is_pool_master_resilient().await == Some(true);
-        match disarm_trap_decision(
-            xapi_restarted_since(&record, &current_boot_id(), &xapi_pid()),
-            xapi::local_ha_armed(),
-            ha,
-            is_master,
-            self.whole_switch_held,
-        ) {
+        let is_master = ha == Some(false) && self.h_master_resilient().await == Some(true);
+        // The fast guard's hold counts as a hold from the moment it disarms
+        // (it runs off the tick, ahead of the tick's own hold), and a record
+        // younger than `DISARM_RECORD_SETTLE` is still settling.
+        let settling = disarm_record_age(&record, unix_now_secs())
+            .is_some_and(|age| age < DISARM_RECORD_SETTLE);
+        let hold = self.whole_switch_held
+            || self.whole_switch_guard.load(std::sync::atomic::Ordering::Relaxed)
+            || settling;
+        let restarted = if cfg!(test) {
+            false
+        } else {
+            xapi_restarted_since(&record, &current_boot_id(), &xapi_pid_bounded().await)
+        };
+        match disarm_trap_decision(restarted, self.h_local_armed(), ha, is_master, hold) {
             DisarmTrapAction::Keep => {}
             DisarmTrapAction::Clear => {
-                let _ = std::fs::remove_file(ha_local_disarm_path());
+                let _ = std::fs::remove_file(&self.disarm_record_path);
             }
             DisarmTrapAction::Rearm => {
+                // A routine in flight owns the obligation it wrote: wait for
+                // it (the record stays, so this is retried).
+                if self.ha_reset_inflight.load(Ordering::SeqCst) {
+                    return;
+                }
                 if ha_obligation_read().is_none() {
                     let Some(sr) = xapi::twinstor_sr_uuid().await else {
                         return;
                     };
                     let timeout = xapi::pool_ha_timeout()
                         .await
-                        .unwrap_or_else(|| crate::setup::ha_timeout_secs(self.arbitrated));
+                        .unwrap_or_else(|| crate::setup::configured_ha_timeout_for(self.arbitrated));
                     warn!(
                         heal_event = "ha_rearm_after_armed_trap",
                         "pool HA is off after xapi restarted on this host while it was locally \
                          HA-disarmed (xapi then disables pool HA); owing a re-arm once the pair \
                          is healthy"
                     );
-                    ha_obligation_write(&sr, timeout.into());
+                    // Evidence that this HA-off is TwinStor's: its own local
+                    // disarm record, xapi restarted since, pool HA read off.
+                    ha_obligation_write(&sr, timeout.into(), ObligationState::Owed);
                 }
-                let _ = std::fs::remove_file(ha_local_disarm_path());
+                let _ = std::fs::remove_file(&self.disarm_record_path);
             }
         }
     }
 
-    /// Re-arm HA after a peer self-fence and rejoin. An XHA self-fence disarms
-    /// without writing a re-arm obligation (only daemon-initiated disables
-    /// do), so HA does not come back on its own. On the master, when the peer
-    /// goes from not live to live (a rejoin, which a maintenance disable never
-    /// causes) while pool HA is off and the pool is healthy, write the
-    /// obligation so `fulfil_ha_rearm_obligation` re-arms. Tying it to the
-    /// rejoin edge, not a steady disarm, keeps it from re-arming a pool an
-    /// operator disabled for maintenance.
+    /// After a peer rejoin with pool HA off and no record that TwinStor turned
+    /// it off: alert only. The inference "HA dropped across a fence, so re-arm
+    /// it" was unsound (no observed fence disabled pool HA; every TwinStor
+    /// disable and disarm writes its own record) and in a lab run it overrode an
+    /// operator's disable. On the master, on the peer's not-live to live edge,
+    /// while pool HA is off and no re-arm is owed and no local-disarm record
+    /// stands: raise "pool HA is off and TwinStor did not turn it off" unless
+    /// HA was seen off while the peer was live (then only a log line). The
+    /// peer's liveness is sampled at the HA check's cadence, so "before" is
+    /// what that cadence saw; never sampled reads unknown, not "off".
     async fn check_ha_rearm_after_fence(&mut self, ha: Option<bool>) {
-        // Only the master re-arms (enable is pool-wide) and can read peer
-        // liveness from the pool DB.
-        if xapi::is_pool_master_resilient().await != Some(true) {
-            self.peer_live_last = None;
+        // Only the master reads peer liveness from the pool DB.
+        let master = xapi::is_pool_master_resilient().await;
+        if master == Some(false) {
+            crate::arbitration::clear_peer_away_seen();
+        }
+        if !self.rejoin_watch.role(master) {
             return;
         }
-        let peer_live = xapi::peer_host_live(&self.config.node.peer).await;
-        let prev_peer_live = self.peer_live_last;
-        let rejoined = prev_peer_live == Some(false) && peer_live == Some(true);
-        // The HA state from before the peer left. Captured only while the peer
-        // is steadily live (last tick and this tick), so the rejoin tick itself,
-        // where HA reads off after a fence, does not clobber it. On the rejoin,
-        // `ha_before` still holds the pre-departure value.
-        let ha_before = self.ha_at_peer_alive;
-        if peer_live == Some(true) && prev_peer_live == Some(true) {
-            self.ha_at_peer_alive = ha;
+        // An absence the view showed since the last sample, consumed here;
+        // one shown now makes this sample's live flag untrustworthy (XAPI can
+        // still read a cut-off peer live): it counts as not live.
+        let now_unix = unix_now_secs();
+        if let Some(since) = crate::arbitration::take_peer_away_since() {
+            self.rejoin_watch.peer_was_away(since);
         }
-        self.peer_live_last = peer_live;
-        if !rearm_after_fence_gate(rejoined, ha, ha_obligation_read().is_some(), ha_before) {
-            // Make an operator disable visible when a rejoin would otherwise
-            // have re-armed, so it is clear HA is off by intent, not lost.
-            if rejoined
-                && ha == Some(false)
-                && ha_obligation_read().is_none()
-                && ha_before != Some(true)
-            {
+        let peer_live = rejoin_peer_live(
+            xapi::peer_host_live(&self.config.node.peer).await,
+            crate::arbitration::peer_away_view(crate::arbitration::current()),
+        );
+        let record_present = ha_obligation_read().is_some()
+            || std::path::Path::new(&ha_local_disarm_path()).exists();
+        match self.rejoin_watch.observe_at(peer_live, ha, record_present, now_unix) {
+            RejoinHaOff::Nothing => {}
+            RejoinHaOff::AlreadyReported => {
+                if self.log_pace.due("ha_off_already_reported", Duration::from_secs(3600)) {
+                    info!(
+                        heal_event = "ha_off_still",
+                        "pool HA is still off; already reported for this episode (no record says \
+                         TwinStor turned it off; not re-arming)"
+                    );
+                }
+            }
+            RejoinHaOff::OffBeforePeerLeft => {
                 info!(
                     heal_event = "ha_rearm_skipped_operator_disable",
-                    "peer rejoined with pool HA off, but HA was already off while the peer \
-                       was alive, so treating this as a deliberate operator pool-ha-disable, not \
-                       a fence; leaving HA off (run pool-ha-enable to re-arm when you want it)"
+                    "peer rejoined with pool HA off; HA was seen off in a sample taken while the \
+                     peer was live, before its absence began, and no record says TwinStor turned \
+                     it off; leaving HA off (run pool-ha-enable to re-arm when you want it)"
                 );
             }
-            return;
+            RejoinHaOff::OffWhilePeerAway => {
+                warn!(
+                    heal_event = "ha_off_not_by_twinstor",
+                    ha_before = "on",
+                    "peer rejoined with pool HA off; HA was on while the peer was last live and \
+                     no record says TwinStor turned it off; not re-arming (alert only)"
+                );
+                let _ = xapi::send_xapi_alert(&ha_off_not_by_twinstor()).await;
+            }
+            RejoinHaOff::OffBeforeUnknown => {
+                warn!(
+                    heal_event = "ha_off_not_by_twinstor",
+                    ha_before = "unknown",
+                    "peer rejoined with pool HA off and no record says TwinStor turned it off; \
+                     whether HA was on before the peer left is unknown (not sampled while the \
+                     peer was live); not re-arming (alert only)"
+                );
+                let _ = xapi::send_xapi_alert(&ha_off_not_by_twinstor()).await;
+            }
         }
-        // Never re-arm into a still-broken pool: require a healthy dual copy.
-        let storage_ok = matches!(
-            self.drbd.status().await,
-            Ok(s) if s.connection == ConnectionState::Connected
-                && s.disk == DiskState::UpToDate
-                && s.peer_disk == Some(DiskState::UpToDate)
-        );
-        if !storage_ok {
-            return;
-        }
-        let Some(sr) = xapi::twinstor_sr_uuid().await else {
-            return;
-        };
-        let timeout = xapi::pool_ha_timeout()
-            .await
-            .unwrap_or_else(|| crate::setup::ha_timeout_secs(self.arbitrated))
-            as u64;
-        warn!(
-            heal_event = "ha_rearm_after_fence",
-            "peer rejoined after a fence and pool HA is off; writing the re-arm \
-               obligation to restore HA"
-        );
-        ha_obligation_write(&sr, timeout);
     }
 
     /// Thrash backstop, checked at the head of both resolvers: if split-brain
@@ -22362,7 +28316,7 @@ impl StateMachine {
                             }
                             let _ = std::fs::remove_file(&marker);
                             self.clear_yield_state_after_keep().await;
-                            self.sb_keepdata_stuck = 0;
+                            self.survivor_episode_end();
                             self.sb_wedge_alerted = false;
                             self.sb_undecidable_alerted = false;
                             self.sb_resolved_alerted = false;
@@ -22439,7 +28393,12 @@ impl StateMachine {
                         let yield_now = action == WedgeAction::Yield
                             && !cfg!(test)
                             && may_restart(self.auto_heal_restarts, self.auto_heal_holds)
-                            && self.peer_reachable().await;
+                            && self.peer_reachable().await
+                            && self.rejoin_assist_allows("dual_master_yield")
+                            && self.ha_gate(
+                                "dual_master_yield",
+                                crate::mgmt_reach::Trigger::Absence,
+                            );
                         if yield_now {
                             self.heal_state_update(
                                 "yield_restart",
@@ -22484,7 +28443,7 @@ impl StateMachine {
                             );
                             if !self.sb_wedge_alerted {
                                 self.sb_wedge_alerted =
-                                    xapi::send_ha_wedge_alert(WEDGE_ALERT_BODY).await;
+                                    xapi::send_ha_wedge_alert_advising_ha_disable(&wedge_alert_body(self.ha_timeout_now())).await;
                             }
                             // Last resort past the cap: the restarts are not
                             // demoting and the survivor's escalation has had its
@@ -22531,7 +28490,7 @@ impl StateMachine {
                         );
                         if !self.sb_wedge_alerted {
                             self.sb_wedge_alerted =
-                                xapi::send_ha_wedge_alert(WEDGE_ALERT_BODY).await;
+                                xapi::send_ha_wedge_alert_advising_ha_disable(&wedge_alert_body(self.ha_timeout_now())).await;
                         }
                         // Best effort: re-admit a peer that auto-demoted to us.
                         if !cfg!(test) {
@@ -22576,10 +28535,17 @@ impl StateMachine {
                                 "survivor HA-reset fires at attempt {ha_reset_threshold} if the peer has not demoted (attempts ~90s apart)"
                             )),
                         );
+                        // The peer's management address must answer (P), in
+                        // place of the ICMP ping of before: the reset is a
+                        // pool-level HA disable, which must never fire across
+                        // a management partition.
                         if !cfg!(test)
                             && is_loser == Some(false)
                             && self.sb_keepdata_stuck >= ha_reset_threshold
-                            && self.peer_reachable().await
+                            && self.ha_gate(
+                                "survivor_ha_reset",
+                                crate::mgmt_reach::Trigger::Positive,
+                            )
                         {
                             self.heal_state_update(
                                 "survivor_ha_reset",
@@ -22604,7 +28570,7 @@ impl StateMachine {
                     // does not end the episode (only a real resolution or the
                     // healthy sweep does), and re-arming the restart here would
                     // let a flapping link drive repeated restarts.
-                    self.sb_keepdata_stuck = 0;
+                    self.survivor_episode_end();
                     self.heal_state_update(
                         "winner_waiting",
                         "split-brain resolved in this node's favor (this node keeps its data); waiting for the peer to reconnect and resync",
@@ -22711,12 +28677,12 @@ impl StateMachine {
             reason
         );
         let _ = std::fs::create_dir_all("/var/lib/twinstor");
-        let _ = std::fs::write(FORCED_REBOOT_BREADCRUMB, crumb);
+        let _ = std::fs::write(FORCED_REBOOT_BREADCRUMB.as_str(), crumb);
         tokio::time::sleep(Duration::from_millis(800)).await;
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             tokio::task::spawn_blocking(|| {
-                for p in ["/var/log/twinstor.log", FORCED_REBOOT_BREADCRUMB] {
+                for p in ["/var/log/twinstor.log", FORCED_REBOOT_BREADCRUMB.as_str()] {
                     if let Ok(f) = std::fs::File::open(p) {
                         let _ = f.sync_all();
                     }
@@ -22959,7 +28925,7 @@ impl StateMachine {
             return;
         }
         let recent = stuck_fence_recent(
-            std::fs::read_to_string(STUCK_PRIMARY_FENCE_STAMP)
+            std::fs::read_to_string(STUCK_PRIMARY_FENCE_STAMP.as_str())
                 .ok()
                 .as_deref(),
             unix_now_secs(),
@@ -22989,10 +28955,10 @@ impl StateMachine {
         )
         .await;
         if !cfg!(test) {
-            if let Some(dir) = std::path::Path::new(STUCK_PRIMARY_FENCE_STAMP).parent() {
+            if let Some(dir) = std::path::Path::new(STUCK_PRIMARY_FENCE_STAMP.as_str()).parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(STUCK_PRIMARY_FENCE_STAMP, unix_now_secs().to_string());
+            let _ = std::fs::write(STUCK_PRIMARY_FENCE_STAMP.as_str(), unix_now_secs().to_string());
         }
         // The forced reboot lands a few seconds after the detached spawn; stop
         // the tick loop from starting another teardown in that window (each
@@ -23167,22 +29133,109 @@ impl StateMachine {
     /// stalls the daemon tick. An RAII guard clears the in-flight flag on every
     /// exit path, panic included, so a panic in the task cannot leave the flag
     /// `true` and block all future heals until the daemon restarts.
-    fn spawn_survivor_ha_reset(&self) {
+    fn spawn_survivor_ha_reset(&mut self) {
         if self.not_starting("survivor HA reset") {
             return;
         }
         if self.ha_reset_inflight.swap(true, Ordering::SeqCst) {
             return; // one already in flight
         }
+        let announce = self.survivor_reset_take_announce();
         let flag = self.ha_reset_inflight.clone();
         // The DRBD resource is "twinstor-<configured>" (see DrbdHandle::new),
         // not the bare config value: the heal-detection `drbdadm status` needs
         // the full name or it never matches and waits out the whole timeout.
         let resource = format!("twinstor-{}", self.config.storage.drbd_resource);
+        // The survivor acts as the pool master; its gates are read again
+        // before each enable.
+        let ops = self.ha_ops(Some(crate::mgmt_reach::Trigger::Positive), Some(true));
         tokio::spawn(async move {
             let _guard = InflightGuard(flag);
-            survivor_ha_reset(&resource).await;
+            survivor_ha_reset(&resource, ops.as_ref(), announce).await;
         });
+    }
+
+    /// The survivor-keep stuck episode ends: its counter and its
+    /// announcement start afresh.
+    fn survivor_episode_end(&mut self) {
+        self.sb_keepdata_stuck = 0;
+        self.survivor_reset_announced = false;
+    }
+
+    /// Whether this survivor reset attempt announces itself: the first of a
+    /// stuck episode only (the tick re-spawns a reset about every 90 s while
+    /// the episode lasts, and the start checks may stop each one).
+    fn survivor_reset_take_announce(&mut self) -> bool {
+        !std::mem::replace(&mut self.survivor_reset_announced, true)
+    }
+
+    /// The pool HA operations for an off-tick routine: the live ones, or
+    /// under the test seam the scripted ones. `trigger` and `expect_master`
+    /// are the fire-time gates the routine re-reads before each enable.
+    fn ha_ops(
+        &self,
+        trigger: Option<crate::mgmt_reach::Trigger>,
+        expect_master: Option<bool>,
+    ) -> Arc<dyn HaOps> {
+        #[cfg(test)]
+        if let Some(o) = &self.test_ha_ops {
+            return o.clone();
+        }
+        Arc::new(LiveHaOps { mgmt: self.mgmt.clone(), trigger, expect_master })
+    }
+
+    /// Under the test seam without scripted operations, an off-tick routine
+    /// is not started (it would run real commands); with them, it runs.
+    fn off_tick_disabled_in_test(&self) -> bool {
+        #[cfg(test)]
+        if self.test_ha_ops.is_none() {
+            return true;
+        }
+        false
+    }
+
+    /// Run one pool HA cycle off the tick (see `pool_ha_cycle`), at most one
+    /// HA-changing routine at a time (the flag the survivor reset shares; the
+    /// re-arm loop holds while it is set). The result is picked up by the
+    /// repair that started it on a later pass.
+    /// `true` when the cycle was spawned; `false` when another HA-changing
+    /// routine holds the in-flight flag (the caller must then not spend its
+    /// budget, record or cooldown).
+    fn spawn_pool_ha_cycle(
+        &self,
+        who: &'static str,
+        sr: String,
+        timeout: u32,
+        trigger: crate::mgmt_reach::Trigger,
+        expect_master: Option<bool>,
+    ) -> bool {
+        if self.ha_reset_inflight.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if self.off_tick_disabled_in_test() {
+            self.ha_reset_inflight.store(false, Ordering::SeqCst);
+            return true;
+        }
+        let flag = self.ha_reset_inflight.clone();
+        let slot = self.ha_cycle_result.clone();
+        let ops = self.ha_ops(Some(trigger), expect_master);
+        tokio::spawn(async move {
+            let _guard = InflightGuard(flag);
+            let r = pool_ha_cycle(ops.as_ref(), &sr, timeout, who).await;
+            if let Ok(mut s) = slot.lock() {
+                s.retain(|(w, _)| *w != who);
+                s.push((who, r));
+            }
+        });
+        true
+    }
+
+    /// Take the result of a finished pool HA cycle started by `who` (results
+    /// are kept per requester: one repair never reads another's).
+    fn take_ha_cycle_result(&self, who: &'static str) -> Option<PoolHaCycle> {
+        let mut slot = self.ha_cycle_result.lock().ok()?;
+        let i = slot.iter().position(|(w, _)| *w == who)?;
+        Some(slot.remove(i).1)
     }
 
     /// Export the current auto-heal episode for `twinstor status` and the
@@ -23405,6 +29458,727 @@ impl StateMachine {
         }
     }
 
+    /// The current P snapshot (see `mgmt_reach`): whether the peer's
+    /// management address answers, and for how long it has.
+    fn p_view(&self) -> crate::mgmt_reach::PView {
+        #[cfg(test)]
+        if let Some(v) = self.test_p {
+            return v;
+        }
+        let now = std::time::Instant::now();
+        let v = self.mgmt.lock().map(|s| s.view(now)).unwrap_or_default();
+        // A prober that stopped must not freeze P at its last value: the
+        // snapshot reads false once stale (see `mgmt_reach::FRESH_MAX`).
+        if v.stale != self.p_stale_logged.swap(v.stale, Ordering::Relaxed) {
+            if v.stale {
+                warn!(
+                    heal_event = "mgmt_reach_stale",
+                    "the management-reachability prober has not probed for over {}s; \
+                     P reads false until it does",
+                    crate::mgmt_reach::FRESH_MAX.as_secs()
+                );
+            } else {
+                info!(heal_event = "mgmt_reach_fresh", "the management-reachability prober probes again");
+            }
+        }
+        v
+    }
+
+    /// The peer's management address P probes, from pool.conf, the address
+    /// cache or local.db `ha_peers` (never the replication address).
+    fn peer_mgmt_addr(&self) -> Option<String> {
+        #[cfg(test)]
+        if self.test_p.is_some() {
+            return Some(self.config.network.peer_address.to_string());
+        }
+        self.mgmt
+            .lock()
+            .ok()
+            .and_then(|s| s.address().map(str::to_string))
+    }
+
+    /// Record that an HA action was withheld at fire time: logged (paced per
+    /// action) as `ha_action_withheld`, and kept for status.
+    fn note_withheld(&mut self, action: &'static str, reason: String) {
+        let v = self.p_view();
+        if self.log_pace.due(action, Duration::from_secs(60)) {
+            info!(
+                heal_event = "ha_action_withheld",
+                action,
+                reason = %reason,
+                p = v.p,
+                answered = v.answered,
+                probes = v.probes,
+                settled_secs = ?v.true_for.map(|d| d.as_secs()),
+                "{action} withheld: {reason}"
+            );
+        }
+        if !cfg!(test) {
+            crate::arbitration::write_status(
+                crate::arbitration::WITHHELD_PATH.as_str(),
+                &[
+                    ("action", action),
+                    ("reason", &reason),
+                    ("answered", &v.answered.to_string()),
+                ],
+            );
+        }
+        self.ha_withheld = Some(Withheld { action, reason });
+    }
+
+    /// The fire-time gate of one HA action (see `mgmt_reach::gate`): P must
+    /// hold, and for a repair triggered by an absence of answer it must have
+    /// held for the settle. Checked where the command fires, never only when
+    /// the repair was scheduled. `true` when the action may fire now; a
+    /// withheld action retries at a later tick.
+    fn ha_gate(&mut self, action: &'static str, trigger: crate::mgmt_reach::Trigger) -> bool {
+        use crate::mgmt_reach::Gate;
+        if self.ha_cycle_in_flight(action) {
+            return false;
+        }
+        let v = self.p_view();
+        match crate::mgmt_reach::gate(&v, trigger) {
+            Gate::Pass => true,
+            Gate::NotReachable => {
+                self.note_withheld(
+                    action,
+                    format!(
+                        "the peer is not shown reachable on its management address: it \
+                         answered {} of the last {} probes",
+                        v.answered,
+                        crate::mgmt_reach::WINDOW
+                    ),
+                );
+                false
+            }
+            Gate::Settling { remaining } => {
+                self.note_withheld(
+                    action,
+                    format!(
+                        "the peer's management address answers again; XAPI usually \
+                         reconnects by itself within minutes, so this waits {}s more",
+                        remaining.as_secs()
+                    ),
+                );
+                false
+            }
+        }
+    }
+
+    /// A pool HA cycle (or the survivor reset) is running off the tick: every
+    /// HA actuator waits for it (logged as withheld). `true` while it runs.
+    fn ha_cycle_in_flight(&mut self, action: &'static str) -> bool {
+        if !self.ha_reset_inflight.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.note_withheld(
+            action,
+            "a pool HA cycle is in flight; HA actions wait for it to return".to_string(),
+        );
+        true
+    }
+
+    /// `[ha] rejoin_assist`: the rejoin repairs may act. Logs the hold when
+    /// they may not.
+    fn rejoin_assist_allows(&mut self, action: &'static str) -> bool {
+        if self.config.ha.rejoin_assist {
+            return true;
+        }
+        self.note_withheld(action, "disabled by [ha] rejoin_assist".to_string());
+        false
+    }
+
+    /// The startup-loop lock (see `mgmt_reach::startup_loop_locked`), read
+    /// fresh at fire time from local.db and the local xhad. `true` when the
+    /// lock holds and the action must not run.
+    async fn startup_loop_locked(&mut self, action: &'static str) -> bool {
+        let armed = self.h_local_armed();
+        if armed != Some(true) {
+            return false;
+        }
+        let p = self.p_view().p;
+        if p {
+            return false;
+        }
+        // An unanswered gethoststate is not Online: the lock holds.
+        let online = self.xha_host_state_explicit().await == Some(XhaHostState::Online);
+        if !crate::mgmt_reach::startup_loop_locked(armed, online, p) {
+            return false;
+        }
+        self.note_withheld(
+            action,
+            "this host is locally HA-armed, its HA daemon is not in the liveset and the \
+             peer's management address does not answer: XAPI holds it in its HA startup \
+             loop, and clearing that would release it as a second master"
+                .to_string(),
+        );
+        true
+    }
+
+    /// The peer's xapi role, probed on its management address only while P
+    /// holds; `Unreachable` at once otherwise (no 15 s probe into a cut).
+    async fn peer_role_probe(&self) -> xapi::PeerXapiRole {
+        if !self.p_view().p {
+            return xapi::PeerXapiRole::Unreachable;
+        }
+        let Some(addr) = self.peer_mgmt_addr() else {
+            return xapi::PeerXapiRole::Unreachable;
+        };
+        #[cfg(test)]
+        {
+            let _ = addr;
+            self.test_role_probes.fetch_add(1, Ordering::Relaxed);
+            self.test_peer_role.clone()
+        }
+        #[cfg(not(test))]
+        {
+            xapi::peer_xapi_role(&addr).await
+        }
+    }
+
+    /// Fire-time gates of the masterless chain's local disarm and transition:
+    /// the peer's management address must answer (P), unless this is the
+    /// lone-survivor path with its own confirmation (no replication, the
+    /// peer's xapi unreachable, and the local liveset reading it gone). The
+    /// startup-loop lock holds in every case; the lone-survivor confirmation
+    /// needs this host's xhad Online, so the two never meet. Callers check it
+    /// before they spend an attempt, take a cooldown or alert.
+    async fn masterless_chain_allowed(&mut self, require_peer_dead: bool) -> bool {
+        if self.ha_cycle_in_flight("masterless_transition") {
+            return false;
+        }
+        if !require_peer_dead
+            && !self.ha_gate("masterless_transition", crate::mgmt_reach::Trigger::Positive)
+        {
+            return false;
+        }
+        !self.startup_loop_locked("masterless_transition").await
+    }
+
+    /// The peer's daemon answers the identity-checked line on the beacon port
+    /// (7900): its node name and this pool's resource. Replication path first,
+    /// then the direct link.
+    async fn peer_beacon_line_ok(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.test_ha.as_ref().is_some_and(|t| t.beacon_ok)
+        }
+        #[cfg(not(test))]
+        {
+            let peer_name = &self.config.node.peer;
+            let res = &self.config.storage.drbd_resource;
+            let peer_repl = self.config.network.peer_address.to_string();
+            if crate::peer_signal::peer_speaks_line_format(&peer_repl, peer_name, res).await {
+                return true;
+            }
+            match &self.peer_dl_ip {
+                Some(dl) => crate::peer_signal::peer_speaks_line_format(dl, peer_name, res).await,
+                None => false,
+            }
+        }
+    }
+
+    /// The management-plane input of an owed re-arm: P holds, and the peer
+    /// is shown present by its identity-checked beacon line or by its xapi
+    /// answering as master or slave. Replaces the peer's `enabled` flag read
+    /// through the pool database (forwarded, and stale across a partition).
+    async fn peer_rearm_ready(&mut self) -> bool {
+        if !self.p_view().matured() {
+            return false;
+        }
+        self.peer_beacon_line_ok().await || self.peer_role_probe_cached().await.answers_normally()
+    }
+
+    /// Whether the peer claims to be a slave, and of which master, probed
+    /// only while P holds; `None` at once otherwise (what the probe returns
+    /// for a host it cannot reach, without its 15 s wait).
+    async fn peer_claims_slave_probe(&self, addr: &str) -> Option<String> {
+        if !self.p_view().p || cfg!(test) {
+            return None;
+        }
+        xapi::peer_claims_slave_of(addr).await
+    }
+
+    /// Whether the peer's agent answers a forwarded operation, probed only
+    /// while P holds; `Some(false)` at once otherwise (what a timeout gave).
+    async fn peer_agent_probe(&self) -> Option<bool> {
+        if !self.p_view().p || cfg!(test) {
+            return Some(false);
+        }
+        xapi::peer_agent_responsive(&self.config.node.peer).await
+    }
+
+    /// Whether the local xapi answers as pool master (`xe pool-list` names
+    /// this host), reused for `LOCAL_MASTER_CACHE_TTL`. `None` when it does
+    /// not answer.
+    async fn local_xapi_master_cached(&mut self, now: std::time::Instant) -> Option<bool> {
+        if let Some((_, m)) = self
+            .local_master_cache
+            .filter(|(t, _)| now.duration_since(*t) < LOCAL_MASTER_CACHE_TTL)
+        {
+            return Some(m);
+        }
+        let m = xapi::is_pool_master().await;
+        if let Some(m) = m {
+            self.local_master_cache = Some((now, m));
+        }
+        m
+    }
+
+    /// The pending pool HA tasks that hold an owed re-arm (see
+    /// `pending_task_decision`): wait for TwinStor's own until it is stale,
+    /// then cancel it (an enable that failed for TwinStor can stay pending and
+    /// block every later re-arm); report one TwinStor did not create and
+    /// never touch it. `true` while the re-arm must hold.
+    /// A routine stopped at its start by a pending pool HA task for longer
+    /// than `OWN_TASK_STALE_AFTER`: apply the stuck-task rule (cancel
+    /// TwinStor's own, report anyone else's with its age), whether or not an
+    /// obligation stands.
+    async fn check_routine_task_hold(&mut self) {
+        let since = ROUTINE_TASK_HOLD.lock().map(|h| h.since).unwrap_or(0);
+        if !self.routine_task_hold_step(since, mono_secs()).await {
+            // Nothing pending any more.
+            routine_task_hold_observe(&[]);
+        }
+    }
+
+    /// The step behind `check_routine_task_hold`, for a hold that began at
+    /// `since` (0: none). Returns whether a task still holds.
+    async fn routine_task_hold_step(&mut self, since: u64, now: u64) -> bool {
+        if since == 0 || now.saturating_sub(since) < OWN_TASK_STALE_AFTER {
+            return since != 0;
+        }
+        self.pending_ha_task_holds(ha_obligation_read().and_then(|o| o.2)).await
+    }
+
+    /// While TwinStor's own pool HA task is seen pending (or a cancel of it
+    /// failed), keep its disable's pending window open for at least
+    /// `PENDING_WINDOW_EXTENSION` more: a disable that lands just after the
+    /// window is then still read as TwinStor's (owed, re-enabled), not as
+    /// someone else's.
+    fn extend_pending_window(&self) {
+        let ops = self.ha_ops(None, None);
+        if let Some(ObligationState::Pending { until }) = ops.obligation_state() {
+            let floor = ops.now_unix() + PENDING_WINDOW_EXTENSION;
+            if until < floor {
+                ops.set_obligation_state(ObligationState::Pending { until: floor });
+            }
+        }
+    }
+
+    async fn pending_ha_task_holds(&mut self, attempt_stamp: Option<u64>) -> bool {
+        let Some(tasks) = self.h_pending_ha_tasks().await else {
+            // Unknown: no clear, no enable; the next pass reads again.
+            if self.log_pace.due("ha_rearm_tasks_unreadable", Duration::from_secs(600)) {
+                info!(heal_event = "ha_rearm_hold", reason = "task_list_unreadable",
+                      "XAPI's pending task list is unreadable; the re-arm holds (no clear, no \
+                       enable) and reads it again on the next pass");
+            }
+            return true;
+        };
+        // Whoever reads the task list keeps the hold clock true: none pending
+        // ends it, a different task restarts it.
+        routine_task_hold_observe(&tasks);
+        let now_unix = self.ha_ops(None, None).now_unix();
+        match pending_task_decision(&tasks, attempt_stamp, now_unix, self.p_view().matured()) {
+            PendingTaskAction::None => false,
+            PendingTaskAction::Wait => {
+                // TwinStor's own disable is still pending: an off seen once it
+                // lands is TwinStor's, so its pending window runs on.
+                self.extend_pending_window();
+                if self
+                    .log_pace
+                    .due("ha_rearm_task_pending", Duration::from_secs(600))
+                {
+                    info!(heal_event = "ha_rearm_hold", reason = "ha_task_pending",
+                          tasks = ?tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                          "a pool-HA re-arm is owed and TwinStor's own pool HA operation is still \
+                           pending in XAPI; holding until it lands or goes stale");
+                }
+                true
+            }
+            PendingTaskAction::Cancel(t) => {
+                warn!(heal_event = "ha_task_cancel", task = %t.uuid, name = %t.name,
+                      "cancelling TwinStor's own pool HA operation, pending since its attempt \
+                       {}s ago; the next re-arm cycle retries the enable",
+                      attempt_stamp.map(|a| now_unix.saturating_sub(a)).unwrap_or(0));
+                let ok = if self.h_record(format!("task-cancel: {}", t.uuid)) {
+                    !self.h_cancel_fails()
+                } else {
+                    xapi::cancel_task(&t.uuid).await
+                };
+                // A cancel that failed: the disable can still land, so the
+                // window runs on. A cancel that went through ends the window
+                // at once only when pool HA positively reads on after it;
+                // off (it took) or unreadable keeps the extension, read again
+                // on the next pass.
+                if !ok || self.h_pool_ha().await != Some(true) {
+                    self.extend_pending_window();
+                } else {
+                    let ops = self.ha_ops(None, None);
+                    if let Some(ObligationState::Pending { .. }) = ops.obligation_state() {
+                        ops.set_obligation_state(ObligationState::Pending { until: ops.now_unix() });
+                    }
+                }
+                // A task that could not be cancelled is tried again on later
+                // passes; its alert is paced.
+                if !ok && !self.log_pace.due("ha_task_cancel_failed_alert", DEGRADED_REALERT_AFTER) {
+                    return true;
+                }
+                let _ = self
+                    .h_alert(&format!(
+                        "TwinStor: a pool HA operation it started ({}, task {}) stayed pending in \
+                         XAPI and blocked the HA re-arm; it {} the task and retries the re-arm.",
+                        t.name,
+                        t.uuid,
+                        if ok { "cancelled" } else { "tried to cancel" }
+                    ))
+                    .await;
+                true
+            }
+            PendingTaskAction::Foreign(t) => {
+                let age = t
+                    .created_unix
+                    .map(|c| format!(", pending for {} minutes", now_unix.saturating_sub(c) / 60))
+                    .unwrap_or_default();
+                let reason = format!(
+                    "a pool HA operation TwinStor did not start is pending in XAPI ({}, task {}{age}) \
+                     and holds TwinStor's HA repairs; TwinStor leaves it alone. If it is stuck, \
+                     cancel it by hand: xe task-cancel uuid={}",
+                    t.name, t.uuid, t.uuid
+                );
+                if !cfg!(test) {
+                    crate::arbitration::write_status(
+                        crate::arbitration::REARM_HOLD_PATH.as_str(),
+                        &[("reason", &reason)],
+                    );
+                }
+                if self
+                    .log_pace
+                    .due("ha_task_foreign", DEGRADED_REALERT_AFTER)
+                {
+                    warn!(heal_event = "ha_task_foreign", task = %t.uuid, name = %t.name, "{reason}");
+                }
+                // The alert's pace is marked once delivered.
+                if self
+                    .log_pace
+                    .is_due("ha_task_foreign_alert", DEGRADED_REALERT_AFTER)
+                    && self.h_alert_unqueued(&format!("TwinStor: {reason}.")).await
+                {
+                    self.log_pace.mark("ha_task_foreign_alert");
+                }
+                true
+            }
+        }
+    }
+
+    // ---- local and peer facts, through the test seam under test ----------
+
+    fn h_conf_master(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.conf_master;
+        }
+        xapi::local_pool_role()
+    }
+
+    fn h_local_armed(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.local_armed;
+        }
+        xapi::local_ha_armed()
+    }
+
+    async fn h_xapi_master(&mut self, now: std::time::Instant) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.xapi_master;
+        }
+        self.local_xapi_master_cached(now).await
+    }
+
+    /// Running guests; `None` when `xl list` fails (never read as zero).
+    async fn h_vm_count(&self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.vms;
+        }
+        self.running_vm_count().await.map(|n| n as u32)
+    }
+
+    /// The local xhad's state, `None` when `gethoststate` does not answer in
+    /// its bound (never read as "not Online").
+    async fn xha_host_state_explicit(&self) -> Option<XhaHostState> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.xhad;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::cmd::cmd_output(CALLDAEMON, &["gethoststate"]),
+        )
+        .await
+        {
+            Ok(Ok(out)) => Some(match out.trim() {
+                "Online" => XhaHostState::Online,
+                "Starting" => XhaHostState::Starting,
+                _ => XhaHostState::Down,
+            }),
+            _ => None,
+        }
+    }
+
+    fn h_slave_master_addr(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.slave_of.clone();
+        }
+        xapi::local_slave_master_addr()
+    }
+
+    async fn h_peer_dead_via_liveset(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.peer_dead_liveset;
+        }
+        self.peer_dead_via_liveset().await
+    }
+
+    async fn h_drbd_connected(&self) -> bool {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.drbd_connected;
+        }
+        matches!(self.drbd.status().await, Ok(s) if s.connection == ConnectionState::Connected)
+    }
+
+    /// One P-style connect to `addr:443`, at fire time.
+    async fn h_addr_answers(&self, addr: &str) -> bool {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            let _ = addr;
+            return t.addr_answers;
+        }
+        crate::mgmt_reach::probe(addr).await
+    }
+
+    /// XAPI's pending pool HA tasks; `None` when the list cannot be read
+    /// (unknown: never read as "none pending").
+    async fn h_pending_ha_tasks(&self) -> Option<Vec<xapi::PendingHaTask>> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return (!t.pending_unreadable).then(|| t.pending_tasks.clone());
+        }
+        xapi::pending_pool_ha_tasks().await
+    }
+
+    /// Under the seam: alerts are recorded but reported undelivered.
+    fn h_alerts_fail(&self) -> bool {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.alerts_fail;
+        }
+        false
+    }
+
+    fn h_cancel_fails(&self) -> bool {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.cancel_fails;
+        }
+        false
+    }
+
+    /// This host's copy is Primary and UpToDate: it serves (the lone
+    /// survivor's readiness).
+    async fn h_local_serving(&self) -> bool {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.local_serving == Some(true);
+        }
+        matches!(self.drbd.status().await,
+                 Ok(s) if s.role == Role::Primary && s.disk == DiskState::UpToDate)
+    }
+
+    async fn h_pool_ha(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            if let Some(v) = t.pool_ha_next.lock().unwrap().pop_front() {
+                return v;
+            }
+            return t.pool_ha;
+        }
+        xapi::is_ha_enabled().await
+    }
+
+    async fn h_master_resilient(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.master_resilient;
+        }
+        xapi::is_pool_master_resilient().await
+    }
+
+    async fn h_agent_live(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(t) = &self.test_ha {
+            return t.agent_live;
+        }
+        xapi::peer_agent_responsive(&self.config.node.peer).await
+    }
+
+    /// Under the test seam, record `action` and report that it was handled
+    /// (the caller then skips the real command).
+    fn h_record(&mut self, action: String) -> bool {
+        #[cfg(test)]
+        if let Some(t) = &mut self.test_ha {
+            t.actions.push(action);
+            return true;
+        }
+        let _ = action;
+        false
+    }
+
+    /// An alert whose remedy is an HA disable (see
+    /// `xapi::send_xapi_alert_advising_ha_disable`).
+    async fn h_alert_advice(&mut self, body: &str) -> bool {
+        if self.h_record(format!("advice: {body}")) {
+            return !self.h_alerts_fail();
+        }
+        xapi::send_xapi_alert_advising_ha_disable(body).await
+    }
+
+    /// An alert sent and queued under `key`; `advice` routes it as advice to
+    /// disable HA (held while a host is parked).
+    async fn h_alert_keyed(&mut self, key: &str, body: &str, advice: bool) -> bool {
+        let tag = if advice { "advice" } else { "alert" };
+        if self.h_record(format!("keyed: {key}")) {
+            self.h_record(format!("{tag}: {body}"));
+            return !self.h_alerts_fail();
+        }
+        if advice {
+            xapi::send_xapi_alert_advising_ha_disable_keyed(key, body).await
+        } else {
+            xapi::send_xapi_alert_keyed(key, body).await
+        }
+    }
+
+    /// Drop an undelivered alert queued under `key` (recorded under the
+    /// seam).
+    fn h_forget_held_alert(&mut self, key: &str) {
+        if self.h_record(format!("forget-alert: {key}")) {
+            return;
+        }
+        let _ = xapi::drop_held_alert("twinstor_degraded", key);
+    }
+
+    /// The same for an alert sent as advice to disable HA under `key` (its
+    /// body, when sent unkeyed).
+    fn h_forget_held_advice(&mut self, key: &str) {
+        if self.h_record(format!("forget-advice: {key}")) {
+            return;
+        }
+        let _ = xapi::drop_held_alert("twinstor_degraded", &xapi::ha_advice_key(key));
+    }
+
+    /// An alert its caller re-raises until delivered (see
+    /// [`xapi::send_xapi_alert_unqueued`]).
+    async fn h_alert_unqueued(&mut self, body: &str) -> bool {
+        if self.h_record(format!("alert-unqueued: {body}")) {
+            return !self.h_alerts_fail();
+        }
+        xapi::send_xapi_alert_unqueued(body).await
+    }
+
+    /// The same for advice to disable HA.
+    async fn h_alert_advice_unqueued(&mut self, body: &str) -> bool {
+        if self.h_record(format!("advice-unqueued: {body}")) {
+            return !self.h_alerts_fail();
+        }
+        xapi::send_xapi_alert_advising_ha_disable_unqueued(body).await
+    }
+
+    async fn h_alert(&mut self, body: &str) -> bool {
+        if self.h_record(format!("alert: {body}")) {
+            return !self.h_alerts_fail();
+        }
+        xapi::send_xapi_alert(body).await
+    }
+
+    /// `peer_role_probe`, reused for `PEER_ROLE_PROBE_TTL`: a repair withheld
+    /// on the peer's answer is re-evaluated every tick, and the probe forks a
+    /// python XenAPI login each time. An Unreachable answer for want of P is
+    /// not cached (it costs nothing).
+    async fn peer_role_probe_cached(&mut self) -> xapi::PeerXapiRole {
+        let now = std::time::Instant::now();
+        if let Some((t, role)) = &self.peer_role_cache
+            && now.duration_since(*t) < PEER_ROLE_PROBE_TTL
+        {
+            return role.clone();
+        }
+        if !self.p_view().p {
+            return xapi::PeerXapiRole::Unreachable;
+        }
+        let role = self.peer_role_probe().await;
+        self.peer_role_cache = Some((now, role.clone()));
+        role
+    }
+
+    /// Gates of the stranded former-master yield and forced reset.
+    async fn stranded_gate(&mut self, name: &'static str, force: bool) -> bool {
+        if !self.rejoin_assist_allows(name)
+            || !self.ha_gate(name, crate::mgmt_reach::Trigger::Absence)
+        {
+            return false;
+        }
+        if force && self.startup_loop_locked(name).await {
+            return false;
+        }
+        let role = self.peer_role_probe_cached().await;
+        if role != xapi::PeerXapiRole::Master {
+            self.note_withheld(
+                name,
+                format!("the peer's xapi does not answer as the pool master ({role:?})"),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Whether a heal stage describes a condition that still holds (never
+    /// reaped while it does): the whole-switch hold.
+    ///
+    /// Keyed on the tick's own hold flag only, which its hold evaluation
+    /// sets and clears every pass: the fast guard's latch alone (which a
+    /// stalled or crashed guard could leave set) never keeps the stage alive.
+    fn heal_stage_still_live(&self, stage: &str) -> bool {
+        stage == "whole_switch_hold" && self.whole_switch_held
+    }
+
+    /// Rewrite the whole-switch hold's heal stage (paced to a minute).
+    fn refresh_live_hold_stage(&mut self) {
+        if !self.log_pace.due("whole_switch_hold_refresh", Duration::from_secs(60)) {
+            return;
+        }
+        self.heal_state_update(
+            "whole_switch_hold",
+            WHOLE_SWITCH_HOLD_SUMMARY,
+            Some(WHOLE_SWITCH_HOLD_NEXT),
+        );
+    }
+
+    /// A slave whose master (the peer) does not answer on its management
+    /// address: every `xe` call is forwarded there and waits out its bound.
+    ///
+    /// Only once the settle clock has reset, i.e. after k consecutive failed
+    /// probes (the same k): one lost probe on a healthy pool must not skip
+    /// ten ticks of housekeeping.
+    fn forwarded_xapi_dead(&self) -> bool {
+        let v = self.p_view();
+        !v.p && v.true_for.is_none() && self.h_conf_master() == Some(false)
+    }
+
     /// Best-effort check that the peer is reachable on the network, meaning
     /// the partition has ended. Gates the auto-heal toolstack restart: xapi's
     /// startup reconciliation can only demote this node if it can reach the
@@ -23449,10 +30223,10 @@ impl StateMachine {
             return;
         }
         if let Ok(secs) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            if let Some(dir) = std::path::Path::new(LAST_HEALTHY_PATH).parent() {
+            if let Some(dir) = std::path::Path::new(LAST_HEALTHY_PATH.as_str()).parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(LAST_HEALTHY_PATH, secs.as_secs().to_string());
+            let _ = std::fs::write(LAST_HEALTHY_PATH.as_str(), secs.as_secs().to_string());
         }
     }
 
@@ -25147,7 +31921,7 @@ impl StateMachine {
             }
         }
         self.demote_target_down = false;
-        self.sb_keepdata_stuck = 0;
+        self.survivor_episode_end();
         self.sb_wedge_alerted = false;
         self.sb_undecidable_alerted = false;
         self.sb_resolved_alerted = false;
@@ -26196,26 +32970,7 @@ fn thrash_detected(
 /// gentle-restart loop completes the demote once the block lifts; this side
 /// only provides the HA-off window and restores HA. Runs on the surviving
 /// master.
-async fn survivor_ha_reset(resource: &str) {
-    // An earlier pool HA operation XAPI still holds pending (a disable that
-    // timed out for its caller): another disable only queues behind it.
-    if let Some(task) = xapi::pending_pool_ha_task().await {
-        warn!(heal_event = "survivor_ha_reset", step = "ha_task_pending", task = %task,
-              "survivor_ha_reset: a pool HA operation is still pending in XAPI; not disabling HA \
-               on top of it (the heal retries later)");
-        return;
-    }
-    warn!(
-        heal_event = "survivor_ha_reset",
-        "dual-master wedge: surviving master briefly disabling pool HA so the wedged peer can \
-           demote (its emergency_reset_master is blocked by HA_IS_ENABLED), then re-arming HA"
-    );
-    let _ = xapi::send_ha_wedge_alert(
-        "TwinStor dual-master recovery: the surviving master is briefly disabling pool HA so the \
-         wedged second master can demote itself, then re-enabling HA. VMs keep running; HA \
-         protection is restored automatically once the cluster reconverges.",
-    )
-    .await;
+async fn survivor_ha_reset(resource: &str, ops: &dyn HaOps, announce: bool) {
     // Resolve the heartbeat SR uuid before disabling HA. Without it we cannot
     // re-arm afterwards, so we must not disable at all (never leave the pool
     // with HA off). xe can time out in this wedge window, so the guard matters.
@@ -26259,49 +33014,92 @@ async fn survivor_ha_reset(resource: &str) {
             }
         },
     };
-    // The pool's failures-to-tolerate as the operator set it (ntol 0 lets XO's
-    // load balancer migrate VMs), put back after the re-arm. Read twice (a
-    // single `xe` read is unreliable mid-wedge); if still unread, it is left as
-    // XAPI keeps it rather than forced to a value the operator may not want.
-    // Read before the obligation is written, so nothing slow sits between that
-    // write and the disable.
-    let mut ntol = None;
-    for _ in 0..2 {
-        ntol = crate::cmd::cmd_output(
-            "xe",
-            &[
-                "pool-list",
-                "params=ha-host-failures-to-tolerate",
-                "--minimal",
-            ],
-        )
-        .await
-        .ok()
-        .and_then(|v| parse_ntol(&v));
-        if ntol.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    survivor_ha_reset_with(resource, ops, &sr, ha_timeout, announce).await;
+}
+
+/// The survivor reset's announcement, once per stuck episode and before its
+/// start checks, so it stays true whether the checks then pass or not.
+fn survivor_reset_announcement(t: u32) -> String {
+    format!(
+        "TwinStor dual-master recovery: the surviving master will reset pool HA if its checks \
+         pass (its gates, pool HA on, no pool HA operation pending): a brief pool HA disable so \
+         the wedged second master can demote itself, then a re-enable with \
+         'ha-config:timeout={t}'. It retries about every 90 seconds while the wedge lasts. HA \
+         protection is back once that enable succeeds; if it does not, TwinStor's re-arm record \
+         keeps retrying it while its own conditions hold."
+    )
+}
+
+/// `survivor_ha_reset` once the SR and the HA timeout are known. Nothing is
+/// awaited between the start checks and the disable: the announcement goes
+/// out first.
+async fn survivor_ha_reset_with(
+    resource: &str,
+    ops: &dyn HaOps,
+    sr: &str,
+    ha_timeout: u32,
+    announce: bool,
+) {
+    let sr = sr.to_string();
+    if announce {
+        ops.wedge_alert(&survivor_reset_announcement(ha_timeout)).await;
     }
-    // Persist the re-arm obligation before disabling: if every in-routine
-    // enable attempt lands in an unlucky window, the HA watchdog keeps
-    // retrying from this marker until HA is confirmed armed again. Stamped as
-    // an attempt: HA still reads armed until the disable lands, and the
-    // watchdog must not take that for a fulfilled obligation.
-    ha_obligation_write(&sr, ha_timeout.into());
-    ha_obligation_touch_attempt();
-    if let Err(e) =
-        crate::cmd::run_cmd_for("xe", &["pool-ha-disable"], HA_CMD_TIMEOUT.as_secs()).await
-    {
-        // Failed or timed out: the outcome is unknown (a disable XAPI keeps
-        // pending can still land much later, tens of minutes on). The
-        // obligation stays: once settled, the HA watchdog clears it if HA
-        // reads armed, or re-arms it if the disable landed.
-        warn!(heal_event = "survivor_ha_reset", step = "disable_failed", error = %e,
-              "survivor_ha_reset: pool-ha-disable failed or timed out; aborting the reset, the \
-               re-arm obligation stays (HA is re-armed if the disable lands later)");
-        ha_obligation_touch_attempt();
-        return;
+    // The same start checks as every pool HA cycle (gates, pool HA on, no
+    // pool HA task pending: another disable would only queue behind it).
+    match pool_ha_cycle_start(ops, "survivor_ha_reset").await {
+        CycleStart::Go => {}
+        CycleStart::Stop(why) => {
+            warn!(heal_event = "survivor_ha_reset", step = "not_started", reason = %why,
+                  "survivor_ha_reset: not disabling pool HA: {why} (the heal retries later)");
+            return;
+        }
+        CycleStart::OffNotByUs(note, clear) => {
+            pool_ha_off_not_by_us(ops, "survivor_ha_reset", &note, clear, &ha_off_not_by_twinstor())
+                .await;
+            return;
+        }
+    }
+    warn!(
+        heal_event = "survivor_ha_reset",
+        "dual-master wedge: surviving master briefly disabling pool HA so the wedged peer can \
+           demote (its emergency_reset_master is blocked by HA_IS_ENABLED), then re-arming HA"
+    );
+    // Persist the re-arm obligation before disabling, pending until the
+    // disable is seen to take (then owed): if every in-routine enable attempt
+    // lands in an unlucky window, the HA watchdog re-enables from it.
+    ops.write_obligation(
+        &sr,
+        ha_timeout.into(),
+        ObligationState::Pending { until: ops.now_unix() + OBLIGATION_PENDING_FOR },
+        &format!("survivor_ha_reset:{}", ops.now_unix()),
+    );
+    ops.touch_attempt();
+    // What is true is read by how the disable ended (see
+    // `pool_ha_disable_step`). Still on, or unreadable: the obligation stays,
+    // and once settled the HA watchdog clears it if HA reads armed or re-arms
+    // it if the disable lands later. Refused while HA reads off: not ours,
+    // nothing re-enables it.
+    match pool_ha_disable_step(ops).await {
+        DisableStep::Disabled(step) => {
+            ops.set_obligation_state(ObligationState::Owed);
+            info!(heal_event = "survivor_ha_reset", step,
+                  "survivor_ha_reset: pool HA is off; continuing");
+        }
+        DisableStep::RefusedButOff(note) => {
+            pool_ha_off_not_by_us(ops, "survivor_ha_reset", &note, true, &ha_off_disable_refused())
+                .await;
+            return;
+        }
+        DisableStep::Failed(note, may_land) => {
+            warn!(heal_event = "survivor_ha_reset", step = "disable_failed", outcome = %note,
+                  may_land,
+                  "survivor_ha_reset: {note}; aborting the reset (if the disable may still land, \
+                   the pending obligation re-arms HA once it does)");
+            if !may_land {
+                ops.clear_obligation();
+            }
+            return;
+        }
     }
     // Wait (bounded) for the peer to demote and DRBD to return to Connected/UpToDate.
     let deadline = std::time::Instant::now() + HA_RESET_HEAL_TIMEOUT;
@@ -26317,75 +33115,48 @@ async fn survivor_ha_reset(resource: &str) {
             break;
         }
     }
-    // Always re-arm HA, healed or not: never leave the pool unprotected.
-    ha_obligation_touch_attempt();
-    let _ = crate::cmd::run_cmd_for(
-        "xe",
-        &[
-            "pool-ha-enable",
-            &format!("heartbeat-sr-uuids={sr}"),
-            &format!("ha-config:timeout={ha_timeout}"),
-        ],
-        HA_CMD_TIMEOUT.as_secs(),
-    )
-    .await;
-    match ntol {
-        Some(ntol) => {
-            let set = match crate::cmd::cmd_output("xe", &["pool-list", "--minimal"]).await {
-                Ok(pool) => {
-                    crate::cmd::run_cmd(
-                        "xe",
-                        &[
-                            "pool-param-set",
-                            &format!("uuid={}", pool.trim()),
-                            &format!("ha-host-failures-to-tolerate={ntol}"),
-                        ],
-                    )
-                    .await
-                }
-                Err(e) => Err(e),
-            };
-            if let Err(e) = set {
-                warn!(ntol, error = %e, "survivor_ha_reset: could not put back the pool's \
-                       ha-host-failures-to-tolerate; check it by hand");
-            }
-        }
-        None => warn!(
-            "survivor_ha_reset: the pool's ha-host-failures-to-tolerate was unreadable \
-                       before the reset; left as XAPI keeps it"
-        ),
+    // Re-arm HA, healed or not, unless a fire-time gate read again now fails:
+    // then the re-arm obligation enables it later under its own gates.
+    if let Some(why) = ops.gates().await {
+        log_cycle_withheld("survivor_ha_reset", "enable", &why);
+        return;
     }
+    if !enable_still_owed(ops, "survivor_ha_reset", "enable") {
+        return;
+    }
+    ops.touch_attempt();
+    let mut returned = ops.enable(&sr, ha_timeout.into()).await == HaCmd::Done;
     // Verify HA came back. This routine must never leave HA off, so a
     // best-effort enable is not enough: confirm, retry once, and if it is still
     // off, alert rather than fail silently.
-    if xapi::is_ha_enabled().await != Some(true) {
+    if !returned && ops.pool_ha().await != Some(true) {
         warn!("survivor_ha_reset: HA still not enabled after re-arm; retrying once");
-        ha_obligation_touch_attempt();
-        let _ = crate::cmd::run_cmd_for(
-            "xe",
-            &[
-                "pool-ha-enable",
-                &format!("heartbeat-sr-uuids={sr}"),
-                &format!("ha-config:timeout={ha_timeout}"),
-            ],
-            HA_CMD_TIMEOUT.as_secs(),
-        )
-        .await;
-        if xapi::is_ha_enabled().await != Some(true) {
+        if let Some(why) = ops.gates().await {
+            log_cycle_withheld("survivor_ha_reset", "enable_retry", &why);
+            return;
+        }
+        if !enable_still_owed(ops, "survivor_ha_reset", "enable_retry") {
+            return;
+        }
+        ops.touch_attempt();
+        returned = ops.enable(&sr, ha_timeout.into()).await == HaCmd::Done;
+        if !returned && ops.pool_ha().await != Some(true) {
             warn!(
                 "survivor_ha_reset: HA still not enabled after retry; the re-arm \
                    obligation stays persisted and the HA watchdog keeps retrying"
             );
-            let _ = xapi::send_ha_wedge_alert(
+            let _ = xapi::send_ha_wedge_alert(&format!(
                 "TwinStor dual-master recovery: HA could not be re-armed after the recovery window \
                  (the peer was likely still rebooting). TwinStor keeps retrying automatically every \
-                 few minutes until it succeeds. To intentionally keep HA off instead, remove \
-                 /var/lib/twinstor/ha-rearm-obligation on this host."
-            ).await;
+                 few minutes until it succeeds. {KEEP_HA_OFF_HOWTO}"
+            )).await;
         }
     }
-    if xapi::is_ha_enabled().await == Some(true) {
-        ha_obligation_clear();
+    // Enabled only when an enable call returned success: an "on" read after
+    // one that did not return may still roll back; the watchdog moves the
+    // obligation once that "on" has settled.
+    if returned {
+        ops.set_obligation_state(ObligationState::Enabled);
     }
     if healed {
         info!(
@@ -27008,54 +33779,54 @@ poll_interval_ms = 10
 
     #[test]
     fn mutual_yield_has_exactly_one_taker() {
-        // The bmax wedge: demo-1's bitmap generation is demo-2's current one
-        // (demo-1 is ahead), demo-2 has no generation of demo-1's.
-        let demo1 = [
+        // A wedge seen in the lab: host A's bitmap generation is host B's
+        // current one (A is ahead), and B has no generation of A's.
+        let host_a = [
             0x355A43DD30F141B6,
             0xF11F0E8D9DCA4F48,
             0x4F327A0297E86FD8,
             0x6453E865C0ECC86E,
         ];
-        let demo2 = [
+        let host_b = [
             0xF11F0E8D9DCA4F48,
             0,
             0xD37D57142B3F2652,
             0xF501772E41B98534,
         ];
         assert!(mutual_yield_takes_win(
-            demo1,
+            host_a,
             0xF11F0E8D9DCA4F48,
             false,
             false
         ));
         assert!(!mutual_yield_takes_win(
-            demo2,
+            host_b,
             0x355A43DD30F141B6,
             true,
             false
         ));
         // The same data: the keeper alone takes it (bit 0 ignored).
         assert!(mutual_yield_takes_win(
-            demo2,
+            host_b,
             0xF11F0E8D9DCA4F49,
             true,
             false
         ));
         assert!(!mutual_yield_takes_win(
-            demo2,
+            host_b,
             0xF11F0E8D9DCA4F49,
             false,
             true
         ));
         // An ancestor in the history counts; an unrelated generation never does.
         assert!(mutual_yield_takes_win(
-            demo2,
+            host_b,
             0xD37D57142B3F2652,
             false,
             false
         ));
         assert!(!mutual_yield_takes_win(
-            demo1,
+            host_a,
             0x1111111111111110,
             true,
             false
@@ -27069,7 +33840,7 @@ poll_interval_ms = 10
         assert!(mutual_yield_takes_win(d1, d2[0], true, true));
         assert!(!mutual_yield_takes_win(d2, d1[0], false, true));
         // Unknown generations never take the win.
-        assert!(!mutual_yield_takes_win(demo1, 0, true, true));
+        assert!(!mutual_yield_takes_win(host_a, 0, true, true));
         assert!(!mutual_yield_takes_win(
             [0; 4],
             0xF11F0E8D9DCA4F48,
@@ -27407,7 +34178,7 @@ poll_interval_ms = 10
 
     #[test]
     fn ha_disabled_past_grace_alerts() {
-        let now = std::time::Instant::now();
+        let now = clock_with_past(); // no underflow on a host up for minutes
         let since = now - Duration::from_secs(1801); // just past 30 min
         assert_eq!(
             ha_check_decision(
@@ -29600,7 +36371,7 @@ poll_interval_ms = 10
 
     #[test]
     fn boot_gate_holds_while_the_peer_is_alive_and_releases_after_the_grace() {
-        let now = std::time::Instant::now();
+        let now = clock_with_past(); // no underflow on a host up for minutes
         let grace = BOOT_GATE_CLEAR_GRACE;
         let ceil = BOOT_GATE_BOOTING_CEILING;
         let d = |ev, keeper, last, booting| {
@@ -29704,7 +36475,7 @@ poll_interval_ms = 10
 
     #[test]
     fn a_peer_seen_serving_is_never_raced_by_a_solo_promote() {
-        let now = std::time::Instant::now();
+        let now = clock_with_past(); // no underflow on a host up for minutes
         let (grace, ceil) = (BOOT_GATE_CLEAR_GRACE, BOOT_GATE_BOOTING_CEILING);
         let none = PeerLifeEvidence::default();
         let beacon = PeerLifeEvidence {
@@ -31549,7 +38320,7 @@ poll_interval_ms = 10
             Box::new(ArcDrbd(drbd.clone())),
             Box::new(MockIscsi::new()),
         );
-        let marker = std::env::temp_dir().join("twinstor-test-dance-refusal-episode");
+        let marker = crate::heal_state::test_tmp_dir().join("twinstor-test-dance-refusal-episode");
         sm.episode_path = marker.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&marker);
 
@@ -31631,7 +38402,7 @@ poll_interval_ms = 10
             )))),
             Box::new(MockIscsi::new()),
         );
-        let marker = std::env::temp_dir().join("twinstor-test-open-episode");
+        let marker = crate::heal_state::test_tmp_dir().join("twinstor-test-open-episode");
         sm.episode_path = marker.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&marker);
 
@@ -33243,12 +40014,123 @@ poll_interval_ms = 10
         }
     }
 
+    /// The no-tiebreaker alert reports what was measured, and a gateway
+    /// answering now and then still alerts. Replays a gateway that failed
+    /// two 10-minute checks during a cut, answered the view's 10-second probe
+    /// for three minutes after the cut ended, then failed again: the streak
+    /// restarts. A later alert states the minutes since the last answer.
+    #[test]
+    fn tiebreaker_alert_reports_the_measured_outage() {
+        use super::{tiebreaker_decision, tiebreaker_observe, tiebreaker_outage_text};
+        struct Check {
+            streak: u32,
+            outage: Option<super::TiebreakerOutage>,
+            last: u64,
+        }
+        impl Check {
+            fn at(&mut self, now: u64, answered: u64, probes: u64) -> bool {
+                let (restart, o) =
+                    tiebreaker_observe(false, answered, probes, self.last.max(1), self.outage, now);
+                self.outage = o;
+                self.last = now;
+                let (s, fire) =
+                    tiebreaker_decision(false, false, false, if restart { 0 } else { self.streak });
+                self.streak = s;
+                fire
+            }
+        }
+        let t0 = 10_000u64;
+        let mut c = Check { streak: 0, outage: None, last: t0 - 600 };
+        // During the cut: silent.
+        assert!(!c.at(t0, 0, 60));
+        assert!(!c.at(t0 + 600, 0, 60));
+        // The cut ends at t0 + 800; the gateway answers 40 of the 60 probes
+        // (until t0 + 1200), then is silent again at the next check: the
+        // streak restarts.
+        assert!(!c.at(t0 + 1200, 40, 60));
+        assert_eq!(c.streak, 1);
+        assert!(!c.at(t0 + 1800, 0, 60));
+        assert!(c.at(t0 + 2400, 0, 60));
+        let last_answer = t0 + 1190;
+        assert_eq!(
+            tiebreaker_outage_text(c.outage, last_answer, t0 + 2400),
+            "has not answered for 20 minutes"
+        );
+        // A gateway answering about one probe per check: no restart, it
+        // alerts at the third check, and the text says how little it answered.
+        let mut c = Check { streak: 0, outage: None, last: t0 - 600 };
+        assert!(!c.at(t0, 1, 60));
+        assert!(!c.at(t0 + 600, 1, 60));
+        assert!(c.at(t0 + 1200, 1, 60));
+        assert_eq!(
+            tiebreaker_outage_text(c.outage, t0 + 1100, t0 + 1200),
+            "answered only 3 of 180 probes over the last 30 minutes"
+        );
+        // Never seen answering since the daemon started: a lower bound.
+        let (_, o) = tiebreaker_observe(false, 0, 120, 1, None, 1201);
+        assert!(
+            tiebreaker_outage_text(o, 0, 1201)
+                .starts_with("has not answered for at least 20 minutes")
+        );
+        // No view probe ran (no counts): the check's own ping decides, as before.
+        let (restart, _) = tiebreaker_observe(false, 0, 0, t0, None, t0 + 600);
+        assert!(!restart);
+        // An answer at the check clears the window.
+        assert_eq!(tiebreaker_observe(true, 0, 60, t0, o, t0 + 600), (false, None));
+    }
+
+    /// The local login probe runs only for a host disarmed out of the
+    /// liveset on a pool whose HA was not last read off: an operator's pool
+    /// HA disable leaves every host so, for good.
+    #[test]
+    fn the_own_login_probe_skips_a_pool_whose_ha_reads_off() {
+        use super::own_login_probe_wanted;
+        // The wedge: pool HA last read on (or never read: the wedged slave's
+        // own xe fails), host disarmed, xhad stopped.
+        assert!(own_login_probe_wanted(Some(false), false, Some(true)));
+        assert!(own_login_probe_wanted(Some(false), false, None));
+        // Pool HA read off in the last few minutes: no probe.
+        assert!(!own_login_probe_wanted(Some(false), false, Some(false)));
+        // An old "off" ages to unknown (see `xapi::last_known_pool_ha`), and
+        // unknown probes: the wedge after a cycle that passed through "off".
+        // Armed, unreadable, or in the liveset: no probe.
+        assert!(!own_login_probe_wanted(Some(true), false, Some(true)));
+        assert!(!own_login_probe_wanted(None, false, Some(true)));
+        assert!(!own_login_probe_wanted(Some(false), true, Some(true)));
+    }
+
+    /// The master's partition view shows the peer disarmed from the
+    /// peer-emergency probe's sighting while it is recent: one other answer
+    /// between two sightings a minute apart does not drop it.
+    #[test]
+    fn a_peer_disarmed_sighting_stays_fresh_between_probes() {
+        use super::{PEER_DISARMED_FRESH_SECS, peer_disarmed_fresh};
+        let t = 2_000_000u64;
+        assert!(!peer_disarmed_fresh(0, t));
+        assert!(peer_disarmed_fresh(t, t));
+        assert!(peer_disarmed_fresh(t - 120, t));
+        assert!(peer_disarmed_fresh(t - PEER_DISARMED_FRESH_SECS, t));
+        assert!(!peer_disarmed_fresh(t - PEER_DISARMED_FRESH_SECS - 1, t));
+    }
+
     #[test]
     fn peer_daemon_down_requires_live_host_and_stale_existing_stamp() {
         use super::peer_daemon_down;
         let stale = 900;
         // Host up, stamp 20 min old.
         assert!(peer_daemon_down(Some(1000), 1000 + 1200, Some(true), stale));
+        // Not counted while the management path is down: the clock is off
+        // while P is false and counts from P's return.
+        let mut back = Option::None;
+        assert_eq!(peer_daemon_p_clock(&mut back, false, 5000), Option::None);
+        assert_eq!(peer_daemon_p_clock(&mut back, true, 6000), Some(6000));
+        assert_eq!(peer_daemon_p_clock(&mut back, true, 6500), Some(6000));
+        let reference = peer_daemon_reference(Some(1000), 6000);
+        assert!(!peer_daemon_down(reference, 6000 + 160, Some(true), stale), "a stamp from before the cut");
+        assert!(peer_daemon_down(reference, 6000 + 900, Some(true), stale), "no report 15 min after P came back");
+        assert_eq!(peer_daemon_p_clock(&mut back, false, 7000), Option::None);
+        assert_eq!(peer_daemon_p_clock(&mut back, true, 7100), Some(7100), "restarted");
+        assert_eq!(peer_daemon_reference(Some(9000), 7100), Some(9000));
         // No stamp at all: the peer may run an older version; never alert.
         assert!(!peer_daemon_down(None, 10_000, Some(true), stale));
         // Fresh stamp: healthy.
@@ -33356,6 +40238,10 @@ poll_interval_ms = 10
         assert_eq!(d(true, None, None, true, false), A::Keep);
         // Realigned by a pool cycle: spent, whatever else.
         assert_eq!(d(true, Some(true), Some(false), true, false), A::Clear);
+        // A hold standing, or the record still settling: a local armed read
+        // is no proof (the disarm may still be landing).
+        assert_eq!(d(false, Some(true), Some(true), true, true), A::Keep);
+        assert_eq!(d(false, Some(true), Option::None, true, true), A::Keep);
 
         let rec = "boot_id=aaaa\nxapi_pid=100\n";
         assert!(!xapi_restarted_since(rec, "aaaa", "100"));
@@ -33525,7 +40411,7 @@ poll_interval_ms = 10
         // treated as a split-brain and could discard legitimate writes on the
         // non-master. This happens when the winner's confirm window misses the
         // reconnect, for example while the loser is in a fence reboot.
-        let marker = std::env::temp_dir().join("twinstor-test-stale-marker");
+        let marker = crate::heal_state::test_tmp_dir().join("twinstor-test-stale-marker");
         std::fs::write(&marker, "stale marker resource=twinstor-data").unwrap();
 
         let drbd = std::sync::Arc::new(MockDrbd::new(online_with_peer()));
@@ -33563,9 +40449,9 @@ poll_interval_ms = 10
         // xapi) reports it as master. The yield overrules the role lookup: the
         // node served nobody while frozen, so it discards and resyncs instead
         // of deadlocking the resolution as a second winner.
-        let yield_file = std::env::temp_dir().join("twinstor-test-yield-loser");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-loser");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
-        let sb_marker = std::env::temp_dir().join("twinstor-test-yield-loser-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-loser-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
 
         let mut status = online_with_peer();
@@ -33578,7 +40464,7 @@ poll_interval_ms = 10
         );
         sm.yield_path = yield_file.to_string_lossy().to_string();
         sm.marker_path = sb_marker.to_string_lossy().to_string();
-        let latch = std::env::temp_dir().join("twinstor-test-yield-loser-latch");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-loser-latch");
         sm.latch_path = latch.to_string_lossy().to_string();
 
         sm.resolve_split_brain().await;
@@ -33606,7 +40492,7 @@ poll_interval_ms = 10
         // (the node may have served writes since), the ordinary winner
         // determination must run. On this test host it is undecidable (no
         // xe, no pool.conf), so nothing may be discarded.
-        let yield_file = std::env::temp_dir().join("twinstor-test-yield-stale");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-stale");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
 
         let drbd = std::sync::Arc::new(MockDrbd::new(online_with_peer()));
@@ -33616,7 +40502,7 @@ poll_interval_ms = 10
             Box::new(MockIscsi::new()),
         );
         sm.yield_path = yield_file.to_string_lossy().to_string();
-        sm.latch_path = std::env::temp_dir()
+        sm.latch_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-yield-stale-latch")
             .to_string_lossy()
             .to_string();
@@ -33639,11 +40525,11 @@ poll_interval_ms = 10
         // survive that round (the attempt consumes the suspend it was verified
         // against), and the node must hold itself down instead of re-serving
         // stale data.
-        let yield_file = std::env::temp_dir().join("twinstor-test-yield-latch-y");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-latch-y");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
-        let sb_marker = std::env::temp_dir().join("twinstor-test-yield-latch-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-latch-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
-        let latch = std::env::temp_dir().join("twinstor-test-yield-latch-l");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-yield-latch-l");
         let _ = std::fs::remove_file(&latch);
 
         // Round 1: suspended, but the peer never appears (stays Connecting).
@@ -33793,9 +40679,9 @@ poll_interval_ms = 10
         // holds the parked discard connect. The episode markers (latch and
         // split-brain marker) plus Connecting identify it; the hook re-adopts
         // instead of falling through to the StandAlone machinery.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-readopt-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-readopt-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
-        let latch = std::env::temp_dir().join("twinstor-test-readopt-l");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-readopt-l");
         std::fs::write(&latch, "latched").unwrap();
 
         let mut s = online_with_peer();
@@ -33850,6 +40736,199 @@ poll_interval_ms = 10
     // The predicate peer_dead_via_liveset applies to the parsed result.
     fn liveset_says_dead(xml: &str) -> Option<bool> {
         parse_peer_liveset(xml).map(|l| l.local_online && !l.peer_live && !l.peer_statefile_access)
+    }
+
+    /// The connected side's isolated-master alert claims the master is in
+    /// the HA liveset only from a liveset this host is Online in. A parked
+    /// host whose xhad is Starting reports stale entries; they are no
+    /// evidence, so its alert makes no liveset claim.
+    #[test]
+    fn isolated_master_alert_claims_the_liveset_only_from_an_online_xhad() {
+        use super::{IsolatedMasterClaim::*, isolated_master_claim, own_liveset_peer_membership};
+        let read = |status: &str, live: &str| {
+            own_liveset_peer_membership(parse_peer_liveset(&liveset_xml(status, live, "TRUE")))
+        };
+        let long = Duration::from_secs(3600);
+        let w = Duration::from_secs(420);
+        let claim = |m| isolated_master_claim(m, Some(long), Option::None, w);
+        assert_eq!(claim(read("Online", "TRUE")), InLiveset);
+        assert_eq!(claim(read("Online", "FALSE")), Removed);
+        // Parked or joining: xhad Starting, whatever the peer entry says.
+        assert_eq!(claim(read("Starting", "TRUE")), LivesetUnknown);
+        assert_eq!(claim(read("Starting", "FALSE")), LivesetUnknown);
+        // Unreadable (xhad down, HA off).
+        assert_eq!(claim(own_liveset_peer_membership(None)), LivesetUnknown);
+        assert_eq!(claim(None), LivesetUnknown);
+        // The unknown-liveset texts claim nothing about the liveset or XHA,
+        // and the HA-off variant gives no advice about HA.
+        use super::isolated_master_unknown_liveset_alert as text;
+        for off in [false, true] {
+            assert!(!text(off).contains("is not in an HA liveset"));
+            assert!(!text(off).contains("removed"));
+            assert!(text(off).contains("clients likely cannot reach"));
+        }
+        assert!(text(false).contains("Do not disable pool HA"));
+        assert!(text(false).contains("the query failed"));
+        assert!(!text(true).contains("Do not disable pool HA"));
+        assert!(text(true).contains("Pool HA is off"));
+    }
+
+    /// The survivor does not claim the master "is still in the HA liveset"
+    /// while XHA may still be deciding, measured on the isolation clock (set
+    /// once the master's xapi stopped answering, debounced). Replays a cut
+    /// master fenced at the verdict (T0+243 s at T_hb 120) whose removal
+    /// reached the survivor's liveset at T0+384 s, the isolation clock having
+    /// started at about T0+94 s: no alert until the window ends, and the
+    /// removal then gives none. The window always ends: a liveset that keeps
+    /// showing the master gets the claim.
+    #[test]
+    fn no_in_liveset_claim_while_xha_may_still_be_deciding() {
+        use super::{IsolatedMasterClaim::*, isolated_master_claim, xha_decision_window};
+        let w = xha_decision_window(120);
+        assert_eq!(w, Duration::from_secs(420));
+        assert_eq!(xha_decision_window(90), Duration::from_secs(330));
+        let isolated = |t0_plus: u64| Some(Duration::from_secs(t0_plus - 94));
+        // At the alert's maturity (T0+394), still listed 7 s before removal.
+        assert_eq!(isolated_master_claim(Some(true), isolated(377), Option::None, w), XhaDeciding);
+        assert_eq!(isolated_master_claim(Some(true), isolated(394), Option::None, w), XhaDeciding);
+        // Removed: no alert at all.
+        assert_eq!(isolated_master_claim(Some(false), isolated(400), Option::None, w), Removed);
+        // Still listed past the window: the claim stands; it cannot hold
+        // forever whatever P does (no P input any more).
+        assert_eq!(isolated_master_claim(Some(true), isolated(94 + 421), Option::None, w), InLiveset);
+        // No liveset: the no-claim alert at once.
+        assert_eq!(isolated_master_claim(None, isolated(377), Option::None, w), LivesetUnknown);
+        // Listed, but when its inputs last changed is unknown: no claim.
+        assert_eq!(isolated_master_claim(Some(true), Option::None, Option::None, w), LivesetUnknown);
+    }
+
+    /// Replay of the partial-heal shape where the survivor claimed too early:
+    /// the isolation clock started 44 s before the cut (the master's xapi
+    /// restarting during the run's preparation, a forwarded read timing out;
+    /// the debounce then held the clock into the cut), so 423 s on that clock
+    /// had passed when the peer, fenced 135 s before, was still listed 6 s
+    /// before the survivor's liveset dropped it. Measured from the later of
+    /// the clock's start and the last change in XHA's inputs (P false 11 s
+    /// after the cut, XHA's removal lines 244 s after it, the DRBD
+    /// disconnect at the fence and the reconnect at the reboot), XHA is still
+    /// deciding then; the removal follows and no alert is raised.
+    #[test]
+    fn the_in_liveset_claim_waits_for_the_last_change_in_xhas_inputs() {
+        use super::{IsolatedMasterClaim::*, XhaReach, XhaReachClock, isolated_master_claim, xha_decision_window};
+        let w = xha_decision_window(120);
+        let cut = std::time::Instant::now();
+        let at = |s: i64| {
+            if s >= 0 { cut + Duration::from_secs(s as u64) } else { cut - Duration::from_secs((-s) as u64) }
+        };
+        let since = Some(at(-44));
+        let healthy = XhaReach { p: true, peer_alive: true, drbd_connected: true,
+                                 peer_live: Some(true), peer_statefile: Some(true) };
+        let mut c = XhaReachClock::default();
+        c.observe(healthy, false, at(-44));
+        c.observe(healthy, false, at(5));
+        let cut_off = XhaReach { p: false, ..healthy };
+        c.observe(cut_off, false, at(11));
+        // An unreadable liveset read is no change.
+        c.observe(XhaReach { peer_live: Option::None, peer_statefile: Option::None, ..cut_off }, false, at(100));
+        assert_eq!(c.changed_at, Some(at(11)));
+        // XHA's removal lines in xha.log, then the fence's DRBD disconnect
+        // and the reboot's reconnect.
+        c.observe(cut_off, true, at(244));
+        c.observe(XhaReach { peer_alive: false, drbd_connected: false, ..cut_off }, false, at(248));
+        c.observe(cut_off, false, at(274));
+        // The old clock alone would have claimed at the alert (cut + 379 s).
+        let old = since.map(|t| at(379).saturating_duration_since(t));
+        assert_eq!(isolated_master_claim(Some(true), old, Option::None, w), InLiveset);
+        assert_eq!(isolated_master_claim(Some(true), c.quiet_for(since, at(379)), Option::None, w), XhaDeciding);
+        // Six seconds later the liveset drops the fenced peer: no alert.
+        assert_eq!(isolated_master_claim(Some(false), c.quiet_for(since, at(385)), Option::None, w), Removed);
+        // Nothing changes any more and the peer stays listed: the window ends.
+        c.observe(cut_off, false, at(600));
+        assert_eq!(isolated_master_claim(Some(true), c.quiet_for(since, at(274 + 421)), Option::None, w), InLiveset);
+        // A clock that started after the last change counts from its start.
+        assert_eq!(c.quiet_for(Some(at(700)), at(800)), Some(Duration::from_secs(100)));
+        // Nothing observed: unknown, no claim.
+        assert_eq!(XhaReachClock::default().quiet_for(since, at(800)), Option::None);
+    }
+
+    /// An input that keeps changing (a flapping link) cannot hold the alert
+    /// forever: past 15 minutes on the isolation clock the alert goes out
+    /// without a liveset claim; the claim itself still needs a quiet window.
+    #[test]
+    fn a_flapping_input_ends_in_the_no_claim_alert_never_the_claim() {
+        use super::{IsolatedMasterClaim::*, XhaReach, XhaReachClock, isolated_master_claim, xha_decision_window};
+        let w = xha_decision_window(120);
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let since = Some(t0);
+        let base = XhaReach { p: false, peer_alive: true, drbd_connected: true,
+                              peer_live: Some(true), peer_statefile: Some(true) };
+        let mut c = XhaReachClock::default();
+        let mut seen = Vec::new();
+        // The replication link flaps every 40 s for 20 minutes.
+        for k in 0..=30u64 {
+            let s = k * 40;
+            c.observe(XhaReach { peer_alive: k % 2 == 0, ..base }, false, at(s));
+            let age = since.map(|t| at(s).saturating_duration_since(t));
+            seen.push((s, isolated_master_claim(Some(true), c.quiet_for(since, at(s)), age, w)));
+        }
+        assert!(seen.iter().all(|(_, cl)| *cl != InLiveset), "{seen:?}");
+        assert!(seen.iter().filter(|(s, _)| *s < 900).all(|(_, cl)| *cl == XhaDeciding), "{seen:?}");
+        assert!(seen.iter().filter(|(s, _)| *s >= 900).all(|(_, cl)| *cl == LivesetUnknown), "{seen:?}");
+        // Once it stops changing, the window can end in the claim again.
+        c.observe(base, false, at(1300));
+        assert_eq!(isolated_master_claim(Some(true), c.quiet_for(since, at(1300 + 421)), Some(Duration::from_secs(1721)), w), InLiveset);
+    }
+
+    /// XHA's account in xha.log that it is deciding, from the survivor's
+    /// own log in that run; read from where the clock started.
+    #[test]
+    fn xha_log_lines_that_say_xha_is_deciding() {
+        use super::{scan_xha_log_deciding, xha_log_deciding};
+        assert!(xha_log_deciding("[debug] SM: Node (1) will be removed from liveset."));
+        assert!(xha_log_deciding("[warn] Host (-1) and the local host do not agree on the view to the pool membership."));
+        assert!(xha_log_deciding("[notice] Liveset has been updated.  new liveset = (10)"));
+        assert!(xha_log_deciding("SC: (script_service_do_query_liveset) \"Heartbeat approaching timeout\" turned FALSE"));
+        assert!(xha_log_deciding("reporting \"State-File approaching timeout\". host[1].time_since_last_update_on_sf=61510."));
+        assert!(!xha_log_deciding("[info] SC: class=gw weight has changed from 0 to 1"));
+        let dir = format!("{}/target/test-ha/xha-deciding-{}", env!("CARGO_MANIFEST_DIR"), std::process::id());
+        let _ = std::fs::create_dir_all(&dir);
+        let f = &format!("{dir}/xha.log");
+        std::fs::write(f, "[notice] Liveset has been updated.\n").unwrap();
+        // First read starts at the end: what came before the clock is not a change.
+        let (moved, off) = scan_xha_log_deciding(f, Option::None);
+        assert!(!moved);
+        let (moved, off) = scan_xha_log_deciding(f, off);
+        assert!(!moved);
+        std::fs::write(f, "[notice] Liveset has been updated.\n[debug] SM: Node (1) will be removed from liveset.\n").unwrap();
+        let (moved, _) = scan_xha_log_deciding(f, off);
+        assert!(moved);
+        // Non-UTF-8 bytes and a read cut inside a multi-byte character:
+        // decoded lossily, and the offset still reaches the end.
+        let mut bytes = std::fs::read(f).unwrap();
+        bytes.extend_from_slice(b"\xff\xfe junk [notice] Liveset has been updated.\n\xe2\x82");
+        std::fs::write(f, &bytes).unwrap();
+        let (_, end) = scan_xha_log_deciding(f, Some(0));
+        let (moved, off2) = scan_xha_log_deciding(f, end);
+        assert_eq!((moved, end), (false, Some(bytes.len() as u64)));
+        assert_eq!(off2, end);
+        assert!(scan_xha_log_deciding(f, Some(0)).0, "the lossy text still matches");
+        // Rotated (shorter than the offset): restart from the end, no change.
+        std::fs::write(f, "x\n").unwrap();
+        assert!(!scan_xha_log_deciding(f, Some(1 << 20)).0);
+    }
+
+    /// A slave disarmed under the armed pool (its xapi refusing calls and
+    /// restarting itself) raised the "pool master does not answer" alert with
+    /// nothing cut: the connected side's alert needs the master's management
+    /// address silent (P false), not merely `xe` failing here. Whether this
+    /// host is itself disarmed plays no part: beside a really isolated master
+    /// it must still alert.
+    #[test]
+    fn the_connected_sides_isolated_master_alert_needs_p_false() {
+        use super::isolated_master_alert_held;
+        assert!(isolated_master_alert_held(true).is_some());
+        assert_eq!(isolated_master_alert_held(false), Option::None);
     }
 
     #[test]
@@ -35031,327 +42110,159 @@ poll_interval_ms = 10
     #[test]
     fn peer_emergency_matrix() {
         use PeerEmergencyAction::*;
-        let now = std::time::Instant::now();
-        let past = now - (PEER_EMERGENCY_AFTER + Duration::from_secs(1));
-        let young = now - Duration::from_secs(30); // signature present but blind maturity not elapsed
-        let wedge_past = now - (PEER_EMERGENCY_WEDGE_CONFIRMED_AFTER + Duration::from_secs(1));
-        let wedge_young = now - Duration::from_secs(30);
-        // Signature aged past the reduced fast maturity but not the full blind one.
-        let fast_mature = now - (PEER_EMERGENCY_FAST_AFTER + Duration::from_secs(1));
-        // Storage is not safe to cycle in these cases, to isolate the blind and
-        // liveset paths.
-        // Signature absent (any leg): clear (peer_in_liveset=false, no wedge).
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(false),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Option::None,
-                now
-            ),
-            None
-        );
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(true),
-                true,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Option::None,
-                now
-            ),
-            None
-        );
+        use crate::mgmt_reach::PView;
+        let settled = PView::settled_for_test();
+        let cut = PView::default();
+        let settling = PView {
+            p: true,
+            last_answered: true,
+            answered: 6,
+            probes: 6,
+            true_for: Some(Duration::from_secs(120)),
+            address_known: true,
+            stale: false,
+        };
+        // Pool HA off, or nothing seen: nothing.
+        assert_eq!(peer_emergency_decision(true, Some(false), &settled, true, true, false, false), None);
+        assert_eq!(peer_emergency_decision(true, Some(true), &settled, false, false, false, false), None);
+        // Confirmed and P holds: resolve without the settle.
+        assert_eq!(peer_emergency_decision(true, Some(true), &settling, true, true, false, false), Resolve);
+        // Confirmed but P false: hold.
+        assert_eq!(peer_emergency_decision(true, Some(true), &cut, true, true, false, false), Hold);
+        // Seen once, not confirmed: hold.
+        assert_eq!(peer_emergency_decision(true, Some(true), &settled, false, true, false, false), Hold);
+        // Disabled by its key, or a reset that could not be issued retried
+        // too soon: hold.
+        assert_eq!(peer_emergency_decision(false, Some(true), &settled, true, true, false, false), Hold);
         assert_eq!(
             peer_emergency_decision(
                 true,
                 Some(true),
-                Some(false),
-                false,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Option::None,
-                now
-            ),
-            None
-        );
-        // Signature present, young / flag off: hold (sentinel covers alerting).
-        assert_eq!(
-            peer_emergency_decision(
+                &settled,
                 true,
-                Some(true),
-                Some(false),
+                true,
                 true,
                 false,
-                false,
-                Option::None,
-                Option::None,
-                Option::None,
-                now
             ),
             Hold
         );
-        assert_eq!(
-            peer_emergency_decision(
-                false,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Option::None,
-                now
-            ),
-            Hold
-        );
-        // Slow path: flag on, persisted past the blind maturity, uncapped: resolve.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Option::None,
-                now
-            ),
-            Resolve
-        );
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Some(now - Duration::from_secs(60)),
-                now
-            ),
-            Hold
-        );
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(past),
-                Option::None,
-                Some(now - (PEER_EMERGENCY_COOLDOWN + Duration::from_secs(1))),
-                now
-            ),
-            Resolve
-        );
-        // Fast path: peer rejoined the liveset and the wedge is confirmed past
-        // the short grace, so it resolves before the blind maturity elapses.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                true,
-                false,
-                Some(young),
-                Some(wedge_past),
-                Option::None,
-                now
-            ),
-            Resolve
-        );
-        // Fast path armed but grace not yet elapsed, blind maturity young: hold.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                true,
-                false,
-                Some(young),
-                Some(wedge_young),
-                Option::None,
-                now
-            ),
-            Hold
-        );
-        // No liveset signal and young: wait out the blind maturity (hold).
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(young),
-                Option::None,
-                Option::None,
-                now
-            ),
-            Hold
-        );
-        // Fast path still respects the action cooldown.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                true,
-                false,
-                Some(young),
-                Some(wedge_past),
-                Some(now - Duration::from_secs(60)),
-                now
-            ),
-            Hold
-        );
-        // Fast path requires the signature (metrics live gives None).
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(true),
-                true,
-                true,
-                false,
-                Some(young),
-                Some(wedge_past),
-                Option::None,
-                now
-            ),
-            None
-        );
-        // Gated fast maturity (no liveset signal): storage fully redundant, so
-        // resolve after the reduced maturity, before the blind timer.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                true,
-                Some(fast_mature),
-                Option::None,
-                Option::None,
-                now
-            ),
-            Resolve
-        );
-        // Same age but storage not safe to cycle: keep the full blind maturity.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                false,
-                Some(fast_mature),
-                Option::None,
-                Option::None,
-                now
-            ),
-            Hold
-        );
-        // Storage safe but signature younger than even the reduced maturity: hold.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                true,
-                Some(young),
-                Option::None,
-                Option::None,
-                now
-            ),
-            Hold
-        );
-        // Storage safe still respects the cooldown after a prior action.
-        assert_eq!(
-            peer_emergency_decision(
-                true,
-                Some(true),
-                Some(false),
-                true,
-                false,
-                true,
-                Some(fast_mature),
-                Option::None,
-                Some(now - Duration::from_secs(60)),
-                now
-            ),
-            Hold
-        );
+        // Confirmed, P holding, the budget holding it: withheld (not a
+        // silent hold); unconfirmed with the budget spent: a plain hold.
+        assert_eq!(peer_emergency_decision(true, Some(true), &settled, true, true, false, true), Withheld);
+        assert_eq!(peer_emergency_decision(true, Some(true), &settled, false, true, false, true), Hold);
     }
 
+    /// Two sightings at least 30 s apart confirm, whatever came in between:
+    /// the wedged slave's own xapi restarts answer with a TCP reset or a
+    /// single HOST_IS_SLAVE. Two normal answers in a row clear them, so does a
+    /// whole window without a sighting; sightings further apart than the
+    /// window do not confirm.
     #[test]
-    fn storage_safe_to_cycle_ha_gate() {
-        // Fully redundant (Connected, both UpToDate, not suspended): safe.
-        assert!(storage_safe_to_cycle_ha(&online_with_peer()));
-        // StandAlone or no peer: unsafe.
-        assert!(!storage_safe_to_cycle_ha(&online_no_peer()));
-        // Peer behind (Inconsistent or resyncing): unsafe.
-        let mut s = online_with_peer();
-        s.peer_disk = Some(DiskState::Inconsistent);
-        assert!(!storage_safe_to_cycle_ha(&s));
-        // Peer disk unknown: unsafe.
-        let mut s = online_with_peer();
-        s.peer_disk = None;
-        assert!(!storage_safe_to_cycle_ha(&s));
-        // Local not UpToDate: unsafe.
-        let mut s = online_with_peer();
-        s.disk = DiskState::Inconsistent;
-        assert!(!storage_safe_to_cycle_ha(&s));
-        // Not Connected (still connecting): unsafe.
-        let mut s = online_with_peer();
-        s.connection = ConnectionState::Connecting;
-        assert!(!storage_safe_to_cycle_ha(&s));
-        // Leftover user or fence I/O suspend: unsafe (matches the storage_healthy
-        // sibling; a just-fenced pair keeps the conservative full maturity).
-        let mut s = online_with_peer();
-        s.suspended_user = true;
-        assert!(!storage_safe_to_cycle_ha(&s));
+    fn armed_mismatch_confirmation_tolerates_the_wedged_slaves_restarts() {
+        use xapi::PeerXapiRole::*;
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let step = |s: MismatchSightings, r: xapi::PeerXapiRole, t: u64| armed_mismatch_confirm(s, &r, at(t));
+        let (s, c) = step(MismatchSightings::default(), ArmedMismatch, 0);
+        assert!(s.open() && !c);
+        let (s, c) = step(s, Unknown, 10);
+        assert!(s.open() && !c);
+        // One HOST_IS_SLAVE while its xapi restarts: kept.
+        let (s, c) = step(s, SlaveOf("10.0.0.1".into()), 20);
+        assert!(s.open() && !c);
+        // Re-probed 30 s after the last probe (the HOST_IS_SLAVE one at 20 s),
+        // not on every tick.
+        assert!(!s.reprobe_due(at(25)) && !s.reprobe_due(at(49)) && s.reprobe_due(at(50)));
+        let (s, c) = step(s, ArmedMismatch, 29);
+        assert!(!c, "29 s apart");
+        let (s, c) = step(s, ArmedMismatch, 31);
+        assert!(c, "31 s apart, one restart answer in between");
+        // A normal answer after it: still confirmed, but the reset waits for
+        // a current armed-mismatch answer (the peer may have just healed);
+        // the next probe is due 30 s on.
+        let (s, c) = step(s, Master, 40);
+        assert!(!c && s.open() && s.confirmed());
+        assert!(!s.fire_ready(at(40)) && s.reprobe_due(at(70)));
+        let (s2, c) = step(s, ArmedMismatch, 70);
+        assert!(c, "a current sighting fires");
+        // A mismatch answer older than 35 s does not fire either.
+        assert!(!s2.fire_ready(at(106)));
+        // Two normal answers in a row clear everything.
+        let (s, c) = step(s, Master, 50);
+        assert!(!c && !s.open());
+        // Sightings 6 minutes apart (a single restart answer between would
+        // not clear them, but the window does): no confirmation; the later
+        // sighting starts afresh and the next one 30 s on confirms.
+        let (s, _) = step(MismatchSightings::default(), ArmedMismatch, 0);
+        let (s, c) = step(s, ArmedMismatch, 360);
+        assert!(!c && s.open());
+        let (_, c) = step(s, ArmedMismatch, 391);
+        assert!(c);
+        // No sighting for a whole window: cleared.
+        let (s, _) = step(MismatchSightings::default(), ArmedMismatch, 0);
+        let (s, _) = step(s, Unknown, 301);
+        assert!(!s.open());
     }
 
+    /// Replays of the lab runs, one probe a minute. A healthy master probing
+    /// an isolated slave across the cut: P false, so no probe and no trigger,
+    /// while the agent probe fails by itself. Parked peers answer with a TCP
+    /// reset (Unknown), never ArmedMismatch. A fenced slave's natural heal:
+    /// it reconnects through its backoff (Unknown, then HOST_IS_SLAVE) while P
+    /// is settling. None of them resolve. A slave wedged locally disarmed
+    /// under the armed pool, answering ArmedMismatch with P back, does.
     #[test]
-    fn fast_maturity_requires_current_raw_wedge() {
-        // Signature holds and the peer is raw-not-live right now: eligible.
-        assert!(fast_maturity_wedge_eligible(true, Some(false)));
-        // Peer is raw-live (already recovered): not eligible. This guard stops
-        // a spurious cycle from a stale debounce: the fast path falls back to
-        // the blind maturity while `live` is only bridged-false.
-        assert!(!fast_maturity_wedge_eligible(true, Some(true)));
-        // Peer liveness unreadable: not eligible (fail closed).
-        assert!(!fast_maturity_wedge_eligible(true, None));
-        // No signature: never eligible, whatever the liveness.
-        assert!(!fast_maturity_wedge_eligible(false, Some(false)));
+    fn peer_emergency_replays_of_the_rig_runs() {
+        use crate::mgmt_reach::PView;
+        use xapi::PeerXapiRole::*;
+        let t0 = std::time::Instant::now();
+        let run = |answers: &[(xapi::PeerXapiRole, PView, bool)]| -> bool {
+            let mut sightings = MismatchSightings::default();
+            for (i, (role, p, _agent_failing)) in answers.iter().enumerate() {
+                let now = t0 + Duration::from_secs(60 * i as u64);
+                // As the daemon does: no probe while P is false.
+                let role = if p.p { role.clone() } else { Unreachable };
+                let (s, confirmed) = armed_mismatch_confirm(sightings, &role, now);
+                sightings = s;
+                if peer_emergency_decision(true, Some(true), p, confirmed, sightings.open(), false, false)
+                    == PeerEmergencyAction::Resolve
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        let cut = PView::default();
+        let settling = |s: u64| PView {
+            p: true,
+            last_answered: true,
+            answered: 6,
+            probes: 6,
+            true_for: Some(Duration::from_secs(s)),
+            address_known: true,
+            stale: false,
+        };
+        // An isolated slave: 30 minutes across the cut, the agent probe
+        // failing throughout.
+        let r1: Vec<_> = (0..30).map(|_| (Unreachable, cut, true)).collect();
+        assert!(!run(&r1), "no pool HA disable across the cut");
+        // Parks seen from the survivor once P is back:
+        // TCP resets for minutes, then a normal slave answer.
+        let mut park: Vec<_> = (0..20).map(|_| (Unreachable, cut, true)).collect();
+        park.extend((0..4).map(|i| (Unknown, settling(60 * i), true)));
+        park.push((SlaveOf("10.0.0.1".into()), settling(240), false));
+        assert!(!run(&park), "a park and its natural rejoin never resolve");
+        // The heal window: about 3 minutes of reconnection after the network
+        // returns, the agent probe still failing, P settling.
+        let heal: Vec<_> = (0..4).map(|i| (Unknown, settling(60 * i), true)).collect();
+        assert!(!run(&heal), "no action during the natural heal");
+        // A slave wedged disarmed under the armed pool.
+        let wedge = vec![
+            (ArmedMismatch, settling(30), true),
+            (Unknown, settling(90), true),
+            (ArmedMismatch, settling(150), true),
+        ];
+        assert!(run(&wedge), "a confirmed armed-mismatch wedge resolves");
     }
 
     #[test]
@@ -35385,18 +42296,6 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // Domain-0 is excluded by exact match; "Domain-0-clone" is a real guest,
         // so its domid 9 is included and the destroy set equals the count set.
         assert_eq!(domids, ["3", "5", "7", "9"]);
-    }
-
-    #[test]
-    fn fast_maturity_is_a_backstop_to_local_self_clear() {
-        // The master's fast pool-HA cycle must fire strictly after the returning
-        // node's local self-clear (SELF_UNWEDGE_AFTER), never in the same tick, so
-        // a pool-wide cycle cannot race a node mid-rejoin.
-        assert!(PEER_EMERGENCY_FAST_AFTER > SELF_UNWEDGE_AFTER);
-        // Still comfortably under the blind maturity it accelerates...
-        assert!(PEER_EMERGENCY_FAST_AFTER < PEER_EMERGENCY_AFTER);
-        // ...and above the flap-debounce so a single bridged flap can't mature it.
-        assert!(PEER_EMERGENCY_FAST_AFTER > PEER_EMERGENCY_FLAP_TOLERANCE);
     }
 
     #[test]
@@ -35572,7 +42471,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
 
     #[test]
     fn the_hourly_cap_and_the_back_off_are_per_vm() {
-        let now = std::time::Instant::now();
+        let now = clock_with_past(); // no underflow on a host up for minutes
         let min = Duration::from_secs(60);
         assert!(protected_vm_start_due(Option::None, Option::None, now));
         // Started by the watchdog a minute ago: not again within the hour.
@@ -35609,32 +42508,38 @@ Domain-0-clone                               9  1024     1     -b----      10.0
 
     #[test]
     fn protected_vm_can_serve_matrix() {
-        // args: local_serveable, peer_nonserving, incident_open, ha_on, xhad_online
+        // args: local_serveable, peer_nonserving, incident_open, ha_on,
+        // xhad_online, own_lock
         let d = protected_vm_can_serve;
         // Not serveable (stale/suspended local copy): never, whatever else.
-        assert!(!d(false, true, true, true, true));
-        assert!(!d(false, false, true, true, true));
-        // Normal path: serveable, HA on, xhad Online: yes (incident irrelevant).
-        assert!(d(true, false, false, true, true));
-        assert!(d(true, false, true, true, true));
+        assert!(!d(false, true, true, true, true, true));
+        assert!(!d(false, false, true, true, true, true));
+        // Normal path: serveable, HA on, xhad Online, own master lock: yes
+        // (incident irrelevant).
+        assert!(d(true, false, false, true, true, true));
+        assert!(d(true, false, true, true, true, true));
         // Normal path but xhad not Online while the peer is still serving: no
         // (do not race XHA's own restart attempt).
-        assert!(!d(true, false, false, true, false));
+        assert!(!d(true, false, false, true, false, false));
+        // Liveset ground without this host holding the master lock in its own
+        // liveset (a second master, the peer holds the lock): no.
+        assert!(!d(true, false, false, true, true, false));
+        assert!(!d(true, false, true, true, true, false));
         // Peer is a stood-down, non-serving Secondary and a heal episode is
         // open, so our xhad can never reach Online (the liveset cannot form) and
         // pool HA is churning: restart anyway, regardless of ha_on.
-        assert!(d(true, true, true, true, false));
-        assert!(d(true, true, true, false, false)); // ha_on churned off mid-incident: still yes
+        assert!(d(true, true, true, true, false, false));
+        assert!(d(true, true, true, false, false, false)); // ha_on churned off mid-incident: still yes
         // Peer is Secondary but no heal episode is open: an operator's planned
         // demote, a resync target or HA-off maintenance, not a fault stand-down.
         // The relaxed ground must not fire, or we would force-start a VM the
         // operator stopped. Falls back to the liveset ground.
-        assert!(!d(true, true, false, false, false)); // maintenance: HA off, no episode: no
-        assert!(!d(true, true, false, true, false)); // HA on but no episode and xhad down: no
-        assert!(d(true, true, false, true, true)); // ...unless the liveset ground holds on its own
+        assert!(!d(true, true, false, false, false, false)); // maintenance: HA off, no episode: no
+        assert!(!d(true, true, false, true, false, false)); // HA on but no episode and xhad down: no
+        assert!(d(true, true, false, true, true, true)); // ...unless the liveset ground holds on its own
         // The xhad-Online branch still requires ha_on: serveable + xhad Online but
         // HA off and the peer is serving: no.
-        assert!(!d(true, false, false, false, true));
+        assert!(!d(true, false, false, false, true, true));
     }
 
     #[test]
@@ -35757,7 +42662,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // watchdog would enable the host a minute after convergence, and a start
         // or migration here could then reuse the stale attachment.
         let p =
-            std::env::temp_dir().join(format!("twinstor-test-hostenable-{}", std::process::id()));
+            crate::heal_state::test_tmp_dir().join(format!("twinstor-test-hostenable-{}", std::process::id()));
         let path = p.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&p);
         assert!(!boundary_owns_host_enable(&path), "no record");
@@ -35998,41 +42903,163 @@ Domain-0-clone                               9  1024     1     -b----      10.0
 
     #[test]
     fn rearm_after_fence_distinguishes_operator_disable() {
-        // args: rejoined, ha, obligation_present, ha_before_peer_left
-        // Fence: peer rejoined, HA off, no obligation, HA was on before it left: re-arm.
-        assert!(rearm_after_fence_gate(true, Some(false), false, Some(true)));
-        // Operator disable: HA was already off while the peer was alive: no re-arm.
-        assert!(!rearm_after_fence_gate(
-            true,
-            Some(false),
-            false,
-            Some(false)
-        ));
-        // Unknown pre-departure HA (daemon just started, say): fail closed, no re-arm.
-        assert!(!rearm_after_fence_gate(
-            true,
-            Some(false),
-            false,
-            Option::None
-        ));
-        // Not a rejoin edge: never.
-        assert!(!rearm_after_fence_gate(
-            false,
-            Some(false),
-            false,
-            Some(true)
-        ));
-        // HA already on (nothing to re-arm): never.
-        assert!(!rearm_after_fence_gate(true, Some(true), false, Some(true)));
-        // An obligation is pending: the normal re-arm path owns it, not this catch-all.
-        assert!(!rearm_after_fence_gate(true, Some(false), true, Some(true)));
-        // HA unknown this tick: never (act only on a confirmed off).
-        assert!(!rearm_after_fence_gate(
-            true,
-            Option::None,
-            false,
-            Some(true)
-        ));
+        use super::RejoinHaOff::*;
+        // args: rejoined, ha, record_present, ha_before_peer_left
+        // HA seen on while the peer was live, off at its rejoin, no record:
+        // it went off while the peer was away, not by TwinStor. Alert only.
+        assert_eq!(rejoin_ha_off(true, Some(false), false, Some(true)), OffWhilePeerAway);
+        // HA already seen off while the peer was live: an earlier disable.
+        assert_eq!(rejoin_ha_off(true, Some(false), false, Some(false)), OffBeforePeerLeft);
+        // Never sampled while the peer was live (a master of a few minutes):
+        // its own outcome, never read as an operator disable.
+        assert_eq!(rejoin_ha_off(true, Some(false), false, None), OffBeforeUnknown);
+        // Not a rejoin edge, HA on, HA unread, or a TwinStor record: nothing.
+        assert_eq!(rejoin_ha_off(false, Some(false), false, Some(true)), Nothing);
+        assert_eq!(rejoin_ha_off(true, Some(true), false, Some(true)), Nothing);
+        assert_eq!(rejoin_ha_off(true, None, false, Some(true)), Nothing);
+        assert_eq!(rejoin_ha_off(true, Some(false), true, Some(true)), Nothing);
+        assert_eq!(rejoin_ha_off(true, Some(false), true, None), Nothing);
+    }
+
+    /// The memory of HA "while the peer was live" takes every sample with the
+    /// peer live and HA read, so a master whose samples never saw the peer
+    /// live twice in a row still has it. Replays a master that took over
+    /// minutes before a cut: one live sample with HA on, two with the peer
+    /// gone (the operator disables HA meanwhile), then the rejoin.
+    #[test]
+    fn ha_before_is_kept_from_a_single_live_sample() {
+        use super::RejoinHaOff::*;
+        let samples: [(Option<bool>, Option<bool>); 4] = [
+            (Some(true), Some(true)),   // peer live (a rejoin edge itself), HA on
+            (Some(false), Some(true)),  // peer gone
+            (Some(false), Some(false)), // peer gone, HA disabled meanwhile
+            (Some(true), Some(false)),  // peer rejoins, HA off
+        ];
+        let (mut before, mut prev) = (None, Some(false));
+        let mut last = Nothing;
+        for (live, ha) in samples {
+            let rejoined = prev == Some(false) && live == Some(true);
+            last = rejoin_ha_off(rejoined, ha, false, before);
+            before = ha_at_peer_alive_next(before, live, ha);
+            prev = live;
+        }
+        assert_eq!(last, OffWhilePeerAway);
+        // An unread HA never overwrites what was seen.
+        assert_eq!(ha_at_peer_alive_next(Some(true), Some(true), None), Some(true));
+        // A sample with the peer away keeps it too.
+        assert_eq!(ha_at_peer_alive_next(Some(true), Some(false), Some(false)), Some(true));
+        // After that rejoin, HA off is what was seen with the peer live.
+        assert_eq!(before, Some(false));
+    }
+
+    /// A master move forgets what was seen in the earlier term: a host that
+    /// saw HA off with the peer live, lost mastership, and became master again
+    /// with nothing sampled in between, reads the next rejoin as unknown,
+    /// never "seen off while the peer was live".
+    #[test]
+    fn a_master_move_forgets_ha_seen_in_an_earlier_term() {
+        use super::{RejoinHaOff::*, RejoinWatch};
+        let mut w = RejoinWatch::default();
+        // First term: HA off by the operator while the peer is live.
+        assert_eq!(w.observe(Some(true), Some(false), false), Nothing);
+        assert_eq!(w.observe(Some(true), Some(false), false), Nothing);
+        // An unanswered mastership read in between forgets nothing.
+        let mut kept = w;
+        assert!(!kept.role(Option::None));
+        assert_eq!(kept, w);
+        // Mastership moves to the peer, then back.
+        assert!(!w.role(Some(false)));
+        assert!(w.role(Some(true)));
+        // Second term: the peer is gone at the first sample, back at the next,
+        // pool HA off; nothing about HA was seen in this term.
+        assert_eq!(w.observe(Some(false), Some(false), false), Nothing);
+        assert_eq!(w.observe(Some(true), Some(false), false), OffBeforeUnknown);
+        // Without the move, the same samples read as seen off before.
+        let mut w = RejoinWatch::default();
+        w.observe(Some(true), Some(false), false);
+        w.observe(Some(false), Some(false), false);
+        assert_eq!(w.observe(Some(true), Some(false), false), OffBeforePeerLeft);
+    }
+
+    /// The peer away for less than one 10-minute HA sample (fenced and back),
+    /// an operator's pool HA disable meanwhile: no sample saw the peer not
+    /// live, so without the view's latch there was no rejoin edge and no
+    /// alert. With it, the sample after the peer's return alerts "pool HA is
+    /// off and TwinStor did not turn it off", HA seen on before. Never a
+    /// re-enable (the outcomes alert or log only).
+    #[test]
+    fn a_peer_away_between_two_samples_still_makes_a_rejoin_edge() {
+        use super::{RejoinHaOff::*, RejoinWatch};
+        use crate::arbitration::{PartitionView, peer_away_view};
+        let sample = |away: bool| {
+            let mut w = RejoinWatch::default();
+            assert!(w.role(Some(true)));
+            // Sample 1: the peer live, pool HA on.
+            assert_eq!(w.observe_at(Some(true), Some(true), false, 100), Nothing);
+            // Between samples: the view shows the peer gone/parked, the
+            // operator disables pool HA, the peer comes back.
+            if away {
+                w.peer_was_away(150);
+            }
+            // Sample 2: the peer live again, pool HA off, no record.
+            w.observe(Some(true), Some(false), false)
+        };
+        assert_eq!(sample(false), Nothing, "the 10-minute samples alone miss it");
+        assert_eq!(sample(true), OffWhilePeerAway, "before: on");
+        // HA already seen off while the peer was live: still only a log.
+        let mut w = RejoinWatch::default();
+        w.observe_at(Some(true), Some(false), false, 100);
+        w.peer_was_away(150);
+        assert_eq!(w.observe(Some(true), Some(false), false), OffBeforePeerLeft);
+        // A record of TwinStor's own disable: nothing.
+        let mut w = RejoinWatch::default();
+        w.observe(Some(true), Some(true), false);
+        w.peer_was_away(150);
+        assert_eq!(w.observe(Some(true), Some(false), true), Nothing);
+        // The views that set the latch.
+        for v in [PartitionView::PeerGone, PartitionView::PeerParked, PartitionView::PeerParkedPending, PartitionView::PeerClientIsolated] {
+            assert!(peer_away_view(v), "{v:?}");
+        }
+        for v in [PartitionView::None, PartitionView::Settling, PartitionView::ClientIsolated, PartitionView::ParkedMember] {
+            assert!(!peer_away_view(v), "{v:?}");
+        }
+    }
+
+    /// One report per pool-HA-off episode: after "pool HA is off and
+    /// TwinStor did not turn it off", later samples of the same episode
+    /// report nothing more (the paced "still off" line), until pool HA reads
+    /// on again. And "seen off while the peer was live" stands only on a
+    /// sample taken before the absence the view showed: a sample taken
+    /// during it (a cut-off peer XAPI still read live) makes "before"
+    /// unknown, and a sample taken while the view shows the peer away counts
+    /// the peer not live.
+    #[test]
+    fn an_ha_off_episode_is_reported_once_and_before_means_before() {
+        use super::{RejoinHaOff::*, RejoinWatch};
+        let mut w = RejoinWatch::default();
+        w.observe_at(Some(true), Some(true), false, 100);
+        w.peer_was_away(150);
+        assert_eq!(w.observe_at(Some(true), Some(false), false, 700), OffWhilePeerAway);
+        // The view shows the peer away again, and it returns: same episode.
+        w.peer_was_away(800);
+        assert_eq!(w.observe_at(Some(true), Some(false), false, 1300), AlreadyReported);
+        // Pool HA on again, then off by an operator with the peer present,
+        // then an absence: a new episode, with "before" a genuine sample.
+        assert_eq!(w.observe_at(Some(true), Some(true), false, 1900), Nothing);
+        assert_eq!(w.observe_at(Some(true), Some(false), false, 2500), Nothing);
+        w.peer_was_away(2600);
+        assert_eq!(w.observe_at(Some(true), Some(false), false, 3100), OffBeforePeerLeft);
+        // A "live" sample taken during the absence (XAPI still read the
+        // cut-off peer live): before is unknown, not "seen off".
+        let mut w = RejoinWatch::default();
+        w.observe_at(Some(true), Some(true), false, 100);
+        w.observe_at(Some(true), Some(false), false, 700);
+        w.peer_was_away(500);
+        assert_eq!(w.observe_at(Some(true), Some(false), false, 1300), OffBeforeUnknown);
+        // The view showing the peer away at sample time: not live.
+        assert_eq!(rejoin_peer_live(Some(true), true), Some(false));
+        assert_eq!(rejoin_peer_live(Some(true), false), Some(true));
+        assert_eq!(rejoin_peer_live(Option::None, false), Option::None);
     }
 
     #[test]
@@ -36387,16 +43414,14 @@ Domain-0-clone                               9  1024     1     -b----      10.0
     fn ha_rearm_ts_cap_is_persisted() {
         // The toolstack-restart cap must survive a daemon restart (as the
         // obligation does), or each restart grants fresh restarts and loops the master.
-        let p = std::env::temp_dir().join("twinstor-test-ha-rearm-ts");
-        // SAFETY: test-only env mutation on a var unique to this test.
-        unsafe { std::env::set_var("TWINSTOR_HA_REARM_TS", &p) };
-        ha_rearm_ts_clear();
-        assert_eq!(ha_rearm_ts_read(), (0, 0)); // absent: default
-        ha_rearm_ts_write(1, 12345);
-        assert_eq!(ha_rearm_ts_read(), (1, 12345)); // would survive a process restart
-        ha_rearm_ts_write(REARM_TS_CAP, 99999);
+        let p = format!("{}/rearm-ts", seam_dir("rearm-ts-cap"));
+        ha_rearm_ts_clear(&p);
+        assert_eq!(ha_rearm_ts_read(&p), (0, 0)); // absent: default
+        assert!(ha_rearm_ts_write(&p, 1, 12345));
+        assert_eq!(ha_rearm_ts_read(&p), (1, 12345)); // would survive a process restart
+        assert!(ha_rearm_ts_write(&p, REARM_TS_CAP, 99999));
         // At the cap the escalation predicate refuses regardless of attempt count.
-        let (count, last) = ha_rearm_ts_read();
+        let (count, last) = ha_rearm_ts_read(&p);
         assert_eq!(count, REARM_TS_CAP);
         assert!(!rearm_should_toolstack(
             99,
@@ -36405,8 +43430,37 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             REARM_TS_AFTER,
             REARM_TS_CAP
         ));
-        ha_rearm_ts_clear();
-        assert_eq!(ha_rearm_ts_read(), (0, 0)); // cleared when the obligation clears
+        ha_rearm_ts_clear(&p);
+        assert_eq!(ha_rearm_ts_read(&p), (0, 0)); // cleared when the obligation clears
+    }
+
+    /// The re-arm escalation's toolstack restart is counted against its cap
+    /// before it runs, so a restart that kills or hangs the daemon still
+    /// uses up one; at the cap it does not run.
+    #[tokio::test]
+    async fn the_rearm_toolstack_restart_is_counted_before_it_runs() {
+        let mut sm = seam_sm("rearm-ts-before");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        sm.rearm_attempt = REARM_TS_AFTER;
+        let failed = || Some(RearmEnable::Failed("HA enable in progress".into()));
+        assert!(sm.rearm_enable_followup(failed(), true).await);
+        assert_eq!(seam_actions(&sm, "toolstack-restart count=1"), 1, "{:?}", sm.test_ha.as_ref().unwrap().actions);
+        // At the cap: no restart.
+        assert!(ha_rearm_ts_write(&sm.rearm_ts_path, REARM_TS_CAP, 0));
+        assert!(!sm.rearm_enable_followup(failed(), true).await);
+        assert_eq!(seam_actions(&sm, "toolstack-restart"), 1);
+        // A count that cannot be written: no restart, one alert saying why.
+        let mut sm = seam_sm("rearm-ts-unwritable");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        sm.rearm_attempt = REARM_TS_AFTER;
+        let blocker = format!("{}/not-a-dir", seam_dir("rearm-ts-unwritable-b"));
+        std::fs::write(&blocker, "x").unwrap();
+        sm.rearm_ts_path = format!("{blocker}/rearm-ts");
+        assert!(!sm.rearm_enable_followup(failed(), true).await);
+        assert!(!sm.rearm_enable_followup(failed(), true).await);
+        assert_eq!(seam_actions(&sm, "toolstack-restart"), 0);
+        assert_eq!(seam_actions(&sm, "alert-unqueued: ") , 1, "one alert, paced");
+        assert!(sm.test_ha.as_ref().unwrap().actions.iter().any(|a| a.contains("restart count cannot be written")));
     }
 
     #[test]
@@ -36630,10 +43684,10 @@ Domain-0-clone                               9  1024     1     -b----      10.0
 
     #[test]
     fn ha_obligation_round_trip() {
-        let p = std::env::temp_dir().join("twinstor-test-ha-obligation");
+        let p = crate::heal_state::test_tmp_dir().join("twinstor-test-ha-obligation");
         // SAFETY: test-only env mutation; other tests use the default path.
         unsafe { std::env::set_var("TWINSTOR_HA_REARM_OBLIGATION", &p) };
-        ha_obligation_write("sr-uuid-123", 90);
+        ha_obligation_write("sr-uuid-123", 90, ObligationState::Owed);
         assert_eq!(
             ha_obligation_read(),
             Some(("sr-uuid-123".to_string(), 90, Option::None))
@@ -37100,7 +44154,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
 
     #[test]
     fn scan_xha_log_finds_signals_and_tracks_offset() {
-        let p = std::env::temp_dir().join("twinstor-test-xha-log");
+        let p = crate::heal_state::test_tmp_dir().join("twinstor-test-xha-log");
         std::fs::write(&p, "Jul 09 [info] fine\n").unwrap();
         let (sig, off) = scan_xha_log(p.to_str().unwrap(), 0);
         assert!(!sig.embrace && !sig.storm);
@@ -37143,11 +44197,11 @@ Domain-0-clone                               9  1024     1     -b----      10.0
     async fn episode_id_spans_rounds_and_closes_on_convergence() {
         // The id is minted at first resolution, survives held rounds (one
         // episode, one id), and is closed by the convergence path.
-        let yield_file = std::env::temp_dir().join("twinstor-test-epid-y");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-epid-y");
         std::fs::write(&yield_file, "t").unwrap();
-        let sb = std::env::temp_dir().join("twinstor-test-epid-sb");
+        let sb = crate::heal_state::test_tmp_dir().join("twinstor-test-epid-sb");
         std::fs::write(&sb, "resource=twinstor-data").unwrap();
-        let latch = std::env::temp_dir().join("twinstor-test-epid-l");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-epid-l");
         let _ = std::fs::remove_file(&latch);
 
         let mut s = online_with_peer();
@@ -37190,7 +44244,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // (Secondary, target off) before its verdict flipped. winner_keep
         // convergence must hand back to bring-up: nothing in the Online tick
         // re-promotes, so without this the pool runs on one node.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-demoted-winner-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-demoted-winner-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
 
         let mut s = online_with_peer();
@@ -37254,7 +44308,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             Box::new(ArcDrbd(drbd.clone())),
             Box::new(MockIscsi::new()),
         );
-        sm.marker_path = std::env::temp_dir()
+        sm.marker_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-init-sa-none")
             .to_string_lossy()
             .to_string();
@@ -37288,7 +44342,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // the loser from Init: the local copy is already invalid, so no 45 s
         // verdict sampling is needed and --discard-my-data loses nothing.
         // Convergence hands back to normal bring-up: no promote or target start here.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-init-inc-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-init-inc-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
         let start_called = std::sync::Arc::new(AtomicBool::new(false));
         let stop_called = std::sync::Arc::new(AtomicBool::new(false));
@@ -37333,11 +44387,11 @@ Domain-0-clone                               9  1024     1     -b----      10.0
     async fn init_standalone_latched_yield_resolves_loser_from_init() {
         // An UpToDate disk with the episode latch on disk (fenced after the
         // yield verdict, before the discard): still the loser from Init.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-init-latch-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-init-latch-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
-        let yield_file = std::env::temp_dir().join("twinstor-test-init-latch-y");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-init-latch-y");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
-        let latch = std::env::temp_dir().join("twinstor-test-init-latch-l");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-init-latch-l");
         std::fs::write(&latch, "latched").unwrap();
 
         let drbd = std::sync::Arc::new(MockDrbd::new(syncing_from_peer()));
@@ -37533,7 +44587,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             ("none", None, InitSaOutcome::Hold),
         ];
         for (label, hs, expect) in cases {
-            let sb_marker = std::env::temp_dir().join(format!("twinstor-test-init-fast-{label}"));
+            let sb_marker = crate::heal_state::test_tmp_dir().join(format!("twinstor-test-init-fast-{label}"));
             std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
             let drbd = std::sync::Arc::new(MockDrbd::new(dual_master_standalone()));
             drbd.set_handshake(hs);
@@ -37543,11 +44597,11 @@ Domain-0-clone                               9  1024     1     -b----      10.0
                 Box::new(MockIscsi::new()),
             );
             sm.marker_path = sb_marker.to_string_lossy().to_string();
-            sm.yield_path = std::env::temp_dir()
+            sm.yield_path = crate::heal_state::test_tmp_dir()
                 .join(format!("twinstor-test-init-fast-y-{label}"))
                 .to_string_lossy()
                 .to_string();
-            sm.latch_path = std::env::temp_dir()
+            sm.latch_path = crate::heal_state::test_tmp_dir()
                 .join(format!("twinstor-test-init-fast-l-{label}"))
                 .to_string_lossy()
                 .to_string();
@@ -37578,7 +44632,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // verdict is undecidable on this host (no xe, no pool.conf): Init must
         // act as neither winner nor loser. It falls through to the promote path
         // and leaves the marker for the Online resolver.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-init-und-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-init-und-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
 
         let drbd = std::sync::Arc::new(MockDrbd::new(dual_master_standalone()));
@@ -37588,11 +44642,11 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             Box::new(MockIscsi::new()),
         );
         sm.marker_path = sb_marker.to_string_lossy().to_string();
-        sm.yield_path = std::env::temp_dir()
+        sm.yield_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-init-und-y")
             .to_string_lossy()
             .to_string();
-        sm.latch_path = std::env::temp_dir()
+        sm.latch_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-init-und-l")
             .to_string_lossy()
             .to_string();
@@ -37623,7 +44677,7 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // split-brain marker and an undecidable verdict must not fall through to
         // the promote path (drbdadm primary cannot succeed): it reconnects
         // non-destructively and holds, re-sampling the verdict.
-        let sb = std::env::temp_dir().join("twinstor-test-consistent-sb");
+        let sb = crate::heal_state::test_tmp_dir().join("twinstor-test-consistent-sb");
         std::fs::write(&sb, "resource=twinstor-data").unwrap();
         let mut snapshot = starting_secondary(); // StandAlone + Secondary
         // The parser maps 'Consistent' to Unknown; either way it is not
@@ -37637,11 +44691,11 @@ Domain-0-clone                               9  1024     1     -b----      10.0
             Box::new(MockIscsi::new()),
         );
         sm.marker_path = sb.to_string_lossy().to_string();
-        sm.yield_path = std::env::temp_dir()
+        sm.yield_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-consistent-y")
             .to_string_lossy()
             .to_string();
-        sm.latch_path = std::env::temp_dir()
+        sm.latch_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-consistent-l")
             .to_string_lossy()
             .to_string();
@@ -37701,9 +44755,9 @@ Domain-0-clone                               9  1024     1     -b----      10.0
         // attempt means the peer also offered to discard, so it claims loser
         // too). A node that did not yield kept serving during the partition, so
         // it flips to winner instead of re-offering its served writes forever.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-flip-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-flip-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
-        let latch = std::env::temp_dir().join("twinstor-test-flip-latch");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-flip-latch");
         let _ = std::fs::remove_file(&latch);
 
         let mut status = online_with_peer();
@@ -37813,7 +44867,7 @@ poll_interval_ms = 10
             Box::new(ArcDrbd(drbd.clone())),
             Box::new(MockIscsi::new()),
         );
-        let dir = std::env::temp_dir();
+        let dir = crate::heal_state::test_tmp_dir();
         let f = |n: &str| {
             dir.join(format!(
                 "twinstor-test-wedge-{tag}-{n}-{}",
@@ -38319,7 +45373,7 @@ poll_interval_ms = 10
             Box::new(ArcDrbd(drbd.clone())),
             Box::new(MockIscsi::new()),
         );
-        let latch = std::env::temp_dir().join(format!(
+        let latch = crate::heal_state::test_tmp_dir().join(format!(
             "twinstor-test-latch-promote-{}",
             std::process::id()
         ));
@@ -38338,7 +45392,7 @@ poll_interval_ms = 10
 
     #[test]
     fn fork_records_roundtrip() {
-        let p = std::env::temp_dir().join(format!("twinstor-test-forkrec-{}", std::process::id()));
+        let p = crate::heal_state::test_tmp_dir().join(format!("twinstor-test-forkrec-{}", std::process::id()));
         let p = p.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&p);
         assert_eq!(read_fork_record(&p), None);
@@ -38374,9 +45428,9 @@ poll_interval_ms = 10
         // (both StandAlone). The non-keeper must not flip to a second serving
         // master; it holds down (no force_primary) and parks its discard offer to
         // converge on the keeper, so clients never see a split-brain.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-nk-flip-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-nk-flip-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
-        let latch = std::env::temp_dir().join("twinstor-test-nk-flip-latch");
+        let latch = crate::heal_state::test_tmp_dir().join("twinstor-test-nk-flip-latch");
         let _ = std::fs::remove_file(&latch);
 
         // A non-keeper config: node name > peer name (node-z > node-a).
@@ -38435,7 +45489,7 @@ poll_interval_ms = 10
         // nor re-promote: the elected loser parks its discard offer and holds
         // down, waiting for the winner to take it. Re-promoting here re-splits
         // and re-serves doomed data every ~15 s.
-        let sb_marker = std::env::temp_dir().join("twinstor-test-noflip-sb");
+        let sb_marker = crate::heal_state::test_tmp_dir().join("twinstor-test-noflip-sb");
         std::fs::write(&sb_marker, "resource=twinstor-data").unwrap();
 
         let mut status = online_with_peer();
@@ -38447,7 +45501,7 @@ poll_interval_ms = 10
             Box::new(MockIscsi::new()),
         );
         sm.marker_path = sb_marker.to_string_lossy().to_string();
-        sm.latch_path = std::env::temp_dir()
+        sm.latch_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-noflip-latch")
             .to_string_lossy()
             .to_string();
@@ -38823,11 +45877,11 @@ poll_interval_ms = 10
             Box::new(ArcDrbd(drbd.clone())),
             Box::new(MockIscsi::new()),
         );
-        sm.yield_path = std::env::temp_dir()
+        sm.yield_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-no-yield")
             .to_string_lossy()
             .to_string();
-        sm.latch_path = std::env::temp_dir()
+        sm.latch_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-no-latch")
             .to_string_lossy()
             .to_string();
@@ -38918,7 +45972,7 @@ poll_interval_ms = 10
                 stop_called: iscsi_stop,
             }),
         );
-        let dir = std::env::temp_dir();
+        let dir = crate::heal_state::test_tmp_dir();
         let marker = dir.join(format!("twinstor-test-lb-{tag}-sb"));
         std::fs::write(&marker, "resource=twinstor-data").unwrap();
         sm.marker_path = marker.to_string_lossy().to_string();
@@ -39171,7 +46225,7 @@ poll_interval_ms = 10
         *drbd.current_uuid.lock().unwrap() = Some(0x7266_27B9_52C8_F8A6);
         let (mut sm, marker) = lb_machine(tag, drbd.clone(), guests, iscsi_stop);
         let _ = std::fs::remove_file(&marker);
-        let dir = std::env::temp_dir();
+        let dir = crate::heal_state::test_tmp_dir();
         sm.offer_path = dir
             .join(format!("twinstor-test-{tag}-offer-{}", std::process::id()))
             .to_string_lossy()
@@ -40408,7 +47462,7 @@ poll_interval_ms = 10
         }));
         let fake = std::sync::Arc::new(fake);
         let (mut sm, marker) = lb_machine("yield-exported", drbd.clone(), fake.clone(), iscsi_stop);
-        let yield_file = std::env::temp_dir().join("twinstor-test-lb-yield-exported-marker");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-lb-yield-exported-marker");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
         sm.yield_path = yield_file.to_string_lossy().to_string();
         sm.resolve_split_brain().await;
@@ -40476,7 +47530,7 @@ poll_interval_ms = 10
             fake.clone(),
             std::sync::Arc::new(AtomicBool::new(false)),
         );
-        let yield_file = std::env::temp_dir().join("twinstor-test-lb-yield-marker");
+        let yield_file = crate::heal_state::test_tmp_dir().join("twinstor-test-lb-yield-marker");
         std::fs::write(&yield_file, "2026-01-01 00:00:00").unwrap();
         sm.yield_path = yield_file.to_string_lossy().to_string();
         sm.resolve_split_brain().await;
@@ -40539,7 +47593,7 @@ poll_interval_ms = 10
             fake,
             std::sync::Arc::new(AtomicBool::new(false)),
         );
-        sm.offer_path = std::env::temp_dir()
+        sm.offer_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-lb-offer-landed-unarmed-offer")
             .to_string_lossy()
             .to_string();
@@ -40604,7 +47658,7 @@ poll_interval_ms = 10
             fake,
             std::sync::Arc::new(AtomicBool::new(false)),
         );
-        sm.offer_path = std::env::temp_dir()
+        sm.offer_path = crate::heal_state::test_tmp_dir()
             .join("twinstor-test-lb-offer-readopt-offer")
             .to_string_lossy()
             .to_string();
@@ -41061,12 +48115,81 @@ poll_interval_ms = 10
         assert_eq!(w, ["x"]);
     }
 
+    /// Every writer of the obligation goes through one function: a standing
+    /// obligation keeps its attempt stamp (a routine in flight may have just
+    /// stamped it), and the file is replaced atomically (no temporary left).
     #[test]
-    fn ntol_parse_keeps_zero_and_rejects_garbage() {
-        assert_eq!(parse_ntol("0\n"), Some(0));
-        assert_eq!(parse_ntol(" 1 "), Some(1));
-        assert_eq!(parse_ntol(""), None);
-        assert_eq!(parse_ntol("<not in database>"), None);
+    fn owing_a_rearm_keeps_the_attempt_stamp_and_writes_atomically() {
+        let dir = seam_dir("obligation-owe");
+        let p = format!("{dir}/obligation");
+        let _ = std::fs::remove_file(&p);
+        ha_obligation_write_at(&p, "sr-1", 120, ObligationState::Owed);
+        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 120, Option::None)));
+        ha_obligation_touch_attempt_at(&p);
+        let stamp = ha_obligation_fields_at(&p).unwrap().2;
+        assert!(stamp.is_some());
+        // A later writer (the tick, say) owes it again: the stamp stays.
+        ha_obligation_write_at(&p, "sr-1", 90, ObligationState::Owed);
+        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 90, stamp)));
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// Writers on several threads at once (the tick and routines off it):
+    /// every read sees a whole file, a standing attempt stamp survives later
+    /// writes, and no temporary file is left behind.
+    #[test]
+    fn concurrent_obligation_writers_never_tear_or_leave_temporaries() {
+        let dir = seam_dir("obligation-concurrent");
+        let p = format!("{dir}/obligation");
+        let _ = std::fs::remove_file(&p);
+        ha_obligation_write_at(&p, "sr-1", 120, ObligationState::Owed);
+        ha_obligation_touch_attempt_at(&p);
+        let stamp = ha_obligation_fields_at(&p).unwrap().2;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let p = p.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if i % 2 == 0 {
+                        ha_obligation_write_at(&p, "sr-1", 120, ObligationState::Owed);
+                    } else {
+                        let f = ha_obligation_fields_at(&p);
+                        assert!(f.is_some(), "a reader saw a partial or missing file");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(ha_obligation_fields_at(&p).unwrap().2, stamp, "the stamp survived");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// An obligation written by an earlier build may carry an `ntol=` entry:
+    /// it is ignored, wherever it sits, and dropped by the next write.
+    #[test]
+    fn an_obligation_with_an_old_ntol_entry_still_reads() {
+        let dir = seam_dir("obligation-ntol");
+        let p = format!("{dir}/obligation");
+        std::fs::write(&p, "sr-1 120 1234 ntol=0").unwrap();
+        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 120, Some(1234))));
+        std::fs::write(&p, "sr-1 120 ntol=0").unwrap();
+        assert_eq!(ha_obligation_fields_at(&p), Some(("sr-1".into(), 120, Option::None)));
+        ha_obligation_touch_attempt_at(&p);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("ntol"), "{text}");
+        assert!(ha_obligation_fields_at(&p).unwrap().2.is_some());
     }
 
     #[test]
@@ -41431,139 +48554,6 @@ poll_interval_ms = 10
     }
 
     #[test]
-    fn debounce_peer_live_bridges_flaps_but_yields_to_sustained_recovery() {
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let tol = Duration::from_secs(180);
-
-        // Debounce off: identity, no tracking.
-        assert_eq!(
-            debounce_peer_live(Some(true), true, None, false, tol, t0),
-            (Some(true), None)
-        );
-        assert_eq!(
-            debounce_peer_live(Some(false), true, None, false, tol, t0),
-            (Some(false), None)
-        );
-
-        // No emergency tracked: pass through even with debounce on.
-        assert_eq!(
-            debounce_peer_live(Some(true), false, None, true, tol, t0),
-            (Some(true), None)
-        );
-
-        // Not live while tracked: pass through, clear the tracker.
-        assert_eq!(
-            debounce_peer_live(Some(false), true, Some(t0), true, tol, t0),
-            (Some(false), None)
-        );
-
-        // First blip to live while tracked: hold Some(false), start the clear clock.
-        let (eff, clr) = debounce_peer_live(Some(true), true, None, true, tol, t0);
-        assert_eq!(eff, Some(false));
-        assert_eq!(clr, Some(t0));
-
-        // Still within tolerance (a flap): keep holding Some(false).
-        let (eff, clr) = debounce_peer_live(
-            Some(true),
-            true,
-            Some(t0),
-            true,
-            tol,
-            t0 + Duration::from_secs(120),
-        );
-        assert_eq!(eff, Some(false));
-        assert_eq!(clr, Some(t0));
-
-        // None (unknown) also counts as "not Some(false)": bridged within tolerance.
-        let (eff, _) = debounce_peer_live(
-            None,
-            true,
-            Some(t0),
-            true,
-            tol,
-            t0 + Duration::from_secs(60),
-        );
-        assert_eq!(eff, Some(false));
-
-        // Sustained clear past tolerance is a real recovery: pass the value, reset.
-        assert_eq!(
-            debounce_peer_live(
-                Some(true),
-                true,
-                Some(t0),
-                true,
-                tol,
-                t0 + Duration::from_secs(181)
-            ),
-            (Some(true), None)
-        );
-
-        // A flap back to not-live before tolerance keeps the clock maturing:
-        // effective stays Some(false), and the caller's since keeps accumulating
-        // toward PEER_EMERGENCY_AFTER instead of resetting.
-        assert_eq!(
-            debounce_peer_live(
-                Some(false),
-                true,
-                Some(t0),
-                true,
-                tol,
-                t0 + Duration::from_secs(90)
-            ),
-            (Some(false), None)
-        );
-    }
-
-    #[test]
-    fn peer_emergency_confirm_matrix() {
-        use std::time::{Duration, Instant};
-        let window = Duration::from_secs(210);
-        let t0 = Instant::now();
-        let resolve_at = Some(t0);
-        // Peer came back live within the window: resolved.
-        assert_eq!(
-            peer_emergency_confirm(Some(true), resolve_at, t0 + Duration::from_secs(30), window),
-            PeerConfirmAction::Confirmed
-        );
-        // Still not live, inside the window: keep confirming (do not re-cycle,
-        // do not claim success).
-        assert_eq!(
-            peer_emergency_confirm(
-                Some(false),
-                resolve_at,
-                t0 + Duration::from_secs(60),
-                window
-            ),
-            PeerConfirmAction::Confirming
-        );
-        assert_eq!(
-            peer_emergency_confirm(None, resolve_at, t0 + Duration::from_secs(60), window),
-            PeerConfirmAction::Confirming
-        );
-        // Window elapsed, peer still not live: the reset did not recruit it.
-        assert_eq!(
-            peer_emergency_confirm(
-                Some(false),
-                resolve_at,
-                t0 + Duration::from_secs(211),
-                window
-            ),
-            PeerConfirmAction::Failed
-        );
-        // Even past the window, a live peer is Confirmed (a late join still wins).
-        assert_eq!(
-            peer_emergency_confirm(
-                Some(true),
-                resolve_at,
-                t0 + Duration::from_secs(500),
-                window
-            ),
-            PeerConfirmAction::Confirmed
-        );
-    }
-
-    #[test]
     fn self_unwedge_fires_only_on_full_stable_signature() {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
@@ -41732,32 +48722,6 @@ poll_interval_ms = 10
                 past
             ),
             SelfUnwedgeAction::Hold
-        );
-    }
-
-    #[test]
-    fn peer_emergency_reset_is_not_confirmed_by_master_side_alone() {
-        use std::time::{Duration, Instant};
-        // The wedge shape: the master issues the reset and its own pool-HA reads
-        // fine, but the peer's agent stays unresponsive for the whole
-        // confirmation window. The confirmation must not resolve; it must Fail
-        // so the master stops claiming success and escalates.
-        let window = Duration::from_secs(210);
-        let t0 = Instant::now();
-        for secs in [0u64, 60, 120, 205] {
-            assert_eq!(
-                peer_emergency_confirm(
-                    Some(false),
-                    Some(t0),
-                    t0 + Duration::from_secs(secs),
-                    window
-                ),
-                PeerConfirmAction::Confirming
-            );
-        }
-        assert_eq!(
-            peer_emergency_confirm(Some(false), Some(t0), t0 + Duration::from_secs(210), window),
-            PeerConfirmAction::Failed
         );
     }
 
@@ -43628,5 +50592,4572 @@ poll_interval_ms = 10
         );
         assert_eq!(sm.state, NodeState::Init);
         freeze_cleanup(&sm);
+    }
+
+    // ---- HA arbitration, Increment 1: fire-time gates -------------------
+
+    fn inc1_sm() -> StateMachine {
+        let (sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(MockDrbd::new(connecting_secondary())),
+            Box::new(MockIscsi::new()),
+        );
+        sm
+    }
+
+    fn p_settling(secs: u64) -> crate::mgmt_reach::PView {
+        crate::mgmt_reach::PView {
+            p: true,
+            last_answered: true,
+            answered: 6,
+            probes: 6,
+            true_for: Some(Duration::from_secs(secs)),
+            address_known: true,
+            stale: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn ha_gate_withholds_without_p_and_absence_repairs_wait_the_settle() {
+        use crate::mgmt_reach::Trigger::*;
+        let mut sm = inc1_sm();
+        // No probe has answered: every gated action is withheld and recorded.
+        assert!(!sm.ha_gate("survivor_ha_reset", Positive));
+        assert!(!sm.ha_gate("ha_deadlock_exit", Absence));
+        assert_eq!(sm.ha_withheld.as_ref().map(|w| w.action), Some("ha_deadlock_exit"));
+        // P holds since 100 s: positive-evidence repairs act, absence-triggered
+        // ones wait out the settle.
+        sm.test_p = Some(p_settling(100));
+        assert!(sm.ha_gate("self_unwedge", Positive));
+        assert!(!sm.ha_gate("masterless_defer_rejoin", Absence));
+        assert!(sm.ha_withheld.as_ref().unwrap().reason.contains("waits"));
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        assert!(sm.ha_gate("masterless_defer_rejoin", Absence));
+        assert!(sm.ha_gate("dual_master_yield", Absence));
+    }
+
+    #[tokio::test]
+    async fn stranded_yield_needs_settle_and_a_master_answer() {
+        let mut sm = inc1_sm();
+        // Holds: P false (the parked or cut-off case).
+        assert!(!sm.stranded_gate("stranded_yield", false).await);
+        // Holds: P settled but the peer is not answering as the master
+        // (parked behind a TCP reset, wedged, or a slave).
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        for role in [
+            xapi::PeerXapiRole::Unknown,
+            xapi::PeerXapiRole::ArmedMismatch,
+            xapi::PeerXapiRole::SlaveOf("10.0.0.1".into()),
+            xapi::PeerXapiRole::Unreachable,
+        ] {
+            sm.test_peer_role = role;
+            sm.peer_role_cache = None;
+            assert!(!sm.stranded_gate("stranded_yield", false).await);
+        }
+        // Acts: settled and the peer is the master.
+        sm.test_peer_role = xapi::PeerXapiRole::Master;
+        sm.peer_role_cache = None;
+        assert!(sm.stranded_gate("stranded_yield", false).await);
+        assert!(sm.stranded_gate("stranded_force_reset", true).await);
+        // Holds: settling.
+        sm.test_p = Some(p_settling(60));
+        assert!(!sm.stranded_gate("stranded_yield", false).await);
+        // Holds: switched off by its key.
+        let mut cfg = (*test_config()).clone();
+        cfg.ha.rejoin_assist = false;
+        sm.config = std::sync::Arc::new(cfg);
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        assert!(!sm.stranded_gate("stranded_yield", false).await);
+    }
+
+    #[test]
+    fn readmission_keys_split_dance_and_revive() {
+        use ReadmissionAction::*;
+        assert_eq!(readmission_keys(Schedule, true, true), Schedule);
+        assert_eq!(readmission_keys(Schedule, false, true), AlertManual);
+        assert_eq!(readmission_keys(Revive, true, true), Revive);
+        assert_eq!(readmission_keys(Revive, true, false), AlertManual);
+        assert_eq!(readmission_keys(Revive, false, true), Revive);
+        assert_eq!(readmission_keys(Schedule, true, false), Schedule);
+        assert_eq!(readmission_keys(Wait, false, false), Wait);
+    }
+
+    /// The local revive and the manual runbook ("stop xhad on both hosts,
+    /// then re-arm") never on a pool whose HA reads off, nor on a host held
+    /// in XAPI's HA startup loop (a parked host still cut off). An unknown
+    /// pool HA proceeds: a slave in a real join deadlock has a forwarded xe
+    /// that times out, and its escalation (and the HA-deadlock exit behind
+    /// it) must still run.
+    #[test]
+    fn readmission_revive_and_runbook_hold_only_on_ha_off_or_park() {
+        use ReadmissionAction::*;
+        for action in [Revive, AlertManual] {
+            assert_eq!(readmission_scope(action, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }), (action, None));
+            assert_eq!(readmission_scope(action, ReadmissionScope { pool_ha: None, startup_loop: false, ..Default::default() }), (action, None));
+            for (ha, park) in [(Some(false), false), (Some(true), true), (None, true)] {
+                let (a, why) = readmission_scope(action, ReadmissionScope { pool_ha: ha, startup_loop: park, ..Default::default() });
+                assert_eq!(a, Wait, "{action:?} with pool HA {ha:?}, parked {park}");
+                assert!(why.is_some());
+            }
+        }
+        // The dance keeps its own fire-time gates; the rest pass unchanged.
+        for action in [Schedule, Wait, Clear, AlertStormFirst] {
+            assert_eq!(readmission_scope(action, ReadmissionScope { pool_ha: None, startup_loop: true, ..Default::default() }), (action, None));
+        }
+    }
+
+    /// An operator's pool HA disable reaching a cut-off slave: its HA daemon
+    /// exits once with "Invalid pool state (1906)" and nothing restarts it
+    /// (the local armed flag goes false with it, so the startup-loop hold
+    /// no longer applies). That exit is local evidence that pool HA is off:
+    /// no revive and no runbook alert, whatever the earlier join failure
+    /// (1903) in the window. A repeating 1906 (the invalid-state wedge, a
+    /// daemon restarted again and again) is not that evidence. A slave cut off
+    /// from its master is held too, armed or not; an unknown pool HA with
+    /// the management network up still proceeds.
+    #[test]
+    fn a_disabled_pool_seen_in_xha_log_holds_the_runbook() {
+        use ReadmissionAction::*;
+        let dir = seam_dir("xha-1906");
+        let log = format!("{dir}/xha.log");
+        let start = "Nov 18 12:13:47 CET 2026 [notice] HA daemon started - built at Nov 13 09:32:08 UTC 2025 - \n";
+        let join_fail = "Nov 18 12:13:33 CET 2026 [err] Could not join the existing liveset (1903) Cannot start HA daemon, because Start Criteria is not met for the local host.  - Abort.\n";
+        let exit = "Nov 18 12:16:05 CET 2026 [err] Invalid pool state (1906).\nNov 18 12:16:06 CET 2026 [notice] HA daemon started shutdown process.\n";
+        std::fs::write(&log, format!("{join_fail}{start}{exit}")).unwrap();
+        let (sig, _) = scan_xha_log(&log, 0);
+        assert!(sig.embrace && sig.pool_ha_off_seen(), "{sig:?}");
+        // Restarted after the exit: not evidence.
+        std::fs::write(&log, format!("{join_fail}{start}{exit}{start}")).unwrap();
+        assert!(!scan_xha_log(&log, 0).0.pool_ha_off_seen());
+        // Cycling (the wedge): two exits in the window, not evidence.
+        std::fs::write(&log, format!("{start}{exit}{start}{exit}")).unwrap();
+        assert!(!scan_xha_log(&log, 0).0.pool_ha_off_seen());
+        // Accumulated across scans as the check does.
+        std::fs::write(&log, format!("{join_fail}{start}")).unwrap();
+        let (a, off2) = scan_xha_log(&log, 0);
+        assert_eq!(a.last_start_invalid_pool, Some(false));
+        std::fs::write(&log, format!("{join_fail}{start}{exit}")).unwrap();
+        let (b, _) = scan_xha_log(&log, off2);
+        let mut acc = a;
+        acc.invalid_pool_exits += b.invalid_pool_exits;
+        if b.last_start_invalid_pool.is_some() {
+            acc.last_start_invalid_pool = b.last_start_invalid_pool;
+        }
+        assert!(acc.pool_ha_off_seen());
+        // The plan: runbook and revive held on that evidence, with pool HA
+        // unreadable; held on a slave cut off from its master.
+        let ha = crate::config::HaConfig::default();
+        for d in [AlertManual, Revive] {
+            let off_seen = ReadmissionScope { pool_ha: Option::None, pool_ha_off_seen: true, ..Default::default() };
+            let (a, why) = readmission_plan(d, &ha, off_seen);
+            assert_eq!(a, Wait);
+            assert!(why.unwrap().contains("1906"));
+            let cut = ReadmissionScope { pool_ha: Option::None, cut_from_master: true, ..Default::default() };
+            assert_eq!(readmission_plan(d, &ha, cut).0, Wait);
+            // Unknown pool HA, management up, no 1906: proceeds.
+            assert_eq!(readmission_plan(d, &ha, ReadmissionScope::default()), (d, Option::None));
+        }
+        assert!(readmission_cut_from_master(false, true, Some(false)));
+        assert!(!readmission_cut_from_master(true, true, Some(false)), "P true");
+        assert!(!readmission_cut_from_master(false, false, Some(false)), "peer not alive");
+        assert!(!readmission_cut_from_master(false, true, Some(true)), "the master");
+    }
+
+    /// A rebooted, still-isolated ex-master is locally armed, its xhad
+    /// is not Online and P is false. Its own dance and every disarm path are
+    /// withheld: the dance's phase-1 gate fails (it is cancelled) and the
+    /// startup-loop lock holds whatever replication says.
+    #[test]
+    fn a_parked_ex_master_is_never_disarmed() {
+        use crate::mgmt_reach::{Gate, PView, Trigger, gate, startup_loop_locked};
+        let cut = PView::default();
+        assert_eq!(gate(&cut, Trigger::Absence), Gate::NotReachable);
+        assert_eq!(gate(&cut, Trigger::Positive), Gate::NotReachable);
+        assert!(startup_loop_locked(Some(true), false, cut.p));
+        // Once the network has returned and XAPI reassembled the pool, the
+        // lock is gone (the host joined: xhad Online).
+        assert!(!startup_loop_locked(Some(true), true, true));
+    }
+
+    // ---- HA arbitration, Increment 1: the re-arm rule -------------------
+
+    #[test]
+    fn rearm_obligation_only_with_a_record() {
+        // An operator disabled pool HA during a slave park; the
+        // peer rejoins. No TwinStor record exists, so no obligation: the
+        // re-arm decision has nothing to do, and the rejoin edge only alerts.
+        assert_eq!(
+            ha_rearm_decision(false, Some(false), Some(true), true, true, true, true, false, true),
+            HaRearmAction::None
+        );
+        assert_eq!(
+            rejoin_ha_off(true, Some(false), false, Some(true)),
+            RejoinHaOff::OffWhilePeerAway
+        );
+        // With a record (an owed re-arm or a local-disarm record), no alert:
+        // the record's own path owns it.
+        assert_eq!(rejoin_ha_off(true, Some(false), true, Some(true)), RejoinHaOff::Nothing);
+        // An owed re-arm still acts once its gates hold, and holds without the
+        // management-plane input (P and the peer shown present).
+        assert_eq!(
+            ha_rearm_decision(true, Some(false), Some(true), true, true, true, true, false, true),
+            HaRearmAction::Attempt
+        );
+        assert_eq!(
+            ha_rearm_decision(true, Some(false), Some(true), true, true, true, false, false, true),
+            HaRearmAction::Hold
+        );
+    }
+
+    #[test]
+    fn masterless_chain_on_an_unarmed_host_owes_no_rearm() {
+        assert!(masterless_rearm_owed(Some(true)));
+        assert!(!masterless_rearm_owed(Some(false)));
+        assert!(!masterless_rearm_owed(None));
+    }
+
+    /// Every `host-emergency-ha-disable` the daemon runs records itself first
+    /// (`note_local_ha_disarm`), so a TwinStor disarm always leaves the record
+    /// the re-arm rule needs. Six sites: the whole-switch fast guard, the
+    /// stranded forced reset, `ha_disable_local` (whole-switch hold,
+    /// stand-downs, slave post-fence disarm), the self-unwedge, the dance's
+    /// phase 1 and the masterless chain.
+    #[test]
+    fn every_local_disarm_site_records_itself() {
+        let src = include_str!("state_machine.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut sites = 0;
+        for (i, l) in lines.iter().enumerate() {
+            let invokes = l.contains("\"host-emergency-ha-disable\",")
+                || l.contains("(xe host-emergency-ha-disable");
+            if !invokes {
+                continue;
+            }
+            sites += 1;
+            let from = i.saturating_sub(12);
+            assert!(
+                lines[from..i].iter().any(|p| p.contains("note_local_ha_disarm()")),
+                "local disarm without a record at line {}",
+                i + 1
+            );
+        }
+        assert_eq!(sites, 6, "the six local-disarm sites");
+    }
+
+    // ---- HA arbitration, Increment 1: second-master demote guard ---------
+
+    fn liveset_masters_xml(local_status: &str, local_master: &str, peer_live: &str, peer_master: &str) -> String {
+        format!(
+            r#"<ha_liveset_info version="1.0">
+  <status>{local_status}</status>
+  <localhost><HostID>AAAA</HostID><HostIndex>0</HostIndex></localhost>
+  <host><HostID>AAAA</HostID><liveness>TRUE</liveness><master>{local_master}</master><statefile_access>TRUE</statefile_access></host>
+  <host><HostID>BBBB</HostID><liveness>{peer_live}</liveness><master>{peer_master}</master><statefile_access>TRUE</statefile_access></host>
+</ha_liveset_info>"#
+        )
+    }
+
+    #[test]
+    fn liveset_master_flags_parse() {
+        let l = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "TRUE", "TRUE")).unwrap();
+        assert!(l.local_online && !l.local_master && l.peer_live && l.peer_master);
+        let l = parse_liveset_masters(&liveset_masters_xml("Online", "TRUE", "TRUE", "FALSE")).unwrap();
+        assert!(l.local_master && !l.peer_master);
+        // The "Starting" output carries this host only: no peer entry.
+        let starting = r#"<ha_liveset_info><status>Starting</status><localhost><HostID>AAAA</HostID></localhost>
+<host><HostID>AAAA</HostID><liveness>TRUE</liveness><master>FALSE</master></host></ha_liveset_info>"#;
+        assert_eq!(parse_liveset_masters(starting), None);
+        assert_eq!(parse_liveset_masters(""), None);
+    }
+
+    /// A partial heal (heartbeat back before HTTP) of an ex-master whose
+    /// `ha_peers` lacks the survivor. The
+    /// returning ex-master's xapi answers as master while its own Online
+    /// liveset names the peer as master. Two reads 30 s apart demote it; one
+    /// read, or a liveset naming this host, never does.
+    #[test]
+    fn a_second_master_is_demoted_on_its_own_liveset_evidence() {
+        use SecondMasterAction::*;
+        let t0 = std::time::Instant::now();
+        let second = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "TRUE", "TRUE"));
+        assert!(second_master_evidence_a(second, true));
+        // First read: watch.
+        assert_eq!(second_master_decision(true, Some(t0), false, false, true, t0), Watch);
+        assert_eq!(
+            second_master_decision(true, Some(t0), false, false, true, t0 + Duration::from_secs(29)),
+            Watch
+        );
+        // Confirming read 30 s later: demote, with no P requirement.
+        assert_eq!(
+            second_master_decision(true, Some(t0), false, false, true, t0 + Duration::from_secs(30)),
+            Demote
+        );
+        // Not allowed (key off, no peer address, budget): alert only.
+        assert_eq!(
+            second_master_decision(true, Some(t0), false, false, false, t0 + Duration::from_secs(30)),
+            AlertOnly
+        );
+        // Holds: this host holds the lock, the local xapi does not answer as
+        // master, the peer is not live, or the local xhad is not Online.
+        let me = parse_liveset_masters(&liveset_masters_xml("Online", "TRUE", "TRUE", "FALSE"));
+        assert!(!second_master_evidence_a(me, true));
+        assert!(!second_master_evidence_a(second, false));
+        let gone = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "FALSE", "TRUE"));
+        assert!(!second_master_evidence_a(gone, true));
+        let joining = parse_liveset_masters(&liveset_masters_xml("Starting", "FALSE", "TRUE", "TRUE"));
+        assert!(!second_master_evidence_a(joining, true));
+        assert!(!second_master_evidence_a(Option::None, true));
+        assert_eq!(second_master_decision(false, Option::None, false, false, true, t0), None);
+    }
+
+    /// A pool disable released a parked ex-master while it was still cut
+    /// off; it came back as a second master. Demoted when the peer is shown
+    /// alive, alert-only when dark; a parked slave, a host with VMs, or one
+    /// with P back never matches.
+    #[test]
+    fn a_released_ex_master_demotes_when_the_peer_is_shown_alive() {
+        use SecondMasterAction::*;
+        let now = std::time::Instant::now();
+        assert!(released_while_cut(true, true, Some(false), true, true, false, Some(0)));
+        assert_eq!(second_master_decision(false, Option::None, true, true, true, now), Demote);
+        assert_eq!(second_master_decision(false, Option::None, true, false, true, now), AlertOnly);
+        // Never seen parked, released by anything but an invalid pool state
+        // (an operator's local emergency disable), still armed, a slave in
+        // pool.conf, not answering as master, P back, VMs running, or the VM
+        // count unreadable: no evidence.
+        assert!(!released_while_cut(false, true, Some(false), true, true, false, Some(0)));
+        assert!(!released_while_cut(true, false, Some(false), true, true, false, Some(0)));
+        assert!(!released_while_cut(true, true, Some(true), true, true, false, Some(0)));
+        assert!(!released_while_cut(true, true, Some(false), false, true, false, Some(0)));
+        assert!(!released_while_cut(true, true, Some(false), true, false, false, Some(0)));
+        assert!(!released_while_cut(true, true, Some(false), true, true, true, Some(0)));
+        assert!(!released_while_cut(true, true, Some(false), true, true, false, Some(2)));
+        assert!(!released_while_cut(true, true, Some(false), true, true, false, Option::None));
+    }
+
+    /// No management-plane probe while P is false: each answers at once with
+    /// what a probe into a cut returned after its timeout.
+    #[tokio::test]
+    async fn no_management_probe_while_p_is_false() {
+        let mut sm = inc1_sm();
+        sm.test_peer_role = xapi::PeerXapiRole::Master;
+        let t0 = std::time::Instant::now();
+        assert_eq!(sm.peer_role_probe().await, xapi::PeerXapiRole::Unreachable);
+        assert_eq!(sm.peer_claims_slave_probe("10.0.0.2").await, Option::None);
+        assert_eq!(sm.peer_agent_probe().await, Some(false));
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        // With P, the role probe answers.
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        assert_eq!(sm.peer_role_probe().await, xapi::PeerXapiRole::Master);
+    }
+
+    /// The dance is gated at its phase-1 firing, not only at scheduling, and
+    /// cancelled when P is false or still settling (a parked ex-master's own
+    /// dance misfired that way in a lab run).
+    #[tokio::test]
+    async fn readmission_dance_is_cancelled_when_p_fails_at_phase_one() {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for p in [None, Some(p_settling(60))] {
+            let mut sm = inc1_sm();
+            sm.test_p = p;
+            sm.readmission_dance_t = Some(now_unix + 30);
+            sm.drive_readmission_dance(now_unix + 30).await;
+            assert_eq!(sm.readmission_dance_t, Option::None, "cancelled");
+            assert!(!sm.readmission_disabled_done, "no local disarm");
+            assert_eq!(
+                sm.ha_withheld.as_ref().map(|w| w.action),
+                Some("readmission_dance_phase1")
+            );
+        }
+    }
+
+    /// The masterless transition needs P, except on the lone-survivor path
+    /// with its own confirmation; a withheld one does not take the cooldown.
+    #[tokio::test]
+    async fn masterless_transition_needs_p_except_for_the_lone_survivor() {
+        let mut sm = seam_sm("masterless");
+        seam(&mut sm).slave_of = Some("127.0.0.1".into()); // slave of itself
+        sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, false)
+            .await;
+        assert_eq!(sm.masterless_last_recover, Option::None, "withheld, cooldown kept");
+        assert_eq!(
+            sm.ha_withheld.as_ref().map(|w| w.action),
+            Some("masterless_transition")
+        );
+        assert_eq!(seam_actions(&sm, "masterless_transition"), 0);
+        // Lone survivor (confirmed dead on every channel): not held by P.
+        seam(&mut sm).peer_dead_liveset = Some(true);
+        sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, true)
+            .await;
+        assert!(sm.masterless_last_recover.is_some());
+        assert_eq!(seam_actions(&sm, "masterless_transition"), 1);
+        // The startup-loop lock holds it even there.
+        let mut sm = seam_sm("masterless-locked");
+        let t = seam(&mut sm);
+        t.slave_of = Some("127.0.0.1".into());
+        t.peer_dead_liveset = Some(true);
+        t.local_armed = Some(true);
+        t.xhad = Some(XhaHostState::Starting);
+        sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, true)
+            .await;
+        assert_eq!(seam_actions(&sm, "masterless_transition"), 0);
+    }
+
+    /// The startup-loop lock and the lone-survivor confirmation cannot meet:
+    /// the lock needs the local xhad not Online, the confirmation needs it
+    /// Online.
+    #[test]
+    fn startup_loop_lock_and_lone_survivor_never_conflict() {
+        for (status, peer_live, peer_sf) in [
+            ("Starting", "FALSE", "FALSE"),
+            ("Starting", "TRUE", "TRUE"),
+            ("Online", "FALSE", "FALSE"),
+        ] {
+            let xml = liveset_xml(status, peer_live, peer_sf);
+            let l = parse_peer_liveset(&xml).unwrap();
+            let lone_survivor_confirmable = l.local_online && !l.peer_live && !l.peer_statefile_access;
+            let locked = crate::mgmt_reach::startup_loop_locked(Some(true), l.local_online, false);
+            assert!(!(lone_survivor_confirmable && locked), "{status}");
+        }
+        // Whatever the peer's replication state, an armed, unjoined, cut-off
+        // host is locked.
+        assert!(crate::mgmt_reach::startup_loop_locked(Some(true), false, false));
+    }
+
+    /// A repair withheld on the peer's answer is re-evaluated every tick; the
+    /// XenAPI login probe behind it runs once per cache period, not per tick.
+    #[tokio::test]
+    async fn withheld_stranded_yield_does_not_probe_every_tick() {
+        let mut sm = inc1_sm();
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        sm.test_peer_role = xapi::PeerXapiRole::Unknown;
+        for _ in 0..20 {
+            assert!(!sm.stranded_gate("stranded_yield", false).await);
+        }
+        assert_eq!(sm.test_role_probes.load(Ordering::Relaxed), 1);
+        // Past the cache period it probes again.
+        sm.peer_role_cache = sm
+            .peer_role_cache
+            .take()
+            .map(|(t, r)| (t - PEER_ROLE_PROBE_TTL, r));
+        assert!(!sm.stranded_gate("stranded_yield", false).await);
+        assert_eq!(sm.test_role_probes.load(Ordering::Relaxed), 2);
+    }
+
+    // ---- HA checks driven through their real call sites (test seam) ------
+
+    /// A private directory under the build tree for one test's files.
+    fn seam_dir(name: &str) -> String {
+        let d = format!(
+            "{}/target/test-ha/{name}-{}",
+            env!("CARGO_MANIFEST_DIR"),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn seam_sm(name: &str) -> StateMachine {
+        let dir = seam_dir(name);
+        let mut sm = inc1_sm();
+        sm.test_ha = Some(TestHa::default());
+        sm.rearm_ts_path = format!("{dir}/rearm-ts");
+        sm.second_master_budget_path = format!("{dir}/budget");
+        sm.peer_emergency_budget_path = format!("{dir}/pe-budget");
+        sm.xha_log_path = format!("{dir}/xha.log");
+        let _ = std::fs::write(&sm.xha_log_path, "");
+        sm
+    }
+
+    fn seam(sm: &mut StateMachine) -> &mut TestHa {
+        sm.test_ha.as_mut().unwrap()
+    }
+
+    /// An instant with a month of room behind it, for tests of pure
+    /// decisions that subtract hours from `now`: `Instant::now() - d` panics
+    /// on a host up for less than `d`.
+    fn clock_with_past() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(30 * 24 * 3600)
+    }
+
+    fn seam_actions(sm: &StateMachine, prefix: &str) -> usize {
+        sm.test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .filter(|a| a.starts_with(prefix))
+            .count()
+    }
+
+    fn append_log(path: &str, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    /// The second-master shape with evidence (a): master in pool.conf,
+    /// answering as master, its own liveset naming the peer as master.
+    fn second_master_shape(sm: &mut StateMachine) {
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(sm);
+        t.conf_master = Some(true);
+        t.local_armed = Some(true);
+        t.xapi_master = Some(true);
+        t.vms = Some(0);
+        t.addr_answers = true;
+        t.liveset = parse_liveset_masters(&liveset_masters_xml("Online", "FALSE", "TRUE", "TRUE"));
+    }
+
+    /// One confirmed read of evidence (a): the check ran 30 s ago.
+    async fn confirmed_check(sm: &mut StateMachine) {
+        sm.second_master_checked_at = None;
+        sm.second_master_a_since = Some(std::time::Instant::now() - SECOND_MASTER_CONFIRM);
+        sm.check_second_master().await;
+    }
+
+    /// Move the persisted last demote back past the pace.
+    fn age_last_demote(sm: &StateMachine) {
+        let boot = current_boot_id();
+        let mut b = demote_budget_read(&sm.second_master_budget_path, &boot);
+        b.last_demote = b.last_demote.saturating_sub(SECOND_MASTER_DEMOTE_RETRY.as_secs() + 1);
+        demote_budget_write(&sm.second_master_budget_path, &boot, &b);
+    }
+
+    /// The second-master alert is paced from its delivery: undelivered, it
+    /// is raised again on the next check (never queued, so never stale);
+    /// delivered, not again for a day while the condition holds.
+    #[tokio::test]
+    async fn the_second_master_alert_is_paced_from_its_delivery() {
+        let alerts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("answers as a second pool master")).cloned().collect::<Vec<_>>();
+        let mut sm = seam_sm("second-master-paced");
+        second_master_shape(&mut sm);
+        seam(&mut sm).addr_answers = false;
+        seam(&mut sm).alerts_fail = true;
+        sm.check_second_master().await;
+        confirmed_check(&mut sm).await;
+        confirmed_check(&mut sm).await;
+        let a = alerts(&sm);
+        assert_eq!(a.len(), 2, "raised again while undelivered: {a:?}");
+        assert!(a.iter().all(|x| x.starts_with("alert-unqueued: ")), "{a:?}");
+        assert_eq!(demote_budget_read(&sm.second_master_budget_path, &current_boot_id()).last_alert, 0);
+        seam(&mut sm).alerts_fail = false;
+        confirmed_check(&mut sm).await;
+        assert_ne!(demote_budget_read(&sm.second_master_budget_path, &current_boot_id()).last_alert, 0);
+        confirmed_check(&mut sm).await;
+        assert_eq!(alerts(&sm).len(), 3, "delivered: paced");
+    }
+
+    /// Condition alerts are withdrawn from the queue when their condition
+    /// ends: the isolated-master alerts of both sides when the isolation clock clears,
+    /// a reset-hold alert when its hold ends, the first-sighting alert when
+    /// its wedge ends, the disarmed host's own alert once it reads armed.
+    #[tokio::test]
+    async fn condition_alerts_are_withdrawn_when_their_condition_ends() {
+        let forgets = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.starts_with("forget-")).cloned().collect::<Vec<_>>();
+        // Isolation: each clear path withdraws every isolated-master variant
+        // of both sides; with no clock running nothing is withdrawn.
+        let all = [MASTER_ISOLATED_ALERT, MASTER_ISOLATED_HA_OFF_ALERT, ISOLATED_MASTER_IN_LIVESET_ALERT,
+                   isolated_master_unknown_liveset_alert(false), isolated_master_unknown_liveset_alert(true)];
+        let withdrew_all = |sm: &StateMachine| {
+            let f = forgets(sm);
+            all.iter().all(|b| f.contains(&format!("forget-alert: {b}")))
+        };
+        let t = std::time::Instant::now();
+        // Master side, the isolation over.
+        let mut sm = seam_sm("withdraw-isolation-master");
+        sm.master_isolation_ended();
+        assert!(forgets(&sm).is_empty(), "no episode, nothing to withdraw");
+        sm.master_isolated_since = Some(t);
+        sm.master_isolated_alerted_at = Some(t);
+        sm.master_isolation_ended();
+        assert!(withdrew_all(&sm), "{:?}", forgets(&sm));
+        assert!(sm.master_isolated_since.is_none() && sm.master_isolated_alerted_at.is_none());
+        // Master side, no longer master.
+        let mut sm = seam_sm("withdraw-isolation-demoted");
+        sm.master_isolated_since = Some(t);
+        sm.master_isolation_ended_not_master();
+        assert!(withdrew_all(&sm) && sm.master_isolated_since.is_none());
+        // Connected side, the master answers again (P) before the clock
+        // clears: withdrawn at once, and once.
+        let mut sm = seam_sm("withdraw-isolation-answers");
+        sm.isolated_master_since = Some(t);
+        sm.isolated_master_answers_again(true);
+        assert!(forgets(&sm).is_empty(), "no alert raised");
+        sm.isolated_master_alerted_at = Some(t);
+        sm.isolated_master_answers_again(false);
+        assert!(forgets(&sm).is_empty(), "still silent");
+        sm.isolated_master_answers_again(true);
+        assert!(withdrew_all(&sm), "{:?}", forgets(&sm));
+        let n = forgets(&sm).len();
+        sm.isolated_master_answers_again(true);
+        assert_eq!(forgets(&sm).len(), n, "once per alert");
+        assert!(sm.isolated_master_since.is_some(), "the clock itself keeps its debounce");
+        // Connected side, the clock cleared.
+        let mut sm = seam_sm("withdraw-isolation-connected");
+        sm.isolated_master_since = Some(t);
+        sm.isolated_master_alerted_at = Some(t);
+        sm.isolated_master_cleared();
+        assert!(withdrew_all(&sm), "{:?}", forgets(&sm));
+        assert!(sm.isolated_master_since.is_none() && sm.isolated_master_alerted_at.is_none());
+        // A reset hold ended, or replaced by another: its alert goes.
+        let mut sm = seam_sm("withdraw-hold");
+        sm.set_peer_emergency_hold(Some((1000, "x".into())));
+        sm.set_peer_emergency_hold(Some((1000, "x".into())));
+        assert!(forgets(&sm).is_empty(), "the same hold: kept");
+        sm.set_peer_emergency_hold(Option::None);
+        assert_eq!(forgets(&sm), vec![format!("forget-advice: {}", peer_emergency_hold_key(1000))]);
+        // The first-sighting alert's wedge ended.
+        let mut sm = seam_sm("withdraw-first");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget { disarm_alerted: 77, ..Default::default() });
+        sm.peer_disarm_mark_clear();
+        assert_eq!(forgets(&sm), vec![format!("forget-advice: {}", peer_disarm_first_key(77))]);
+        // The disarmed host reads armed again.
+        let mut sm = seam_sm("withdraw-disarmed");
+        sm.self_unwedge_vm_alert_raised = true;
+        sm.self_unwedge_episode_reset(Some(false));
+        assert!(forgets(&sm).is_empty());
+        sm.self_unwedge_episode_reset(Some(true));
+        assert_eq!(forgets(&sm), vec![format!("forget-advice: {}", disarmed_host_alert_key(&sm.config.node.name))]);
+    }
+
+    /// The second-master demote waits for a pool HA cycle in flight, as
+    /// every HA actuator does, and acts on the next pass once it returned.
+    #[tokio::test]
+    async fn the_second_master_demote_waits_for_a_cycle_in_flight() {
+        let mut sm = seam_sm("demote-inflight");
+        second_master_shape(&mut sm);
+        sm.check_second_master().await;
+        sm.ha_reset_inflight.store(true, Ordering::SeqCst);
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        assert_eq!(sm.ha_withheld.as_ref().map(|w| w.action), Some("second_master_demote"));
+        sm.ha_reset_inflight.store(false, Ordering::SeqCst);
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+    }
+
+    #[tokio::test]
+    async fn second_master_demote_is_capped_and_paced_across_its_own_demotes() {
+        let mut sm = seam_sm("cap");
+        second_master_shape(&mut sm);
+        // A first read only watches.
+        sm.check_second_master().await;
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        for n in 1..=SECOND_MASTER_DEMOTE_CAP as usize {
+            confirmed_check(&mut sm).await;
+            assert_eq!(seam_actions(&sm, "demote"), n);
+            // The demote rewrote pool.conf to slave: one check sees a slave,
+            // then the second master is back. The count must survive that.
+            seam(&mut sm).conf_master = Some(false);
+            sm.second_master_checked_at = None;
+            sm.check_second_master().await;
+            seam(&mut sm).conf_master = Some(true);
+            // Paced: an immediate retry does not demote.
+            confirmed_check(&mut sm).await;
+            assert_eq!(seam_actions(&sm, "demote"), n, "paced");
+            age_last_demote(&sm);
+        }
+        // Budget spent: alert only (at most once a day), never another demote.
+        for _ in 0..3 {
+            confirmed_check(&mut sm).await;
+            age_last_demote(&sm);
+        }
+        assert_eq!(seam_actions(&sm, "demote"), SECOND_MASTER_DEMOTE_CAP as usize);
+        let spent = sm
+            .test_ha
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .filter(|a| a.contains("is not demoting itself automatically"))
+            .count();
+        assert_eq!(spent, 1, "daily cadence");
+    }
+
+    #[test]
+    fn demote_budget_persists_per_boot_and_resets_after_a_quiet_episode() {
+        let dir = seam_dir("budget");
+        let path = format!("{dir}/budget");
+        let b = DemoteBudget {
+            count: 3,
+            last_demote: 1000,
+            last_alert: 0,
+            last_evidence: 1000,
+        };
+        demote_budget_write(&path, "boot-a", &b);
+        // A daemon restart in the same boot reads it back.
+        assert_eq!(demote_budget_read(&path, "boot-a"), b);
+        // Another boot starts afresh.
+        assert_eq!(demote_budget_read(&path, "boot-b"), DemoteBudget::default());
+        assert!(!demote_budget_allows(&b, 1000 + 3600));
+        // Evidence keeps the episode open; hours of quiet end it.
+        assert_eq!(demote_budget_age(b, true, 1000 + 3600).count, 3);
+        let quiet = demote_budget_age(b, false, 1000 + SECOND_MASTER_EPISODE_QUIET);
+        assert_eq!(quiet.count, 0);
+        assert!(demote_budget_allows(&quiet, 1000 + SECOND_MASTER_EPISODE_QUIET));
+        assert_eq!(demote_budget_age(b, false, 1000 + SECOND_MASTER_EPISODE_QUIET - 1).count, 3);
+    }
+
+    #[tokio::test]
+    async fn the_demote_budget_survives_a_daemon_restart() {
+        let mut sm = seam_sm("restart");
+        second_master_shape(&mut sm);
+        for _ in 0..SECOND_MASTER_DEMOTE_CAP {
+            confirmed_check(&mut sm).await;
+            age_last_demote(&sm);
+        }
+        assert_eq!(seam_actions(&sm, "demote"), SECOND_MASTER_DEMOTE_CAP as usize);
+        // A new daemon on the same boot, same state file.
+        let path = sm.second_master_budget_path.clone();
+        let mut again = seam_sm("restart-2");
+        again.second_master_budget_path = path;
+        second_master_shape(&mut again);
+        confirmed_check(&mut again).await;
+        assert_eq!(seam_actions(&again, "demote"), 0, "no fresh budget after a restart");
+    }
+
+    #[tokio::test]
+    async fn no_demote_toward_a_management_address_that_does_not_answer() {
+        let mut sm = seam_sm("addr");
+        second_master_shape(&mut sm);
+        seam(&mut sm).addr_answers = false;
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        let t = sm.test_ha.as_ref().unwrap();
+        assert!(t.actions.iter().any(|a| a.contains("does not answer")), "{:?}", t.actions);
+        // The address answers: the demote runs.
+        seam(&mut sm).addr_answers = true;
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+    }
+
+    #[tokio::test]
+    async fn evidence_a_is_read_on_a_locally_disarmed_host_too() {
+        let mut sm = seam_sm("disarmed");
+        second_master_shape(&mut sm);
+        seam(&mut sm).local_armed = Some(false);
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+    }
+
+    /// A parked, then released, ex-master: evidence (b).
+    fn parked_shape(sm: &mut StateMachine) {
+        sm.test_p = Some(crate::mgmt_reach::PView::default());
+        let t = seam(sm);
+        t.conf_master = Some(true);
+        t.local_armed = Some(true);
+        t.xapi_master = Some(true);
+        t.vms = Some(0);
+        t.xhad = Some(XhaHostState::Starting);
+        t.beacon_ok = true;
+        t.addr_answers = true;
+    }
+
+    async fn check_now(sm: &mut StateMachine) {
+        sm.second_master_checked_at = None;
+        sm.check_second_master().await;
+    }
+
+    #[tokio::test]
+    async fn a_park_is_seen_only_on_a_failed_join_never_on_a_timeout_or_a_boot() {
+        let mut sm = seam_sm("park");
+        parked_shape(&mut sm);
+        // A boot: armed, cut off, xhad Starting, its join not (yet) failing.
+        check_now(&mut sm).await;
+        check_now(&mut sm).await;
+        assert!(!sm.seen_parked);
+        // gethoststate does not answer: no park, even with a failed join.
+        seam(&mut sm).xhad = Option::None;
+        sm.park_log_offset = Option::None;
+        check_now(&mut sm).await;
+        append_log(&sm.xha_log_path, "ha_start_daemon: Could not join the existing liveset (1903)");
+        check_now(&mut sm).await;
+        assert!(!sm.seen_parked, "a timeout never confirms a park");
+        // An explicit not-Online answer and a failed join after it: parked.
+        seam(&mut sm).xhad = Some(XhaHostState::Starting);
+        check_now(&mut sm).await;
+        append_log(&sm.xha_log_path, "ha_start_daemon: Could not join the existing liveset (1903)");
+        check_now(&mut sm).await;
+        assert!(sm.seen_parked);
+        // P back: forgotten.
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        check_now(&mut sm).await;
+        assert!(!sm.seen_parked);
+    }
+
+    async fn park_and_release(
+        sm: &mut StateMachine,
+        invalid_pool_state: bool,
+        vms: Option<u32>,
+        peer_shown_alive: bool,
+    ) {
+        parked_shape(sm);
+        check_now(sm).await;
+        append_log(&sm.xha_log_path, "Could not join the existing liveset (1903)");
+        check_now(sm).await;
+        assert!(sm.seen_parked);
+        if invalid_pool_state {
+            append_log(&sm.xha_log_path, "xhad: Invalid pool state, exiting");
+        }
+        let t = seam(sm);
+        t.local_armed = Some(false);
+        t.xhad = Some(XhaHostState::Down);
+        t.vms = vms;
+        t.beacon_ok = peer_shown_alive;
+        t.drbd_connected = peer_shown_alive;
+        check_now(sm).await;
+    }
+
+    #[tokio::test]
+    async fn a_release_by_a_pool_disable_demotes_when_the_peer_is_shown_alive() {
+        let mut sm = seam_sm("release");
+        park_and_release(&mut sm, true, Some(0), true).await;
+        assert!(sm.released_by_pool);
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_operator_local_disarm_of_a_lone_master_is_not_a_release() {
+        let mut sm = seam_sm("operator");
+        park_and_release(&mut sm, false, Some(0), true).await;
+        assert!(!sm.released_by_pool);
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        assert_eq!(seam_actions(&sm, "alert"), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_vm_count_never_reads_as_zero() {
+        let mut sm = seam_sm("vms");
+        park_and_release(&mut sm, true, Option::None, true).await;
+        assert!(sm.released_by_pool);
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        check_now(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        // Readable and zero: the same release demotes.
+        seam(&mut sm).vms = Some(0);
+        check_now(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dark_release_alerts_without_reset_master_advice() {
+        let mut sm = seam_sm("dark");
+        park_and_release(&mut sm, true, Some(0), false).await;
+        assert!(sm.released_by_pool);
+        assert_eq!(seam_actions(&sm, "demote"), 0);
+        let t = sm.test_ha.as_ref().unwrap();
+        let alert = t.actions.iter().find(|a| a.starts_with("alert")).expect("alert");
+        assert!(!alert.contains("reset-master"), "{alert}");
+    }
+
+    /// The older signature is retired: a peer whose agent does not answer,
+    /// alive on replication, with P settled for hours, while its xapi answers
+    /// as a slave or as master (the whole-switch and stand-down release
+    /// states), never draws the pool HA reset.
+    #[tokio::test]
+    async fn peer_emergency_never_acts_on_an_unanswering_agent_alone() {
+        for role in [
+            xapi::PeerXapiRole::SlaveOf("10.0.0.1".into()),
+            xapi::PeerXapiRole::Master,
+            xapi::PeerXapiRole::Unknown,
+        ] {
+            let mut sm = seam_sm("pe-retired");
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(false);
+            sm.test_peer_role = role;
+            for _ in 0..30 {
+                sm.check_peer_emergency().await;
+            }
+            assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        }
+    }
+
+    /// The peer's role is probed at every check while pool HA is on and P
+    /// holds, on a quiet healthy pool too (a wedge made there shows nothing
+    /// else); never while P is false. A probe answering as a slave starts
+    /// nothing.
+    #[tokio::test]
+    async fn the_peer_role_is_probed_at_every_check_while_p_holds() {
+        let mut sm = seam_sm("pe-every-check");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        let probes = |sm: &StateMachine| sm.test_role_probes.load(Ordering::Relaxed);
+        for n in 1..=12 {
+            sm.check_peer_emergency().await;
+            assert_eq!(probes(&sm), n);
+        }
+        // P false: no probe goes out.
+        sm.test_p = Some(crate::mgmt_reach::PView::default());
+        sm.check_peer_emergency().await;
+        assert_eq!(probes(&sm), 12);
+        // Pool HA off: none either.
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).pool_ha = Some(false);
+        sm.check_peer_emergency().await;
+        assert_eq!(probes(&sm), 12);
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        assert!(peer_role_probe_wanted(Some(true), true));
+        assert!(!peer_role_probe_wanted(Some(true), false));
+        assert!(!peer_role_probe_wanted(Option::None, true));
+    }
+
+    /// Through the real check: a sighting opens; between the minute's
+    /// checks nothing is probed until 30 s have passed, then the check
+    /// re-probes on its own; a single HOST_IS_SLAVE from the wedged slave's
+    /// xapi restart in between does not reset it; the second sighting
+    /// confirms and the reset fires.
+    #[tokio::test]
+    async fn peer_emergency_reprobes_after_30s_and_rides_a_restart_answer() {
+        let mut sm = seam_sm("pe-reprobe");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(false);
+        let probes = |sm: &StateMachine| sm.test_role_probes.load(Ordering::Relaxed);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.host_enable_ticks = 0;
+        sm.check_peer_emergency().await;
+        assert!(sm.peer_mismatch.open());
+        assert_eq!(probes(&sm), 1);
+        // Off the minute, inside the gap: no probe.
+        sm.host_enable_ticks = 7;
+        sm.check_peer_emergency().await;
+        assert_eq!(probes(&sm), 1);
+        // The slave's xapi restarting answers HOST_IS_SLAVE once (a minute
+        // check): kept.
+        sm.host_enable_ticks = 0;
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        sm.check_peer_emergency().await;
+        assert!(sm.peer_mismatch.open());
+        // 30 s after the first sighting, off the minute: re-probed, confirmed.
+        let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+        sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+        // Inside the gap since the last probe (the restart answer), off the
+        // minute: not yet, then once the gap has passed.
+        sm.host_enable_ticks = 11;
+        sm.check_peer_emergency().await;
+        assert_eq!(probes(&sm), 2);
+        sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        sm.host_enable_ticks = 13;
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.check_peer_emergency().await;
+        assert_eq!(probes(&sm), 3);
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+    }
+
+    /// Through the real check: a confirmation held back (another pool HA
+    /// cycle in flight) does not fire later on a pass whose probe finds the
+    /// peer healed; P going false clears the sightings.
+    #[tokio::test]
+    async fn a_held_confirmation_never_fires_on_a_healthy_answer() {
+        let mut sm = seam_sm("pe-held-healed");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(false);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.check_peer_emergency().await;
+        sm.peer_mismatch.first = sm.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        // Confirmed while another cycle is in flight: held.
+        sm.ha_reset_inflight.store(true, Ordering::SeqCst);
+        sm.check_peer_emergency().await;
+        assert!(sm.peer_mismatch.confirmed());
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        // The hold lifts; the peer has healed meanwhile and answers as a
+        // slave: no reset on that pass.
+        sm.ha_reset_inflight.store(false, Ordering::SeqCst);
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        // P false: cleared.
+        sm.test_p = Some(crate::mgmt_reach::PView::default());
+        sm.check_peer_emergency().await;
+        assert!(!sm.peer_mismatch.open());
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_emergency_positive_trigger_through_its_call_site() {
+        let mut sm = seam_sm("pe-positive");
+        // P holds but is still settling: the positive trigger needs no settle.
+        sm.test_p = Some(p_settling(60));
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(false);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0, "one sighting only");
+        sm.peer_mismatch.first = sm.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+        // Holds: a healthy peer answering as a slave.
+        let mut sm = seam_sm("pe-healthy");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        for _ in 0..3 {
+            sm.check_peer_emergency().await;
+        }
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+    }
+
+    /// A withheld re-assert spends no attempt, no retry stamp and no alert.
+    #[tokio::test]
+    async fn demoted_survivor_budget_is_not_spent_while_withheld() {
+        let mut sm = seam_sm("demoted");
+        let now = std::time::Instant::now();
+        sm.demoted_survivor_reassert(now).await;
+        assert_eq!(sm.demoted_survivor_attempts, 0);
+        assert_eq!(sm.demoted_survivor_action_at, Option::None);
+        assert_eq!(seam_actions(&sm, "alert"), 0);
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        sm.demoted_survivor_reassert(now).await;
+        assert_eq!(sm.demoted_survivor_attempts, 1);
+        assert_eq!(seam_actions(&sm, "alert"), 1);
+    }
+
+    fn ha_task(uuid: &str, created: u64) -> xapi::PendingHaTask {
+        xapi::PendingHaTask {
+            uuid: uuid.into(),
+            name: "Async.pool.enable_ha".into(),
+            created_unix: Some(created),
+        }
+    }
+
+    #[test]
+    fn pending_task_decision_matrix() {
+        let a = 10_000;
+        let own = ha_task("own", a + 3);
+        let stale = a + OWN_TASK_STALE_AFTER;
+        assert_eq!(pending_task_decision(&[], Some(a), stale, true), PendingTaskAction::None);
+        assert_eq!(
+            pending_task_decision(std::slice::from_ref(&own), Some(a), stale, true),
+            PendingTaskAction::Cancel(own.clone())
+        );
+        // Not stale yet, or P false: wait.
+        assert_eq!(
+            pending_task_decision(std::slice::from_ref(&own), Some(a), stale - 1, true),
+            PendingTaskAction::Wait
+        );
+        assert_eq!(
+            pending_task_decision(std::slice::from_ref(&own), Some(a), stale, false),
+            PendingTaskAction::Wait
+        );
+        // Created more than 10 s from the stamp, no stamp, or no creation time:
+        // not TwinStor's.
+        let foreign = ha_task("other", a + 11);
+        assert_eq!(
+            pending_task_decision(std::slice::from_ref(&foreign), Some(a), stale, true),
+            PendingTaskAction::Foreign(foreign.clone())
+        );
+        assert_eq!(
+            pending_task_decision(std::slice::from_ref(&own), Option::None, stale, true),
+            PendingTaskAction::Foreign(own.clone())
+        );
+        let undated = xapi::PendingHaTask { created_unix: Option::None, ..own.clone() };
+        assert_eq!(
+            pending_task_decision(std::slice::from_ref(&undated), Some(a), stale, true),
+            PendingTaskAction::Foreign(undated.clone())
+        );
+    }
+
+    /// The arbitrated baseline shape: a pool HA enable TwinStor issued failed
+    /// and left its task pending, blocking every later re-arm. TwinStor's own
+    /// stale task is cancelled; a task it did not create is reported and left.
+    #[tokio::test]
+    async fn a_stale_own_ha_task_is_cancelled_and_a_foreign_one_is_left_alone() {
+        let now = crate::heal_state::unix_now();
+        let stamp = now - OWN_TASK_STALE_AFTER;
+        let mut sm = seam_sm("task-own");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).pending_tasks = vec![ha_task("own-task", stamp + 2)];
+        assert!(sm.pending_ha_task_holds(Some(stamp)).await);
+        assert_eq!(seam_actions(&sm, "task-cancel: own-task"), 1);
+        // Young: held, not cancelled.
+        let mut sm = seam_sm("task-young");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).pending_tasks = vec![ha_task("young", now - 30)];
+        assert!(sm.pending_ha_task_holds(Some(now - 32)).await);
+        assert_eq!(seam_actions(&sm, "task-cancel"), 0);
+        // Foreign: reported, never cancelled.
+        let mut sm = seam_sm("task-foreign");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).pending_tasks = vec![ha_task("operator-task", stamp - 600)];
+        assert!(sm.pending_ha_task_holds(Some(stamp)).await);
+        assert_eq!(seam_actions(&sm, "task-cancel"), 0);
+        assert_eq!(seam_actions(&sm, "alert"), 1);
+        // None pending: no hold.
+        let mut sm = seam_sm("task-none");
+        assert!(!sm.pending_ha_task_holds(Some(stamp)).await);
+    }
+
+    #[test]
+    fn disarm_record_is_used_once_and_only_in_its_boot() {
+        let rec = "boot_id=b1\nxapi_pid=10\n";
+        assert!(disarm_record_usable(rec, "b1"));
+        assert!(!disarm_record_usable(rec, "b2"));
+        assert!(!disarm_record_usable(rec, ""));
+        assert!(!disarm_record_usable(&format!("{rec}cycled=1\n"), "b1"));
+        assert!(!disarm_record_usable("xapi_pid=10\n", "b1"));
+    }
+
+    #[test]
+    fn recorded_rearm_decision_matrix() {
+        use RecordedRearm::*;
+        let slave = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        let master = xapi::PeerXapiRole::Master;
+        let long = Some(RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER);
+        let d = |rec, ha, armed, live, p, me: Option<bool>, peer: &xapi::PeerXapiRole, hold, task| {
+            recorded_disarm_rearm_decision(rec, ha, armed, live, p, me, peer, hold, task)
+        };
+        // The master acts after 120 s of both hosts live.
+        assert_eq!(d(true, Some(true), Some(false), Some(RECORDED_REARM_LIVESET_FOR), true, Some(true), &slave, false, false), Cycle);
+        // The slave waits 10 minutes more, then acts if still disarmed.
+        assert!(matches!(d(true, Some(true), Some(false), Some(RECORDED_REARM_LIVESET_FOR), true, Some(false), &master, false, false), Wait(_)));
+        assert_eq!(d(true, Some(true), Some(false), long, true, Some(false), &master, false, false), Cycle);
+        // Not this state.
+        assert_eq!(d(false, Some(true), Some(false), long, true, Some(true), &slave, false, false), None);
+        assert_eq!(d(true, Some(false), Some(false), long, true, Some(true), &slave, false, false), None);
+        assert_eq!(d(true, Some(true), Some(true), long, true, Some(true), &slave, false, false), None);
+        // Each gate holds it.
+        for (live, p, peer, hold, task) in [
+            (Some(Duration::from_secs(60)), true, &slave, false, false),
+            (long, false, &slave, false, false),
+            (long, true, &slave, true, false),
+            (long, true, &slave, false, true),
+            (long, true, &master, false, false), // two masters
+            (long, true, &xapi::PeerXapiRole::Unknown, false, false),
+        ] {
+            assert!(matches!(d(true, Some(true), Some(false), live, p, Some(true), peer, hold, task), Wait(_)));
+        }
+        assert!(matches!(d(true, Some(true), Some(false), long, true, Option::None, &master, false, false), Wait(_)));
+    }
+
+    /// One host of the shape: a record of its own disarm in this boot, back
+    /// in its liveset (both live) locally disarmed under the armed pool.
+    fn disarmed_member(name: &str, master: bool) -> StateMachine {
+        let mut sm = seam_sm(name);
+        let dir = std::path::Path::new(&sm.second_master_budget_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        sm.disarm_record_path = dir.join("disarm").to_string_lossy().to_string();
+        std::fs::write(
+            &sm.disarm_record_path,
+            format!("boot_id={}\nxapi_pid=1\n", current_boot_id()),
+        )
+        .unwrap();
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        sm.test_peer_role = if master {
+            xapi::PeerXapiRole::SlaveOf("10.0.0.1".into())
+        } else {
+            xapi::PeerXapiRole::Master
+        };
+        let t = seam(&mut sm);
+        t.pool_ha = Some(true);
+        t.local_armed = Some(false);
+        t.xapi_master = Some(master);
+        t.liveset = parse_liveset_masters(&liveset_masters_xml(
+            "Online",
+            if master { "TRUE" } else { "FALSE" },
+            "TRUE",
+            if master { "FALSE" } else { "TRUE" },
+        ));
+        sm
+    }
+
+    async fn rearm_check_after(sm: &mut StateMachine, live_for: Duration) {
+        sm.recorded_rearm_checked_at = Option::None;
+        if let Some(t) = sm.recorded_rearm_liveset_since.as_mut() {
+            *t = std::time::Instant::now() - live_for;
+        } else {
+            sm.check_recorded_disarm_rearm().await;
+            sm.recorded_rearm_checked_at = Option::None;
+            sm.recorded_rearm_liveset_since = Some(std::time::Instant::now() - live_for);
+        }
+        sm.check_recorded_disarm_rearm().await;
+    }
+
+    /// A one-off report is marked sent only once delivered, so the next
+    /// pass raises it again: the self-clear's report, the re-admission flap
+    /// alert, and paced alerts (marked with `LogPace::mark` on delivery).
+    #[tokio::test]
+    async fn a_one_off_alert_is_owed_until_delivered() {
+        let mut sm = seam_sm("one-off-owed");
+        seam(&mut sm).alerts_fail = true;
+        sm.self_unwedge_report = Some("TwinStor on a: cleared its own local HA state".into());
+        sm.readmission_flap_alert_owed = true;
+        sm.self_unwedge_cleared_send().await;
+        sm.readmission_flap_alert_send().await;
+        assert!(sm.self_unwedge_report.is_some() && sm.readmission_flap_alert_owed, "not delivered: still owed");
+        seam(&mut sm).alerts_fail = false;
+        sm.self_unwedge_cleared_send().await;
+        sm.readmission_flap_alert_send().await;
+        assert!(sm.self_unwedge_report.is_none() && !sm.readmission_flap_alert_owed);
+        let acts = &sm.test_ha.as_ref().unwrap().actions;
+        assert_eq!(acts.iter().filter(|a| a.contains("cleared its own local HA state")).count(), 2);
+        assert_eq!(acts.iter().filter(|a| a.contains("has not completed readmission")).count(), 2);
+        // Never queued: the caller's own next pass is the retry, so no
+        // queued copy can be delivered after its re-send.
+        assert!(acts.iter().filter(|a| a.contains("cleared its own local HA state")).all(|a| a.starts_with("advice-unqueued: ")), "{acts:?}");
+        assert!(acts.iter().filter(|a| a.contains("has not completed readmission")).all(|a| a.starts_with("advice-unqueued: ")), "{acts:?}");
+        sm.self_unwedge_cleared_send().await;
+        let acts = &sm.test_ha.as_ref().unwrap().actions;
+        assert_eq!(acts.iter().filter(|a| a.contains("cleared its own local HA state")).count(), 2, "sent once delivered");
+        let mut pace = LogPace::default();
+        assert!(pace.is_due("k", Duration::from_secs(60)));
+        assert!(pace.is_due("k", Duration::from_secs(60)), "not marked by asking");
+        pace.mark("k");
+        assert!(!pace.is_due("k", Duration::from_secs(60)));
+    }
+
+    /// The self-clear's report follows the command's result: success says
+    /// it returned success, a failure gives its reason and the manual cycle;
+    /// neither claims what was not observed, and the re-arm is said as what
+    /// TwinStor attempts.
+    #[tokio::test]
+    async fn the_self_clear_report_follows_the_command_result() {
+        let report = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("XAPI's HA emergency mode")).cloned().collect::<Vec<_>>();
+        let mut sm = seam_sm("self-clear-ok");
+        sm.self_unwedge_clear().await;
+        let r = report(&sm);
+        assert_eq!(r.len(), 1);
+        assert!(sm.test_ha.as_ref().unwrap().actions.contains(&"emergency-disable-local".to_string()));
+        assert!(r[0].contains("which returned success") && r[0].contains("attempts that cycle"), "{}", r[0]);
+        assert!(!r[0].contains("unaffected") && !r[0].contains("re-arms it"), "{}", r[0]);
+        let mut sm = seam_sm("self-clear-failed");
+        seam(&mut sm).emergency_disable_err = Some("timed out after 30s".into());
+        sm.self_unwedge_clear().await;
+        let r = report(&sm);
+        assert!(r[0].contains("which failed: timed out after 30s") && r[0].contains("'xe pool-ha-disable'"), "{}", r[0]);
+        assert!(!r[0].contains("returned success"));
+        // Undelivered: kept and sent again on the next pass.
+        let mut sm = seam_sm("self-clear-undelivered");
+        seam(&mut sm).alerts_fail = true;
+        sm.self_unwedge_clear().await;
+        assert!(sm.self_unwedge_report.is_some());
+        seam(&mut sm).alerts_fail = false;
+        sm.self_unwedge_cleared_send().await;
+        assert!(sm.self_unwedge_report.is_none());
+        assert_eq!(report(&sm).len(), 2);
+    }
+
+    /// The unplugged-PBD check makes no forwarded xe call while P is false
+    /// on a slave (it timed out at 15 s every minute in the tick); the master
+    /// reads its own xapi, and a slave with P reads as before.
+    #[tokio::test]
+    async fn the_pbd_check_waits_for_p_on_a_slave() {
+        let lists = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| *a == "pbd-list").count();
+        for (role, p, expect) in [
+            (Some(false), false, 0),
+            (Option::None, false, 0),
+            (Some(true), false, 1),
+            (Some(false), true, 1),
+        ] {
+            let mut sm = seam_sm("pbd-check");
+            sm.state = NodeState::Online;
+            seam(&mut sm).conf_master = role;
+            sm.test_p = Some(if p {
+                crate::mgmt_reach::PView::settled_for_test()
+            } else {
+                crate::mgmt_reach::PView::default()
+            });
+            sm.check_pbd_plugged(true).await;
+            assert_eq!(lists(&sm), expect, "role {role:?}, P {p}");
+        }
+    }
+
+    /// The self-unwedge check makes no management-plane read while P is
+    /// false (the pool read and the local login took 20 s on the tick of a
+    /// slave whose master was cut).
+    #[test]
+    fn the_self_unwedge_reads_wait_for_p() {
+        assert!(self_unwedge_reads_futile(false));
+        assert!(!self_unwedge_reads_futile(true));
+    }
+
+    /// The flap and failed-revive alerts say only what was observed: no
+    /// claim that VMs are unaffected; the disarmed host's risk sentence for
+    /// a host locally disarmed under the armed pool.
+    #[test]
+    fn the_flap_and_revive_alerts_say_only_what_was_observed() {
+        let flap = readmission_flap_alert_text(2, 120);
+        assert!(flap.contains(disarmed_host_risk(2)) && flap.contains("ha-config:timeout=120"), "{flap}");
+        assert!(readmission_flap_alert_text(0, 90).contains(disarmed_host_risk(0)));
+        for t in [flap.as_str(), REVIVE_FAILED_ALERT] {
+            assert!(!t.contains("unaffected") && !t.contains("VMs keep running"), "{t}");
+        }
+    }
+
+    /// The demote of a second master that is disarmed, not by TwinStor,
+    /// alerts with the manual pool HA cycle as HA-disable advice (held while
+    /// a host is parked), naming the master and the timeout.
+    #[tokio::test]
+    async fn the_demoted_disarmed_alert_is_advice() {
+        let mut sm = seam_sm("demote-disarmed-advice");
+        sm.disarm_record_path = format!("{}/disarm", seam_dir("demote-disarmed-advice-rec"));
+        seam(&mut sm).local_armed = Some(false);
+        sm.note_demote_while_disarmed().await;
+        let acts = &sm.test_ha.as_ref().unwrap().actions;
+        let a = acts.iter().find(|a| a.contains("demoted from a second pool master")).expect("alerted");
+        assert!(a.starts_with("advice: "), "{a}");
+        assert!(a.contains(&format!("on the pool master {} run", sm.config.node.peer)) && a.contains("ha-config:timeout="), "{a}");
+    }
+
+    /// A source file without its `#[cfg(test)]` modules (wherever they sit
+    /// in the file): every other line is kept. Braces are counted from the
+    /// module's opening line, which is enough for this crate's sources.
+    fn production_code(src: &str) -> String {
+        let mut out = String::new();
+        let mut lines = src.lines().peekable();
+        while let Some(l) = lines.next() {
+            if l.trim() == "#[cfg(test)]"
+                && lines.peek().is_some_and(|n| n.trim_start().starts_with("mod ") && n.trim_end().ends_with('{'))
+            {
+                let mut depth = 0i32;
+                for m in lines.by_ref() {
+                    depth += m.matches('{').count() as i32 - m.matches('}').count() as i32;
+                    if depth <= 0 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Every alert template that names the heartbeat SR uses the one
+    /// placeholder the send point fills (`<twinstor SR uuid>`), and every
+    /// manual pool HA enable in an alert carries the HA timeout. Scans the
+    /// production source of the alert modules: no other SR placeholder
+    /// spelling, and none left after `fill_sr_uuid` with a known uuid.
+    #[test]
+    fn every_sr_placeholder_is_the_one_the_send_point_fills() {
+        let uuid = "00000000-0000-4000-8000-000000000000";
+        for (name, src) in [
+            ("state_machine.rs", include_str!("state_machine.rs")),
+            ("xapi.rs", include_str!("xapi.rs")),
+            ("arbitration.rs", include_str!("arbitration.rs")),
+        ] {
+            let prod = production_code(src);
+            let lines: Vec<&str> = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+            for (i, l) in lines.iter().enumerate() {
+                if let Some(at) = l.find("heartbeat-sr-uuids=") {
+                    let rest = &l[at + "heartbeat-sr-uuids=".len()..];
+                    let filled = crate::xapi::fill_sr_uuid(rest, Some(uuid));
+                    assert!(
+                        rest.starts_with('{') || rest.starts_with('"') || rest.starts_with("`") || rest.is_empty()
+                            || rest.starts_with("<twinstor SR \\") || filled.starts_with(uuid),
+                        "{name}:{}: SR placeholder not filled at send: {l}", i + 1
+                    );
+                }
+                for bad in ["<SR>", "<sr>", "<SR uuid>", "<sr-uuid>", "<heartbeat SR>"] {
+                    assert!(!l.contains(bad), "{name}:{}: {bad}: {l}", i + 1);
+                }
+            }
+        }
+        // The whole production code is scanned, not only what precedes the
+        // first test module.
+        let xapi_prod = production_code(include_str!("xapi.rs"));
+        assert!(xapi_prod.contains("pub async fn local_xapi_role()"), "code after the first test module");
+        assert!(!xapi_prod.contains("mod alert_delivery_tests"));
+        for body in [
+            recorded_rearm_manual("a", "b", 120),
+            demoted_disarmed_alert("a", "b", 120),
+            wedge_alert_body(120),
+        ] {
+            let filled = crate::xapi::fill_sr_uuid(&body, Some(uuid));
+            assert!(filled.contains(&format!("heartbeat-sr-uuids={uuid} ha-config:timeout=120")), "{filled}");
+            assert!(!filled.contains("trap"), "{filled}");
+        }
+    }
+
+    /// The view and hold texts state the re-arm's condition, use the budget
+    /// constants, say the dance's management-network condition once (the
+    /// advice prefix adds it), and use plain words for the disarm risk.
+    #[test]
+    fn the_view_texts_state_their_conditions() {
+        use crate::arbitration::{PartitionView, verdict};
+        let hold = verdict(PartitionView::WholeSwitchHold);
+        assert!(hold.contains("unless auto_resolve_peer_emergency is off"), "{hold}");
+        assert!(WHOLE_SWITCH_HOLD_NEXT.contains("unless auto_resolve_peer_emergency is off"));
+        let pd = verdict(PartitionView::PeerDisarmed);
+        assert!(pd.contains(&format!("at most {PEER_EMERGENCY_BUDGET} resets in {} hours", PEER_EMERGENCY_BUDGET_WINDOW / 3600)), "{pd}");
+        for v in [PartitionView::PeerDisarmed, PartitionView::DisarmedMember] {
+            assert!(!verdict(v).contains("trap"), "{}", verdict(v));
+        }
+        let d = dance_disarmed_alert("a", "b", "x", 120);
+        assert!(!d.contains("management networks are up"), "the advice prefix says it: {d}");
+    }
+
+    /// A disarm record's age: a `written` in the future (the clock stepped
+    /// back) counts as settled.
+    #[test]
+    fn a_record_written_in_the_future_is_settled() {
+        assert_eq!(disarm_record_age("written=1000\n", 1030), Some(30));
+        assert_eq!(disarm_record_age("written=5000\n", 1030), Option::None);
+        assert_eq!(disarm_record_age("boot_id=x\n", 1030), Option::None);
+    }
+
+    /// The whole-switch hold on the master: the fast guard writes the
+    /// disarm record and disarms off the tick, the tick's HA check can run
+    /// before the disarm lands (local still reads armed), then the tick's
+    /// hold, then the release. The record survives all of it, and once both
+    /// hosts are back in the liveset the master's recorded-disarm cycle is
+    /// due. A record that is settled, with no hold, and local armed again is
+    /// spent as before.
+    #[tokio::test]
+    async fn the_masters_disarm_record_survives_the_hold_and_its_repair_runs() {
+        let mut m = disarmed_member("hold-record-master", true);
+        // The fast guard's record, just written.
+        std::fs::write(
+            &m.disarm_record_path,
+            format!("boot_id={}\nxapi_pid=1\nwritten={}\n", current_boot_id(), unix_now_secs()),
+        )
+        .unwrap();
+        m.whole_switch_guard.store(true, Ordering::Relaxed);
+        // The tick's HA check while the guard's disable is still landing.
+        seam(&mut m).local_armed = Some(true);
+        m.check_disarm_trap(Some(true)).await;
+        assert!(std::path::Path::new(&m.disarm_record_path).exists(), "kept while the disarm lands");
+        // Even with the guard flag not seen yet, a fresh record is settling.
+        m.whole_switch_guard.store(false, Ordering::Relaxed);
+        m.check_disarm_trap(Some(true)).await;
+        assert!(std::path::Path::new(&m.disarm_record_path).exists(), "kept while settling");
+        // The tick's hold pass.
+        m.whole_switch_guard.store(true, Ordering::Relaxed);
+        m.whole_switch_held = true;
+        seam(&mut m).local_armed = Some(false);
+        m.check_disarm_trap(Option::None).await;
+        assert!(std::path::Path::new(&m.disarm_record_path).exists());
+        // The release.
+        m.whole_switch_held = false;
+        m.whole_switch_guard.store(false, Ordering::Relaxed);
+        m.check_disarm_trap(Some(true)).await;
+        assert!(std::path::Path::new(&m.disarm_record_path).exists());
+        // Both back in the liveset: the master's repair is due.
+        rearm_check_after(&mut m, RECORDED_REARM_LIVESET_FOR).await;
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
+        // A settled record, no hold, local armed again: spent.
+        let mut m = disarmed_member("hold-record-spent", true);
+        std::fs::write(
+            &m.disarm_record_path,
+            format!("boot_id={}\nxapi_pid=1\nwritten={}\n", current_boot_id(), unix_now_secs() - DISARM_RECORD_SETTLE),
+        )
+        .unwrap();
+        seam(&mut m).local_armed = Some(true);
+        m.check_disarm_trap(Some(true)).await;
+        assert!(!std::path::Path::new(&m.disarm_record_path).exists());
+    }
+
+    /// An unreadable task list is unknown, never "none pending": the
+    /// recorded-disarm re-arm does not cycle, and the re-arm watchdog holds
+    /// (no clear, no enable) until it reads again.
+    #[tokio::test]
+    async fn an_unreadable_task_list_holds_rather_than_reading_as_none() {
+        let mut m = disarmed_member("tasks-unreadable", true);
+        seam(&mut m).pending_unreadable = true;
+        rearm_check_after(&mut m, RECORDED_REARM_LIVESET_FOR).await;
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 0);
+        assert!(m.pending_ha_task_holds(Some(1)).await, "held");
+        assert_eq!(seam_actions(&m, "task-cancel"), 0);
+        // Readable again and empty: no hold, and the cycle runs.
+        seam(&mut m).pending_unreadable = false;
+        assert!(!m.pending_ha_task_holds(Some(1)).await);
+        rearm_check_after(&mut m, RECORDED_REARM_LIVESET_FOR).await;
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
+    }
+
+    /// A task of TwinStor's own that it cannot cancel is tried again on
+    /// later passes, with one alert per period, not one per pass.
+    #[tokio::test]
+    async fn a_failed_cancel_is_retried_with_a_paced_alert() {
+        let mut sm = seam_sm("task-cancel-failed");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let now = crate::heal_state::unix_now();
+        let stamp = now - OWN_TASK_STALE_AFTER;
+        let t = seam(&mut sm);
+        t.cancel_fails = true;
+        t.pending_tasks = vec![xapi::PendingHaTask {
+            uuid: "own".into(),
+            name: "pool.disable_ha".into(),
+            created_unix: Some(stamp),
+        }];
+        for _ in 0..3 {
+            assert!(sm.pending_ha_task_holds(Some(stamp)).await);
+        }
+        assert_eq!(seam_actions(&sm, "task-cancel"), 3, "tried every pass");
+        assert_eq!(seam_actions(&sm, "alert"), 1, "alerted once");
+    }
+
+    /// A routine held at its start by someone else's pending pool HA task,
+    /// with no obligation standing: after the stuck threshold the watchdog
+    /// reports the task, naming it and its age (and leaves it alone);
+    /// before it, nothing.
+    #[tokio::test]
+    async fn a_routine_held_by_a_pending_task_gets_one_report_naming_it() {
+        let mut sm = seam_sm("routine-task-hold");
+        let created = crate::heal_state::unix_now() - 900;
+        seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
+            uuid: "task-1".into(),
+            name: "pool.disable_ha".into(),
+            created_unix: Some(created),
+        }];
+        let since = 1_000;
+        assert!(sm.routine_task_hold_step(since, since + 60).await, "not yet");
+        assert_eq!(seam_actions(&sm, "alert"), 0);
+        assert!(sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER).await);
+        let t = sm.test_ha.as_ref().unwrap();
+        let alert = t.actions.iter().find(|a| a.starts_with("alert")).expect("one report");
+        assert!(alert.contains("pool.disable_ha") && alert.contains("task-1"), "{alert}");
+        assert!(alert.contains("pending for 15 minutes"), "{alert}");
+        assert_eq!(seam_actions(&sm, "task-cancel"), 0, "someone else's: left alone");
+        // Paced: a second pass does not alert again.
+        assert!(sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER + 600).await);
+        assert_eq!(seam_actions(&sm, "alert"), 1);
+        // Gone: the hold ends.
+        seam(&mut sm).pending_tasks.clear();
+        assert!(!sm.routine_task_hold_step(since, since + OWN_TASK_STALE_AFTER + 1200).await);
+    }
+
+    /// The stuck-task clock follows the task: a different task starts it
+    /// afresh and none pending ends it, so an old start never makes a fresh
+    /// task look stuck.
+    #[test]
+    fn the_stuck_task_clock_follows_the_task() {
+        let t = |uuid: &str, created: u64| xapi::PendingHaTask {
+            uuid: uuid.into(),
+            name: "pool.disable_ha".into(),
+            created_unix: Some(created),
+        };
+        let mut h = TaskHold { since: 0, task: String::new() };
+        h.observe(&[t("a", 1)], 100);
+        h.observe(&[t("a", 1)], 500);
+        assert_eq!(h.since, 100, "the same task keeps its clock");
+        h.observe(&[t("b", 1)], 600);
+        assert_eq!(h.since, 600, "a different task starts afresh");
+        h.observe(&[], 700);
+        assert_eq!(h.since, 0, "none pending ends it");
+    }
+
+    /// The dance disarms this host in phase 1 only if its own checks pass:
+    /// with pool HA not reading on, or a pool HA task pending, it is
+    /// cancelled before its local disable; an unreadable task list holds it
+    /// only while more than its normal lead is left before the sync point,
+    /// and cancels it after. Run, it starts the host's own
+    /// re-arm watch.
+    #[tokio::test]
+    async fn the_dance_does_not_disarm_for_a_cycle_that_cannot_start() {
+        let now_unix = crate::heal_state::unix_now();
+        for (pool_ha, tasks, unreadable, runs) in [
+            (Some(true), vec![], false, true),
+            (Some(true), vec![xapi::PendingHaTask { uuid: "t".into(), name: "pool.enable_ha".into(), created_unix: Some(1) }], false, false),
+            (Some(true), vec![], true, false),
+            (Some(false), vec![], false, false),
+            (Option::None, vec![], false, false),
+        ] {
+            let mut sm = seam_sm("dance-precheck");
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.xhad = Some(XhaHostState::Starting);
+            t.pool_ha = pool_ha;
+            t.pending_tasks = tasks;
+            t.pending_unreadable = unreadable;
+            sm.readmission_dance_t = Some(now_unix + 30);
+            sm.drive_readmission_dance(now_unix + 30).await;
+            assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), usize::from(runs), "{pool_ha:?}");
+            assert_eq!(sm.readmission_dance_t.is_some(), runs);
+            assert_eq!(sm.dance_disarm_watch, runs.then_some(now_unix + 30 + DANCE_REARM_WAIT));
+        }
+        // Unreadable when phase 1's window opens (the time left is then at
+        // most the lead): not held into a shorter quiet period, cancelled.
+        let mut sm = seam_sm("dance-precheck-hold");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.xhad = Some(XhaHostState::Starting);
+        t.pool_ha = Some(true);
+        t.pending_unreadable = true;
+        let at = now_unix + 150;
+        sm.readmission_dance_t = Some(at);
+        sm.drive_readmission_dance(at).await;
+        assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), 0);
+        assert_eq!(sm.readmission_dance_t, Option::None, "cancelled, never fired late");
+        // The hold lasts only while more than the normal lead (T + 60 s) is
+        // left: at T + 60 s or less, the dance is cancelled.
+        let lead = 120 + 60;
+        assert_eq!(dance_phase1_check(Some(true), Option::None, lead + 1, lead), DancePhase1::Hold("XAPI's task list is unreadable"));
+        assert!(matches!(dance_phase1_check(Some(true), Option::None, lead, lead), DancePhase1::Cancel(_)));
+        assert!(matches!(dance_phase1_check(Some(true), Option::None, 121, lead), DancePhase1::Cancel(_)));
+    }
+
+    /// The re-admission plan: with the default keys (the dance on), a join
+    /// deadlock (the embrace signature, storage healthy, the peer reachable)
+    /// plans the dance once the suspicion window has run. With the dance
+    /// explicitly off it plans the manual-runbook branch (`AlertManual`,
+    /// whose arm raises the runbook alert and runs the HA-deadlock exit),
+    /// with pool HA read on or unknown (the slave's forwarded read times
+    /// out); held in XAPI's startup loop. A dead, silent HA daemon plans the
+    /// local revive either way. (Pool HA read off never reaches the plan: the
+    /// check stands down before it.)
+    #[test]
+    fn the_readmission_plan_with_the_dance_off_turns_it_into_the_runbook_branch() {
+        let on = crate::config::HaConfig::default();
+        assert!(on.readmission_assist && on.rejoin_assist, "both on by default");
+        let ha = crate::config::HaConfig { readmission_assist: false, ..on.clone() };
+        let t0 = std::time::Instant::now();
+        let embrace = XhaLogSignals { embrace: true, activity: true, ..Default::default() };
+        let decide = |state, signals, at: u64| {
+            readmission_decision(true, state, signals, true, true, Some(t0), None, None,
+                                 t0 + Duration::from_secs(at))
+        };
+        // Inside the window: nothing yet.
+        let d = decide(XhaHostState::Starting, embrace, 299);
+        assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }).0, ReadmissionAction::Wait);
+        // Past it: the dance's case; with the dance off, the runbook branch.
+        let d = decide(XhaHostState::Starting, embrace, 300);
+        assert_eq!(d, ReadmissionAction::Schedule);
+        for pool_ha in [Some(true), Option::None] {
+            assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha, startup_loop: false, ..Default::default() }), (ReadmissionAction::AlertManual, Option::None));
+        }
+        // Held in XAPI's startup loop (armed, not Online, P false).
+        assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha: Some(true), startup_loop: true, ..Default::default() }).0, ReadmissionAction::Wait);
+        // With the default keys, the dance is scheduled.
+        assert_eq!(readmission_plan(d, &on, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }).0, ReadmissionAction::Schedule);
+        // A dead, silent HA daemon: the revive, unchanged by the dance key.
+        let d = decide(XhaHostState::Down, XhaLogSignals::default(), 300);
+        assert_eq!(readmission_plan(d, &ha, ReadmissionScope { pool_ha: Some(true), startup_loop: false, ..Default::default() }).0, ReadmissionAction::Revive);
+    }
+
+    /// Every corrected text names the host a command runs on.
+    #[test]
+    fn the_corrected_texts_name_the_hosts_to_run_commands_on() {
+        let a = peer_not_recruited_alert("x", "hostA", "hostB", 120);
+        assert!(a.contains("On the pool master hostA run 'xe pool-ha-disable'"), "{a}");
+        assert!(a.contains("'xe host-emergency-ha-disable --force' on hostB"), "{a}");
+        assert!(a.contains("then on hostA run 'xe pool-ha-enable"), "{a}");
+        assert!(!a.contains("the peer"), "{a}");
+        let h = peer_emergency_hold_alert(0, "y", "hostA", "hostB", 120);
+        assert!(h.contains("the peer host hostB answers") && h.contains("on the pool master hostA run"), "{h}");
+        let d = dance_disarmed_alert("hostB", "hostA", "z", 90);
+        assert!(d.contains("on the pool master hostA run") && d.contains("ha-config:timeout=90'"), "{d}");
+        assert!(!d.contains("fate-shared |"), "{d}");
+    }
+
+    /// Times shown to an operator are the host's local time with its UTC
+    /// offset, and how far from now, not UTC that reads like "now"; the
+    /// offset can be read again while the daemon runs.
+    #[test]
+    fn operator_times_are_local_with_offset_and_distance() {
+        // Alerts carry the absolute time only (they can wait in the queue);
+        // status texts add the distance.
+        let soon = unix_now_secs() + 3600;
+        assert!(!operator_time(soon).contains("min"), "{}", operator_time(soon));
+        assert!(operator_time_rel(soon).contains("in 60 min"), "{}", operator_time_rel(soon));
+        let off = local_utc_offset_now().expect("the C library gives an offset");
+        assert!(off.abs() <= 14 * 3600);
+        // 01:54:16 UTC on a +01:00 host.
+        let t = 1_794_966_856u64;
+        assert_eq!(local_hm_at(t, 3600), "02:54 +01:00");
+        assert_eq!(local_hm_at(t, 0), "01:54 +00:00");
+        assert_eq!(local_hm_at(t, -5 * 3600 - 1800), "20:24 -05:30");
+        assert_eq!(relative_minutes(t, t - 3600), "in 60 min");
+        assert_eq!(relative_minutes(t, t - 3000), "in 50 min");
+        assert_eq!(relative_minutes(t, t + 30), "now");
+        assert_eq!(relative_minutes(t, t + 600), "10 min ago");
+    }
+
+    /// The HA timeout falls back to the mode's default (fate-shared 120 s,
+    /// arbitrated 90 s) only when the pool configures none.
+    #[test]
+    fn the_ha_timeout_falls_back_to_each_modes_default() {
+        use crate::setup::configured_ha_timeout_from as from;
+        assert_eq!(from(None, false), 120, "fate-shared");
+        assert_eq!(from(None, true), 90, "arbitrated");
+        assert_eq!(from(Some(60), true), 60, "the configured value wins");
+        assert_eq!(from(Some(60), false), 60);
+        let sm = inc1_sm();
+        assert_eq!(sm.ha_timeout_now(), crate::setup::configured_ha_timeout_for(sm.arbitrated));
+    }
+
+    /// The pool-HA-off alerts give the configured timeout, never the
+    /// per-mode placeholder.
+    #[test]
+    fn the_ha_off_alerts_give_the_configured_timeout() {
+        let t = crate::setup::configured_ha_timeout();
+        for a in [ha_off_not_by_twinstor(), ha_off_disable_refused()] {
+            assert!(a.contains(&format!("ha-config:timeout={t}")), "{a}");
+            assert!(!a.contains("fate-shared |"), "{a}");
+        }
+    }
+
+    /// Two log lines that said more than was true: the re-arm hold names the
+    /// record's real state, and the disarmed host's line speaks of VMs only
+    /// when it runs some.
+    #[test]
+    fn the_hold_and_disarmed_lines_say_the_real_state() {
+        assert!(rearm_hold_line(Some(ObligationState::Owed)).contains("owed but not attempted"));
+        let enabled = rearm_hold_line(Some(ObligationState::Enabled));
+        assert!(enabled.contains("re-enabled pool HA") && !enabled.contains("owed"), "{enabled}");
+        assert!(rearm_hold_line(Some(ObligationState::Pending { until: 1 })).contains("pending"));
+        let none = disarmed_host_risk(0);
+        assert!(none.contains("runs no VMs") && !none.contains("while they still run here"), "{none}");
+        assert!(disarmed_host_risk(2).contains("while they still run here"));
+    }
+
+    /// The master alerts on its first sighting of the peer locally disarmed
+    /// under the armed pool, through its own xapi: once per wedge (two
+    /// normal answers end it), naming the peer and its running VMs per the
+    /// pool database, with the hold if one applies (which then is not
+    /// alerted again); a peer with no VM gets a log line only; an unread
+    /// count is left out.
+    #[tokio::test]
+    async fn the_master_alerts_on_its_first_sighting_of_a_disarmed_peer() {
+        let wedged = |name: &str, vms: Option<u32>| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(true);
+            t.peer_vms = vms;
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            sm
+        };
+        let first = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("reports itself locally disarmed under the armed pool.")).cloned().collect::<Vec<_>>();
+        let mut sm = wedged("pe-first-alert", Some(2));
+        sm.check_peer_emergency().await;
+        let a = first(&sm);
+        assert_eq!(a.len(), 1);
+        assert!(a[0].starts_with("advice: "), "routed as advice to disable HA: {}", a[0]);
+        assert!(a[0].contains(&format!("the peer host {} reports", sm.config.node.peer)), "{}", a[0]);
+        assert!(a[0].contains("It runs 2 VM(s) according to the pool database"), "{}", a[0]);
+        assert!(a[0].contains("resets pool HA automatically once a second probe confirms it"), "{}", a[0]);
+        assert!(a[0].contains(&format!("on the pool master {} run 'xe pool-ha-disable'", sm.config.node.name)), "{}", a[0]);
+        // Same wedge, later probes: no second one.
+        sm.check_peer_emergency().await;
+        sm.peer_mismatch = MismatchSightings::default();
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm).len(), 1);
+        // Two normal answers end the wedge; a new one is alerted again.
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        sm.check_peer_emergency().await;
+        sm.check_peer_emergency().await;
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm).len(), 2);
+        // No VM: a log line only. Unread count: left out.
+        let mut sm = wedged("pe-first-none", Some(0));
+        sm.check_peer_emergency().await;
+        assert!(first(&sm).is_empty());
+        let mut sm = wedged("pe-first-unread", Option::None);
+        sm.check_peer_emergency().await;
+        let a = first(&sm);
+        assert!(a.len() == 1 && !a[0].contains("VM(s) according"), "{a:?}");
+        // A hold applies: said with its end, and that hold is not alerted again.
+        let mut sm = wedged("pe-first-hold", Some(2));
+        let now = unix_now_secs();
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
+            resets: vec![now - 3000, now - 2000, now - 1000], ..Default::default()
+        });
+        sm.check_peer_emergency().await;
+        let a = first(&sm);
+        let until = now - 3000 + PEER_EMERGENCY_BUDGET_WINDOW;
+        assert!(a.len() == 1 && a[0].contains(&format!("on hold until {}", local_hm(until))), "{a:?}");
+        assert!(!a[0].contains(" min)"), "no relative time in an alert: {}", a[0]);
+        let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+        sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+        sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        sm.check_peer_emergency().await;
+        let holds = sm.test_ha.as_ref().unwrap().actions.iter().filter(|x| x.contains("is on hold until") && x.contains("answers that it is locally disarmed")).count();
+        assert_eq!(holds, 0, "the hold alert is not sent again for the same hold");
+        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).alerted_until, until, "marked once delivered");
+        // Not delivered: the hold stays unalerted, so its own alert goes out later.
+        let mut sm = wedged("pe-first-undelivered", Some(2));
+        seam(&mut sm).alerts_fail = true;
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
+            resets: vec![now - 3000, now - 2000, now - 1000], ..Default::default()
+        });
+        sm.check_peer_emergency().await;
+        sm.check_peer_emergency().await;
+        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).alerted_until, 0);
+        // A restarted daemon in the same wedge: no second alert.
+        let mut sm = wedged("pe-first-restart", Some(2));
+        let path = sm.peer_emergency_budget_path.clone();
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm).len(), 1);
+        let mut again = wedged("pe-first-restart-2", Some(2));
+        again.peer_emergency_budget_path = path.clone();
+        again.check_peer_emergency().await;
+        assert!(first(&again).is_empty(), "kept in the budget file");
+        // What applies, said: reset turned off.
+        let mut sm = wedged("pe-first-disabled", Some(2));
+        std::sync::Arc::make_mut(&mut sm.config).ha.auto_resolve_peer_emergency = false;
+        sm.check_peer_emergency().await;
+        assert!(first(&sm)[0].contains("turned off by configuration"), "{:?}", first(&sm));
+        // The reset needs P only (no settle), as does the sighting: a
+        // settling view still expects the reset; no P, no sighting.
+        let mut sm = wedged("pe-first-settling", Some(2));
+        sm.test_p = Some(p_settling(10));
+        sm.check_peer_emergency().await;
+        assert!(first(&sm)[0].contains("once a second probe confirms it"), "{:?}", first(&sm));
+        let mut sm = wedged("pe-first-no-p", Some(2));
+        sm.test_p = Some(crate::mgmt_reach::PView::default());
+        sm.check_peer_emergency().await;
+        assert!(first(&sm).is_empty(), "{:?}", first(&sm));
+        // TwinStor's own doing, or a relapse window: no first-sighting alert.
+        let mut sm = wedged("pe-first-relapse", Some(2));
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
+            resets: vec![now - 900], freed_at: now - 300, freed_reset: now - 900, ..Default::default()
+        });
+        sm.check_peer_emergency().await;
+        assert!(first(&sm).is_empty(), "the relapse alert speaks for that wedge");
+        let mut sm = wedged("pe-first-own", Some(2));
+        sm.whole_switch_held = true;
+        sm.check_peer_emergency().await;
+        assert!(first(&sm).is_empty(), "a whole-switch hold disarmed both hosts");
+        // Not latched: once the explanation ends, a later sighting alerts.
+        sm.whole_switch_held = false;
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm).len(), 1, "looked at again once the hold ended");
+    }
+
+    /// The first-sighting alert's per-wedge mark ends when this host's
+    /// mastership changes either way, and when the send is dropped because
+    /// this host is no longer master right before it; a delivered alert
+    /// never rolls back a newer hold's alerted mark.
+    #[tokio::test]
+    async fn the_first_sighting_mark_ends_with_mastership_and_a_dropped_send() {
+        let wedged = |name: &str| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(true);
+            t.peer_vms = Some(1);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            sm
+        };
+        let first = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("reports itself locally disarmed under the armed pool.")).count();
+        // Mastership lost then regained: a wedge seen then is a new one.
+        let mut sm = wedged("pe-mark-master");
+        let path = sm.peer_emergency_budget_path.clone();
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm), 1);
+        assert_ne!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0);
+        seam(&mut sm).master_resilient = Some(false);
+        sm.check_peer_emergency().await;
+        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0, "cleared on losing mastership");
+        seam(&mut sm).master_resilient = Some(true);
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm), 2, "alerted again as master");
+        // Unknown mastership (an unanswered read) changes nothing.
+        seam(&mut sm).master_resilient = Option::None;
+        sm.check_peer_emergency().await;
+        assert_ne!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0);
+        // No longer master right before the send: dropped, tried again later.
+        let mut sm = wedged("pe-mark-dropped");
+        let path = sm.peer_emergency_budget_path.clone();
+        seam(&mut sm).master_at_send = Some(Some(false));
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm), 0);
+        assert!(sm.peer_disarm_alerted, "in flight until its outcome is read");
+        seam(&mut sm).master_at_send = Option::None;
+        sm.check_peer_emergency().await;
+        assert_eq!(first(&sm), 1, "the drop cleared the mark; the next sighting sends it");
+        assert_ne!(peer_emergency_budget_read(&path, &current_boot_id()).disarm_alerted, 0);
+        // A late delivery naming an older hold keeps the newer hold's mark.
+        let mut sm = wedged("pe-mark-max");
+        let path = sm.peer_emergency_budget_path.clone();
+        let now = unix_now_secs();
+        peer_emergency_budget_write(&path, &current_boot_id(), &PeerEmergencyBudget {
+            alerted_until: now + 7200, disarm_alerted: now, ..Default::default()
+        });
+        *sm.peer_disarm_alert_result.lock().unwrap() = Some(FirstAlertOutcome::Delivered(Some(now + 600)));
+        sm.check_peer_emergency().await;
+        assert_eq!(peer_emergency_budget_read(&path, &current_boot_id()).alerted_until, now + 7200);
+    }
+
+    /// A slave disarmed whose xapi restarted refuses local calls with "pool
+    /// HA enabled, this host disabled", and the peer answers its login as
+    /// master: that is enough for the alert, never for the self-clear (an
+    /// emergency HA disable on this host), which needs the pool read and the
+    /// peer's agent.
+    #[test]
+    fn the_self_clear_needs_the_pool_read_and_the_peer_agent() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + SELF_UNWEDGE_AFTER + Duration::from_secs(1);
+        let decide = |(pool, master): (Option<bool>, bool)| {
+            ha_self_unwedge_decision(Some(false), pool, false, true, master, true, Some(t0), Option::None, later)
+        };
+        let local = SelfUnwedgeEvidence {
+            pool_read: Option::None,
+            local_refusal: true,
+            peer_agent_master: false,
+            peer_login_master: true,
+        };
+        assert_eq!(local.for_alert(), (Some(true), true), "the alert sees the wedge");
+        assert_eq!(decide(local.for_action()), SelfUnwedgeAction::Hold, "no self-clear on local evidence");
+        // The refusal alone, with the peer's agent live: still no pool read.
+        let refusal = SelfUnwedgeEvidence { peer_agent_master: true, ..local };
+        assert_eq!(decide(refusal.for_action()), SelfUnwedgeAction::Hold);
+        // A pool read wins over the refusal for the alert too.
+        let off = SelfUnwedgeEvidence { pool_read: Some(false), ..local };
+        assert_eq!(off.for_alert().0, Some(false));
+        // Pool read on and the peer's agent live: the self-clear acts.
+        let read = SelfUnwedgeEvidence {
+            pool_read: Some(true),
+            local_refusal: false,
+            peer_agent_master: true,
+            peer_login_master: false,
+        };
+        assert_eq!(decide(read.for_action()), SelfUnwedgeAction::Clear);
+    }
+
+    /// A second disarm on the same day gets the disarmed host's alert
+    /// again: the pacing ends once the host reads armed between them.
+    #[test]
+    fn the_disarmed_host_alert_is_paced_per_episode() {
+        let mut sm = seam_sm("unwedge-episode");
+        let t = std::time::Instant::now();
+        sm.self_unwedge_miss_alerted_at = Some(t);
+        sm.self_unwedge_vm_alerted_at = Some(t);
+        sm.self_unwedge_episode_reset(Some(false));
+        sm.self_unwedge_episode_reset(Option::None);
+        assert!(sm.self_unwedge_vm_alerted_at.is_some(), "still the same episode");
+        sm.self_unwedge_episode_reset(Some(true));
+        assert!(sm.self_unwedge_miss_alerted_at.is_none() && sm.self_unwedge_vm_alerted_at.is_none());
+    }
+
+    /// During a whole-switch cut the isolated-master check (and its "fix
+    /// this host's cable" alert) stands down whether the tick's hold or
+    /// only the fast guard holds the verdict.
+    #[test]
+    fn the_isolated_master_alert_stands_down_under_either_whole_switch_hold() {
+        assert!(whole_switch_in_force(true, false));
+        assert!(whole_switch_in_force(false, true));
+        assert!(!whole_switch_in_force(false, false));
+    }
+
+    /// The revive on a host whose daemon is simply stopped under a local
+    /// disarm says so (not "died during boot"), that the host stays disarmed
+    /// until pool HA is cycled, and the pool-level commands on the master.
+    #[test]
+    fn the_revive_says_what_it_found() {
+        assert_eq!(revive_cause(Some(false), Some(true), false), ReviveCause::LocallyDisarmed { by_twinstor: false });
+        assert_eq!(revive_cause(Some(false), Option::None, true), ReviveCause::LocallyDisarmed { by_twinstor: true });
+        assert_eq!(revive_cause(Some(true), Some(true), false), ReviveCause::BootRace);
+        assert_eq!(revive_cause(Option::None, Some(true), false), ReviveCause::BootRace);
+        let off = revived_disarmed_alert("hostB", "hostA", false, 90, true);
+        assert!(!off.contains("armed pool") && off.contains("Pool HA now reads off"), "{off}");
+        assert!(!off.contains("xe pool-ha-disable"), "{off}");
+        let a = revived_disarmed_alert("hostB", "hostA", false, 90, false);
+        assert!(a.starts_with("TwinStor on hostB: the HA daemon was not running"), "{a}");
+        assert!(a.contains("locally disarmed under the armed pool (TwinStor did not disarm it)"), "{a}");
+        assert!(a.contains("stays locally disarmed until pool HA is cycled"), "{a}");
+        assert!(a.contains("on the pool master hostA run 'xe pool-ha-disable'") && a.contains("ha-config:timeout=90'"), "{a}");
+        assert!(!a.contains("during boot"), "{a}");
+    }
+
+    /// The armed-mismatch alert names where to run the re-alignment and
+    /// gives the configured timeout, not the per-mode placeholder.
+    #[test]
+    fn the_armed_mismatch_alert_names_the_master_and_the_timeout() {
+        let m = armed_mismatch_alert(true, "hostA", "hostB", 120);
+        assert!(m.contains("(hostA, the pool master)") && m.contains("Re-align now on hostA"), "{m}");
+        let s = armed_mismatch_alert(false, "hostB", "hostA", 90);
+        assert!(s.contains("on the master (hostA) run 'xe pool-ha-disable'"), "{s}");
+        for t in [&m, &s] {
+            assert!(t.contains("ha-config:timeout=") && !t.contains("fate-shared |"), "{t}");
+        }
+    }
+
+    /// A host disarmed under the armed pool with VMs running: the alert says
+    /// the master may reset pool HA by itself, and what to do if `twinstor
+    /// status` still shows it disarmed after 5 minutes (XAPI messages never
+    /// disappear; only always-true claims: the reset
+    /// may be on hold or turned off, which this host cannot know), names the
+    /// master to run the commands on if the VMs must be protected now, and
+    /// warns that a disable by hand stays off. Only a record from this boot
+    /// counts as TwinStor's own disarm.
+    #[test]
+    fn the_disarmed_host_alert_says_who_resets_and_where_to_run_what() {
+        let a = disarmed_host_vms_alert("hostA", "hostB", 2, 120);
+        assert!(a.starts_with("TwinStor on hostA:") && a.contains("runs 2 VM(s)"), "{a}");
+        assert!(a.contains("TwinStor on the pool master (hostB) may reset pool HA automatically"), "{a}");
+        assert!(a.contains("if 'twinstor status' on this host still shows it disarmed after 5 minutes, it has not"), "{a}");
+        assert!(!a.contains("still present"), "XAPI messages never disappear: {a}");
+        assert!(!a.contains("usually within"), "{a}");
+        assert!(a.contains("on hostB run 'xe pool-ha-disable'"), "{a}");
+        assert!(a.contains("ha-config:timeout=120"), "{a}");
+        assert!(a.contains("stays off until it is re-enabled by hand"), "{a}");
+        assert!(disarm_record_this_boot("boot_id=b1\nxapi_pid=1\ncycled=1\n", "b1"));
+        assert!(!disarm_record_this_boot("boot_id=b0\n", "b1"));
+        assert!(!disarm_record_this_boot("boot_id=b1\n", ""));
+    }
+
+    /// The join-deadlock runbook: the pool HA cycle first; its fallback (the
+    /// emergency disable on both hosts) is followed by the wait, then the
+    /// master's pool HA disable before the re-enable, since pool HA still
+    /// reads enabled after local disables.
+    #[test]
+    fn the_join_deadlock_runbook_disables_pool_ha_before_every_enable() {
+        let a = join_deadlock_runbook_alert("hostA", "hostB", "hostB", 120);
+        let at = |needle: &str, from: usize| from + a[from..].find(needle).unwrap_or_else(|| panic!("{needle}: {a}"));
+        let d1 = at("on the pool master (hostB) run 'xe pool-ha-disable'", 0);
+        let e1 = at("'xe pool-ha-enable", d1);
+        let em = at("'xe host-emergency-ha-disable --force' on both hosts (hostA and hostB) within 30 seconds", e1);
+        let w = at("wait 150 seconds", em);
+        let d2 = at("on hostB run 'xe pool-ha-disable'", w);
+        let e2 = at("'xe pool-ha-enable heartbeat-sr-uuids=<twinstor SR uuid> ha-config:timeout=120'", d2);
+        assert!(d1 < e1 && e1 < em && em < w && w < d2 && d2 < e2);
+        assert!(!a.contains("VMs keep running") && !a.contains("unaffected; VMs"), "{a}");
+    }
+
+    /// With the dance on: after phase 1 disarmed this host, a phase 2 that
+    /// does not cycle pool HA (its gate, its cycle's start checks) raises
+    /// one alert at once, naming this host, that it stays disarmed, and the
+    /// manual re-arm; it names no repair that cannot run.
+    #[tokio::test]
+    async fn a_stopped_phase_two_alerts_at_once_and_truthfully() {
+        let mut m = seam_sm("dance-p2-stopped");
+        m.readmission_disabled_done = true;
+        m.finish_readmission_dance(Some(PoolHaCycle {
+            disabled: false,
+            enabled: false,
+            disable_note: "a pool HA operation is already pending in XAPI (pool.enable_ha)".into(),
+            operator_off: false,
+            disable_issued: false,
+            disable_may_land: false,
+            withheld: Option::None,
+        }))
+        .await;
+        let t = m.test_ha.as_ref().unwrap();
+        let alerts: Vec<_> = t.actions.iter().filter(|a| a.starts_with("advice")).collect();
+        assert_eq!(alerts.len(), 1);
+        let a = alerts[0];
+        assert!(a.contains(&format!("TwinStor on {}", m.config.node.name)), "{a}");
+        assert!(a.contains("stays locally disarmed") && a.contains("pool.enable_ha"), "{a}");
+        assert!(a.contains("xe pool-ha-enable heartbeat-sr-uuids="), "{a}");
+        assert!(!a.contains("recorded-disarm") && !a.contains("obligation"), "{a}");
+        // Its gate closed at the sync point (P not settled): the same, at once.
+        let now_unix = crate::heal_state::unix_now();
+        let mut m = seam_sm("dance-p2-gated");
+        m.readmission_disabled_done = true;
+        seam(&mut m).master_resilient = Some(true);
+        seam(&mut m).xhad = Some(XhaHostState::Starting);
+        m.test_p = Some(crate::mgmt_reach::PView::default());
+        m.readmission_dance_t = Some(now_unix);
+        m.drive_readmission_dance(now_unix).await;
+        assert_eq!(seam_actions(&m, "advice"), 1);
+        assert_eq!(seam_actions(&m, "readmission_dance_phase2"), 0);
+        assert_eq!(m.dance_disarm_watch, Option::None, "one alert per host");
+    }
+
+    /// A host the dance disarmed alerts about itself, once, if it is still
+    /// locally disarmed under the armed pool when the master's cycle has had
+    /// its time (the slave hears nothing from the master); re-armed, or pool
+    /// HA off, ends the watch with no alert; an unknown read waits.
+    #[tokio::test]
+    async fn a_host_the_dance_left_disarmed_alerts_about_itself_once() {
+        let mut m = seam_sm("dance-watch");
+        m.dance_disarm_watch = Some(1000);
+        seam(&mut m).local_armed = Some(false);
+        seam(&mut m).pool_ha = Some(true);
+        m.dance_disarm_watch_pass(999).await;
+        assert_eq!(seam_actions(&m, "advice"), 0);
+        seam(&mut m).local_armed = Option::None;
+        m.dance_disarm_watch_pass(1000).await;
+        assert_eq!((seam_actions(&m, "advice"), m.dance_disarm_watch), (0, Some(1000)));
+        seam(&mut m).local_armed = Some(false);
+        m.dance_disarm_watch_pass(1000).await;
+        m.dance_disarm_watch_pass(1100).await;
+        assert_eq!(seam_actions(&m, "advice"), 1);
+        let a = m.test_ha.as_ref().unwrap().actions.iter().find(|a| a.starts_with("advice")).unwrap().clone();
+        assert!(a.contains(&format!("TwinStor on {}", m.config.node.name)), "{a}");
+        assert!(a.contains("no pool HA cycle re-armed it") && a.contains("stays locally disarmed"), "{a}");
+        for (armed, pool_ha) in [(Some(true), Some(true)), (Some(false), Some(false))] {
+            let mut m = seam_sm("dance-watch-ok");
+            m.dance_disarm_watch = Some(1000);
+            seam(&mut m).local_armed = armed;
+            seam(&mut m).pool_ha = pool_ha;
+            m.dance_disarm_watch_pass(2000).await;
+            assert_eq!((seam_actions(&m, "advice"), m.dance_disarm_watch), (0, Option::None));
+        }
+    }
+
+    /// The whole-switch release shape seen on the arbitrated pool: both hosts
+    /// disarmed by the hold, both back in the liveset, still disarmed under the
+    /// armed pool. Exactly one pool HA cycle runs, by the master; the slave's
+    /// conditions are gone once that cycle re-armed it; a record is used once.
+    #[tokio::test]
+    async fn whole_switch_release_gets_exactly_one_pool_ha_cycle_by_the_master() {
+        let mut m = disarmed_member("ws-master", true);
+        let mut sl = disarmed_member("ws-slave", false);
+        // 2 minutes in: the master cycles, the slave waits.
+        rearm_check_after(&mut m, RECORDED_REARM_LIVESET_FOR).await;
+        rearm_check_after(&mut sl, RECORDED_REARM_LIVESET_FOR).await;
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
+        assert_eq!(seam_actions(&sl, "recorded_rearm_cycle"), 0);
+        // The cycle re-armed both hosts: the slave never runs one.
+        seam(&mut sl).local_armed = Some(true);
+        rearm_check_after(&mut sl, RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER).await;
+        assert_eq!(seam_actions(&sl, "recorded_rearm_cycle"), 0);
+        // Once per record: even if the master stayed disarmed, no second cycle.
+        for _ in 0..3 {
+            rearm_check_after(&mut m, Duration::from_secs(3600)).await;
+        }
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
+        assert!(std::fs::read_to_string(&m.disarm_record_path).unwrap().contains("cycled=1"));
+    }
+
+    /// A slave that alone holds a record acts after its defer; two masters
+    /// (a stand-down release before the demote) never cycle.
+    #[tokio::test]
+    async fn recorded_rearm_on_a_lone_slave_record_and_never_between_two_masters() {
+        let mut sl = disarmed_member("rr-slave", false);
+        rearm_check_after(&mut sl, RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER).await;
+        assert_eq!(seam_actions(&sl, "recorded_rearm_cycle"), 1);
+        let mut dual = disarmed_member("rr-dual", true);
+        dual.test_peer_role = xapi::PeerXapiRole::Master;
+        rearm_check_after(&mut dual, Duration::from_secs(3600)).await;
+        assert_eq!(seam_actions(&dual, "recorded_rearm_cycle"), 0);
+    }
+
+    /// The stand-down release shape seen on the arbitrated pool: after an
+    /// isolated-master stand-down and the network's return, the host's xhad
+    /// is back in the liveset, its armed flag is false (the stand-down's own
+    /// recorded disarm), pool.conf still says master and its xapi answers as
+    /// master, while its liveset names the peer as master. The second-master
+    /// guard demotes it exactly once.
+    #[tokio::test]
+    async fn stand_down_release_with_the_peer_holding_the_lock_demotes_once() {
+        let mut sm = seam_sm("standdown-release");
+        second_master_shape(&mut sm);
+        seam(&mut sm).local_armed = Some(false);
+        sm.check_second_master().await;
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+        // The demote rewrote pool.conf: the host is a slave from here on.
+        seam(&mut sm).conf_master = Some(false);
+        for _ in 0..5 {
+            confirmed_check(&mut sm).await;
+        }
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+    }
+
+    // ---- arbitrated winner's freeze lift --------------------------------
+
+    /// An arbitrated survivor frozen by its own fence-peer yield, reconnected
+    /// to its fenced peer: Connected, Primary, UpToDate, suspended by the
+    /// yield, and the handshake as given.
+    fn arb_frozen_winner(
+        tag: &str,
+        replication: Option<crate::drbd::Replication>,
+        peer_disk: DiskState,
+    ) -> (StateMachine, std::sync::Arc<MockDrbd>) {
+        let (mut sm, drbd) = wedge_survivor(tag, crate::peer_signal::PeerClaim::Unreachable);
+        let _ = std::fs::remove_file(&sm.marker_path);
+        let _ = std::fs::remove_file(&sm.latch_path);
+        let _ = std::fs::remove_file(&sm.win_path);
+        sm.arbitrated = true;
+        std::fs::write(&sm.yield_path, "yielded\n").unwrap();
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.connection = ConnectionState::Connected;
+        st.role = Role::Primary;
+        st.disk = DiskState::UpToDate;
+        st.peer_disk = Some(peer_disk);
+        st.replication = replication;
+        st.suspended_user = true;
+        st.suspended_fencing = false;
+        drbd.set_status(st);
+        sm.connected_since =
+            std::time::Instant::now().checked_sub(LEFTOVER_LIFT_STABLE + Duration::from_secs(1));
+        (sm, drbd)
+    }
+
+    async fn two_passes(sm: &mut StateMachine) {
+        sm.release_winner_freeze().await;
+        sm.release_winner_freeze().await;
+    }
+
+    /// The deadlock seen on the arbitrated pool: the fenced peer came back
+    /// Outdated, DRBD made this frozen survivor the source and waits in
+    /// WFBitMapS for the frozen writes to drain. The lift now releases it.
+    #[tokio::test(start_paused = true)]
+    async fn arbitrated_survivor_frozen_in_wfbitmap_toward_an_outdated_peer_is_lifted() {
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-wfb", Some(crate::drbd::Replication::WFBitMap), DiskState::Outdated);
+        two_passes(&mut sm).await;
+        assert!(drbd.calls().contains(&"resume_io"), "calls: {:?}", drbd.calls());
+        assert!(!std::path::Path::new(&sm.yield_path).exists());
+        cleanup(&sm);
+        // SyncSource toward an Inconsistent peer: the same.
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-src", Some(crate::drbd::Replication::SyncSource), DiskState::Inconsistent);
+        two_passes(&mut sm).await;
+        assert!(drbd.calls().contains(&"resume_io"));
+        cleanup(&sm);
+        // The older path, peer UpToDate and Established: lifted too.
+        let (mut sm, drbd) = arb_frozen_winner("arb-utd", Option::None, DiskState::UpToDate);
+        two_passes(&mut sm).await;
+        assert!(drbd.calls().contains(&"resume_io"));
+        cleanup(&sm);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arbitrated_survivor_lift_holds_outside_its_exact_shape() {
+        use crate::drbd::Replication::WFBitMap;
+        let held = |sm: &StateMachine, drbd: &MockDrbd, why: &str| {
+            assert!(!drbd.calls().contains(&"resume_io"), "{why}: calls {:?}", drbd.calls());
+            assert!(std::path::Path::new(&sm.yield_path).exists(), "{why}");
+        };
+        // Local copy not UpToDate.
+        let (mut sm, drbd) = arb_frozen_winner("arb-h1", Some(WFBitMap), DiskState::Outdated);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.disk = DiskState::Outdated;
+        drbd.set_status(st);
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "local not UpToDate");
+        cleanup(&sm);
+        // No yield marker: not this node's own freeze.
+        let (mut sm, drbd) = arb_frozen_winner("arb-h2", Some(WFBitMap), DiskState::Outdated);
+        let _ = std::fs::remove_file(&sm.yield_path);
+        two_passes(&mut sm).await;
+        assert!(!drbd.calls().contains(&"resume_io"), "no yield marker");
+        cleanup(&sm);
+        // Split-brain: DRBD disconnected (StandAlone), or the resolver's marker.
+        let (mut sm, drbd) = arb_frozen_winner("arb-h3", Option::None, DiskState::Outdated);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.connection = ConnectionState::StandAlone;
+        st.peer_disk = Option::None;
+        drbd.set_status(st);
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "StandAlone");
+        cleanup(&sm);
+        let (mut sm, drbd) = arb_frozen_winner("arb-h4", Some(WFBitMap), DiskState::Outdated);
+        std::fs::write(&sm.marker_path, "resource=data").unwrap();
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "split-brain marker");
+        cleanup(&sm);
+        // Latched as the split-brain loser.
+        let (mut sm, drbd) = arb_frozen_winner("arb-h5", Some(WFBitMap), DiskState::Outdated);
+        std::fs::write(&sm.latch_path, "latched\n").unwrap();
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "latched loser");
+        cleanup(&sm);
+        // Connection younger than the 5 s hold.
+        let (mut sm, drbd) = arb_frozen_winner("arb-h6", Some(WFBitMap), DiskState::Outdated);
+        sm.connected_since = Some(std::time::Instant::now());
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "connection not held");
+        cleanup(&sm);
+        // Peer disk not yet known (Connected before the handshake decided).
+        let (mut sm, drbd) = arb_frozen_winner("arb-h7", Some(WFBitMap), DiskState::Outdated);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.peer_disk = Option::None;
+        st.replication = Option::None;
+        drbd.set_status(st);
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "handshake undecided");
+        cleanup(&sm);
+        // One pass only.
+        let (mut sm, drbd) = arb_frozen_winner("arb-h8", Some(WFBitMap), DiskState::Outdated);
+        sm.release_winner_freeze().await;
+        held(&sm, &drbd, "one pass");
+        cleanup(&sm);
+    }
+
+    /// A scheduled re-admission dance on a host that has just rejoined the
+    /// liveset by itself (a healthy unaided heal) is cancelled at its firing,
+    /// before any disarm, whatever the settle says; it runs only while the
+    /// join is still failing.
+    #[tokio::test]
+    async fn the_dance_is_cancelled_once_the_host_is_back_in_the_liveset() {
+        let now_unix = crate::heal_state::unix_now();
+        for p in [crate::mgmt_reach::PView::settled_for_test(), p_settling(60)] {
+            let mut sm = seam_sm("dance-rejoined");
+            sm.test_p = Some(p);
+            seam(&mut sm).xhad = Some(XhaHostState::Online);
+            sm.readmission_dance_t = Some(now_unix + 30);
+            sm.drive_readmission_dance(now_unix + 30).await;
+            assert_eq!(sm.readmission_dance_t, Option::None);
+            assert!(!sm.readmission_disabled_done);
+            assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), 0);
+        }
+        // Still failing to join, P settled, phase 2's cycle could start
+        // (pool HA on, nothing pending): phase 1 fires.
+        let mut sm = seam_sm("dance-stuck");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).xhad = Some(XhaHostState::Starting);
+        seam(&mut sm).pool_ha = Some(true);
+        sm.readmission_dance_t = Some(now_unix + 30);
+        sm.drive_readmission_dance(now_unix + 30).await;
+        assert!(sm.readmission_disabled_done);
+        assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), 1);
+    }
+
+    /// The whole-switch hold's heal stage is never reaped while the tick's
+    /// own hold stands, and is once it has ended; the fast guard's latch alone
+    /// never keeps it alive.
+    #[tokio::test]
+    async fn the_whole_switch_hold_stage_is_not_reaped_while_the_hold_stands() {
+        let mut sm = seam_sm("hold-stage");
+        sm.whole_switch_held = true;
+        assert!(sm.heal_stage_still_live("whole_switch_hold"));
+        assert!(!sm.heal_stage_still_live("split_brain"));
+        sm.whole_switch_held = false;
+        sm.whole_switch_guard.store(true, Ordering::Relaxed);
+        assert!(!sm.heal_stage_still_live("whole_switch_hold"));
+        sm.whole_switch_guard.store(false, Ordering::Relaxed);
+        assert!(!sm.heal_stage_still_live("whole_switch_hold"));
+    }
+
+    /// After a second-master demote on a host left locally disarmed (the
+    /// stand-down release on the arbitrated pool), exactly one repair owns
+    /// the re-arm. The demote keeps a disarm record for the boot. When the
+    /// restarted xapi comes back wedged (answering the mismatch code, its
+    /// own xapi unusable), the master's peer-emergency reset acts and the
+    /// recorded re-arm waits; when it comes back a normal slave, the
+    /// recorded re-arm acts and the peer-emergency trigger cannot.
+    #[tokio::test]
+    async fn after_a_demote_while_disarmed_exactly_one_repair_owns_the_re_arm() {
+        // The demote writes the record.
+        let mut sm = seam_sm("demote-record");
+        second_master_shape(&mut sm);
+        seam(&mut sm).local_armed = Some(false);
+        let dir = std::path::Path::new(&sm.second_master_budget_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        sm.disarm_record_path = dir.join("disarm").to_string_lossy().to_string();
+        // TwinStor's own disarm in this boot (the whole-switch guard's latch).
+        sm.whole_switch_guard_ever_disarmed.store(true, Ordering::Relaxed);
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+        let rec = std::fs::read_to_string(&sm.disarm_record_path).unwrap();
+        assert!(disarm_record_usable(&rec, &current_boot_id()), "{rec}");
+
+        // Wedged demoted slave: its own xapi does not answer; it waits.
+        let mut slave = disarmed_member("own-wedged-slave", false);
+        seam(&mut slave).xapi_master = Option::None;
+        rearm_check_after(&mut slave, Duration::from_secs(3600)).await;
+        assert_eq!(seam_actions(&slave, "recorded_rearm_cycle"), 0);
+        // ...while the master sees the mismatch answer and resets.
+        let mut master = seam_sm("own-wedged-master");
+        master.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut master);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(false);
+        master.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        master.check_peer_emergency().await;
+        master.peer_mismatch.first =
+            master.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        master.check_peer_emergency().await;
+        assert_eq!(seam_actions(&master, "peer_emergency_reset"), 1);
+
+        // Normal demoted slave (answers HOST_IS_SLAVE): the recorded re-arm
+        // acts after its defer; the master's trigger never fires.
+        let mut slave = disarmed_member("own-normal-slave", false);
+        rearm_check_after(&mut slave, RECORDED_REARM_LIVESET_FOR + RECORDED_REARM_SLAVE_DEFER).await;
+        assert_eq!(seam_actions(&slave, "recorded_rearm_cycle"), 1);
+        let mut master = seam_sm("own-normal-master");
+        master.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut master);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(true);
+        master.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        for _ in 0..12 {
+            master.check_peer_emergency().await;
+        }
+        assert_eq!(seam_actions(&master, "peer_emergency_reset"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arbitrated_survivor_lift_review_cases() {
+        use crate::drbd::Replication::WFBitMap;
+        let no_resume = |drbd: &MockDrbd, why: &str| {
+            assert!(!drbd.calls().contains(&"resume_io"), "{why}: calls {:?}", drbd.calls());
+        };
+        // Secondary: hold.
+        let (mut sm, drbd) = arb_frozen_winner("arb-r1", Some(WFBitMap), DiskState::Outdated);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.role = Role::Secondary;
+        drbd.set_status(st);
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "Secondary");
+        cleanup(&sm);
+        // Not arbitrated, and fate-shared freeze mode off: hold.
+        let (mut sm, drbd) = arb_frozen_winner("arb-r2", Some(WFBitMap), DiskState::Outdated);
+        sm.arbitrated = false;
+        let _ = std::fs::remove_file(&sm.peer_fs_freeze_path);
+        assert!(!sm.fs_freeze());
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "fate-shared without freeze mode");
+        cleanup(&sm);
+        // A fencing suspend still set at the resume: resume-io is not sent.
+        let (mut sm, drbd) = arb_frozen_winner("arb-r3", Some(WFBitMap), DiskState::Outdated);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.suspended_fencing = true;
+        drbd.set_status(st);
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "fencing suspend");
+        cleanup(&sm);
+        // The verdict file grew since the link came back (a run decided).
+        let (mut sm, drbd) = arb_frozen_winner("arb-r4", Some(WFBitMap), DiskState::Outdated);
+        std::fs::write(&sm.verdict_path, "").unwrap();
+        sm.connected_verdict_len = 0;
+        std::fs::write(&sm.verdict_path, "1794918076 4242 survive 4\n").unwrap();
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "verdict file grew");
+        let _ = std::fs::remove_file(&sm.verdict_path);
+        cleanup(&sm);
+        // A fence-peer run still deciding (it holds the handler's lock).
+        let (mut sm, drbd) = arb_frozen_winner("arb-r5", Some(WFBitMap), DiskState::Outdated);
+        std::fs::write(&sm.fence_lock_path, "").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).open(&sm.fence_lock_path).unwrap();
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: locking a descriptor the test owns.
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        }
+        assert!(fence_run_in_flight(&sm.fence_lock_path));
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "fence-peer run in flight");
+        drop(held);
+        assert!(!fence_run_in_flight(&sm.fence_lock_path));
+        two_passes(&mut sm).await;
+        assert!(drbd.calls().contains(&"resume_io"), "lock released: lifts");
+        let _ = std::fs::remove_file(&sm.fence_lock_path);
+        cleanup(&sm);
+        // A latch from an earlier fork (another generation): lift.
+        let (mut sm, drbd) = arb_frozen_winner("arb-r6", Some(WFBitMap), DiskState::Outdated);
+        write_fork_record(&sm.latch_path, Some(0x1111_2222_3333_4444));
+        two_passes(&mut sm).await;
+        assert!(drbd.calls().contains(&"resume_io"), "stale latch: {:?}", drbd.calls());
+        cleanup(&sm);
+        // A latch for this fork (same generation, was-Primary bit aside): hold.
+        let (mut sm, drbd) = arb_frozen_winner("arb-r7", Some(WFBitMap), DiskState::Outdated);
+        write_fork_record(&sm.latch_path, Some(0xF972_7929_49C3_F7FD));
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "latch of this fork");
+        cleanup(&sm);
+        // WFBitMap with the peer UpToDate: not a source picture, hold.
+        let (mut sm, drbd) = arb_frozen_winner("arb-r8", Some(WFBitMap), DiskState::UpToDate);
+        two_passes(&mut sm).await;
+        no_resume(&drbd, "WFBitMap with the peer UpToDate");
+        cleanup(&sm);
+    }
+
+    #[test]
+    fn latch_blocks_only_its_own_fork() {
+        assert!(!latch_blocks(Option::None, Some(0xA0)));
+        assert!(latch_blocks(Some(Some(0xA0)), Some(0xA1)));
+        assert!(!latch_blocks(Some(Some(0xA0)), Some(0xB0)));
+        assert!(latch_blocks(Some(Option::None), Some(0xA0)));
+        assert!(latch_blocks(Some(Some(0xA0)), Option::None));
+    }
+
+    /// With another pool HA cycle in flight, the recorded-disarm re-arm waits
+    /// with its record unused, and runs once the flag clears.
+    #[tokio::test]
+    async fn recorded_rearm_waits_with_its_record_unused_while_a_cycle_is_in_flight() {
+        let mut m = disarmed_member("rr-inflight", true);
+        m.ha_reset_inflight.store(true, Ordering::SeqCst);
+        rearm_check_after(&mut m, Duration::from_secs(3600)).await;
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 0);
+        let rec = std::fs::read_to_string(&m.disarm_record_path).unwrap();
+        assert!(disarm_record_usable(&rec, &current_boot_id()), "record unused: {rec}");
+        m.ha_reset_inflight.store(false, Ordering::SeqCst);
+        rearm_check_after(&mut m, Duration::from_secs(3600)).await;
+        assert_eq!(seam_actions(&m, "recorded_rearm_cycle"), 1);
+    }
+
+    /// A second wedge on the same master soon after a reset: the old hour of
+    /// cooldown left it unrepaired and unexplained. Now the budget decides:
+    /// a reset less than 10 minutes ago, or 3 in the last 6 hours, withholds
+    /// it with the reason, the PeerDisarmed text says until when, and one
+    /// alert names the risk and the manual cycle; the budget survives a
+    /// daemon restart (no second alert either). Within budget and spaced,
+    /// the reset fires and is counted.
+    #[tokio::test]
+    async fn a_second_wedge_is_reset_within_the_budget_and_held_past_it() {
+        let wedged = |name: &str| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(false);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            // The first-sighting alert is tested on its own.
+            sm.peer_disarm_alerted = true;
+            sm
+        };
+        let confirm = |sm: &mut StateMachine| {
+            let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        };
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        // One reset 20 minutes ago (the first wedge): the second is reset.
+        let mut sm = wedged("pe-budget-second");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 1200], ..Default::default() });
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+        assert_eq!(peer_emergency_budget_read(&path, &boot).resets.len(), 2);
+        // Three in the last 6 hours: withheld, with the reason and an end.
+        let mut sm = wedged("pe-budget-spent");
+        let path = sm.peer_emergency_budget_path.clone();
+        let spent = vec![now - 5 * 3600, now - 3600, now - 1200];
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: spent.clone(), ..Default::default() });
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        let w = sm.ha_withheld.clone().unwrap();
+        assert_eq!(w.action, "peer_emergency_resolve");
+        assert!(w.reason.contains("3 resets already ran in the last 6 hours"), "{}", w.reason);
+        let until = now - 5 * 3600 + PEER_EMERGENCY_BUDGET_WINDOW;
+        assert!(w.reason.contains(&local_hm(until)), "{}", w.reason);
+        let note = hold_note(sm.peer_emergency_hold.as_ref(), now);
+        let text = view_text_with(crate::arbitration::PartitionView::PeerDisarmed, note);
+        assert!(text.contains(&format!("on hold until {}", local_hm(until))), "{text}");
+        assert_eq!(seam_actions(&sm, "advice"), 1);
+        let a = sm.test_ha.as_ref().unwrap().actions.iter().find(|a| a.starts_with("advice")).unwrap().clone();
+        assert!(a.contains("locally disarmed under the armed pool") && a.contains("may restart them on another host"), "{a}");
+        assert!(a.contains("xe pool-ha-disable") && a.contains("xe pool-ha-enable heartbeat-sr-uuids="), "{a}");
+        // The configured timeout, never the per-mode placeholder.
+        assert!(a.contains(&format!("ha-config:timeout={}'", sm.ha_timeout_now())), "{a}");
+        assert!(!a.contains("fate-shared |"), "{a}");
+        // Paced: the next pass and a restarted daemon add no alert, and the
+        // restarted daemon is held by the same budget.
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "advice"), 1);
+        let mut again = wedged("pe-budget-restart");
+        again.peer_emergency_budget_path = path.clone();
+        again.check_peer_emergency().await;
+        confirm(&mut again);
+        again.check_peer_emergency().await;
+        assert_eq!(seam_actions(&again, "peer_emergency_reset") + seam_actions(&again, "advice"), 0);
+        assert!(again.ha_withheld.is_some());
+        // Too soon after the last reset: withheld for the spacing.
+        let mut sm = wedged("pe-budget-spacing");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 300], ..Default::default() });
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        assert!(sm.ha_withheld.clone().unwrap().reason.contains("less than 10 minutes ago"));
+        // Pure: the budget ages out, and another boot's budget is not read.
+        let b = |resets: Vec<u64>| PeerEmergencyBudget { resets, ..Default::default() };
+        assert_eq!(peer_emergency_budget_hold(&b(spent.clone()), now + 5 * 3600), Option::None);
+        let h = peer_emergency_budget_hold(&b(vec![now - 300]), now).unwrap();
+        assert_eq!((h.rule, h.until), (BudgetRule::Spacing, now + 300));
+        assert!(!h.alerts());
+        assert!(peer_emergency_budget_read(&path, "another-boot").resets.is_empty());
+        // Past its end the hold adds nothing to the view.
+        assert_eq!(hold_note(Some(&(now, "x".into())), now), Option::None);
+    }
+
+    /// After a reset that did not free the peer, the next waits an hour
+    /// (alerted, naming that rule); after one that did, a new wedge (more than
+    /// 30 minutes after that verdict) may be reset once the 10-minute spacing
+    /// has passed. Freed or not is read
+    /// from the peer's xapi answer after the cycle, not from its agent,
+    /// which answers throughout the wedge. A disable that timed out
+    /// stays spent; one refused, never issued, or an operator's pool HA off
+    /// gives the reset back.
+    #[tokio::test]
+    async fn a_futile_reset_holds_the_next_for_an_hour_and_only_a_refused_one_is_given_back() {
+        let now = crate::heal_state::unix_now();
+        let futile = PeerEmergencyBudget { resets: vec![now - 900], futile: now - 900, ..Default::default() };
+        let h = peer_emergency_budget_hold(&futile, now).unwrap();
+        assert_eq!((h.rule, h.until), (BudgetRule::AfterFutile, now - 900 + 3600));
+        assert!(h.alerts() && h.why.contains("did not free the peer"), "{}", h.why);
+        let freed = PeerEmergencyBudget { futile: 0, ..futile.clone() };
+        assert_eq!(peer_emergency_budget_hold(&freed, now), Option::None);
+        // The later end wins: the budget spent for longer than the hour.
+        let both = PeerEmergencyBudget { resets: vec![now - 3000, now - 2000, now - 900], futile: now - 900, ..Default::default() };
+        assert_eq!(peer_emergency_budget_hold(&both, now).unwrap().rule, BudgetRule::Budget);
+        let boot = current_boot_id();
+        // The verdict's steps: futile on an armed-mismatch answer, freed on
+        // two normal answers in a row, futile without a verdict in time.
+        let t0 = std::time::Instant::now();
+        let v = ResetVerdict::new(t0);
+        let slave = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        assert_eq!(reset_verdict_step(v, &xapi::PeerXapiRole::ArmedMismatch, true, t0).1, Some(true));
+        let (v1, none) = reset_verdict_step(v, &slave, true, t0);
+        assert_eq!(none, Option::None);
+        assert_eq!(reset_verdict_step(v1.unwrap(), &slave, true, t0).1, Some(false));
+        // A master answer is a second master, not a freed slave: it breaks
+        // the run, and master answers alone end futile at the bound.
+        let (vm, none) = reset_verdict_step(v1.unwrap(), &xapi::PeerXapiRole::Master, true, t0);
+        assert_eq!((vm.unwrap().normal_in_row, none), (0, Option::None));
+        let (vm, _) = reset_verdict_step(v, &xapi::PeerXapiRole::Master, true, t0);
+        let (vm, none) = reset_verdict_step(vm.unwrap(), &xapi::PeerXapiRole::Master, true, t0);
+        assert_eq!(none, Option::None);
+        assert_eq!(reset_verdict_step(vm.unwrap(), &xapi::PeerXapiRole::Master, true, t0 + PEER_EMERGENCY_CONFIRM_AFTER).1, Some(true));
+        let (v2, _) = reset_verdict_step(v1.unwrap(), &xapi::PeerXapiRole::Unknown, true, t0);
+        assert_eq!(v2.unwrap().normal_in_row, 0, "an unknown answer breaks the run");
+        assert_eq!(reset_verdict_step(v, &xapi::PeerXapiRole::Unreachable, false, t0 + PEER_EMERGENCY_CONFIRM_AFTER).1, Some(true));
+        // Through the check, the peer's agent answering throughout.
+        let wedged = |name: &str| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            sm
+        };
+        let confirm = |sm: &mut StateMachine| {
+            let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        };
+        let cycled = |sm: &mut StateMachine| {
+            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
+                disabled: true,
+                enabled: true,
+                disable_note: "disable".into(),
+                operator_off: false,
+                disable_issued: true,
+                disable_may_land: false,
+                withheld: Option::None,
+            }));
+        };
+        // Futile: the role still answers armed-mismatch after the cycle.
+        let mut sm = wedged("pe-futile");
+        let path = sm.peer_emergency_budget_path.clone();
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+        cycled(&mut sm);
+        let alerts = |sm: &StateMachine, needle: &str| {
+            sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains(needle)).count()
+        };
+        sm.check_peer_emergency().await; // the cycle returned; the agent answers
+        assert!(sm.peer_emergency_resolve_at.is_some() && sm.peer_emergency_verdict.is_some());
+        // An enable task still pending: pool HA reads on, but no probing yet.
+        seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
+            uuid: "t".into(),
+            name: "pool.enable_ha".into(),
+            created_unix: Some(now),
+        }];
+        sm.check_peer_emergency().await;
+        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        seam(&mut sm).pending_unreadable = true; // unreadable: still waiting
+        sm.check_peer_emergency().await;
+        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        seam(&mut sm).pending_unreadable = false;
+        seam(&mut sm).pending_tasks.clear();
+        sm.check_peer_emergency().await; // HA on, no task: probing starts
+        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::Probing);
+        sm.check_peer_emergency().await; // the agent answers, the xapi still disarmed
+        assert_eq!(alerts(&sm, "freed it"), 0, "no freed alert on the agent alone");
+        assert!(sm.peer_emergency_resolve_at.is_none(), "the confirmation ends on the verdict");
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert!(b.futile >= *b.resets.last().unwrap(), "from the later of reset and verdict");
+        let f = sm.test_ha.as_ref().unwrap().actions.iter().find(|a| a.contains("ran, but")).unwrap().clone();
+        assert!(f.contains(&format!("{} still reports that it is locally disarmed", sm.config.node.peer)), "{f}");
+        assert!(f.contains(&format!("will not try again until {}", local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE))), "{f}");
+        assert!(f.contains("may restart them on another host") && f.contains("xe pool-ha-disable"), "{f}");
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1, "held");
+        let w = sm.ha_withheld.clone().unwrap();
+        assert!(w.reason.contains("did not free the peer") && w.reason.contains("60 minutes"), "{}", w.reason);
+        assert_eq!(sm.peer_emergency_hold.clone().unwrap().0, b.futile + PEER_EMERGENCY_AFTER_FUTILE);
+        sm.check_peer_emergency().await;
+        // One alert for the futile reset, standing for its hold too.
+        assert_eq!(alerts(&sm, "ran, but") + alerts(&sm, "is on hold until"), 1);
+        // Freed: two normal answers after the cycle; a new wedge 11 minutes
+        // after that reset is reset.
+        let mut sm = wedged("pe-freed");
+        let path = sm.peer_emergency_budget_path.clone();
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+        cycled(&mut sm);
+        sm.test_peer_role = slave.clone();
+        sm.check_peer_emergency().await; // the cycle returned
+        sm.check_peer_emergency().await; // HA on, no task: probing starts
+        sm.check_peer_emergency().await; // one normal answer
+        assert!(sm.peer_emergency_verdict.is_some());
+        let freed = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("now answers normally as a slave")).count();
+        assert_eq!(freed(&sm), 0);
+        sm.check_peer_emergency().await; // two
+        assert!(sm.peer_emergency_verdict.is_none() && sm.peer_emergency_resolve_at.is_none());
+        assert_eq!(freed(&sm), 1);
+        sm.check_peer_emergency().await;
+        assert_eq!(freed(&sm), 1, "once");
+        let mut b = peer_emergency_budget_read(&path, &boot);
+        assert_eq!(b.futile, 0);
+        assert!(b.freed_at != 0);
+        // A new wedge more than 30 minutes after the verdict (an earlier one
+        // would be the same wedge relapsing): reset again.
+        b.resets = b.resets.iter().map(|r| r - 2400).collect();
+        b.freed_at -= 1860;
+        b.verdict_at -= 1860;
+        peer_emergency_budget_write(&path, &boot, &b);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 2);
+        // Given back or not, from the cycle's outcome.
+        for (issued, may_land, off, kept) in [
+            (true, true, false, 1),   // timed out: may still take, judged later
+            (true, false, false, 0),  // refused: given back
+            (false, false, false, 0), // never issued: given back
+            (false, false, true, 0),  // an operator's pool HA off: given back
+        ] {
+            let mut sm = seam_sm("pe-giveback");
+            seam(&mut sm).master_resilient = Some(true);
+            seam(&mut sm).pool_ha = Some(true);
+            let path = sm.peer_emergency_budget_path.clone();
+            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 30], pending: now - 30, ..Default::default() });
+            sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
+            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
+                disabled: false,
+                enabled: false,
+                disable_note: "x".into(),
+                operator_off: off,
+                disable_issued: issued,
+                disable_may_land: may_land,
+                withheld: Option::None,
+            }));
+            sm.check_peer_emergency().await;
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert_eq!(b.resets.len(), kept, "{issued} {may_land} {off}");
+            assert_eq!(b.pending != 0, kept == 1, "the mark goes with a reset given back");
+        }
+        // A timed-out disable stays spent whatever follows; the re-arm
+        // record says what to do. It took, and the watchdog re-enabled
+        // within a minute, no pass ever reading pool HA off (the record went
+        // owed, then enabled): the verdict runs. It did not take (the record
+        // ended while still pending): no verdict, no alert, still spent.
+        for took in [true, false] {
+            let mut sm = seam_sm("pe-disable-unknown");
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            seam(&mut sm).master_resilient = Some(true);
+            seam(&mut sm).pool_ha = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            let obl = format!("{}/obligation", seam_dir("pe-disable-unknown-obl"));
+            sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
+            // This reset's own cycle wrote the record (just after the spend).
+            let own = format!("peer_emergency:{}", now - 29);
+            ha_obligation_write_owned_at(&obl, "sr", 120, ObligationState::Pending { until: now + 420 }, &own);
+            let path = sm.peer_emergency_budget_path.clone();
+            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 30], pending: now - 30, ..Default::default() });
+            sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
+            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
+                disabled: false,
+                enabled: false,
+                disable_note: "pool-ha-disable timed out".into(),
+                operator_off: false,
+                disable_issued: true,
+                disable_may_land: true,
+                withheld: Option::None,
+            }));
+            sm.check_peer_emergency().await;
+            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::DisableUnknown);
+            // Every pass reads pool HA on.
+            sm.check_peer_emergency().await;
+            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::DisableUnknown);
+            if took {
+                ha_obligation_set_state_at(&obl, ObligationState::Owed);
+                ha_obligation_set_state_at(&obl, ObligationState::Enabled);
+                sm.check_peer_emergency().await;
+                assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+                sm.check_peer_emergency().await; // HA on, no task: probing
+                assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::Probing);
+                let b = peer_emergency_budget_read(&path, &boot);
+                assert_eq!((b.resets.len(), b.pending != 0), (1, true), "spent, verdict pending");
+                continue;
+            }
+            // Far past 420 s, HA on, no task: still not given back.
+            sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict {
+                returned: v.returned - OBLIGATION_PENDING_FOR,
+                ..v
+            });
+            sm.check_peer_emergency().await;
+            assert_eq!(peer_emergency_budget_read(&path, &boot).resets.len(), 1);
+            // The record ends while pending: no verdict, no alert, spent.
+            let _ = std::fs::remove_file(&obl);
+            sm.check_peer_emergency().await;
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert!(b.resets.len() == 1 && b.pending == 0 && b.futile == 0, "{b:?}");
+            assert!(sm.peer_emergency_resolve_at.is_none());
+            // The spacing runs from the decision, not the reset's spawn.
+            assert!(b.verdict_at >= now, "{b:?}");
+            let h = peer_emergency_budget_hold(&b, b.verdict_at).unwrap();
+            assert_eq!((h.rule, h.until), (BudgetRule::Spacing, b.verdict_at + PEER_EMERGENCY_SPACING));
+            let alerts = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but") || a.contains("now answers normally as a slave")).count();
+            assert_eq!(alerts, 0);
+        }
+    }
+
+    /// Whether a timed-out disable took is read only from this reset's own
+    /// record. One another routine wrote (owed, by the masterless chain, or
+    /// one from before the reset) says nothing about it, and a record gone
+    /// without having been seen pending here (fulfilled and cleared while
+    /// this host was not master) is unknown: futile (Unknown), never "did
+    /// not take" and never "took".
+    #[tokio::test]
+    async fn only_the_resets_own_record_says_whether_its_disable_took() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        assert!(record_is_resets(Some(&format!("peer_emergency:{}", now - 29)), now - 30));
+        assert!(!record_is_resets(Some(&format!("peer_emergency:{}", now - 31)), now - 30), "older than the reset");
+        assert!(!record_is_resets(Some(&format!("masterless:{}", now - 29)), now - 30));
+        assert!(!record_is_resets(Option::None, now - 30));
+        for (owner, state) in [
+            (Some(format!("masterless:{}", now - 10)), Some(ObligationState::Owed)),
+            (Option::None, Some(ObligationState::Owed)),
+            (Option::None, Option::None),
+        ] {
+            let mut sm = seam_sm("pe-record-owner");
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            seam(&mut sm).master_resilient = Some(true);
+            seam(&mut sm).pool_ha = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            let obl = format!("{}/obligation", seam_dir("pe-record-owner-obl"));
+            sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
+            if let Some(st) = state {
+                match &owner {
+                    Some(o) => ha_obligation_write_owned_at(&obl, "sr", 120, st, o),
+                    None => ha_obligation_write_at(&obl, "sr", 120, st),
+                }
+            }
+            let path = sm.peer_emergency_budget_path.clone();
+            // Resumed (restart or mastership back) in the disable phase.
+            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+                resets: vec![now - 30], pending: now - 30, pending_phase: "disable".into(), pending_since: now - 20,
+                ..Default::default()
+            });
+            sm.check_peer_emergency().await; // resumed
+            sm.check_peer_emergency().await;
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert!(b.pending == 0 && b.futile != 0, "{owner:?} {state:?}: {b:?}");
+            let lost = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("before it could tell")).count();
+            assert_eq!(lost, 1);
+        }
+        // The masterless chain leaves a record another routine holds
+        // pending or owed, and writes over none or an enabled one.
+        let owed = Some(ObligationState::Owed);
+        assert_eq!(masterless_record_write(Some(ObligationState::Pending { until: now + 1 }), owed, now), Option::None);
+        assert_eq!(masterless_record_write(Some(ObligationState::Pending { until: now }), owed, now), owed, "past its window");
+        assert_eq!(masterless_record_write(Some(ObligationState::Owed), owed, now), Option::None);
+        assert_eq!(masterless_record_write(Some(ObligationState::Enabled), owed, now), owed);
+        assert_eq!(masterless_record_write(Option::None, owed, now), owed);
+    }
+
+    /// The masterless chain under another routine's pending record that
+    /// went stale while no master read pool HA: on the new master, pool HA
+    /// reads off, the chain's own transition owes the re-arm, so it replaces
+    /// the stale record with its own owed one, and the watchdog's next pass
+    /// enables (no not-by-TwinStor alert). A pending record still inside its
+    /// window is left, and the chain proceeds under it.
+    #[tokio::test]
+    async fn the_masterless_chain_replaces_a_stale_pending_record_and_rearms() {
+        let dir = seam_dir("masterless-stale");
+        let obl = format!("{dir}/obligation");
+        let mut sm = seam_sm("masterless-stale-sm");
+        let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
+        sm.test_ha_ops = Some(ops.clone());
+        seam(&mut sm).pool_ha = Some(false);
+        let now = ops.now_unix();
+        // Another routine's disable, pending since before the pool went
+        // masterless: its window long past.
+        ha_obligation_write_owned_at(&obl, "sr", 120, ObligationState::Pending { until: now - 600 }, "peer_emergency:1");
+        sm.masterless_write_record("sr", 120).await;
+        let f = ha_obligation_file_at(&obl).unwrap();
+        assert_eq!(f.state, ObligationState::Owed);
+        assert!(f.owner.as_deref().is_some_and(|o| o.starts_with("masterless:")), "{f:?}");
+        // The watchdog's next pass: owed, HA off: the enable runs.
+        assert_eq!(obligation_step(&*ops, Some(false), true).await, ObligationStep::Proceed);
+        assert!(matches!(rearm_enable(&*ops, "sr", 120).await, RearmEnable::Returned));
+        assert_eq!(ops.count("enable"), 1);
+        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 0);
+        // A pending record still inside its window: left as it is.
+        ha_obligation_write_owned_at(&obl, "sr", 120, ObligationState::Pending { until: now + 300 }, "peer_emergency:2");
+        sm.masterless_write_record("sr", 120).await;
+        let f = ha_obligation_file_at(&obl).unwrap();
+        assert_eq!((f.state, f.owner.as_deref()), (ObligationState::Pending { until: now + 300 }, Some("peer_emergency:2")));
+    }
+
+    /// A reset judged freed, then relapsing: its futile alert is sent under
+    /// the same key as its freed alert, and the queued freed alert under that
+    /// key is dropped first, so it cannot go out after the futile one.
+    #[tokio::test]
+    async fn a_relapse_drops_the_queued_freed_alert_of_the_same_reset() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let mut sm = seam_sm("pe-freed-dropped");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).master_resilient = Some(true);
+        seam(&mut sm).pool_ha = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        let path = sm.peer_emergency_budget_path.clone();
+        let reset = now - 300;
+        // The verdict on a reset, probing: two slave answers free it.
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![reset], pending: reset, ..Default::default() });
+        sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
+        sm.peer_emergency_verdict = Some(ResetVerdict::at(VerdictPhase::Probing, std::time::Instant::now(), now - 200));
+        sm.check_peer_emergency().await;
+        sm.check_peer_emergency().await;
+        let key = peer_emergency_verdict_key(reset);
+        let acts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.clone();
+        assert!(acts(&sm).iter().any(|a| a.contains("now answers normally as a slave")));
+        assert!(acts(&sm).contains(&format!("keyed: {key}")));
+        // It relapses (two sightings): the futile alert for the same reset.
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.check_peer_emergency().await;
+        let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+        sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+        sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        sm.check_peer_emergency().await;
+        let a = acts(&sm);
+        let forget = a.iter().position(|x| *x == format!("forget-alert: {key}")).expect("the queued freed alert is dropped");
+        let relapse = a.iter().position(|x| x.contains("again reports that it is locally disarmed")).unwrap();
+        assert!(forget < relapse, "dropped before the futile alert is raised");
+        assert_eq!(a.iter().filter(|x| **x == format!("keyed: {key}")).count(), 2, "both under one key");
+    }
+
+    /// Pool HA turned off by hand while the verdict probes the peer (the
+    /// re-arm record enabled or gone): the verdict ends as interrupted: no
+    /// futile verdict, no hour's hold, no alert. With TwinStor's own record
+    /// still owing the enable, the verdict goes on as before.
+    #[tokio::test]
+    async fn an_operator_disable_during_the_probe_interrupts_the_verdict() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let probing = |name: &str, record: Option<ObligationState>| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            seam(&mut sm).master_resilient = Some(true);
+            seam(&mut sm).pool_ha = Some(false);
+            sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+            let obl = format!("{}/obligation", seam_dir(&format!("{name}-obl")));
+            sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
+            if let Some(r) = record {
+                ha_obligation_write_owned_at(&obl, "sr", 120, r, &format!("peer_emergency:{}", now - 300));
+            }
+            let path = sm.peer_emergency_budget_path.clone();
+            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+                resets: vec![now - 300], pending: now - 300, pending_phase: "probe".into(),
+                pending_since: now - 200, ..Default::default()
+            });
+            sm.peer_emergency_resolve_at = Some(std::time::Instant::now());
+            sm.peer_emergency_verdict = Some(ResetVerdict::at(VerdictPhase::Probing, std::time::Instant::now(), now - 200));
+            (sm, path)
+        };
+        for record in [Option::None, Some(ObligationState::Enabled)] {
+            let (mut sm, path) = probing("pe-interrupted", record);
+            sm.check_peer_emergency().await;
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert_eq!((b.pending, b.futile, b.alerted_until), (0, 0, 0), "{record:?}: {b:?}");
+            assert!(b.verdict_at >= now, "the spacing runs from the interruption");
+            assert!(sm.peer_emergency_verdict.is_none() && sm.peer_emergency_resolve_at.is_none());
+            assert!(sm.test_ha.as_ref().unwrap().actions.iter().all(|a| !a.starts_with("alert") && !a.starts_with("advice") && !a.starts_with("keyed")),
+                "no alert: {:?}", sm.test_ha.as_ref().unwrap().actions);
+            let hold = peer_emergency_budget_hold(&b, now).expect("the usual spacing");
+            assert!(hold.until <= b.verdict_at + PEER_EMERGENCY_SPACING, "no hour's hold: {hold:?}");
+        }
+        // TwinStor's own record owes the enable: not interrupted.
+        let (mut sm, path) = probing("pe-not-interrupted", Some(ObligationState::Owed));
+        sm.check_peer_emergency().await;
+        assert_ne!(peer_emergency_budget_read(&path, &boot).pending, 0);
+    }
+
+    /// The verdict outlives the daemon: a reset's pending verdict is in the
+    /// budget file from the moment the reset is spent. A daemon that starts
+    /// with one past its bound counts that reset futile (one alert, the
+    /// hour's hold); a younger one resumes the verdict. Losing mastership
+    /// clears the verdict in memory, not the file. A budget that cannot be
+    /// written runs no reset.
+    #[tokio::test]
+    async fn a_pending_verdict_survives_a_restart_and_an_unwritable_budget_runs_no_reset() {
+        let wedged = |name: &str| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            sm
+        };
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        // The reset is spent with its verdict pending before it runs.
+        let mut sm = wedged("pe-pending-spent");
+        let path = sm.peer_emergency_budget_path.clone();
+        sm.check_peer_emergency().await;
+        let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+        sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+        sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        sm.check_peer_emergency().await;
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+        assert!(b.pending != 0 && b.resets == vec![b.pending]);
+        // Mastership lost: the verdict goes from memory, stays in the file.
+        sm.peer_emergency_verdict = Some(ResetVerdict::new(std::time::Instant::now()));
+        seam(&mut sm).master_resilient = Some(false);
+        sm.check_peer_emergency().await;
+        assert!(sm.peer_emergency_verdict.is_none() && sm.peer_emergency_resolve_at.is_none());
+        assert_eq!(peer_emergency_budget_read(&path, &boot).pending, b.pending);
+        // A restarted daemon, the verdict pending past its bound: futile.
+        let old = now - PEER_EMERGENCY_VERDICT_BOUND.as_secs() - 5;
+        let mut sm = wedged("pe-pending-old");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![old], pending: old, ..Default::default() });
+        sm.check_peer_emergency().await;
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert_eq!(b.pending, 0);
+        assert!(b.futile >= now, "the hour runs from the verdict, not the old reset");
+        let a = sm.test_ha.as_ref().unwrap().actions.iter().find(|a| a.contains("ran, but")).unwrap().clone();
+        assert!(a.contains("before it could tell whether that freed"), "{a}");
+        assert!(a.contains(&local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)), "{a}");
+        // A younger one: the verdict resumes.
+        let young = now - 60;
+        let mut sm = wedged("pe-pending-young");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![young], pending: young, ..Default::default() });
+        sm.check_peer_emergency().await;
+        assert!(sm.peer_emergency_resolve_at.is_some() && sm.peer_emergency_verdict.is_some());
+        assert_eq!(peer_emergency_budget_read(&path, &boot).pending, young);
+        // An unwritable budget (its directory is a file): no reset.
+        let mut sm = wedged("pe-unwritable");
+        let dir = std::path::Path::new(&sm.peer_emergency_budget_path).parent().unwrap().to_path_buf();
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        sm.peer_emergency_budget_path = blocker.join("budget").to_string_lossy().into_owned();
+        sm.check_peer_emergency().await;
+        sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+        sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+        sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        assert!(sm.peer_emergency_resolve_at.is_none());
+    }
+
+    /// A cycle whose enable did not run or failed leaves pool HA off: the
+    /// verdict waits for pool HA to read on (the re-arm record's enable),
+    /// with no futile alert meanwhile, then frees the peer on its answers;
+    /// with the record gone and HA off, the reset counts futile in the log
+    /// only (the HA-off alerts cover it).
+    #[tokio::test]
+    async fn the_verdict_waits_for_pool_ha_when_the_cycles_enable_did_not_run() {
+        let wedged = |name: &str| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            sm
+        };
+        let confirm = |sm: &mut StateMachine| {
+            let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        };
+        let boot = current_boot_id();
+        for record_kept in [true, false] {
+            let mut sm = wedged("pe-enable-pending");
+            let path = sm.peer_emergency_budget_path.clone();
+            let obl = format!("{}/obligation", seam_dir("pe-enable-pending-obl"));
+            sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
+            sm.check_peer_emergency().await;
+            confirm(&mut sm);
+            sm.check_peer_emergency().await;
+            assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+            sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", PoolHaCycle {
+                disabled: true,
+                enabled: false,
+                disable_note: "disable".into(),
+                operator_off: false,
+                disable_issued: true,
+                disable_may_land: false,
+                withheld: Option::None,
+            }));
+            if record_kept {
+                ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+            } else {
+                let _ = std::fs::remove_file(&obl);
+            }
+            seam(&mut sm).pool_ha = Some(false);
+            sm.check_peer_emergency().await; // the cycle returned, HA off
+            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+            // Long past the verdict's own time, HA still off.
+            sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict {
+                since: v.since - PEER_EMERGENCY_CONFIRM_AFTER * 3,
+                ..v
+            });
+            sm.check_peer_emergency().await;
+            let alerts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but") || a.contains("now answers normally as a slave")).count();
+            if !record_kept {
+                // Nothing owes the enable: futile, logged only.
+                assert!(sm.peer_emergency_resolve_at.is_none());
+                let b = peer_emergency_budget_read(&path, &boot);
+                assert!(b.futile >= b.resets[0]);
+                assert_eq!(alerts(&sm), 0);
+                continue;
+            }
+            assert!(sm.peer_emergency_resolve_at.is_some(), "still waiting for pool HA");
+            assert_eq!(alerts(&sm), 0, "no futile alert while the re-enable is pending");
+            // The record's enable runs; the peer answers as a slave twice.
+            seam(&mut sm).pool_ha = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+            sm.check_peer_emergency().await; // the verdict starts
+            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::Probing);
+            sm.check_peer_emergency().await;
+            sm.check_peer_emergency().await;
+            assert!(sm.peer_emergency_resolve_at.is_none());
+            let freed = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("now answers normally as a slave")).count();
+            assert_eq!(freed, 1);
+            assert_eq!(peer_emergency_budget_read(&path, &boot).futile, 0);
+        }
+    }
+
+    /// Every waiting phase is bounded at 30 minutes from the cycle's return,
+    /// whatever the reads: pool HA off with the record still owed, pool HA
+    /// unreadable, or pool HA on with an HA task pending forever. Then the
+    /// reset is futile with one alert saying only what the last reads showed,
+    /// with the manual command only where it applies. A restarted daemon
+    /// resumes the wait with the same bound (the cycle's return is kept with
+    /// the budget), not the cycle's own bound.
+    #[tokio::test]
+    async fn every_wait_is_bounded_and_the_alert_says_only_what_was_read() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let waiting = |name: &str, returned: u64, pool_ha: Option<bool>| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            seam(&mut sm).master_resilient = Some(true);
+            seam(&mut sm).pool_ha = pool_ha;
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            let obl = format!("{}/obligation", seam_dir(&format!("{name}-obl")));
+            sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None)));
+            ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+            let path = sm.peer_emergency_budget_path.clone();
+            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+                resets: vec![returned - 200],
+                pending: returned - 200,
+                pending_phase: "ha".into(),
+                pending_since: returned,
+                ..Default::default()
+            });
+            (sm, path)
+        };
+        let alerts = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("minutes after its pool-level HA reset")).cloned().collect::<Vec<_>>();
+        let task_at = now - 25 * 60;
+        for (ha, task, read, enable) in [
+            (Some(false), false, "pool HA reads off", true),
+            (Option::None, false, "pool HA could not be read", false),
+            (Some(true), true, &*format!("an HA operation has been pending since {}", local_hm(task_at)), false),
+        ] {
+            // A restarted daemon 20 minutes into the wait (past the cycle's
+            // own 570 s bound): resumes the wait, no verdict yet.
+            let (mut sm, path) = waiting("pe-wait-bound", now - 20 * 60, ha);
+            if task {
+                seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
+                    uuid: "t".into(),
+                    name: "pool.enable_ha".into(),
+                    created_unix: Some(task_at),
+                }];
+            }
+            sm.check_peer_emergency().await;
+            assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+            sm.check_peer_emergency().await;
+            assert!(sm.peer_emergency_resolve_at.is_some() && alerts(&sm).is_empty(), "{ha:?}");
+            assert_eq!(peer_emergency_budget_read(&path, &boot).futile, 0);
+            // Thirty minutes from the cycle's return: futile, one alert.
+            sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict { returned: now - 31 * 60, ..v });
+            sm.check_peer_emergency().await;
+            let a = alerts(&sm);
+            assert_eq!(a.len(), 1, "{a:?}");
+            assert!(a[0].contains(read), "{}", a[0]);
+            assert!(a[0].contains(&format!("for the peer host {}", sm.config.node.peer)), "{}", a[0]);
+            assert_eq!(a[0].contains("xe pool-ha-enable"), enable, "{}", a[0]);
+            assert!(!a[0].contains("xe pool-ha-disable"), "{}", a[0]);
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert!(b.futile != 0 && b.pending == 0);
+            sm.check_peer_emergency().await;
+            assert_eq!(alerts(&sm).len(), 1);
+        }
+    }
+
+    /// Another routine's pool HA cycle in flight does not delay the
+    /// waiting bound.
+    #[tokio::test]
+    async fn the_waiting_bound_is_not_delayed_by_a_routine_in_flight() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let mut sm = seam_sm("pe-bound-inflight");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).master_resilient = Some(true);
+        seam(&mut sm).pool_ha = Some(false);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+            resets: vec![now - 1300], pending: now - 1300, pending_phase: "ha".into(), pending_since: now - 1200,
+            ..Default::default()
+        });
+        sm.check_peer_emergency().await; // resumed, 20 minutes into the wait
+        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        sm.ha_reset_inflight.store(true, Ordering::SeqCst);
+        sm.peer_emergency_verdict = sm.peer_emergency_verdict.map(|v| ResetVerdict { returned: now - 31 * 60, ..v });
+        sm.check_peer_emergency().await;
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert!(b.pending == 0 && b.futile != 0, "{b:?}");
+        sm.ha_reset_inflight.store(false, Ordering::SeqCst);
+    }
+
+    /// A verdict taken up again two hours after its cycle returned (a
+    /// restart, or mastership back) whose peer now answers as a slave: no
+    /// probe, no "freed"; futile (Unknown), the hour's hold from now, and no
+    /// relapse window opened from it.
+    #[tokio::test]
+    async fn a_verdict_resumed_hours_later_is_never_freed() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        for phase in ["probe", "ha", "disable"] {
+            let mut sm = seam_sm("pe-resume-late");
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            seam(&mut sm).master_resilient = Some(true);
+            seam(&mut sm).pool_ha = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+            let path = sm.peer_emergency_budget_path.clone();
+            peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+                resets: vec![now - 7300],
+                pending: now - 7300,
+                pending_phase: phase.into(),
+                pending_since: now - 7200,
+                ..Default::default()
+            });
+            for _ in 0..4 {
+                sm.check_peer_emergency().await;
+            }
+            let acts = &sm.test_ha.as_ref().unwrap().actions;
+            assert_eq!(acts.iter().filter(|a| a.contains("now answers normally as a slave")).count(), 0, "{phase}");
+            assert_eq!(acts.iter().filter(|a| a.contains("before it could tell")).count(), 1, "{phase}");
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert!(b.pending == 0 && b.futile >= now && b.freed_at == 0, "{b:?}");
+            assert_eq!(peer_emergency_budget_hold(&b, now).unwrap().until, b.futile + PEER_EMERGENCY_AFTER_FUTILE);
+        }
+    }
+
+    /// The record's enable landing between the pool HA read and the record
+    /// read (the record gone, pool HA now on) is not taken for pool HA left
+    /// off: pool HA is read again after the record.
+    #[tokio::test]
+    async fn an_enable_landing_between_the_reads_is_not_ha_left_off() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let mut sm = seam_sm("pe-ha-race");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).master_resilient = Some(true);
+        seam(&mut sm).pool_ha = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        let obl = format!("{}/obligation", seam_dir("pe-ha-race-obl"));
+        sm.test_ha_ops = Some(Arc::new(ScriptedHaOps::at(&obl, Option::None))); // no record
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+            resets: vec![now - 300], pending: now - 300, pending_phase: "ha".into(), pending_since: now - 200,
+            ..Default::default()
+        });
+        sm.check_peer_emergency().await; // resumed, waiting for pool HA
+        assert_eq!(sm.peer_emergency_verdict.unwrap().phase, VerdictPhase::AwaitingHa);
+        // The pass's first read sees HA off; the enable lands; the record is
+        // gone; the read after it sees HA on.
+        seam(&mut sm).pool_ha_next.lock().unwrap().extend([Some(false), Some(true)]);
+        sm.check_peer_emergency().await;
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert!(b.pending != 0 && b.futile == 0, "not futile: {b:?}");
+        assert!(sm.peer_emergency_resolve_at.is_some());
+        // Off on both reads, no record: HA left off.
+        seam(&mut sm).pool_ha_next.lock().unwrap().extend([Some(false), Some(false)]);
+        sm.check_peer_emergency().await;
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert!(b.pending == 0 && b.futile != 0, "{b:?}");
+    }
+
+    /// A peer judged freed that answers locally disarmed again within 30
+    /// minutes, on two sightings as a reset needs, is the same wedge: one
+    /// sighting is not enough. The earlier reset then becomes futile (the
+    /// hour's hold from it, one alert) and no reset follows 10 minutes on.
+    /// Past 30 minutes, the spacing alone applies.
+    #[tokio::test]
+    async fn a_relapse_within_half_an_hour_makes_the_freed_reset_futile() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let wedged = |name: &str| {
+            let mut sm = seam_sm(name);
+            sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+            let t = seam(&mut sm);
+            t.master_resilient = Some(true);
+            t.pool_ha = Some(true);
+            t.agent_live = Some(true);
+            sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+            sm
+        };
+        let confirm = |sm: &mut StateMachine| {
+            let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        };
+        // Freed 11 minutes after its reset, then the wedge again at once.
+        let reset = now - 660;
+        let mut sm = wedged("pe-relapse");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+            resets: vec![reset], freed_at: now - 60, freed_reset: reset, ..Default::default()
+        });
+        sm.check_peer_emergency().await;
+        // One sighting is not a relapse yet.
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert_eq!((b.futile, b.freed_at), (0, now - 60));
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        let b = peer_emergency_budget_read(&path, &boot);
+        assert!(b.futile >= now && b.freed_at == 0, "the hour runs from the relapse");
+        let w = sm.ha_withheld.clone().unwrap();
+        assert!(w.reason.contains("did not free the peer"), "{}", w.reason);
+        let relapse: Vec<_> = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but")).cloned().collect();
+        assert_eq!(relapse.len(), 1);
+        assert!(relapse[0].contains("again reports that it is locally disarmed"), "{}", relapse[0]);
+        assert!(relapse[0].contains(&local_hm(b.futile + PEER_EMERGENCY_AFTER_FUTILE)), "{}", relapse[0]);
+        // Freed more than 30 minutes ago: a new wedge, reset after the spacing.
+        let mut sm = wedged("pe-new-wedge");
+        let path = sm.peer_emergency_budget_path.clone();
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget {
+            resets: vec![now - 2400], freed_at: now - 1860, freed_reset: now - 2400, ..Default::default()
+        });
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+        assert_eq!(peer_emergency_budget_read(&path, &boot).futile, 0);
+    }
+
+    /// A budget that cannot be rewritten after a reset ran: the change is
+    /// kept in memory, the write retried each pass, one alert; the stale
+    /// file never drives the restart path again (no repeated futile alert),
+    /// and once writable the file catches up.
+    #[tokio::test]
+    async fn an_unwritable_budget_after_a_reset_is_kept_in_memory_and_alerted_once() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let mut sm = seam_sm("pe-unwritable-after");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::SlaveOf("10.0.0.1".into());
+        // A reset whose verdict was pending past its bound when the daemon
+        // started, the file then turning unwritable.
+        let good = sm.peer_emergency_budget_path.clone();
+        let old = now - PEER_EMERGENCY_VERDICT_BOUND.as_secs() - 5;
+        peer_emergency_budget_write(&good, &boot, &PeerEmergencyBudget { resets: vec![old], pending: old, ..Default::default() });
+        let dir = std::path::Path::new(&good).parent().unwrap().to_path_buf();
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let path = blocked.join("budget").to_string_lossy().into_owned();
+        std::fs::copy(&good, &path).unwrap();
+        let mut perm = std::fs::metadata(&blocked).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(0o500);
+        std::fs::set_permissions(&blocked, perm.clone()).unwrap();
+        sm.peer_emergency_budget_path = path.clone();
+        let futile = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("ran, but")).count();
+        let unwritable = |sm: &StateMachine| sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("cannot write its pool HA reset budget")).count();
+        // Running as root ignores the directory's mode: then nothing to test.
+        let writable = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(blocked.join("probe")).is_ok();
+        if !writable {
+            for _ in 0..4 {
+                sm.check_peer_emergency().await;
+            }
+            assert_eq!(futile(&sm), 1, "the restart path ran once, not every pass");
+            assert_eq!(unwritable(&sm), 1, "one alert while the write keeps failing");
+            assert_eq!(sm.pe_budget().pending, 0);
+            assert_eq!(peer_emergency_budget_read(&path, &boot).pending, old, "the file is stale");
+            perm.set_mode(0o700);
+            std::fs::set_permissions(&blocked, perm).unwrap();
+            sm.check_peer_emergency().await;
+            assert!(sm.pe_budget_unwritten.is_none());
+            let b = peer_emergency_budget_read(&path, &boot);
+            assert_eq!((b.pending, b.futile != 0), (0, true));
+            assert_eq!(futile(&sm), 1);
+        } else {
+            perm.set_mode(0o700);
+            std::fs::set_permissions(&blocked, perm).unwrap();
+        }
+    }
+
+    /// A verdict long after its reset still holds the next reset: the hour
+    /// after a futile reset, and the spacing, run from the later of the
+    /// reset and its verdict.
+    #[test]
+    fn the_holds_run_from_the_later_of_the_reset_and_its_verdict() {
+        let now = 1_000_000u64;
+        // A futile verdict 70 minutes after its reset: an hour from the verdict.
+        let late = PeerEmergencyBudget { resets: vec![now - 4200], futile: now, verdict_at: now, ..Default::default() };
+        let h = peer_emergency_budget_hold(&late, now + 60).unwrap();
+        assert_eq!((h.rule, h.until), (BudgetRule::AfterFutile, now + PEER_EMERGENCY_AFTER_FUTILE));
+        // The spacing from a verdict newer than its reset.
+        let freed = PeerEmergencyBudget { resets: vec![now - 1200], verdict_at: now - 120, ..Default::default() };
+        let h = peer_emergency_budget_hold(&freed, now).unwrap();
+        assert_eq!((h.rule, h.until), (BudgetRule::Spacing, now - 120 + PEER_EMERGENCY_SPACING));
+        // A reset after the verdict: from the reset.
+        let after = PeerEmergencyBudget { resets: vec![now - 1200, now - 60], verdict_at: now - 600, ..Default::default() };
+        assert_eq!(peer_emergency_budget_hold(&after, now).unwrap().until, now - 60 + PEER_EMERGENCY_SPACING);
+    }
+
+    /// A futile reset's alert stands for its hold: the hold alert does not
+    /// follow it. Its routing: only the texts that advise a pool HA disable
+    /// go out as such advice (held while a host is parked); "lost track" and
+    /// the waiting texts are plain. An unwritable budget gets one alert,
+    /// whether a change after a reset could not be kept or a confirmed reset
+    /// was refused for it.
+    #[tokio::test]
+    async fn one_alert_per_hold_routed_by_what_it_advises() {
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let mut sm = seam_sm("pe-one-alert");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).master_resilient = Some(true);
+        seam(&mut sm).pool_ha = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        // The first-sighting alert is tested on its own.
+        sm.peer_disarm_alerted = true;
+        let path = sm.peer_emergency_budget_path.clone();
+        // A verdict lost past the cycle's bound: futile (Unknown).
+        let old = now - PEER_EMERGENCY_VERDICT_BOUND.as_secs() - 5;
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![old], pending: old, ..Default::default() });
+        sm.check_peer_emergency().await;
+        let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        for _ in 0..3 {
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+            sm.check_peer_emergency().await;
+        }
+        let acts = sm.test_ha.as_ref().unwrap().actions.clone();
+        let lost: Vec<_> = acts.iter().filter(|a| a.contains("before it could tell")).collect();
+        assert_eq!(lost.len(), 1);
+        assert!(lost[0].starts_with("alert: "), "plain, not advice: {}", lost[0]);
+        assert!(sm.ha_withheld.clone().unwrap().reason.contains("did not free the peer"));
+        assert_eq!(acts.iter().filter(|a| a.contains("is on hold until")).count(), 0, "one hold, one alert");
+        // Routing by text.
+        let h = BudgetHold { rule: BudgetRule::AfterFutile, why: "x".into(), until: now };
+        let waited = FutileWhy::Waited { last_ha: Some(true), task_since: 0, task_read_failed: false };
+        let t = futile_reset_alert(waited, &h, now, "a", "b", 120);
+        assert!(t.contains("pool HA reads on,") && !t.contains("task list"), "{t}");
+        let failed = FutileWhy::Waited { last_ha: Some(true), task_since: 0, task_read_failed: true };
+        assert!(futile_reset_alert(failed, &h, now, "a", "b", 120).contains("task list could not be read"));
+        // One alert for an unwritable budget, refused reset or not.
+        let mut sm = seam_sm("pe-unwritable-one");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        seam(&mut sm).master_resilient = Some(true);
+        seam(&mut sm).pool_ha = Some(true);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        let dir = std::path::Path::new(&sm.peer_emergency_budget_path).parent().unwrap().to_path_buf();
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        sm.peer_emergency_budget_path = blocker.join("budget").to_string_lossy().into_owned();
+        sm.pe_budget_unwritten = Some(PeerEmergencyBudget::default());
+        sm.check_peer_emergency().await;
+        for _ in 0..3 {
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+            sm.check_peer_emergency().await;
+        }
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        let unwritable: Vec<_> = sm.test_ha.as_ref().unwrap().actions.iter().filter(|a| a.contains("cannot write its pool HA reset budget")).cloned().collect();
+        assert_eq!(unwritable.len(), 1, "{unwritable:?}");
+        assert!(unwritable[0].contains("xe pool-ha-disable") && unwritable[0].contains(&sm.config.node.peer), "{}", unwritable[0]);
+    }
+
+    /// The pacing across both kinds of hold: a spacing hold is logged and
+    /// shown but raises no alert, so the budget hold that follows still gets
+    /// its one alert; that alert is not repeated on the next pass.
+    #[tokio::test]
+    async fn a_spacing_hold_does_not_use_up_the_budget_holds_alert() {
+        let mut sm = seam_sm("pe-hold-pacing");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(false);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        // The first-sighting alert is tested on its own.
+        sm.peer_disarm_alerted = true;
+        let boot = current_boot_id();
+        let now = crate::heal_state::unix_now();
+        let path = sm.peer_emergency_budget_path.clone();
+        let confirm = |sm: &mut StateMachine| {
+            let back = |o: Option<std::time::Instant>| o.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+            sm.peer_mismatch.first = back(sm.peer_mismatch.first);
+            sm.peer_mismatch.last = back(sm.peer_mismatch.last);
+            sm.peer_mismatch.probed = back(sm.peer_mismatch.probed);
+        };
+        // Two resets, the last 4 minutes ago: the spacing holds it.
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 3600, now - 240], ..Default::default() });
+        sm.check_peer_emergency().await;
+        confirm(&mut sm);
+        sm.check_peer_emergency().await;
+        assert!(sm.ha_withheld.clone().unwrap().reason.contains("the spacing"));
+        assert!(sm.peer_emergency_hold.is_some());
+        assert_eq!(seam_actions(&sm, "advice"), 0);
+        // A third reset ran meanwhile: the budget holds it, alerted once.
+        peer_emergency_budget_write(&path, &boot, &PeerEmergencyBudget { resets: vec![now - 3600, now - 1800, now - 900], ..Default::default() });
+        sm.check_peer_emergency().await;
+        assert!(sm.ha_withheld.clone().unwrap().reason.contains("the budget"));
+        assert_eq!(seam_actions(&sm, "advice"), 1);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "advice"), 1);
+        assert_eq!(peer_emergency_budget_read(&path, &boot).alerted_until, now - 3600 + PEER_EMERGENCY_BUDGET_WINDOW);
+    }
+
+    /// With another pool HA cycle in flight, a confirmed peer-emergency
+    /// trigger waits: no budget spent, no confirmation started.
+    #[tokio::test]
+    async fn peer_emergency_spends_nothing_while_a_cycle_is_in_flight() {
+        let mut sm = seam_sm("pe-inflight");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        let t = seam(&mut sm);
+        t.master_resilient = Some(true);
+        t.pool_ha = Some(true);
+        t.agent_live = Some(false);
+        sm.test_peer_role = xapi::PeerXapiRole::ArmedMismatch;
+        sm.ha_reset_inflight.store(true, Ordering::SeqCst);
+        sm.check_peer_emergency().await;
+        sm.peer_mismatch.first = sm.peer_mismatch.first.map(|t| t - PEER_EMERGENCY_CONFIRM_GAP);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 0);
+        assert_eq!(sm.peer_emergency_unissued_at, Option::None);
+        assert!(peer_emergency_budget_read(&sm.peer_emergency_budget_path, &current_boot_id()).resets.is_empty());
+        assert_eq!(sm.peer_emergency_resolve_at, Option::None);
+        sm.ha_reset_inflight.store(false, Ordering::SeqCst);
+        sm.check_peer_emergency().await;
+        assert_eq!(seam_actions(&sm, "peer_emergency_reset"), 1);
+    }
+
+    #[test]
+    fn pool_ha_cycle_results_are_kept_per_requester() {
+        let sm = inc1_sm();
+        let r = |n: &str| PoolHaCycle {
+            disabled: true,
+            enabled: true,
+            disable_note: n.into(),
+            operator_off: false,
+            disable_issued: true,
+            disable_may_land: false,
+            withheld: Option::None,
+        };
+        sm.ha_cycle_result.lock().unwrap().push(("peer_emergency", r("a")));
+        sm.ha_cycle_result.lock().unwrap().push(("recorded_rearm", r("b")));
+        assert_eq!(sm.take_ha_cycle_result("recorded_rearm").unwrap().disable_note, "b");
+        assert_eq!(sm.take_ha_cycle_result("recorded_rearm"), Option::None);
+        assert_eq!(sm.take_ha_cycle_result("peer_emergency").unwrap().disable_note, "a");
+    }
+
+    /// Scripted pool HA operations: each call takes the next scripted answer
+    /// (when a script runs out: pool HA unreadable, no task pending, gates
+    /// open, commands returning) and is logged by name.
+    #[derive(Default)]
+    struct ScriptedHaOps {
+        disable: std::sync::Mutex<std::collections::VecDeque<HaCmd>>,
+        enable: std::sync::Mutex<std::collections::VecDeque<HaCmd>>,
+        pool_ha: std::sync::Mutex<std::collections::VecDeque<Option<bool>>>,
+        pending: std::sync::Mutex<std::collections::VecDeque<Option<Vec<xapi::PendingHaTask>>>>,
+        gates: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
+        log: std::sync::Mutex<Vec<String>>,
+        /// The re-arm obligation file (a real file, so a "restarted daemon"
+        /// with fresh operations reads what an earlier one wrote).
+        obl_path: String,
+        /// Seconds added to the scripted wall clock.
+        clock: AtomicU64,
+        /// Run one per gates() call, in order (an operator's action between
+        /// two steps).
+        on_gates: std::sync::Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl ScriptedHaOps {
+        fn new() -> Self {
+            Self::default()
+        }
+        /// Pool HA reads on just before the disable (the normal start).
+        fn armed() -> Self {
+            let o = Self::new();
+            o.pool_ha.lock().unwrap().push_back(Some(true));
+            o
+        }
+        /// With a real obligation file at `path` (none standing yet) and
+        /// pool HA reading `before` just before the disable.
+        fn at(path: &str, before: Option<bool>) -> Self {
+            let _ = std::fs::remove_file(path);
+            let o = Self { obl_path: path.to_string(), ..Default::default() };
+            o.pool_ha.lock().unwrap().push_back(before);
+            o
+        }
+        fn note(&self, s: &str) {
+            self.log.lock().unwrap().push(s.to_string());
+        }
+        fn count(&self, s: &str) -> usize {
+            self.log.lock().unwrap().iter().filter(|l| l.starts_with(s)).count()
+        }
+        fn task(name: &str, created: u64) -> xapi::PendingHaTask {
+            xapi::PendingHaTask { uuid: "t".into(), name: name.into(), created_unix: Some(created) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HaOps for ScriptedHaOps {
+        async fn disable(&self) -> HaCmd {
+            self.note("disable");
+            self.disable.lock().unwrap().pop_front().unwrap_or(HaCmd::Done)
+        }
+        async fn enable(&self, _sr: &str, _timeout: u64) -> HaCmd {
+            self.note("enable");
+            self.enable.lock().unwrap().pop_front().unwrap_or(HaCmd::Done)
+        }
+        async fn pool_ha(&self) -> Option<bool> {
+            self.note("pool_ha");
+            self.pool_ha.lock().unwrap().pop_front().flatten()
+        }
+        async fn pending_tasks(&self) -> Option<Vec<xapi::PendingHaTask>> {
+            self.pending.lock().unwrap().pop_front().unwrap_or(Some(Vec::new()))
+        }
+        async fn plug_pbds(&self) {
+            self.note("plug");
+        }
+        async fn stop_local_xhad(&self) {
+            self.note("stop_xhad");
+        }
+        async fn gates(&self) -> Option<String> {
+            self.note("gates");
+            let hook = self.on_gates.lock().unwrap().pop_front();
+            if let Some(h) = hook {
+                h();
+            }
+            self.gates.lock().unwrap().pop_front().flatten()
+        }
+        async fn pause(&self, _d: Duration) {
+            tokio::task::yield_now().await;
+        }
+        fn touch_attempt(&self) {
+            if !self.obl_path.is_empty() {
+                ha_obligation_touch_attempt_at(&self.obl_path);
+            }
+        }
+        fn clear_obligation(&self) {
+            self.note("clear_obligation");
+            if !self.obl_path.is_empty() {
+                let _ = std::fs::remove_file(&self.obl_path);
+            }
+        }
+        fn write_obligation(&self, sr: &str, timeout: u64, state: ObligationState, owner: &str) {
+            self.note("write_obligation");
+            if !self.obl_path.is_empty() {
+                ha_obligation_write_owned_at(&self.obl_path, sr, timeout, state, owner);
+            }
+        }
+        fn obligation_owner(&self) -> Option<String> {
+            ha_obligation_file_at(&self.obl_path).and_then(|f| f.owner)
+        }
+        fn set_obligation_state(&self, state: ObligationState) {
+            if !self.obl_path.is_empty() {
+                ha_obligation_set_state_at(&self.obl_path, state);
+            }
+        }
+        fn obligation_state(&self) -> Option<ObligationState> {
+            if self.obl_path.is_empty() {
+                // No file: as if the routine's own write stood, owed once
+                // its disable took (the cycle tests that need the states use
+                // a file).
+                return Some(ObligationState::Owed);
+            }
+            ha_obligation_file_at(&self.obl_path).map(|f| f.state)
+        }
+        fn now_unix(&self) -> u64 {
+            1_000_000 + self.clock.load(Ordering::Relaxed)
+        }
+        fn obligation_attempt(&self) -> Option<u64> {
+            if self.obl_path.is_empty() {
+                return Option::None;
+            }
+            ha_obligation_fields_at(&self.obl_path).and_then(|f| f.2)
+        }
+        async fn alert(&self, body: &str) {
+            self.note(&format!("alert: {body}"));
+        }
+        async fn wedge_alert(&self, body: &str) {
+            self.note(&format!("wedge-alert: {body}"));
+        }
+    }
+
+    /// The survivor reset announces itself before its start checks: nothing
+    /// is awaited between those checks and the disable, and the text says
+    /// what is about to happen and when HA comes back, not that it has.
+    #[tokio::test]
+    async fn the_survivor_reset_announces_before_its_start_checks() {
+        let dir = seam_dir("survivor-order");
+        let ops = ScriptedHaOps::at(&format!("{dir}/obl"), Some(true));
+        ops.disable.lock().unwrap().push_back(HaCmd::Refused("x".into()));
+        ops.pool_ha.lock().unwrap().push_back(Some(true));
+        survivor_ha_reset_with("r", &ops, "sr", 120, true).await;
+        let log = ops.log.lock().unwrap().clone();
+        let alert = log.iter().position(|l| l.starts_with("wedge-alert: ")).expect("announced");
+        let gates = log.iter().position(|l| l == "gates").unwrap();
+        let disable = log.iter().position(|l| l == "disable").unwrap();
+        assert!(alert < gates, "{log:?}");
+        assert!(log[gates..disable].iter().all(|l| !l.contains("alert")), "{log:?}");
+        assert!(!log[alert].contains("VMs keep running") && log[alert].contains("if its checks pass"));
+        assert!(log[alert].contains("ha-config:timeout=120"));
+        // A later attempt of the same episode: no announcement.
+        let ops = ScriptedHaOps::at(&format!("{dir}/obl2"), Some(true));
+        ops.disable.lock().unwrap().push_back(HaCmd::Refused("x".into()));
+        ops.pool_ha.lock().unwrap().push_back(Some(true));
+        survivor_ha_reset_with("r", &ops, "sr", 120, false).await;
+        assert_eq!(ops.count("wedge-alert"), 0);
+        // Once per stuck episode: the first attempt announces, the next do
+        // not, and the episode's end re-arms it.
+        let mut sm = seam_sm("survivor-announce-once");
+        assert!(sm.survivor_reset_take_announce());
+        assert!(!sm.survivor_reset_take_announce());
+        assert!(!sm.survivor_reset_take_announce());
+        sm.sb_keepdata_stuck = 7;
+        sm.survivor_episode_end();
+        assert_eq!(sm.sb_keepdata_stuck, 0);
+        assert!(sm.survivor_reset_take_announce(), "a new episode announces again");
+    }
+
+    /// Before the enable, the cycle reads its fire-time gates again; one that
+    /// fails leaves the enable to the re-arm obligation, and the disable it
+    /// already did stands. With the gates open it enables.
+    #[tokio::test]
+    async fn a_pool_ha_cycle_reads_its_gates_again_before_the_enable() {
+        let ops = ScriptedHaOps::armed();
+        ops.gates.lock().unwrap().extend([Option::None, Some("P false".into())]);
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(r.disabled && !r.enabled);
+        assert_eq!(r.withheld.as_deref(), Some("enable: P false"));
+        assert_eq!(ops.count("enable"), 0);
+        assert_eq!(ops.count("clear_obligation"), 0, "the obligation does the enable later");
+        let ops = ScriptedHaOps::armed();
+        let r = pool_ha_cycle(&ops, "sr", 120, "readmission_dance").await;
+        assert!(r.disabled && r.enabled && r.withheld.is_none());
+        assert_eq!(ops.count("gates"), 2, "before the disable and before the enable");
+        assert_eq!(ops.count("enable"), 1);
+        // A gate closed before the disable (maintenance): nothing issued,
+        // nothing written.
+        let ops = ScriptedHaOps::armed();
+        ops.gates.lock().unwrap().push_back(Some("a host is in maintenance".into()));
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(!r.disable_issued && !r.disabled);
+        assert_eq!(ops.count("disable") + ops.count("write_obligation"), 0);
+    }
+
+    /// Texts `xe` printed on the rigs (copied from the lab logs).
+    const XE_HA_NOT_ENABLED: &str = "The operation could not be performed because HA is not enabled on the Pool";
+    const XE_HA_DISABLE_IN_PROGRESS: &str =
+        "The operation could not be performed because HA disable is in progress";
+    const XE_CANNOT_FORWARD: &str = "Cannot forward messages because the server cannot be contacted. \
+        The server may be switched off or there may be network connectivity problems.";
+    const XE_CONN_REFUSED: &str = "Error: Connection refused (calling connect )";
+
+    /// Whose disable it was, decided by how our call ended, never by its
+    /// text or by clocks: pool HA on and nothing pending is required before
+    /// it; our call returning, or getting no answer within its bound with HA
+    /// off afterwards, is ours (the cycle goes on to the enable); any answer
+    /// from XAPI that is an error, with HA off afterwards, is not ours (no
+    /// enable, this cycle's obligation dropped, the refused-disable alert).
+    #[tokio::test]
+    async fn a_pool_ha_cycle_tells_its_own_disable_by_how_the_call_ended() {
+        let dir = seam_dir("disable-owner");
+        let obl = format!("{dir}/obligation");
+        let task = |name: &str| ScriptedHaOps::task(name, 1);
+        // No answer within the bound (a cycle run on a slave: the pending
+        // task's clock is never compared); HA off once it is done: ours.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.disable.lock().unwrap().push_back(HaCmd::TimedOut);
+        ops.pending.lock().unwrap().extend([Some(vec![]), Some(vec![task("pool.disable_ha")])]);
+        ops.pool_ha.lock().unwrap().push_back(Some(false));
+        let r = pool_ha_cycle(&ops, "sr", 120, "recorded_rearm").await;
+        assert!(r.disable_issued && r.disabled && r.enabled && !r.operator_off, "{r:?}");
+        assert_eq!(r.disable_note, "disable_timed_out_but_effective");
+        assert_eq!(ops.count("write_obligation"), 1);
+        // XAPI answered "HA is not enabled" (an operator got there between
+        // our read and our call): not ours, whatever the text says.
+        for refusal in [XE_HA_NOT_ENABLED, XE_HA_DISABLE_IN_PROGRESS, XE_CANNOT_FORWARD, XE_CONN_REFUSED] {
+            let ops = ScriptedHaOps::at(&obl, Some(true));
+            ops.disable.lock().unwrap().push_back(HaCmd::Refused(refusal.into()));
+            ops.pool_ha.lock().unwrap().push_back(Some(false));
+            let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+            assert!(r.operator_off && !r.enabled, "{refusal}");
+            assert_eq!(ops.count("enable"), 0, "{refusal}");
+            assert_eq!(ops.count("clear_obligation"), 1, "{refusal}");
+            assert!(std::fs::metadata(&obl).is_err(), "nothing re-enables later");
+            assert_eq!(ops.count("alert: TwinStor: pool HA is off. TwinStor's own pool HA disable was refused"), 1);
+        }
+        // A disable that could not be run at all: the same.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.disable.lock().unwrap().push_back(HaCmd::NotRun("No such file or directory".into()));
+        ops.pool_ha.lock().unwrap().push_back(Some(false));
+        assert!(pool_ha_cycle(&ops, "sr", 120, "x").await.operator_off);
+        // Refused with HA still on, or unreadable: stops, no enable.
+        for after in [Some(true), Option::None] {
+            let ops = ScriptedHaOps::at(&obl, Some(true));
+            ops.disable.lock().unwrap().push_back(HaCmd::Refused(XE_CANNOT_FORWARD.into()));
+            ops.pool_ha.lock().unwrap().push_back(after);
+            let r = pool_ha_cycle(&ops, "sr", 120, "x").await;
+            assert!(r.disable_issued && !r.disabled && !r.enabled && !r.operator_off);
+            assert_eq!(ops.count("enable"), 0);
+        }
+        // No answer and the task list unreadable afterwards: stop, obligation kept.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.disable.lock().unwrap().push_back(HaCmd::TimedOut);
+        ops.pending.lock().unwrap().extend([Some(vec![]), Option::None]);
+        let r = pool_ha_cycle(&ops, "sr", 120, "x").await;
+        assert!(!r.disabled && !r.operator_off);
+        assert!(ha_obligation_fields_at(&obl).is_some(), "kept");
+        // Before the disable: someone else's HA task pending (an operator's
+        // disable under way): nothing issued, nothing written.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.pending.lock().unwrap().push_back(Some(vec![task("pool.disable_ha")]));
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(!r.disable_issued && !r.operator_off);
+        assert_eq!(ops.count("disable") + ops.count("write_obligation"), 0);
+        assert!(std::fs::metadata(&obl).is_err());
+        // Task list or pool HA unreadable before: nothing issued.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.pending.lock().unwrap().push_back(Option::None);
+        assert!(!pool_ha_cycle(&ops, "sr", 120, "x").await.disable_issued);
+        let ops = ScriptedHaOps::at(&obl, Option::None);
+        assert!(!pool_ha_cycle(&ops, "sr", 120, "x").await.disable_issued);
+        assert_eq!(ops.count("disable"), 0);
+        // Already off and no TwinStor re-arm owed: someone else's; nothing
+        // written or cleared, the not-by-TwinStor alert.
+        let ops = ScriptedHaOps::at(&obl, Some(false));
+        let r = pool_ha_cycle(&ops, "sr", 120, "readmission_dance").await;
+        assert!(r.operator_off && !r.disable_issued);
+        assert_eq!(ops.count("disable") + ops.count("clear_obligation") + ops.count("write_obligation"), 0);
+        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 1);
+        // Already off with an earlier TwinStor re-arm owed (its enable was
+        // withheld): just stop; that obligation stands, no alert.
+        let ops = ScriptedHaOps::at(&obl, Some(false));
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(!r.operator_off && !r.disable_issued);
+        assert_eq!(ops.count("alert") + ops.count("clear_obligation") + ops.count("disable"), 0);
+        assert!(ha_obligation_fields_at(&obl).is_some());
+    }
+
+    /// The obligation carries what TwinStor knows, and only an owed one leads
+    /// to an enable. An operator's disable after TwinStor's enable, while the
+    /// obligation still stands, is not TwinStor's: no enable, the obligation
+    /// goes, the not-by-TwinStor alert.
+    #[tokio::test]
+    async fn an_operator_disable_after_twinstors_enable_is_never_re_enabled() {
+        let dir = seam_dir("obl-after-enable");
+        let obl = format!("{dir}/obligation");
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(r.enabled);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Enabled);
+        // The operator runs pool-ha-disable a minute later; the watchdog's
+        // next pass reads HA off.
+        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Stop);
+        assert!(std::fs::metadata(&obl).is_err(), "the obligation went");
+        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 1);
+        // Nothing can enable from it any more.
+        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        // A new cycle finding HA off with no owed re-arm: not TwinStor's.
+        let ops = ScriptedHaOps::at(&obl, Some(false));
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Enabled);
+        let r = pool_ha_cycle(&ops, "sr", 120, "recorded_rearm").await;
+        assert!(r.operator_off && !r.disable_issued);
+        assert!(std::fs::metadata(&obl).is_err());
+    }
+
+    /// A disable that got no answer leaves the obligation pending for its
+    /// window: HA read off within it, the disable was TwinStor's (owed, then
+    /// re-enabled); the window passing with HA on, it never took (nothing
+    /// owed); HA read off only after the window, it is not TwinStor's.
+    #[tokio::test]
+    async fn a_pending_disable_becomes_owed_expires_or_is_not_ours() {
+        let dir = seam_dir("obl-pending");
+        let obl = format!("{dir}/obligation");
+        let pending_cycle = || async {
+            let ops = ScriptedHaOps::at(&obl, Some(true));
+            ops.disable.lock().unwrap().push_back(HaCmd::TimedOut);
+            ops.pool_ha.lock().unwrap().push_back(Some(true));
+            let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+            assert!(r.disable_issued && !r.disabled);
+            assert!(matches!(
+                ha_obligation_file_at(&obl).unwrap().state,
+                ObligationState::Pending { .. }
+            ));
+            ops
+        };
+        // Lands within the window: owed, and the obligation's enable runs.
+        let ops = pending_cycle().await;
+        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)), "not owed yet");
+        ops.clock.store(120, Ordering::Relaxed);
+        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Proceed);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Returned);
+        assert_eq!(ops.count("enable"), 1);
+        // The window passes with HA on: it never took; nothing owed.
+        let ops = pending_cycle().await;
+        ops.clock.store(OBLIGATION_PENDING_FOR + 1, Ordering::Relaxed);
+        assert_eq!(obligation_step(&ops, Some(true), true).await, ObligationStep::Stop);
+        assert!(std::fs::metadata(&obl).is_err());
+        // HA off only after the window: not TwinStor's.
+        let ops = pending_cycle().await;
+        ops.clock.store(OBLIGATION_PENDING_FOR + 1, Ordering::Relaxed);
+        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Stop);
+        assert!(std::fs::metadata(&obl).is_err());
+        assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not"), 1);
+        assert_eq!(ops.count("enable"), 0);
+    }
+
+    /// Through the watchdog's real pass: an owed record whose last enable
+    /// attempt is recent stays owed on an "on" (it may still roll back); once
+    /// the attempt is the settle time old, with no HA task pending, the "on"
+    /// makes it enabled. A pending task, or an unreadable task list, holds.
+    /// TwinStor's own disable seen pending (or a cancel of it that failed)
+    /// keeps its pending window open for two watchdog passes: a disable
+    /// landing just after the original window is still TwinStor's (owed,
+    /// then re-enabled), with no "TwinStor did not turn it off" alert. A
+    /// cancel that went through ends the window at once only when pool HA
+    /// positively reads on after it; off or unreadable keeps the extension.
+    #[tokio::test]
+    async fn a_disable_landing_just_after_its_window_is_still_twinstors() {
+        // (cancel attempted, cancel fails, pool HA at the cancel, owed after)
+        for (cancel, fails, ha_at_cancel, owed) in [
+            (false, false, Some(true), true),
+            (true, true, Some(true), true),
+            (true, false, Some(true), false),
+            (true, false, Some(false), true),
+            (true, false, Option::None, true),
+        ] {
+            let dir = seam_dir("obl-late-extension");
+            let obl = format!("{dir}/obligation");
+            let mut sm = seam_sm("obl-late-extension-sm");
+            let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
+            sm.test_ha_ops = Some(ops.clone());
+            seam(&mut sm).cancel_fails = fails;
+            seam(&mut sm).pool_ha = ha_at_cancel;
+            let attempt = ops.now_unix();
+            // Pending, its window about to end.
+            ha_obligation_store(&obl, &ObligationFile {
+                sr: "sr".into(),
+                timeout: 120,
+                attempt: Some(attempt),
+                state: ObligationState::Pending { until: attempt + 30 },
+                owner: None,
+            });
+            seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
+                uuid: "t".into(),
+                name: "pool.disable_ha".into(),
+                created_unix: Some(attempt),
+            }];
+            if cancel {
+                // Stale and P holding: cancelled.
+                sm.test_p = Some(p_settling(400));
+                ops.clock.store(OWN_TASK_STALE_AFTER, Ordering::Relaxed);
+            }
+            assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Stop);
+            assert_eq!(seam_actions(&sm, "task-cancel"), usize::from(cancel));
+            // The task gone; one pass later (past the original window), pool
+            // HA reads off.
+            seam(&mut sm).pending_tasks.clear();
+            ops.clock.fetch_add(HA_REARM_RETRY_INTERVAL.as_secs(), Ordering::Relaxed);
+            sm.obligation_watch(Some(false)).await;
+            let state = ha_obligation_file_at(&obl).map(|f| f.state);
+            let case = (cancel, fails, ha_at_cancel);
+            assert_eq!(state == Some(ObligationState::Owed), owed, "{case:?}: {state:?}");
+            assert_eq!(ops.count("alert: TwinStor: pool HA is off and TwinStor did not") == 0, owed, "{case:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_trusts_on_only_once_the_last_attempt_has_settled() {
+        let dir = seam_dir("obl-settle");
+        let obl = format!("{dir}/obligation");
+        let mut sm = seam_sm("obl-settle-sm");
+        let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
+        sm.test_ha_ops = Some(ops.clone());
+        // An enable attempt just now (the scripted clock).
+        ha_obligation_store(&obl, &ObligationFile {
+            sr: "sr".into(),
+            timeout: 120,
+            attempt: Some(ops.now_unix()),
+            state: ObligationState::Owed,
+            owner: None,
+        });
+        assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Proceed);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        // Settle time later, but TwinStor's own enable still pending (created
+        // at its attempt, on the same scripted clock): hold, unchanged, with
+        // no foreign-task alert and no cancel (not stale yet).
+        // P holds, so the real clock (far past the scripted attempt) would
+        // read the task as stale and cancel it: the hold must read the
+        // scripted clock.
+        sm.test_p = Some(p_settling(400));
+        let attempt = ops.now_unix();
+        ops.clock.store(HA_REARM_SETTLE, Ordering::Relaxed);
+        seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
+            uuid: "t".into(),
+            name: "pool.enable_ha".into(),
+            created_unix: Some(attempt),
+        }];
+        assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Stop);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(seam_actions(&sm, "alert"), 0, "own young task: the Wait branch (no foreign-task or cancel alert)");
+        assert_eq!(seam_actions(&sm, "task-cancel"), 0);
+        // The task list unreadable: hold too.
+        seam(&mut sm).pending_tasks.clear();
+        seam(&mut sm).pending_unreadable = true;
+        assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Stop);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        // Nothing pending, settled: enabled.
+        seam(&mut sm).pending_unreadable = false;
+        assert_eq!(sm.obligation_watch(Some(true)).await, ObligationStep::Proceed);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Enabled);
+    }
+
+    /// Every enable reads the obligation file right before it: an operator
+    /// who deleted it (to keep HA off, as the alerts say) gets no enable,
+    /// from the cycle, from the re-arm's second enable after an orphan-xhad
+    /// stop, or from the re-arm itself.
+    #[tokio::test]
+    async fn deleting_the_obligation_stops_every_enable() {
+        let dir = seam_dir("obl-deleted");
+        let obl = format!("{dir}/obligation");
+        // The cycle: its disable took, then the operator deletes the file
+        // while it waits; the gates pass; no enable.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.gates.lock().unwrap().push_back(Option::None);
+        let p2 = obl.clone();
+        // Delete just before the enable's gate read (the second gates call).
+        ops.on_gates.lock().unwrap().push_back(Box::new(|| {}));
+        ops.on_gates.lock().unwrap().push_back(Box::new(move || {
+            let _ = std::fs::remove_file(&p2);
+        }));
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(r.disabled && !r.enabled);
+        assert_eq!(ops.count("enable"), 0);
+        // The re-arm's second enable after stopping an orphan xhad.
+        let ops = ScriptedHaOps::at(&obl, Option::None);
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+        ops.enable.lock().unwrap().push_back(HaCmd::Refused(
+            "The server failed to handle your request, due to an internal error.\nmessage: Xha_scripts.Xha_error(15)".into(),
+        ));
+        let p3 = obl.clone();
+        ops.on_gates.lock().unwrap().push_back(Box::new(|| {}));
+        ops.on_gates.lock().unwrap().push_back(Box::new(move || {
+            let _ = std::fs::remove_file(&p3);
+        }));
+        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert_eq!(ops.count("enable"), 1, "no second enable");
+        // The re-arm itself: the record deleted while its gates are read.
+        let ops = ScriptedHaOps::at(&obl, Option::None);
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+        let p4 = obl.clone();
+        ops.on_gates.lock().unwrap().push_back(Box::new(move || {
+            let _ = std::fs::remove_file(&p4);
+        }));
+        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert_eq!(ops.count("enable"), 0);
+        // The re-arm with no file at all.
+        let ops = ScriptedHaOps::at(&obl, Option::None);
+        assert!(matches!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Withheld(_)));
+        assert_eq!(ops.count("enable"), 0);
+        assert!(KEEP_HA_OFF_HOWTO.contains("/var/lib/twinstor/ha-rearm-obligation"));
+    }
+
+    /// TwinStor's own disable that got no answer and lands only at 330 s
+    /// is still TwinStor's (owed); and while its own task is still seen
+    /// pending, the window runs on, so a landing after that is too.
+    #[tokio::test]
+    async fn a_disable_landing_late_is_still_twinstors() {
+        let dir = seam_dir("obl-late-landing");
+        let obl = format!("{dir}/obligation");
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.disable.lock().unwrap().push_back(HaCmd::TimedOut);
+        ops.pool_ha.lock().unwrap().push_back(Some(true));
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(r.disable_issued && !r.disabled);
+        ops.clock.store(330, Ordering::Relaxed);
+        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Proceed);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        const { assert!(OBLIGATION_PENDING_FOR > OWN_TASK_STALE_AFTER) };
+        // Own task still pending past the window: the watchdog extends it.
+        let mut sm = seam_sm("obl-late-landing-sm");
+        let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Pending { until: 1_000_000 + OBLIGATION_PENDING_FOR });
+        sm.test_ha_ops = Some(ops.clone());
+        let stamp = crate::heal_state::unix_now();
+        seam(&mut sm).pending_tasks = vec![xapi::PendingHaTask {
+            uuid: "own".into(),
+            name: "pool.disable_ha".into(),
+            created_unix: Some(stamp),
+        }];
+        ops.clock.store(OBLIGATION_PENDING_FOR + 30, Ordering::Relaxed);
+        assert!(sm.pending_ha_task_holds(Some(stamp)).await, "own task: wait");
+        let until = match ha_obligation_file_at(&obl).unwrap().state {
+            ObligationState::Pending { until } => until,
+            s => panic!("{s:?}"),
+        };
+        assert_eq!(until, 1_000_000 + OBLIGATION_PENDING_FOR + 30 + PENDING_WINDOW_EXTENSION);
+        ops.clock.store(OBLIGATION_PENDING_FOR + 60, Ordering::Relaxed);
+        assert_eq!(obligation_step(ops.as_ref(), Some(false), true).await, ObligationStep::Proceed);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+    }
+
+    /// XAPI reads pool HA enabled while an enable still runs, and back off
+    /// if it fails. An enable whose call ran out of time with HA reading on
+    /// leaves the obligation owed; an "off" seen next is still TwinStor's (the
+    /// re-arm retries it), and only a settled "on" makes it enabled.
+    #[tokio::test]
+    async fn an_enable_that_timed_out_stays_owed_until_on_has_settled() {
+        let dir = seam_dir("obl-enable-timeout");
+        let obl = format!("{dir}/obligation");
+        // Pool HA reads on right after the enable that got no answer.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+        ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, RearmEnable::Returned);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        // The enable fails in XAPI and HA reads off again: still TwinStor's.
+        assert_eq!(obligation_step(&ops, Some(false), true).await, ObligationStep::Proceed);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+        assert_eq!(ops.count("alert"), 0);
+        // When "on" is trusted is the watchdog's own computation: see
+        // `the_watchdog_trusts_on_only_once_the_last_attempt_has_settled`.
+        // The same for the cycle's own enable: not returned, not enabled.
+        let ops = ScriptedHaOps::at(&obl, Some(true));
+        ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
+        let r = pool_ha_cycle(&ops, "sr", 120, "peer_emergency").await;
+        assert!(r.disabled && !r.enabled);
+        assert_eq!(ha_obligation_file_at(&obl).unwrap().state, ObligationState::Owed);
+    }
+
+    /// `twinstor status` prints the obligation's real state with its meaning.
+    #[test]
+    fn the_status_line_names_the_real_obligation_state() {
+        assert!(rearm_state_text(ObligationState::Pending { until: 1_300 }, 1_000)
+            .starts_with("pending: ") && rearm_state_text(ObligationState::Pending { until: 1_300 }, 1_000).contains("300s"));
+        assert!(rearm_state_text(ObligationState::Owed, 0).starts_with("owed: "));
+        assert!(rearm_state_text(ObligationState::Enabled, 0).starts_with("enabled: "));
+    }
+
+    /// The obligation file stays readable by 0.7.4 (sr, timeout, attempt as
+    /// its first fields), and a file without a state reads as owed.
+    #[test]
+    fn the_obligation_file_keeps_its_first_fields_for_older_readers() {
+        let old_reader = |text: &str| {
+            let mut it = text.split_whitespace();
+            let sr = it.next().map(str::to_string);
+            let timeout = it.next().and_then(|t| t.parse::<u64>().ok());
+            let attempt = it.next().and_then(|t| t.parse::<u64>().ok());
+            (sr, timeout, attempt)
+        };
+        let f = |attempt, state| ObligationFile { sr: "sr-1".into(), timeout: 120, attempt, state, owner: None };
+        for state in [ObligationState::Pending { until: 99 }, ObligationState::Owed, ObligationState::Enabled] {
+            let line = obligation_render(&f(Some(1234), state));
+            assert_eq!(old_reader(&line), (Some("sr-1".into()), Some(120), Some(1234)), "{line}");
+            assert_eq!(obligation_parse(&line), Some(f(Some(1234), state)));
+            let line = obligation_render(&f(Option::None, state));
+            assert_eq!(old_reader(&line), (Some("sr-1".into()), Some(120), Option::None), "{line}");
+            assert_eq!(obligation_parse(&line), Some(f(Option::None, state)));
+        }
+        assert_eq!(obligation_parse("sr-1 120 1234").unwrap().state, ObligationState::Owed);
+        assert_eq!(obligation_parse("sr-1 120").unwrap().state, ObligationState::Owed);
+    }
+
+    /// A refused disable's outcome says which refusal it was, read from the
+    /// texts `xe` printed on the rigs; the decision itself never depends on
+    /// it (a refusal of any kind with HA off afterwards is not TwinStor's).
+    #[tokio::test]
+    async fn a_refused_disables_outcome_names_the_refusal() {
+        for (refusal, said) in [
+            (XE_HA_NOT_ENABLED, "pool HA not enabled"),
+            (XE_HA_DISABLE_IN_PROGRESS, "another pool HA disable in progress"),
+            (XE_CANNOT_FORWARD, "the pool master could not be contacted"),
+            (XE_CONN_REFUSED, "the local XAPI refused the connection"),
+        ] {
+            let ops = ScriptedHaOps::armed();
+            ops.disable.lock().unwrap().push_back(HaCmd::Refused(refusal.into()));
+            ops.pool_ha.lock().unwrap().push_back(Some(true));
+            let r = pool_ha_cycle(&ops, "sr", 120, "x").await;
+            assert!(!r.disabled && !r.operator_off);
+            assert!(r.disable_note.contains(said), "{}", r.disable_note);
+            assert!(r.disable_note.contains(refusal), "{}", r.disable_note);
+        }
+    }
+
+    /// A lone-survivor masterless driver under the seam, due now, with an
+    /// owed obligation file and scripted operations.
+    fn lone_survivor(name: &str) -> (StateMachine, Arc<ScriptedHaOps>, String) {
+        let dir = seam_dir(name);
+        let obl = format!("{dir}/obligation");
+        let mut sm = seam_sm(&format!("{name}-sm"));
+        let t = seam(&mut sm);
+        t.pool_ha = Some(false);
+        t.local_serving = Some(true);
+        let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Owed);
+        sm.test_ha_ops = Some(ops.clone());
+        let now = std::time::Instant::now();
+        sm.masterless_retry = Some(MasterlessRetry {
+            sr: "sr".into(),
+            timeout: 120,
+            issued_base: 0,
+            started: now,
+            next_at: now,
+        });
+        (sm, ops, obl)
+    }
+
+    async fn drive_once(sm: &mut StateMachine) {
+        sm.drive_masterless_rearm_retry().await;
+        while sm.ha_reset_inflight.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        if let Some(r) = sm.masterless_retry.as_mut() {
+            r.next_at = std::time::Instant::now();
+        }
+    }
+
+    /// The lone survivor's own enable retry: withheld tries do not count
+    /// toward its cap of issued enables, but its 30-minute window ends them;
+    /// an operator's disable after one of its enables returned is never
+    /// re-enabled; it waits while the peer answers as master or this host's
+    /// copy does not serve, and hands over once the peer is back.
+    #[tokio::test]
+    async fn the_lone_survivor_enable_retry_keeps_its_premise() {
+        // Withheld every time (maintenance unanswered): no enable issued, the
+        // retry goes on until its window, then gives up; the obligation stays.
+        let (mut sm, ops, obl) = lone_survivor("lone-withheld");
+        for _ in 0..8 {
+            ops.gates.lock().unwrap().push_back(Some("a host is in maintenance, or XAPI did not say".into()));
+            drive_once(&mut sm).await;
+        }
+        assert!(sm.masterless_retry.is_some(), "withheld tries do not count toward the cap");
+        assert_eq!(ops.count("enable"), 0);
+        sm.masterless_retry.as_mut().unwrap().started =
+            std::time::Instant::now() - MASTERLESS_RETRY_WINDOW - Duration::from_secs(1);
+        drive_once(&mut sm).await;
+        assert!(sm.masterless_retry.is_none(), "the window ends it");
+        assert!(ha_obligation_fields_at(&obl).is_some());
+        // An enable returns; the operator then disables pool HA: the next
+        // due retry sees no owed re-arm and stops, issuing nothing.
+        let (mut sm, ops, _obl) = lone_survivor("lone-operator");
+        drive_once(&mut sm).await;
+        assert_eq!(ops.count("enable"), 1);
+        seam(&mut sm).pool_ha = Some(false);
+        drive_once(&mut sm).await;
+        assert!(sm.masterless_retry.is_none());
+        assert_eq!(ops.count("enable"), 1, "never re-enabled over the operator");
+        // The peer back (its management address answers, here as master):
+        // handed over to the normal re-arm path, no enable here. This host's
+        // copy not serving: no enable while that holds.
+        let (mut sm, ops, _obl) = lone_survivor("lone-premise");
+        sm.test_p = Some(crate::mgmt_reach::PView { p: true, ..crate::mgmt_reach::PView::settled_for_test() });
+        sm.test_peer_role = xapi::PeerXapiRole::Master;
+        drive_once(&mut sm).await;
+        assert!(sm.masterless_retry.is_none(), "the peer is back: handed over");
+        assert_eq!(ops.count("enable"), 0);
+        let (mut sm, ops, _obl) = lone_survivor("lone-storage");
+        seam(&mut sm).local_serving = Some(false);
+        drive_once(&mut sm).await;
+        assert!(sm.masterless_retry.is_some());
+        assert_eq!(ops.count("enable"), 0);
+        // A pending obligation (the chain could not read pool HA after its
+        // transition): wait, then go on as owed once the watchdog says so.
+        let (mut sm, ops, obl) = lone_survivor("lone-pending");
+        ha_obligation_write_at(&obl, "sr", 120, ObligationState::Pending { until: u64::MAX });
+        drive_once(&mut sm).await;
+        assert!(sm.masterless_retry.is_some(), "pending: waits, does not stop");
+        assert_eq!(ops.count("enable"), 0);
+        ha_obligation_set_state_at(&obl, ObligationState::Owed);
+        drive_once(&mut sm).await;
+        assert_eq!(ops.count("enable"), 1);
+        // Five issued enables (each refused): the cap.
+        let (mut sm, ops, _obl) = lone_survivor("lone-cap");
+        for _ in 0..MASTERLESS_RETRY_CAP {
+            ops.enable.lock().unwrap().push_back(HaCmd::Refused("The SR has no attached PBDs".into()));
+            drive_once(&mut sm).await;
+        }
+        assert_eq!(ops.count("enable"), MASTERLESS_RETRY_CAP as usize);
+        drive_once(&mut sm).await;
+        assert!(sm.masterless_retry.is_none());
+    }
+
+    /// The stuck-xhad reconcile's stop reads the gates and needs an owed
+    /// re-arm record right before it, as the stop in the re-arm enable does:
+    /// a record in another state, or a closed gate, stops nothing.
+    #[tokio::test]
+    async fn the_stuck_xhad_stop_needs_open_gates_and_an_owed_record() {
+        let run = |name: &str, state: Option<ObligationState>, gate: Option<String>| {
+            let name = name.to_string();
+            async move {
+                let mut sm = seam_sm(&name);
+                let obl = format!("{}/obl", seam_dir(&format!("{name}-obl")));
+                let ops = Arc::new(ScriptedHaOps::at(&obl, Option::None));
+                ops.gates.lock().unwrap().push_back(gate);
+                if let Some(st) = state {
+                    ha_obligation_write_at(&obl, "sr", 120, st);
+                }
+                sm.test_ha_ops = Some(ops.clone());
+                sm.xhad_mismatch_since = Some(std::time::Instant::now());
+                sm.reconcile_xhad_stop(std::time::Instant::now()).await;
+                (ops.count("stop_xhad"), sm.xhad_mismatch_since.is_none())
+            }
+        };
+        assert_eq!(run("xhad-stop-owed", Some(ObligationState::Owed), Option::None).await, (1, true));
+        assert_eq!(run("xhad-stop-pending", Some(ObligationState::Pending { until: u64::MAX }), Option::None).await, (0, false));
+        assert_eq!(run("xhad-stop-enabled", Some(ObligationState::Enabled), Option::None).await, (0, false));
+        assert_eq!(run("xhad-stop-none", Option::None, Option::None).await, (0, false));
+        assert_eq!(run("xhad-stop-gate", Some(ObligationState::Owed), Some("P false".into())).await, (0, false));
+    }
+
+    /// The re-arm enable reads its gates again before each enable and before
+    /// an orphan-xhad stop (and again before the enable after it), and an
+    /// enable whose call
+    /// ran out of time but left pool HA on counts as returned.
+    #[tokio::test]
+    async fn the_rearm_enable_reads_gates_before_each_enable_and_counts_effective_as_success() {
+        use super::RearmEnable::*;
+        let ops = ScriptedHaOps::new();
+        ops.gates.lock().unwrap().push_back(Some("maintenance".into()));
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, Withheld("maintenance".into()));
+        assert_eq!(ops.count("enable"), 0);
+        let ops = ScriptedHaOps::new();
+        ops.enable.lock().unwrap().push_back(HaCmd::Refused("The server failed to handle your request, due to an internal error. The given message may give details useful for debugging the problem.\nmessage: Xha_scripts.Xha_error(15)".into()));
+        ops.gates.lock().unwrap().extend([Option::None, Some("P false".into())]);
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, Withheld("P false".into()));
+        assert_eq!(ops.count("stop_xhad"), 0, "no xhad stop past a closed gate");
+        assert_eq!(ops.count("enable"), 1);
+        let ops = ScriptedHaOps::new();
+        ops.enable.lock().unwrap().push_back(HaCmd::Refused("message: Xha_scripts.Xha_error(15)".into()));
+        ops.gates.lock().unwrap().extend([Option::None, Option::None, Some("P false".into())]);
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, Withheld("P false".into()));
+        assert_eq!(ops.count("stop_xhad"), 1);
+        assert_eq!(ops.count("enable"), 1, "no second enable past a closed gate");
+        let ops = ScriptedHaOps::new();
+        ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
+        ops.pool_ha.lock().unwrap().push_back(Some(true));
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, Returned);
+        let ops = ScriptedHaOps::new();
+        ops.enable.lock().unwrap().push_back(HaCmd::Refused(XE_HA_DISABLE_IN_PROGRESS.into()));
+        ops.pool_ha.lock().unwrap().push_back(Some(false));
+        assert_eq!(rearm_enable(&ops, "sr", 120).await, Failed(XE_HA_DISABLE_IN_PROGRESS.into()));
+    }
+
+    /// The spawned bodies run under the test seam: the re-arm enable and the
+    /// dance's cycle, off the tick under the shared flag, each result read by
+    /// its own pass. A failure counts toward the toolstack escalation only on
+    /// the master's Attempt path; returned, effective or withheld never do.
+    #[tokio::test]
+    async fn the_off_tick_bodies_run_and_their_results_are_read_by_their_own_pass() {
+        use super::RearmEnable::*;
+        let mut sm = inc1_sm();
+        let ops = Arc::new(ScriptedHaOps::new());
+        ops.enable.lock().unwrap().push_back(HaCmd::TimedOut);
+        ops.pool_ha.lock().unwrap().push_back(Some(true));
+        sm.test_ha_ops = Some(ops.clone());
+        sm.ha_reset_inflight.store(true, Ordering::SeqCst);
+        assert!(!sm.spawn_rearm_enable("sr".into(), 120, true, Some(crate::mgmt_reach::Trigger::Positive)), "refused while one runs");
+        sm.ha_reset_inflight.store(false, Ordering::SeqCst);
+        assert!(sm.spawn_rearm_enable("sr".into(), 120, true, Some(crate::mgmt_reach::Trigger::Positive)));
+        while sm.ha_reset_inflight.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let now = std::time::Instant::now();
+        assert_eq!(sm.take_fresh_rearm_result(now), Some(Returned), "the pass after its start");
+        assert_eq!(sm.take_fresh_rearm_result(now), Option::None, "read once");
+        for (r, as_master, from_slave) in [
+            (Returned, true, false),
+            (Withheld("x".into()), true, false),
+            (DaemonPresentRetried, true, false),
+            (Failed("x".into()), false, false),
+            (Failed("x".into()), true, true),
+            (Failed("x".into()), true, false),
+        ] {
+            sm.rearm_enable_from_slave = from_slave;
+            sm.rearm_attempt = 0;
+            assert!(!sm.rearm_enable_followup(Some(r), as_master).await);
+        }
+        let i = HA_REARM_RETRY_INTERVAL;
+        // Started on the previous pass, a few seconds past one interval (a
+        // stalled tick): still this pass's.
+        let p = sm.rearm_pass;
+        *sm.rearm_enable_result.lock().unwrap() =
+            Some((Failed("late".into()), now - i - Duration::from_secs(5), p));
+        assert_eq!(sm.take_fresh_rearm_result(now), Some(Failed("late".into())));
+        // Older than twice the interval: dropped.
+        let p = sm.rearm_pass;
+        *sm.rearm_enable_result.lock().unwrap() =
+            Some((Failed("old".into()), now - i * 2 - Duration::from_secs(1), p));
+        assert_eq!(sm.take_fresh_rearm_result(now), Option::None);
+        // Started two passes ago (a pass went by without reading it): dropped.
+        let p = sm.rearm_pass.wrapping_sub(1);
+        *sm.rearm_enable_result.lock().unwrap() = Some((Failed("skipped".into()), now, p));
+        assert_eq!(sm.take_fresh_rearm_result(now), Option::None);
+        assert!(sm.rearm_enable_result.lock().unwrap().is_none());
+        // The dance's cycle: run, result kept for the dance, held while in flight.
+        let ops = Arc::new(ScriptedHaOps::armed());
+        sm.test_ha_ops = Some(ops.clone());
+        assert!(sm.spawn_pool_ha_cycle(
+            "readmission_dance",
+            "sr".into(),
+            120,
+            crate::mgmt_reach::Trigger::Absence,
+            Some(true),
+        ));
+        // Not yet run (single-threaded test runtime): the re-admission check
+        // holds while it is in flight.
+        assert!(readmission_cycle_holds(true, sm.ha_reset_inflight.load(Ordering::SeqCst)));
+        while sm.ha_reset_inflight.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sm.take_ha_cycle_result("peer_emergency"), Option::None);
+        let r = sm.take_ha_cycle_result("readmission_dance").expect("the dance's own result");
+        assert!(r.disabled && r.enabled);
+        assert_eq!(ops.count("disable"), 1);
+        assert_eq!(ops.count("enable"), 1);
+    }
+
+    /// While a pool HA cycle runs off the tick, every HA actuator waits: the
+    /// fire-time gate, the dance's local disarm, the masterless chain (lone
+    /// survivor included).
+    #[tokio::test]
+    async fn every_ha_actuator_waits_while_a_pool_ha_cycle_is_in_flight() {
+        use crate::mgmt_reach::Trigger::*;
+        let mut sm = seam_sm("inflight-all");
+        sm.test_p = Some(crate::mgmt_reach::PView::settled_for_test());
+        sm.ha_reset_inflight.store(true, Ordering::SeqCst);
+        for action in ["survivor_ha_reset", "self_unwedge", "dual_master_yield"] {
+            assert!(!sm.ha_gate(action, Positive));
+            assert!(!sm.ha_gate(action, Absence));
+        }
+        assert!(sm.ha_withheld.as_ref().unwrap().reason.contains("in flight"));
+        // The dance's phase 1: cancelled, no disarm.
+        let now_unix = crate::heal_state::unix_now();
+        seam(&mut sm).xhad = Some(XhaHostState::Starting);
+        sm.readmission_dance_t = Some(now_unix + 30);
+        sm.drive_readmission_dance(now_unix + 30).await;
+        assert_eq!(seam_actions(&sm, "readmission_dance_phase1"), 0);
+        // The masterless chain, lone survivor included.
+        let t = seam(&mut sm);
+        t.slave_of = Some("127.0.0.1".into());
+        t.peer_dead_liveset = Some(true);
+        sm.run_masterless_recovery_for(MasterlessFlavor::SlaveOfSelf, true).await;
+        assert_eq!(seam_actions(&sm, "masterless_transition"), 0);
+        // Flag cleared: the gate passes again.
+        sm.ha_reset_inflight.store(false, Ordering::SeqCst);
+        assert!(sm.ha_gate("survivor_ha_reset", Positive));
+    }
+
+    /// A slave skips its forwarded-xe housekeeping only once the settle clock
+    /// has reset (k consecutive failed probes), never on one lost probe.
+    #[test]
+    fn forwarded_xe_skip_needs_k_consecutive_failures() {
+        let mut sm = seam_sm("fwd-skip");
+        seam(&mut sm).conf_master = Some(false);
+        // One lost probe: P false, the settle still running.
+        sm.test_p = Some(crate::mgmt_reach::PView {
+            p: false,
+            last_answered: false,
+            answered: 5,
+            probes: 6,
+            true_for: Some(Duration::from_secs(900)),
+            address_known: true,
+            stale: false,
+        });
+        assert!(!sm.forwarded_xapi_dead());
+        // k failures in a row: the settle clock reset.
+        sm.test_p = Some(crate::mgmt_reach::PView { probes: 6, ..Default::default() });
+        assert!(sm.forwarded_xapi_dead());
+        // The master never skips (its xe is local).
+        seam(&mut sm).conf_master = Some(true);
+        assert!(!sm.forwarded_xapi_dead());
+    }
+
+    /// An operator's own `host-emergency-ha-disable` is not TwinStor's: a
+    /// demote on such a host writes no disarm record (so no pool HA cycle
+    /// re-arms it) and alerts instead.
+    #[tokio::test]
+    async fn a_demote_on_a_host_an_operator_disarmed_writes_no_record() {
+        let mut sm = seam_sm("demote-operator");
+        second_master_shape(&mut sm);
+        seam(&mut sm).local_armed = Some(false);
+        let dir = std::path::Path::new(&sm.second_master_budget_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        sm.disarm_record_path = dir.join("disarm").to_string_lossy().to_string();
+        confirmed_check(&mut sm).await;
+        assert_eq!(seam_actions(&sm, "demote"), 1);
+        assert!(!std::path::Path::new(&sm.disarm_record_path).exists());
+        let t = sm.test_ha.as_ref().unwrap();
+        assert!(t.actions.iter().any(|a| a.contains("TwinStor did not disarm it")), "{:?}", t.actions);
     }
 }

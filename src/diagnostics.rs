@@ -522,7 +522,7 @@ pub async fn run(
         ),
         (
             "state/heal-state.json".into(),
-            PathBuf::from(crate::heal_state::HEAL_STATE_PATH),
+            PathBuf::from(crate::heal_state::HEAL_STATE_PATH.as_str()),
         ),
     ];
 
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn tarball_roundtrips_generated_entries() {
-        let dir = std::env::temp_dir();
+        let dir = crate::heal_state::test_tmp_dir();
         let out = dir.join("twinstor-test-bundle.tar.gz");
         let _ = std::fs::remove_file(&out);
 
@@ -733,7 +733,7 @@ mod tests {
             .expect("read /proc/self/status");
         assert!(!content.is_empty(), "proc file should have content");
 
-        let dir = std::env::temp_dir();
+        let dir = crate::heal_state::test_tmp_dir();
         let out = dir.join("twinstor-test-proc.tar.gz");
         let _ = std::fs::remove_file(&out);
         let generated = vec![("state/proc.txt".to_string(), content.clone())];

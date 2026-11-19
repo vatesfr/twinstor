@@ -525,7 +525,7 @@ mod tests {
     fn the_password_file_is_private_and_removed() {
         let path;
         {
-            let f = PasswordFile::new_in(&std::env::temp_dir(), "s3cret").expect("created");
+            let f = PasswordFile::new_in(&crate::heal_state::test_tmp_dir(), "s3cret").expect("created");
             path = f.0.clone();
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();

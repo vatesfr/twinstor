@@ -19,7 +19,41 @@
 
 use tracing::debug;
 
-pub const HEAL_STATE_PATH: &str = "/run/twinstor/heal-state.json";
+pub static HEAL_STATE_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::heal_state::state_path("/run/twinstor/heal-state.json"));
+
+/// The unit tests' scratch directory: this test process's own directory
+/// in `target/test-state/` (created), never the system temp directory.
+pub fn test_tmp_dir() -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(format!(
+        "{}/target/test-state/{}/tmp",
+        env!("CARGO_MANIFEST_DIR"),
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+/// A state file's path: `default` in the daemon. In unit tests, the same
+/// path under this test process's own directory in `target/test-state/`
+/// (its parent created), so no test reads or writes the real /run/twinstor
+/// or /var/lib/twinstor, nor anything under /tmp.
+pub fn state_path(default: &str) -> String {
+    if cfg!(test) {
+        let p = format!(
+            "{}/target/test-state/{}/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            std::process::id(),
+            default.trim_start_matches('/')
+        );
+        if let Some(dir) = std::path::Path::new(&p).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        return p;
+    }
+    default.to_string()
+}
+
 
 /// A parsed snapshot for display. Numeric fields default to 0 when absent so
 /// the renderer never needs to distinguish "old file" from "no counter".
@@ -60,24 +94,24 @@ pub fn write(
         r#"{{"stage":"{stage}","summary":"{summary}","next":{next_json},"attempts":{attempts},"restarts":{restarts},"holds":{holds},"started_unix":{started_unix},"updated_unix":{}}}"#,
         unix_now(),
     );
-    if let Some(dir) = std::path::Path::new(HEAL_STATE_PATH).parent() {
+    if let Some(dir) = std::path::Path::new(HEAL_STATE_PATH.as_str()).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(HEAL_STATE_PATH, body) {
+    if let Err(e) = std::fs::write(HEAL_STATE_PATH.as_str(), body) {
         debug!(error = %e, "could not write heal-state file");
     }
 }
 
 /// Remove the state file (episode over, or daemon starting fresh).
 pub fn clear() {
-    let _ = std::fs::remove_file(HEAL_STATE_PATH);
+    let _ = std::fs::remove_file(HEAL_STATE_PATH.as_str());
 }
 
 /// Read and minimally parse the state file for display. Returns None when the
 /// file is absent (no episode) or unreadable/garbled (fail quiet: status must
 /// never break on a half-written snapshot).
 pub fn read() -> Option<HealState> {
-    let text = std::fs::read_to_string(HEAL_STATE_PATH).ok()?;
+    let text = std::fs::read_to_string(HEAL_STATE_PATH.as_str()).ok()?;
     Some(HealState {
         stage: json_str(&text, "stage")?,
         summary: json_str(&text, "summary")?,
@@ -92,7 +126,7 @@ pub fn read() -> Option<HealState> {
 
 /// Raw file content for embedding into `status --json` (it is already JSON).
 pub fn read_raw() -> Option<String> {
-    std::fs::read_to_string(HEAL_STATE_PATH).ok()
+    std::fs::read_to_string(HEAL_STATE_PATH.as_str()).ok()
 }
 
 fn json_str(text: &str, key: &str) -> Option<String> {

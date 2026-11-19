@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn dir_contents_removed_dir_kept() {
-        let dir = std::env::temp_dir().join(format!("twinstor-uninstall-{}", std::process::id()));
+        let dir = crate::heal_state::test_tmp_dir().join(format!("twinstor-uninstall-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("last-healthy"), "1").unwrap();
         std::fs::write(dir.join("sub/x"), "1").unwrap();
