@@ -353,6 +353,40 @@ const LEFTOVER_LIFT_STABLE: Duration = Duration::from_secs(5);
 /// still guard each lift.
 const LEFTOVER_LIFT_SHORT: Duration = Duration::from_secs(1);
 const LIFT_PRESSURE_MARGIN: Duration = Duration::from_secs(20);
+
+/// Arbitrated mode, a copy frozen by its own yield that DRBD has made the
+/// resync source: once only the connection hold (or the second sample in a
+/// row) stands between it and the lift, the pass re-reads the status on this
+/// cadence instead of returning to the tick. A tick during a management cut
+/// lasts about 10 s (probes into the cut), so two of them around the 5 s hold
+/// kept the guests frozen about 20 s after the reconnect, against an XHA
+/// statefile window that had already run most of its course.
+const ARB_LIFT_RECHECK: Duration = Duration::from_secs(1);
+/// Bounds on scheduling those re-checks in one pass: at most 8 of them, and
+/// none scheduled once 8 s have passed since the pass began. They bound when
+/// a re-check may start, not the pass's total duration: the last one still
+/// sleeps its second and runs its status reads (and a lift) to the end. From
+/// a first Connected sample, the 5 s hold and the second sample in a row take
+/// 6. Past either bound the tick's own cadence takes over, as before.
+const ARB_LIFT_RECHECKS: u32 = 8;
+const ARB_LIFT_RECHECK_FOR: Duration = Duration::from_secs(8);
+
+/// What one evaluation of the frozen-copy lift left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiftPass {
+    /// Lifted, or not a lift's shape (any guard failed): back to the tick.
+    Settled,
+    /// Arbitrated source shape, every guard holds but the connection hold or
+    /// the second sample in a row.
+    AwaitingHold,
+}
+
+/// Whether the pass that owns an arbitrated lift re-reads in place: only
+/// while the lift waits for its hold, within both bounds.
+fn arb_lift_recheck(pass: LiftPass, rechecks: u32, waited: Duration) -> bool {
+    pass == LiftPass::AwaitingHold && rechecks < ARB_LIFT_RECHECKS && waited < ARB_LIFT_RECHECK_FOR
+}
+
 /// Freeze mode, a copy behind a frozen peer: how long before the freeze
 /// budget its early step-down stops waiting for this host's XAPI. The
 /// step-down (boundary, teardown, demote, handshake) must land before the
@@ -16086,9 +16120,32 @@ impl StateMachine {
     /// A yielded node that kept its copy resumes its frozen I/O once the pair
     /// is Connected (the peer accepted the discard and resyncs from it), and
     /// drops its yield marker so nothing reads it as frozen any more.
+    ///
+    /// Arbitrated source shape (see `release_winner_freeze_once`): while
+    /// only the hold stands, the pass re-reads every `ARB_LIFT_RECHECK`, every
+    /// guard re-checked on each read, within `arb_lift_recheck`'s bounds.
     async fn release_winner_freeze(&mut self) {
+        let started = tokio::time::Instant::now();
+        let mut rechecks = 0;
+        loop {
+            let pass = self.release_winner_freeze_once(rechecks).await;
+            if !arb_lift_recheck(pass, rechecks, started.elapsed()) || self.stop_requested() {
+                return;
+            }
+            tokio::time::sleep(ARB_LIFT_RECHECK).await;
+            // A stop requested during the sleep starts no further read.
+            if self.stop_requested() {
+                return;
+            }
+            rechecks += 1;
+        }
+    }
+
+    /// One evaluation of the lift from a fresh status read. `rechecks`: how
+    /// many in-place re-reads came before it in this pass (logged).
+    async fn release_winner_freeze_once(&mut self, rechecks: u32) -> LiftPass {
         let Ok(s) = self.drbd.status().await else {
-            return;
+            return LiftPass::Settled;
         };
         self.note_connection(&s);
         if s.connection == ConnectionState::Connected {
@@ -16115,7 +16172,9 @@ impl StateMachine {
         // decides (peer disk still unknown), and a resume there would
         // acknowledge writes on a copy that may yet turn out behind. The
         // bitmap exchange itself waits for the resume, so WFBitMap counts
-        // once the peer's disk is known to be behind. Two passes in a row.
+        // once the peer's disk is known to be behind. Two reads in a row past
+        // the hold (two passes, or in the arbitrated source shape two in-place
+        // reads a second apart).
         let peer_behind = matches!(
             s.peer_disk,
             Some(DiskState::Outdated | DiskState::Inconsistent | DiskState::Consistent)
@@ -16185,8 +16244,16 @@ impl StateMachine {
             || !(self.fs_freeze() || std::path::Path::new(&self.yield_path).exists())
         {
             self.release_streak = 0;
-            return;
+            return LiftPass::Settled;
         }
+        // Only the hold or the second read stands: the arbitrated source
+        // shape re-reads in place (`release_winner_freeze`); every other
+        // shape keeps the tick's cadence.
+        let waiting = if arbitrated_source {
+            LiftPass::AwaitingHold
+        } else {
+            LiftPass::Settled
+        };
         // The handshake decided, but a link that drops a moment later starts
         // a fresh fence-peer decision, whose freeze the lift would release.
         if !self.link_held(&s) {
@@ -16199,16 +16266,17 @@ impl StateMachine {
                       connected_secs = ?self.connected_since.map(|t| t.elapsed().as_secs()),
                       "kept copy: waiting for the connection to hold before resuming its frozen I/O");
             }
-            return;
+            return waiting;
         }
         self.release_streak = self.release_streak.saturating_add(1);
         if self.release_streak < 2 {
-            return;
+            return waiting;
         }
         self.release_streak = 0;
         if arbitrated_source && !win_record {
             warn!(
                 heal_event = "arb_source_resume_io",
+                rechecks,
                 "arbitrated: DRBD made this copy, frozen by its own fence-peer yield, the \
                  resync source of a peer that is behind; resuming its frozen I/O so the resync \
                  can start"
@@ -16222,6 +16290,7 @@ impl StateMachine {
         if self.resume_io_while_connected("winner_resume").await {
             let _ = std::fs::remove_file(&self.yield_path);
         }
+        LiftPass::Settled
     }
 
     /// Track since when the resource has been Connected without a break,
@@ -34152,6 +34221,9 @@ mod tests {
         standalone_on_disconnect: AtomicBool,
         // `resume_io` makes every later status read fail.
         fail_status_after_resume: AtomicBool,
+        // Statuses the next reads return in order (each becomes the current
+        // status); empty = the current status.
+        status_script: Mutex<std::collections::VecDeque<DrbdStatus>>,
         // The generation `resume_io` starts (None = unchanged): DRBD resuming
         // a fencing-suspended Primary starts a new current generation.
         uuid_after_resume: Mutex<Option<u64>>,
@@ -34168,6 +34240,7 @@ mod tests {
                 status_after_resume: Mutex::new(None),
                 standalone_on_disconnect: AtomicBool::new(false),
                 fail_status_after_resume: AtomicBool::new(false),
+                status_script: Mutex::new(std::collections::VecDeque::new()),
                 uuid_after_resume: Mutex::new(None),
                 handshake: Mutex::new(None),
                 reads: Mutex::new(Vec::new()),
@@ -34212,6 +34285,9 @@ mod tests {
             self.reads.lock().unwrap().push("status");
             if self.fail_status.load(Ordering::Relaxed) {
                 anyhow::bail!("mock DRBD status failure");
+            }
+            if let Some(next) = self.status_script.lock().unwrap().pop_front() {
+                *self.status.lock().unwrap() = next;
             }
             Ok(self.status.lock().unwrap().clone())
         }
@@ -55421,10 +55497,21 @@ poll_interval_ms = 10
         two_passes(&mut sm).await;
         held(&sm, &drbd, "handshake undecided");
         cleanup(&sm);
-        // One pass only.
+        // One read only: the second read, in place a second later, no
+        // longer shows the source picture (the handshake undecided).
         let (mut sm, drbd) = arb_frozen_winner("arb-h8", Some(WFBitMap), DiskState::Outdated);
+        let first = drbd.status.lock().unwrap().clone();
+        let undecided = DrbdStatus {
+            peer_disk: Option::None,
+            replication: Option::None,
+            ..first.clone()
+        };
+        drbd.status_script
+            .lock()
+            .unwrap()
+            .extend([first, undecided]);
         sm.release_winner_freeze().await;
-        held(&sm, &drbd, "one pass");
+        held(&sm, &drbd, "one read");
         cleanup(&sm);
     }
 
@@ -55630,6 +55717,222 @@ poll_interval_ms = 10
         two_passes(&mut sm).await;
         no_resume(&drbd, "WFBitMap with the peer UpToDate");
         cleanup(&sm);
+    }
+
+    // ---- arbitrated lift: in-place re-checks -----------------------------
+
+    /// `drbdadm status` on the arbitrated survivor before the lift (arbitrated
+    /// lab pool, 2026-11-19, run S1, the survivor's state sample stamped
+    /// 04:17:15, line breaks as drbdadm prints them): frozen by its yield,
+    /// the fenced peer back Outdated, DRBD waiting in WFBitMapS for the
+    /// frozen writes.
+    const ARB_LIFT_WFBITMAP_STATUS: &str = "twinstor-data role:Primary suspended:user\n  \
+         disk:UpToDate open:yes blocked:upper\n  \
+         twinstor-2 role:Primary\n    \
+         replication:WFBitMapS peer-disk:Outdated\n";
+    /// The same host during the cut (same run, the sample stamped 04:16:42).
+    const ARB_LIFT_CONNECTING_STATUS: &str = "twinstor-data role:Primary suspended:user,fencing\n  \
+         disk:UpToDate open:yes blocked:upper\n  \
+         twinstor-2 connection:Connecting\n";
+
+    fn status_reads(drbd: &MockDrbd) -> usize {
+        drbd.reads().iter().filter(|r| **r == "status").count()
+    }
+
+    #[test]
+    fn arb_lift_rechecks_only_while_the_hold_stands_and_within_bounds() {
+        let some = Duration::from_millis(1);
+        assert!(arb_lift_recheck(LiftPass::AwaitingHold, 0, Duration::ZERO));
+        assert!(arb_lift_recheck(
+            LiftPass::AwaitingHold,
+            ARB_LIFT_RECHECKS - 1,
+            ARB_LIFT_RECHECK_FOR - some
+        ));
+        assert!(!arb_lift_recheck(LiftPass::Settled, 0, Duration::ZERO));
+        assert!(!arb_lift_recheck(
+            LiftPass::AwaitingHold,
+            ARB_LIFT_RECHECKS,
+            Duration::ZERO
+        ));
+        assert!(!arb_lift_recheck(
+            LiftPass::AwaitingHold,
+            0,
+            ARB_LIFT_RECHECK_FOR
+        ));
+        // From a first Connected read: the hold, then the second read in a
+        // row, fit inside both bounds with room for slow status reads.
+        let needed = LEFTOVER_LIFT_STABLE + ARB_LIFT_RECHECK;
+        assert!(ARB_LIFT_RECHECK * ARB_LIFT_RECHECKS > needed);
+        assert!(ARB_LIFT_RECHECK_FOR > needed);
+    }
+
+    #[test]
+    fn the_rig_statuses_read_as_the_lift_expects() {
+        let s = crate::drbd::parse_drbdadm_text(ARB_LIFT_WFBITMAP_STATUS).unwrap();
+        assert_eq!(s.connection, ConnectionState::Connected);
+        assert_eq!(s.role, Role::Primary);
+        assert_eq!(s.disk, DiskState::UpToDate);
+        assert_eq!(s.peer_disk, Some(DiskState::Outdated));
+        assert_eq!(s.replication, Some(crate::drbd::Replication::WFBitMap));
+        assert!(s.suspended_user && !s.suspended_fencing);
+        let c = crate::drbd::parse_drbdadm_text(ARB_LIFT_CONNECTING_STATUS).unwrap();
+        assert_eq!(c.connection, ConnectionState::Connecting);
+        assert!(c.suspended_user && c.suspended_fencing);
+    }
+
+    /// A held connection: the pass lifts on its second read, one re-check
+    /// (a second) after the first, instead of on the next tick.
+    #[tokio::test(start_paused = true)]
+    async fn arbitrated_lift_takes_its_second_read_in_place() {
+        let rig = crate::drbd::parse_drbdadm_text(ARB_LIFT_WFBITMAP_STATUS).unwrap();
+        let (mut sm, drbd) = arb_frozen_winner("arb-in1", rig.replication, rig.peer_disk.unwrap());
+        drbd.set_status(rig);
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        assert_eq!(t0.elapsed(), ARB_LIFT_RECHECK);
+        assert_eq!(
+            drbd.calls().iter().filter(|c| **c == "resume_io").count(),
+            1,
+            "calls: {:?}",
+            drbd.calls()
+        );
+        assert!(!std::path::Path::new(&sm.yield_path).exists());
+        cleanup(&sm);
+    }
+
+    /// A connection younger than the hold: the pass re-reads in place and
+    /// never lifts before the hold; past its bounds it hands back to the
+    /// tick. (Virtual time: the hold's clock does not move here, so the
+    /// pass runs to its bound.) Once the hold is met it lifts.
+    #[tokio::test(start_paused = true)]
+    async fn arbitrated_lift_waits_in_place_for_the_hold_within_its_bound() {
+        let rig = crate::drbd::parse_drbdadm_text(ARB_LIFT_WFBITMAP_STATUS).unwrap();
+        let (mut sm, drbd) = arb_frozen_winner("arb-in2", rig.replication, rig.peer_disk.unwrap());
+        drbd.set_status(rig);
+        sm.connected_since = Option::None;
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        assert_eq!(t0.elapsed(), ARB_LIFT_RECHECK * ARB_LIFT_RECHECKS);
+        assert_eq!(status_reads(&drbd), 1 + ARB_LIFT_RECHECKS as usize);
+        assert!(!drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        assert!(std::path::Path::new(&sm.yield_path).exists());
+        assert!(sm.connected_since.is_some(), "the hold's clock runs");
+        // The hold met: the next pass lifts.
+        sm.connected_since =
+            std::time::Instant::now().checked_sub(LEFTOVER_LIFT_STABLE + Duration::from_secs(1));
+        sm.release_winner_freeze().await;
+        assert!(drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        cleanup(&sm);
+    }
+
+    /// The link drops during the in-place wait: the read that sees it ends
+    /// the pass without a lift and the hold starts over; the next Connected
+    /// read waits the whole hold again.
+    #[tokio::test(start_paused = true)]
+    async fn arbitrated_lift_in_place_stops_on_a_drop_and_restarts_the_hold() {
+        let rig = crate::drbd::parse_drbdadm_text(ARB_LIFT_WFBITMAP_STATUS).unwrap();
+        let cut = crate::drbd::parse_drbdadm_text(ARB_LIFT_CONNECTING_STATUS).unwrap();
+        let (mut sm, drbd) = arb_frozen_winner("arb-in3", rig.replication, rig.peer_disk.unwrap());
+        drbd.set_status(rig.clone());
+        sm.connected_since = Option::None;
+        drbd.status_script
+            .lock()
+            .unwrap()
+            .extend([rig.clone(), rig.clone(), cut]);
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        assert_eq!(t0.elapsed(), ARB_LIFT_RECHECK * 2, "ends at the drop");
+        assert_eq!(status_reads(&drbd), 3);
+        assert_eq!(sm.connected_since, Option::None);
+        assert_eq!(sm.release_streak, 0);
+        assert!(!drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        // Back: a fresh hold, waited in place again, no lift inside it.
+        drbd.set_status(rig);
+        sm.release_winner_freeze().await;
+        assert!(!drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        assert!(
+            sm.connected_since
+                .is_some_and(|t| t.elapsed() < LEFTOVER_LIFT_STABLE)
+        );
+        cleanup(&sm);
+    }
+
+    /// Only the arbitrated source shape waits in place: a lift that a guard
+    /// blocks, or another shape (split-brain marker, fence-peer run in
+    /// flight, freeze mode), takes one read and returns to the tick.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_arbitrated_source_shape_rechecks_in_place() {
+        use crate::drbd::Replication::WFBitMap;
+        let one_read = |sm: &StateMachine, drbd: &MockDrbd, t0: tokio::time::Instant, why: &str| {
+            assert_eq!(t0.elapsed(), Duration::ZERO, "{why}");
+            assert_eq!(status_reads(drbd), 1, "{why}");
+            assert!(!drbd.calls().contains(&"resume_io"), "{why}");
+            assert!(std::path::Path::new(&sm.yield_path).exists(), "{why}");
+        };
+        // Split-brain marker, young connection.
+        let (mut sm, drbd) = arb_frozen_winner("arb-in4", Some(WFBitMap), DiskState::Outdated);
+        std::fs::write(&sm.marker_path, "resource=data").unwrap();
+        sm.connected_since = Option::None;
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        one_read(&sm, &drbd, t0, "split-brain marker");
+        cleanup(&sm);
+        // Peer disk unknown (the handshake undecided), young connection.
+        let (mut sm, drbd) = arb_frozen_winner("arb-in5", Some(WFBitMap), DiskState::Outdated);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.peer_disk = Option::None;
+        st.replication = Option::None;
+        drbd.set_status(st);
+        sm.connected_since = Option::None;
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        one_read(&sm, &drbd, t0, "handshake undecided");
+        cleanup(&sm);
+        // A fence-peer run in flight.
+        let (mut sm, drbd) = arb_frozen_winner("arb-in6", Some(WFBitMap), DiskState::Outdated);
+        std::fs::write(&sm.fence_lock_path, "").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&sm.fence_lock_path)
+            .unwrap();
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: locking a descriptor the test owns.
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+        }
+        sm.connected_since = Option::None;
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        one_read(&sm, &drbd, t0, "fence-peer run in flight");
+        drop(lock);
+        let _ = std::fs::remove_file(&sm.fence_lock_path);
+        cleanup(&sm);
+        // Fate-shared freeze mode: its own cadence, unchanged.
+        let (mut sm, drbd) = freeze_node(
+            "fz-inplace",
+            crate::peer_signal::PeerClaim::Unreachable,
+            true,
+        );
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.connection = ConnectionState::Connected;
+        st.peer_disk = Some(DiskState::UpToDate);
+        st.replication = Option::None;
+        drbd.set_status(st);
+        sm.connected_since = Option::None;
+        drbd.reads.lock().unwrap().clear();
+        let t0 = tokio::time::Instant::now();
+        sm.release_winner_freeze().await;
+        one_read(&sm, &drbd, t0, "freeze mode");
+        freeze_cleanup(&sm);
     }
 
     #[test]
