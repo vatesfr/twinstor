@@ -1217,6 +1217,11 @@ pub struct SkipScan {
     /// they name one drop.
     pub owed_openings: usize,
     pub owed_drops: usize,
+    /// Since the last transition into Inconsistent, the copy left
+    /// Inconsistent through a force (the force line right after a
+    /// `disk( Inconsistent -> X )`), not through a resync: a rebuild that
+    /// was forced, not completed.
+    pub forced_out_of_inconsistent: bool,
 }
 
 impl SkipScan {
@@ -1295,6 +1300,8 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
     let volume = format!("{resource}/0");
     let mut scan = SkipScan::default();
     let mut inconsistent = false;
+    // The last device disk transition left Inconsistent.
+    let mut left_inconsistent = false;
     // Inside an invalidate's window: after a StartingSyncT, before the next
     // transition into Inconsistent.
     let mut after_starting_sync_t = false;
@@ -1312,6 +1319,7 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
         };
         let message = message.trim();
         if context.trim() == resource && message == FORCED_UP_TO_DATE {
+            scan.forced_out_of_inconsistent |= left_inconsistent;
             scan.owed_drops = 0;
             scan.owed_open = false;
             scan.owed_evidence.clear();
@@ -1356,8 +1364,10 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
             && let Some((from, to)) = state_change(message, "disk(")
         {
             inconsistent = to == "Inconsistent";
+            left_inconsistent = from == "Inconsistent";
             if inconsistent {
                 after_starting_sync_t = false;
+                scan.forced_out_of_inconsistent = false;
             }
             if inconsistent || from == "Inconsistent" {
                 scan.owed_drops = 0;
@@ -2807,6 +2817,30 @@ exists path name:twinstor-data peer-node-id:1 conn-name:twinstor-2 local:ipv4:19
             FORCE_LINE.replace("twinstor-data:", "twinstor-other:")
         );
         assert!(scan_resync_skip(&other, "twinstor-data").owed_open);
+    }
+
+    #[test]
+    fn a_rebuild_left_by_a_force_reads_forced() {
+        // Lines as the arbitrated rig logged a lone force of an Inconsistent
+        // copy (2026-07-23): the disk transition, then the force line.
+        let t = "[Thu Jul 23 11:19:23 2026] drbd twinstor-data";
+        let into = format!("{t}/0 drbd0: disk( UpToDate -> Inconsistent ) [invalidate]");
+        let finished = format!("{t}/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]");
+        let forced_up = format!("{t}/0 drbd0: disk( Inconsistent -> UpToDate ) [primary]");
+        let force = format!("{t}: Forced to consider local data as UpToDate!");
+        let scan = |lines: &[&str]| scan_resync_skip(&lines.join("\n"), "twinstor-data");
+        assert!(scan(&[&into, &forced_up, &force]).forced_out_of_inconsistent);
+        assert!(!scan(&[&into, &finished]).forced_out_of_inconsistent);
+        // Rebuilt, then outdated and forced: the rebuild was not forced.
+        let outdated = format!("{t}/0 drbd0: disk( UpToDate -> Outdated ) [disconnected]");
+        let forced_outdated = format!("{t}/0 drbd0: disk( Outdated -> UpToDate ) [primary]");
+        let s = scan(&[&into, &finished, &outdated, &forced_outdated, &force]);
+        assert!(!s.forced_out_of_inconsistent, "{s:?}");
+        // A later rebuild starts over.
+        assert!(!scan(&[&into, &forced_up, &force, &into]).forced_out_of_inconsistent);
+        // Another resource's force does not count.
+        let other = force.replace("twinstor-data:", "twinstor-other:");
+        assert!(!scan(&[&into, &forced_up, &other]).forced_out_of_inconsistent);
     }
 
     #[test]

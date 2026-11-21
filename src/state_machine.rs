@@ -270,6 +270,42 @@ fn resync_skip_path_for_new() -> String {
     resync_skip_marker()
 }
 
+/// The resync-skip rebuild alert still owed to XAPI: written before that
+/// alert's first send (see `forget_resync_skip_then_alert`), removed once it
+/// is delivered or once the rebuild it describes has completed (this copy
+/// UpToDate again), whichever comes first. While it exists the daemon raises
+/// the alert again, paced, until XAPI takes it (`owed_skip_alert_step`), also
+/// after a daemon restart. About the alert only: no storage decision reads
+/// it. If the rebuild completes first and XAPI never took the "rebuilding"
+/// alert, a past-tense alert is raised instead. A marker whose removal
+/// failed after delivery, followed by a daemon restart, gives a second
+/// message. A marker left behind by a downgrade (an older release ignores
+/// it) is read at the next upgrade, with the copy UpToDate by then: it ends
+/// with a late past-tense alert.
+fn skip_alert_owed_marker() -> String {
+    crate::heal_state::state_path("/var/lib/twinstor/resync-skip-alert")
+}
+
+/// The owed rebuild alert is raised again at most this often.
+const SKIP_ALERT_OWED_EVERY: Duration = Duration::from_secs(30);
+
+/// The XAPI key of the resync-skip alerts (the waiting variants and the
+/// rebuild one): a later version replaces a held earlier one.
+const SKIP_ALERT_KEY: &str = "resync-skip";
+
+/// The XAPI key of the past-tense alert raised when a skip's rebuild
+/// completed before any alert about it reached XAPI.
+const SKIP_REBUILT_ALERT_KEY: &str = "resync-skip-rebuilt";
+
+/// The owed-alert marker's content: when the alert was first raised (first,
+/// for the startup line), then what the file is.
+fn skip_alert_owed_record(at: u64) -> String {
+    format!(
+        "raised_at={at}\n# the resync-skip rebuild alert has not reached XAPI yet; raised again \
+         until it does or the rebuild completes\n"
+    )
+}
+
 /// The resync-skip record's content: this copy's generation when readable,
 /// when and in which boot the skip was found, and the kernel records that
 /// show it, on one line.
@@ -423,6 +459,25 @@ fn resync_skip_repaired_alert_text(peer: &str) -> String {
          detected it and is rebuilding this host's copy with a full resync from {peer}. Until \
          that resync completes the pool runs on a single copy, the one on {peer}. No action \
          needed; do not power off or restart {peer} meanwhile."
+    )
+}
+
+/// Whether a skip's rebuild is really done: this copy and the peer's both
+/// UpToDate, the pair connected. A copy an operator forced while the peer
+/// was lost also reads UpToDate, and was not rebuilt.
+fn skip_pair_rebuilt(st: &DrbdStatus) -> bool {
+    st.disk == DiskState::UpToDate
+        && st.peer_disk == Some(DiskState::UpToDate)
+        && st.connection == ConnectionState::Connected
+}
+
+/// The alert for a skip whose full resync completed before any alert about
+/// it reached XAPI (XAPI did not answer during the whole rebuild).
+fn resync_skip_rebuilt_alert_text(peer: &str) -> String {
+    format!(
+        "After a connection drop, DRBD skipped the resync this host's copy needed. TwinStor \
+         detected it and rebuilt this host's copy with a full resync from {peer}; that resync \
+         has completed. No action needed."
     )
 }
 
@@ -11203,6 +11258,22 @@ pub struct StateMachine {
     /// A skip found but not recorded (see `resync_skip_step`) was alerted;
     /// reset by a clean check.
     skip_unrecorded_alerted: bool,
+    /// The owed rebuild alert's marker (see `skip_alert_owed_marker`), its
+    /// last raise, and whether it reached XAPI in this run although the
+    /// marker could not be removed (then it is not raised again).
+    skip_alert_owed_path: String,
+    skip_alert_owed_at: Option<std::time::Instant>,
+    skip_alert_owed_sent: bool,
+    /// The owed rebuild alert's background send, while one runs or until
+    /// its outcome is picked up (see `start_owed_send`).
+    skip_alert_owed_task: Option<tokio::task::JoinHandle<bool>>,
+    /// The marker could not be written: the rebuild alert went to the
+    /// held-back set instead, to be withdrawn once the rebuild completes.
+    skip_alert_fallback_held: bool,
+    /// That held alert was withdrawn undelivered for a copy already
+    /// UpToDate whose pair was not yet seen rebuilt: the past-tense alert
+    /// is owed, from memory.
+    skip_fallback_rebuilt_owed: bool,
     /// Connection re-creations (see `recreate_returner_connection`): the
     /// record file, and its count and last drop kept in memory too (the cap
     /// holds in this run even if the file cannot be written).
@@ -11221,6 +11292,10 @@ pub struct StateMachine {
     skip_alerts: Vec<String>,
     #[cfg(test)]
     skip_alert_delivers: bool,
+    /// Tests: how many of those reached XAPI (the stand-in for its message
+    /// count).
+    #[cfg(test)]
+    skip_alerts_delivered: usize,
     /// The once-per-run resync-skip check of a copy already Primary at
     /// bring-up ran (see `serving_skip_check`).
     serving_skip_checked: bool,
@@ -12172,6 +12247,12 @@ impl StateMachine {
             skip_scan_fail_open_logged: false,
             resync_skip_alert_at: None,
             skip_unrecorded_alerted: false,
+            skip_alert_owed_path: test_private_path("resync-skip-alert", skip_alert_owed_marker()),
+            skip_alert_owed_at: None,
+            skip_alert_owed_sent: false,
+            skip_alert_owed_task: None,
+            skip_alert_fallback_held: false,
+            skip_fallback_rebuilt_owed: false,
             recreate_path: test_private_path("resync-recreate", resync_recreate_marker()),
             recreate_count: 0,
             recreate_last: None,
@@ -12183,6 +12264,8 @@ impl StateMachine {
             skip_alerts: Vec::new(),
             #[cfg(test)]
             skip_alert_delivers: false,
+            #[cfg(test)]
+            skip_alerts_delivered: 0,
             serving_skip_checked: false,
             boot_id: read_boot_id(),
             resync_pending_since: None,
@@ -12449,6 +12532,7 @@ impl StateMachine {
               boot_gate_peer_served = %memory_brief(&self.peer_served_path),
               boot_gate_yielded = %memory_brief(&self.yielded_behind_path),
               resync_skip = %resync_skip_brief(&self.resync_skip_path),
+              resync_skip_alert_owed = %file_brief(&self.skip_alert_owed_path),
               steer_pending = %file_brief(&self.steer_pending_path),
               fs_freeze_off = %file_brief(&self.fs_freeze_off_path),
               peer_fs_freeze = %file_brief(&self.peer_fs_freeze_path),
@@ -13005,6 +13089,12 @@ impl StateMachine {
             // waits out its bound: the XAPI-bound housekeeping steps below are
             // skipped then (none can act without the master).
             let fwd = !self.forwarded_xapi_dead();
+            // Held alerts are retried on a timer once XAPI answers, not only
+            // after another alert is sent: in the background, paced, and not
+            // while the split-brain or freeze window keeps XAPI quiet.
+            if fwd && !sb_fresh && !quiet {
+                xapi::retry_held_alerts();
+            }
             // A skip that lasts while replication is Connected (a prober that
             // stalled, or a master answering nothing on 443 though alive) is
             // not silent.
@@ -13099,6 +13189,9 @@ impl StateMachine {
                     "check_sr_uuid_record",
                     self.check_sr_uuid_record().await
                 );
+            }
+            if fwd && !sb_fresh && !self.xapi_quiet().await {
+                step!(self, "owed_skip_alert", self.owed_skip_alert_step().await);
             }
             if !sb_fresh && !self.xapi_quiet().await {
                 step!(
@@ -19299,7 +19392,7 @@ impl StateMachine {
                     } else {
                         resync_skip_unrecorded_alert_text(&peer, &self.resync_skip_path)
                     };
-                    let _ = self.send_skip_alert("resync-skip", &alert).await;
+                    let _ = self.send_skip_alert(SKIP_ALERT_KEY, &alert).await;
                 }
                 true
             }
@@ -19473,7 +19566,7 @@ impl StateMachine {
             variant,
         ) {
             let alert = resync_skip_alert_text(&peer, &res, held);
-            if self.send_skip_alert("resync-skip", &alert).await {
+            if self.send_skip_alert(SKIP_ALERT_KEY, &alert).await {
                 self.note_skip_alerted(variant);
             }
         }
@@ -19519,17 +19612,287 @@ impl StateMachine {
     /// record goes first so a slow XAPI cannot delay the clear (and the
     /// promote that may follow in this pass); a delivered alert is noted so
     /// a record that could not be removed is not alerted again each pass.
-    async fn forget_resync_skip_then_alert(&mut self, why: &'static str) {
-        let already = self.skip_alert_delivered().is_some();
+    ///
+    /// The alert says the copy is being rebuilt, so it stays owed while the
+    /// rebuild runs: the owed-alert marker (`skip_alert_owed_marker`) is
+    /// written before the first send and removed once XAPI takes it; until
+    /// then `owed_skip_alert_step` raises it again. The send runs in the
+    /// background (this is on the promote path) and is not queued in the
+    /// held-back set: the marker is its only retry. `rebuilding` false (the
+    /// resync already completed when the daemon got to it): a "rebuilding"
+    /// alert would no longer be true, so the past-tense alert is raised
+    /// instead.
+    async fn forget_resync_skip_then_alert(&mut self, why: &'static str, rebuilding: bool) {
+        let already = self.skip_alert_delivered().is_some()
+            || std::path::Path::new(&self.skip_alert_owed_path).exists()
+            || self.skip_alert_fallback_held;
         self.forget_resync_skip(why);
         if already {
             return;
         }
+        // A waiting variant still held for XAPI is superseded either way.
+        // One a flush delivered is not noted (only this daemon's own sends
+        // are), so the "rebuilding" alert can follow it.
+        let _ = xapi::drop_held_alert("twinstor_degraded", SKIP_ALERT_KEY);
+        if !rebuilding {
+            // Noted first: a record that could not be removed brings this
+            // path back on every pass, and the alert goes out once per run.
+            // No pair check here: this path is a Secondary whose kernel log
+            // shows our invalidate's full resync ran (`resync_skip_repair`),
+            // so the rebuild is proven.
+            self.resync_skip_alerted = Some("");
+            info!(
+                heal_event = "resync_skip",
+                why,
+                "resync-skip: the full resync completed before an alert about it reached \
+                   XAPI; raising the rebuilt alert instead"
+            );
+            self.raise_skip_rebuilt_alert();
+            return;
+        }
         let alert = resync_skip_repaired_alert_text(&self.config.node.peer);
-        if self.send_skip_alert("resync-skip", &alert).await {
-            // Noted in the record too when it could not be removed, so a
-            // daemon restart does not send it again.
-            self.note_skip_alerted("");
+        if let Err(e) = write_file_durably(
+            &self.skip_alert_owed_path,
+            &skip_alert_owed_record(unix_now_secs()),
+        ) {
+            // Without the marker the held-back set is the retry; the held
+            // alert is withdrawn once the rebuild completes (see
+            // `owed_skip_alert_step`).
+            warn!(heal_event = "resync_skip", error = %e,
+                  "resync-skip: could not write the owed-alert marker; the alert is retried \
+                   from memory only");
+            // Sent in the owed send's slot: the step withdraws the held
+            // alert only once this send has ended, so a late failure cannot
+            // queue it after the withdrawal.
+            self.skip_alert_fallback_held = true;
+            let send = self.skip_rebuild_alert_send(alert, true);
+            self.skip_alert_owed_task = Some(tokio::spawn(send));
+            return;
+        }
+        self.skip_alert_owed_sent = false;
+        self.start_owed_send(alert);
+    }
+
+    /// The owed rebuild alert reached XAPI: the marker goes, and the record
+    /// (when it could not be removed) notes it, so a daemon restart does not
+    /// send it again.
+    fn skip_alert_owed_delivered(&mut self) {
+        self.note_skip_alerted("");
+        match std::fs::remove_file(&self.skip_alert_owed_path) {
+            Ok(()) => self.skip_alert_owed_sent = false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.skip_alert_owed_sent = false,
+            Err(e) => {
+                self.skip_alert_owed_sent = true;
+                warn!(heal_event = "resync_skip", error = %e,
+                      "resync-skip: the alert reached XAPI but its owed-alert marker could not \
+                       be removed; retrying the removal");
+            }
+        }
+    }
+
+    /// Send the owed rebuild alert in the background (one at a time): a
+    /// pass never waits on XAPI for it. Its outcome is picked up by a later
+    /// `owed_skip_alert_step`.
+    fn start_owed_send(&mut self, alert: String) {
+        if self.skip_alert_owed_task.is_some() {
+            return;
+        }
+        self.skip_alert_owed_at = Some(std::time::Instant::now());
+        let send = self.skip_rebuild_alert_send(alert, false);
+        self.skip_alert_owed_task = Some(tokio::spawn(send));
+    }
+
+    /// The background send's outcome, once it ended: `Some(true)` when
+    /// XAPI took the alert (the marker then goes), `Some(false)` when not,
+    /// `None` while none ended (still running, or none started). An outcome
+    /// picked up after a second skip was recorded, like a marker whose
+    /// removal failed, can stand for that second skip's alert too.
+    async fn collect_owed_send(&mut self) -> Option<bool> {
+        if !self
+            .skip_alert_owed_task
+            .as_ref()
+            .is_some_and(|t| t.is_finished())
+        {
+            return None;
+        }
+        let task = self.skip_alert_owed_task.take()?;
+        let delivered = task.await.unwrap_or(false);
+        if delivered {
+            self.skip_alert_owed_delivered();
+        }
+        Some(delivered)
+    }
+
+    /// On the tick: while the owed-alert marker exists, every
+    /// `SKIP_ALERT_OWED_EVERY` (at once after a daemon start), and never
+    /// while its background send runs, read this copy's state. UpToDate
+    /// with the pair connected and both copies UpToDate
+    /// (`skip_pair_rebuilt`): the rebuild completed, the marker goes, and
+    /// unless XAPI took the "rebuilding" alert the past-tense rebuilt alert
+    /// is raised instead. UpToDate and forced out of the rebuild
+    /// (`skip_copy_forced`): the marker goes, no alert. UpToDate otherwise
+    /// (the pair not connected, the peer's copy unknown): nothing is
+    /// raised, the marker stays and is checked again on a later pass.
+    /// Otherwise the rebuild still runs (or waits, Inconsistent, for the
+    /// connection): the same alert, same key, raised again until XAPI takes
+    /// it. Without a marker (it could not be written) the alert held in
+    /// memory is withdrawn once the copy is UpToDate, and replaced by the
+    /// past-tense one, under the same conditions, when it had not been
+    /// delivered.
+    async fn owed_skip_alert_step(&mut self) {
+        if self.skip_alert_owed_task.is_some() && self.collect_owed_send().await.is_none() {
+            return;
+        }
+        let marker = std::path::Path::new(&self.skip_alert_owed_path).exists();
+        if !marker {
+            self.skip_alert_owed_sent = false;
+        }
+        if !marker && !self.skip_alert_fallback_held {
+            return;
+        }
+        if self
+            .skip_alert_owed_at
+            .is_some_and(|t| t.elapsed() < SKIP_ALERT_OWED_EVERY)
+        {
+            return;
+        }
+        let Ok(status) = self.drbd.status().await else {
+            return;
+        };
+        self.skip_alert_owed_at = Some(std::time::Instant::now());
+        let rebuilt = skip_pair_rebuilt(&status);
+        if !marker {
+            if status.disk == DiskState::UpToDate {
+                // The "rebuilding" alert is no longer true: withdrawn at
+                // once; what it owed waits in memory for a pair seen rebuilt.
+                self.skip_fallback_rebuilt_owed |=
+                    xapi::drop_held_alert("twinstor_degraded", SKIP_ALERT_KEY);
+                if !rebuilt && self.skip_fallback_rebuilt_owed && !self.skip_copy_forced().await {
+                    return;
+                }
+                self.skip_alert_fallback_held = false;
+                if std::mem::take(&mut self.skip_fallback_rebuilt_owed) && rebuilt {
+                    self.raise_skip_rebuilt_alert();
+                }
+            }
+            return;
+        }
+        if status.disk == DiskState::UpToDate {
+            // Not rebuilt yet in view (the pair not connected, or the peer
+            // not UpToDate) and no force in the kernel log: kept, checked
+            // again on a later pass.
+            if !rebuilt && !self.skip_alert_owed_sent && !self.skip_copy_forced().await {
+                debug!(heal_event = "resync_skip", connection = ?status.connection,
+                       peer_disk = ?status.peer_disk,
+                       "resync-skip: this copy is UpToDate but the pair is not seen rebuilt \
+                        yet; the owed alert waits");
+                return;
+            }
+            let delivered = std::mem::take(&mut self.skip_alert_owed_sent);
+            match std::fs::remove_file(&self.skip_alert_owed_path) {
+                Ok(()) if !delivered && rebuilt => {
+                    info!(
+                        heal_event = "resync_skip",
+                        "resync-skip: the full resync completed before its alert reached XAPI; \
+                         raising the rebuilt alert instead"
+                    );
+                    self.raise_skip_rebuilt_alert();
+                }
+                Ok(()) if !delivered => info!(
+                    heal_event = "resync_skip",
+                    connection = ?status.connection,
+                    peer_disk = ?status.peer_disk,
+                    "resync-skip: the kernel log shows this copy was forced out of its rebuild, \
+                     not resynced; the owed alert is dropped, no alert"
+                ),
+                Ok(()) => {}
+                Err(e) => {
+                    self.skip_alert_owed_sent = delivered;
+                    warn!(heal_event = "resync_skip", error = %e,
+                          "resync-skip: could not remove the owed-alert marker; retrying");
+                }
+            }
+            return;
+        }
+        if self.skip_alert_owed_sent {
+            self.skip_alert_owed_delivered();
+            return;
+        }
+        if self
+            .log_pace
+            .due("resync_skip_alert_owed", Duration::from_secs(600))
+        {
+            info!(heal_event = "resync_skip", disk = ?status.disk,
+                  "resync-skip: the rebuild alert has not reached XAPI yet and the rebuild is \
+                   not complete; raising it again");
+        }
+        self.start_owed_send(resync_skip_repaired_alert_text(&self.config.node.peer));
+    }
+
+    /// Positive evidence that this copy, UpToDate, was forced out of its
+    /// rebuild rather than resynced: this boot's kernel log shows the force
+    /// right after the copy left Inconsistent
+    /// (`SkipScan::forced_out_of_inconsistent`). A log that cannot be read
+    /// is no evidence.
+    async fn skip_copy_forced(&self) -> bool {
+        self.drbd
+            .resync_skip_scan()
+            .await
+            .is_ok_and(|s| s.forced_out_of_inconsistent)
+    }
+
+    /// The skip's rebuild completed and no alert about it reached XAPI:
+    /// the past-tense alert, once, queued as ordinary alerts are (the timed
+    /// retry delivers it once XAPI answers). Like any held alert it is
+    /// dropped if XAPI stays down more than 15 minutes after this.
+    fn raise_skip_rebuilt_alert(&mut self) {
+        let alert = resync_skip_rebuilt_alert_text(&self.config.node.peer);
+        self.spawn_skip_alert(SKIP_REBUILT_ALERT_KEY, alert);
+    }
+
+    /// The owed rebuild alert's send: not queued (the owed-alert marker is
+    /// its retry), or `queue`d when the marker could not be written. Tests
+    /// record it as [`Self::send_skip_alert`] does and answer with
+    /// `skip_alert_delivers`.
+    fn skip_rebuild_alert_send(
+        &mut self,
+        body: String,
+        queue: bool,
+    ) -> impl std::future::Future<Output = bool> + Send + 'static {
+        #[cfg(test)]
+        {
+            let _ = queue;
+            self.skip_alerts.push(body);
+            self.skip_alerts_delivered += usize::from(self.skip_alert_delivers);
+            let delivers = self.skip_alert_delivers;
+            async move { delivers }
+        }
+        #[cfg(not(test))]
+        {
+            async move {
+                if queue {
+                    xapi::send_xapi_alert_keyed(SKIP_ALERT_KEY, &body).await
+                } else {
+                    xapi::send_xapi_alert_keyed_unqueued(SKIP_ALERT_KEY, &body).await
+                }
+            }
+        }
+    }
+
+    /// A queued resync-skip alert sent in the background (a pass never
+    /// waits on XAPI for it; the held-back set retries it). Tests record it.
+    fn spawn_skip_alert(&mut self, key: &'static str, body: String) {
+        #[cfg(test)]
+        {
+            let _ = key;
+            self.skip_alerts.push(body);
+            self.skip_alerts_delivered += usize::from(self.skip_alert_delivers);
+        }
+        #[cfg(not(test))]
+        {
+            tokio::spawn(async move {
+                let _ = xapi::send_xapi_alert_keyed(key, &body).await;
+            });
         }
     }
 
@@ -19540,6 +19903,7 @@ impl StateMachine {
         {
             let _ = key;
             self.skip_alerts.push(body.to_string());
+            self.skip_alerts_delivered += usize::from(self.skip_alert_delivers);
             self.skip_alert_delivers
         }
         #[cfg(not(test))]
@@ -19578,7 +19942,8 @@ impl StateMachine {
         if invalidated != SkipInvalidated::No && resyncing(status) {
             match self.read_skip_scan().await {
                 Ok(scan) if !scan.invalidate_cleared => {
-                    self.forget_resync_skip_then_alert("full resync").await;
+                    self.forget_resync_skip_then_alert("full resync", true)
+                        .await;
                     return;
                 }
                 Ok(_) | Err(false) => reinvalidate = true,
@@ -19591,7 +19956,8 @@ impl StateMachine {
         if invalidated == SkipInvalidated::ThisBoot && status.disk == DiskState::UpToDate {
             match self.read_skip_scan().await {
                 Ok(scan) if !scan.owed_open && !scan.invalidate_cleared => {
-                    self.forget_resync_skip_then_alert("full resync done").await;
+                    self.forget_resync_skip_then_alert("full resync done", false)
+                        .await;
                     return;
                 }
                 Ok(_) | Err(false) => reinvalidate = true,
@@ -19637,7 +20003,8 @@ impl StateMachine {
         if held.is_none() && self.skip_invalidate(connected).await {
             match self.drbd.status().await {
                 Ok(st) if resyncing(&st) => {
-                    self.forget_resync_skip_then_alert("full resync").await;
+                    self.forget_resync_skip_then_alert("full resync", true)
+                        .await;
                     return;
                 }
                 _ => self.mark_skip_invalidated(),
@@ -19732,6 +20099,9 @@ impl StateMachine {
         self.resync_skip_alerted = None;
         self.resync_skip_refusal_logged = false;
         self.resync_skip_invalidate_at = None;
+        // A waiting alert still held for XAPI ("this host does not serve
+        // it") is no longer true.
+        let _ = xapi::drop_held_alert("twinstor_degraded", SKIP_ALERT_KEY);
         warn!(
             heal_event = "resync_skip",
             memory = "cleared",
@@ -30343,8 +30713,8 @@ impl StateMachine {
              the SR. Nothing is discarded while this lasts. Pick the node whose copy should win: \
              normally the one that did not yield, never one whose disk is not UpToDate. On that \
              node only: (1) systemctl stop twinstor; (2) drbdadm -d adjust {res}; if it prints \
-             anything other than 'drbdsetup connect' or 'drbdsetup new-path' lines, stop here and \
-             get support; (3) drbdsetup del-peer {res} <peer-node-id> (read it on that node: \
+             anything other than 'drbdsetup net-options', 'drbdsetup connect' or 'drbdsetup \
+             new-path' lines, stop here and get support; (3) drbdsetup del-peer {res} <peer-node-id> (read it on that node: \
              drbdsetup events2 --now {res} | grep -o 'peer-node-id:[0-9]*' | head -1); \
              (4) drbdadm adjust {res}; (5) if that node yielded too: rm -f \
              /run/twinstor/fence-yielded /var/lib/twinstor/yield-loser-latched \
@@ -57458,6 +57828,7 @@ poll_interval_ms = 10
             invalidate_cleared: false,
             owed_openings: 1,
             owed_drops: 1,
+            forced_out_of_inconsistent: false,
         }
     }
 
@@ -58715,6 +59086,392 @@ poll_interval_ms = 10
         assert_eq!(again.skip_record(), SkipRecord::Absent);
         assert!(again.skip_alerts.is_empty(), "{:?}", again.skip_alerts);
         let _ = std::fs::remove_file(&sm.resync_skip_path);
+    }
+
+    /// A state machine whose full resync from the skip repair is running
+    /// (the rig's returner right after its invalidate), the record already
+    /// gone, and the owed rebuild alert raised once by the clear (its
+    /// background send ended and picked up).
+    async fn rebuild_alert_raised(delivers: bool) -> (StateMachine, std::sync::Arc<MockDrbd>) {
+        let drbd = std::sync::Arc::new(MockDrbd::new(rig_resyncing()));
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.skip_alert_delivers = delivers;
+        sm.forget_resync_skip_then_alert("full resync", true).await;
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert!(sm.skip_alerts[0].contains("is rebuilding this host's copy"));
+        settle(&mut sm).await;
+        (sm, drbd)
+    }
+
+    fn owed(sm: &StateMachine) -> bool {
+        std::path::Path::new(&sm.skip_alert_owed_path).exists()
+    }
+
+    /// Let the owed alert's background send end, and pick up its outcome.
+    async fn settle(sm: &mut StateMachine) {
+        while sm
+            .skip_alert_owed_task
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+        let _ = sm.collect_owed_send().await;
+    }
+
+    /// The owed step as the tick runs it, its send then ended.
+    async fn owed_step(sm: &mut StateMachine) {
+        sm.owed_skip_alert_step().await;
+        settle(sm).await;
+    }
+
+    /// The owed step once its pace has elapsed.
+    async fn owed_step_due(sm: &mut StateMachine) {
+        sm.skip_alert_owed_at = None;
+        owed_step(sm).await;
+    }
+
+    fn rebuilt_alerts(sm: &StateMachine) -> usize {
+        sm.skip_alerts
+            .iter()
+            .filter(|a| a.contains("that resync has completed"))
+            .count()
+    }
+
+    fn up_to_date_after_rebuild() -> DrbdStatus {
+        DrbdStatus {
+            disk: DiskState::UpToDate,
+            replication: Some(crate::drbd::Replication::Established),
+            ..sample(SAMPLE_RIG_RESYNCING)
+        }
+    }
+
+    /// XAPI answers the first send: one message, no marker left, nothing
+    /// raised again on later ticks, nor once the rebuild completes.
+    #[tokio::test]
+    async fn a_rebuild_alert_delivered_at_once_leaves_nothing_owed() {
+        let (mut sm, drbd) = rebuild_alert_raised(true).await;
+        assert!(!owed(&sm));
+        for _ in 0..3 {
+            owed_step_due(&mut sm).await;
+        }
+        drbd.set_status(up_to_date_after_rebuild());
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert_eq!(sm.skip_alerts_delivered, 1);
+        assert_eq!(rebuilt_alerts(&sm), 0);
+    }
+
+    /// The owed alert is sent in the background, one send at a time: a
+    /// step while one runs neither waits for it nor starts another.
+    #[tokio::test]
+    async fn the_owed_alert_is_sent_in_the_background_one_at_a_time() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(rig_resyncing()));
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.forget_resync_skip_then_alert("full resync", true).await;
+        // The spawned send has not run yet (nothing awaited since).
+        assert!(sm.skip_alert_owed_task.is_some());
+        sm.skip_alert_owed_at = None;
+        sm.owed_skip_alert_step().await;
+        assert_eq!(sm.skip_alerts.len(), 1, "no second send while one runs");
+        settle(&mut sm).await;
+        assert!(sm.skip_alert_owed_task.is_none());
+        assert!(owed(&sm));
+    }
+
+    /// XAPI does not answer the first send (the host was just fenced and
+    /// rebooted): the alert stays owed in its marker and is raised again on
+    /// the tick, paced, until XAPI takes it; then exactly one message and
+    /// the marker gone.
+    #[tokio::test]
+    async fn an_undelivered_rebuild_alert_is_raised_again_until_delivered() {
+        let (mut sm, _drbd) = rebuild_alert_raised(false).await;
+        assert!(owed(&sm), "owed after a failed first send");
+        let marker = std::fs::read_to_string(&sm.skip_alert_owed_path).unwrap();
+        assert!(marker.starts_with("raised_at="), "{marker}");
+        // Paced: not again within SKIP_ALERT_OWED_EVERY of the last raise.
+        owed_step(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 1);
+        // Due, XAPI still down: raised again, still owed.
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 2);
+        assert!(owed(&sm));
+        // XAPI answers: delivered, the same text, the marker gone.
+        sm.skip_alert_delivers = true;
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 3);
+        assert_eq!(sm.skip_alerts[2], sm.skip_alerts[0], "same text");
+        assert!(!owed(&sm));
+        for _ in 0..3 {
+            owed_step_due(&mut sm).await;
+        }
+        assert_eq!(sm.skip_alerts.len(), 3, "{:?}", sm.skip_alerts);
+        assert_eq!(sm.skip_alerts_delivered, 1, "one XAPI message");
+        // A record left behind (its removal failed) does not raise it again.
+        write_skip_record(&sm);
+        sm.forget_resync_skip_then_alert("full resync", true).await;
+        assert_eq!(sm.skip_alerts.len(), 3);
+    }
+
+    /// The owed rebuild alert has no age limit while its rebuild runs: an
+    /// XAPI outage longer than the held-back set's limit still ends with it
+    /// delivered.
+    #[tokio::test]
+    async fn an_owed_rebuild_alert_is_not_aged_out_while_the_rebuild_runs() {
+        let (mut sm, _drbd) = rebuild_alert_raised(false).await;
+        // The last raise as long ago as the held-back set's age limit.
+        sm.skip_alert_owed_at = std::time::Instant::now()
+            .checked_sub(crate::xapi::PENDING_ALERT_MAX_AGE + Duration::from_secs(60));
+        owed_step(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 2, "raised again");
+        assert!(owed(&sm));
+        sm.skip_alert_delivers = true;
+        owed_step_due(&mut sm).await;
+        assert!(!owed(&sm));
+        assert_eq!(sm.skip_alerts_delivered, 1);
+    }
+
+    /// A daemon restart during the rebuild, before XAPI took the alert: the
+    /// new run raises it again from the marker, once, and no run after
+    /// that sends it again.
+    #[tokio::test]
+    async fn a_restart_during_the_rebuild_raises_the_alert_once() {
+        let (sm, drbd) = rebuild_alert_raised(false).await;
+        assert!(owed(&sm));
+        let marker = sm.skip_alert_owed_path.clone();
+        let restart = |delivers: bool| {
+            let (mut again, _) = skip_sm(&drbd);
+            again.skip_alert_owed_path = marker.clone();
+            again.skip_alert_delivers = delivers;
+            again
+        };
+        // The first tick after the restart: XAPI does not answer yet.
+        let mut again = restart(false);
+        owed_step(&mut again).await;
+        assert_eq!(again.skip_alerts.len(), 1);
+        assert!(owed(&again));
+        // Another restart; XAPI answers now.
+        let mut again = restart(true);
+        owed_step(&mut again).await;
+        assert_eq!(again.skip_alerts.len(), 1);
+        assert_eq!(again.skip_alerts[0], sm.skip_alerts[0], "same text");
+        assert_eq!(again.skip_alerts_delivered, 1);
+        assert!(!owed(&again));
+        owed_step_due(&mut again).await;
+        let mut later = restart(true);
+        owed_step(&mut later).await;
+        assert!(later.skip_alerts.is_empty(), "{:?}", later.skip_alerts);
+        assert_eq!(again.skip_alerts_delivered + later.skip_alerts_delivered, 1);
+    }
+
+    /// The rebuild completes before XAPI took the "rebuilding" alert: that
+    /// one is not sent any more, the marker goes, and the past-tense alert
+    /// is raised once instead, in the same run and after a restart.
+    #[tokio::test]
+    async fn a_rebuild_completed_before_delivery_raises_the_rebuilt_alert() {
+        let (mut sm, drbd) = rebuild_alert_raised(false).await;
+        drbd.set_status(up_to_date_after_rebuild());
+        sm.skip_alert_delivers = true;
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 2, "{:?}", sm.skip_alerts);
+        assert_eq!(rebuilt_alerts(&sm), 1);
+        assert!(sm.skip_alerts[1].contains("full resync from node-b"));
+        assert!(sm.skip_alerts[1].contains("No action needed"));
+        assert!(!owed(&sm));
+        for _ in 0..2 {
+            owed_step_due(&mut sm).await;
+        }
+        assert_eq!(sm.skip_alerts.len(), 2, "once");
+        // Same, with a daemon restart between the raise and the end.
+        let (sm, drbd) = rebuild_alert_raised(false).await;
+        drbd.set_status(up_to_date_after_rebuild());
+        let (mut again, _) = skip_sm(&drbd);
+        again.skip_alert_owed_path = sm.skip_alert_owed_path.clone();
+        again.skip_alert_delivers = true;
+        owed_step(&mut again).await;
+        assert_eq!(again.skip_alerts.len(), 1, "{:?}", again.skip_alerts);
+        assert_eq!(rebuilt_alerts(&again), 1);
+        assert!(!owed(&again));
+    }
+
+    /// A full resync found already completed when the record ends: no
+    /// "rebuilding" alert; the past-tense alert when nothing about the skip
+    /// reached XAPI, nothing when a waiting variant already did.
+    #[tokio::test]
+    async fn a_resync_already_done_at_the_clear_raises_the_rebuilt_alert_once() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        sm.forget_resync_skip_then_alert("full resync done", false)
+            .await;
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert_eq!(rebuilt_alerts(&sm), 1);
+        assert!(!owed(&sm));
+        // A waiting variant reached XAPI for this record: nothing more.
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        sm.note_skip_alerted(SKIP_HELD_PEER);
+        sm.resync_skip_alerted = None;
+        sm.forget_resync_skip_then_alert("full resync done", false)
+            .await;
+        assert!(sm.skip_alerts.is_empty(), "{:?}", sm.skip_alerts);
+    }
+
+    /// The marker cannot be written: the alert goes out once through the
+    /// held-back set, in the owed send's slot, and is not raised again by
+    /// later clears. The hold on it ends once the copy is UpToDate, but
+    /// never while that send still runs (a late failure would queue it
+    /// after the withdrawal).
+    #[tokio::test]
+    async fn an_unwritable_marker_falls_back_to_one_held_alert() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(rig_resyncing()));
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.skip_alert_owed_path = "/proc/twinstor-test-no-such-dir/resync-skip-alert".into();
+        sm.forget_resync_skip_then_alert("full resync", true).await;
+        assert_eq!(sm.skip_alerts.len(), 1);
+        assert!(sm.skip_alert_fallback_held);
+        write_skip_record(&sm);
+        sm.forget_resync_skip_then_alert("full resync", true).await;
+        assert_eq!(sm.skip_alerts.len(), 1, "not again");
+        // The copy is UpToDate while the send has not ended: still held.
+        drbd.set_status(up_to_date_after_rebuild());
+        assert!(sm.skip_alert_owed_task.is_some());
+        sm.skip_alert_owed_at = None;
+        sm.owed_skip_alert_step().await;
+        assert!(sm.skip_alert_fallback_held, "not while the send runs");
+        settle(&mut sm).await;
+        owed_step_due(&mut sm).await;
+        assert!(!sm.skip_alert_fallback_held);
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+    }
+
+    /// A record that cannot be removed brings the "full resync done" clear
+    /// back on every pass: the past-tense alert still goes out once.
+    #[tokio::test]
+    async fn the_rebuilt_alert_goes_out_once_when_the_record_stays() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_memory_path("skip-record-ro");
+        std::fs::create_dir_all(&dir).unwrap();
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.resync_skip_path = format!("{dir}/resync-skipped");
+        write_skip_record(&sm);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        for _ in 0..3 {
+            sm.forget_resync_skip_then_alert("full resync done", false)
+                .await;
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(std::path::Path::new(&sm.resync_skip_path).exists());
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert_eq!(rebuilt_alerts(&sm), 1);
+    }
+
+    /// A copy UpToDate with the pair not connected (the peer fenced or
+    /// rebooted after the rebuild, XAPI down until then).
+    fn up_to_date_alone() -> DrbdStatus {
+        DrbdStatus {
+            role: Role::Primary,
+            connection: ConnectionState::StandAlone,
+            peer_disk: None,
+            peer_role: None,
+            replication: None,
+            ..up_to_date_after_rebuild()
+        }
+    }
+
+    /// The rebuild completed but the pair is not connected when the step
+    /// looks: that proves neither a rebuild nor a force, so nothing is
+    /// raised and the marker stays, also on later passes. Once connected
+    /// with both copies UpToDate: one past-tense alert, the marker gone.
+    #[tokio::test]
+    async fn an_owed_alert_waits_while_the_pair_is_not_connected() {
+        let (mut sm, drbd) = rebuild_alert_raised(false).await;
+        drbd.set_status(up_to_date_alone());
+        sm.skip_alert_delivers = true;
+        for _ in 0..3 {
+            owed_step_due(&mut sm).await;
+        }
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert!(owed(&sm));
+        drbd.set_status(up_to_date_after_rebuild());
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 2, "{:?}", sm.skip_alerts);
+        assert_eq!(rebuilt_alerts(&sm), 1);
+        assert!(!owed(&sm));
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 2, "once");
+    }
+
+    /// Same without a marker: the held alert waits in memory, then the
+    /// past-tense one once the pair is seen rebuilt.
+    #[tokio::test]
+    async fn a_held_owed_alert_waits_while_the_pair_is_not_connected() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(up_to_date_alone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.skip_alert_fallback_held = true;
+        // Its held copy was withdrawn undelivered on an earlier pass.
+        sm.skip_fallback_rebuilt_owed = true;
+        for _ in 0..3 {
+            owed_step_due(&mut sm).await;
+        }
+        assert!(sm.skip_alert_fallback_held && sm.skip_fallback_rebuilt_owed);
+        assert!(sm.skip_alerts.is_empty(), "{:?}", sm.skip_alerts);
+        drbd.set_status(up_to_date_after_rebuild());
+        owed_step_due(&mut sm).await;
+        assert!(!sm.skip_alert_fallback_held && !sm.skip_fallback_rebuilt_owed);
+        assert_eq!(rebuilt_alerts(&sm), 1);
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+    }
+
+    /// A copy an operator forced out of its rebuild after losing the peer
+    /// (the force in this boot's kernel log) was not rebuilt: no
+    /// past-tense alert, with or without a marker; the marker goes.
+    #[tokio::test]
+    async fn a_forced_copy_gets_no_rebuilt_alert() {
+        let forced_scan = crate::drbd::SkipScan {
+            forced_out_of_inconsistent: true,
+            ..Default::default()
+        };
+        let (mut sm, drbd) = rebuild_alert_raised(false).await;
+        drbd.set_status(up_to_date_alone());
+        *drbd.skip_scan.lock().unwrap() = Ok(forced_scan.clone());
+        sm.skip_alert_delivers = true;
+        owed_step_due(&mut sm).await;
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert!(!owed(&sm));
+        // Without a marker.
+        let drbd = std::sync::Arc::new(MockDrbd::new(up_to_date_alone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(forced_scan);
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.skip_alert_fallback_held = true;
+        sm.skip_fallback_rebuilt_owed = true;
+        owed_step_due(&mut sm).await;
+        assert!(!sm.skip_alert_fallback_held && !sm.skip_fallback_rebuilt_owed);
+        assert!(sm.skip_alerts.is_empty(), "{:?}", sm.skip_alerts);
+    }
+
+    /// The "full resync done" clear is reached only once this boot's kernel
+    /// log shows the invalidate's full resync ran: the past-tense alert
+    /// goes out whatever the pair reads now, without another DRBD read.
+    #[tokio::test]
+    async fn the_resync_done_clear_alerts_without_a_pair_check() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(DrbdStatus {
+            connection: ConnectionState::StandAlone,
+            peer_disk: None,
+            ..skipped_returner()
+        }));
+        drbd.fail_status.store(true, Ordering::Relaxed);
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        drbd.reads.lock().unwrap().clear();
+        sm.forget_resync_skip_then_alert("full resync done", false)
+            .await;
+        assert_eq!(rebuilt_alerts(&sm), 1, "{:?}", sm.skip_alerts);
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert!(drbd.reads().is_empty(), "{:?}", drbd.reads());
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
     }
 
     /// A skip whose record cannot be written: one alert saying the copy is

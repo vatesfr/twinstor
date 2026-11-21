@@ -2174,7 +2174,35 @@ struct PendingAlerts {
     /// Of those, withdrawn (or delivered by a newer send) after they were
     /// taken: the flush drops them instead of sending.
     withdrawn: Vec<(String, String)>,
+    /// In `xe message-create` right now: (name, key, the body when a flush
+    /// sends it, `None` for a fresh send, and when the same text was raised
+    /// again during a flush's send). A fresh send and a flush never send
+    /// the same message at once.
+    sending: Vec<(String, String, Option<String>, Option<std::time::Instant>)>,
 }
+
+/// What a fresh send of a message finds before it goes to XAPI.
+#[derive(Debug, PartialEq, Eq)]
+enum FreshSend {
+    /// Send it.
+    Go,
+    /// A flush is sending this message right now, with this body: the
+    /// fresh send does not wait for it (see `send_alert_in`).
+    Busy(String),
+}
+
+/// The daemon tick retries held alerts on its own (`retry_held_alerts`)
+/// at most this often, so an alert raised once is delivered once XAPI
+/// answers again even if nothing else is sent.
+const HELD_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The timed retry leaves an alert raised again within this to its caller:
+/// a caller that keeps raising it delivers it itself on its next pass.
+const HELD_RETRY_QUIET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// At most this many held alerts per delivery attempt (each bounded by
+/// `message_create`'s timeout); the rest wait for the next attempt.
+const HELD_FLUSH_BATCH: usize = 4;
 
 const PENDING_ALERTS_MAX: usize = 32;
 const PENDING_PER_NAME_MAX: usize = 8;
@@ -2184,7 +2212,8 @@ const PENDING_PER_NAME_MAX: usize = 8;
 /// An advice held for a parked host is kept for the park. Applied on every
 /// daemon tick ([`expire_held_alerts`]) and again right before a held alert
 /// is delivered, so none older is ever delivered.
-const PENDING_ALERT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub(crate) const PENDING_ALERT_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
 
 impl PendingAlerts {
     #[cfg(test)]
@@ -2243,10 +2272,134 @@ impl PendingAlerts {
 
     /// A flush is about to send `(name, key)`, taken earlier: whether to
     /// drop it instead, because it was withdrawn (or delivered) since, or a
-    /// newer version was raised meanwhile (that one goes out instead).
+    /// newer version was raised meanwhile or is being sent fresh (that one
+    /// goes out instead).
     fn flush_skip(&self, name: &str, key: &str) -> bool {
         self.withdrawn.iter().any(|(n, k)| n == name && k == key)
             || self.items.iter().any(|(n, k, _, _)| n == name && k == key)
+            || self
+                .sending
+                .iter()
+                .any(|(n, k, flush, _)| flush.is_none() && n == name && k == key)
+    }
+
+    /// A flush sends `body` as `(name, key)` now unless
+    /// [`PendingAlerts::flush_skip`] says otherwise; checked and claimed under
+    /// one lock, so a fresh send starting meanwhile sees it.
+    fn flush_begin(&mut self, name: &str, key: &str, body: &str) -> bool {
+        if self.flush_skip(name, key) {
+            return false;
+        }
+        self.sending.push((
+            name.to_string(),
+            key.to_string(),
+            Some(body.to_string()),
+            None,
+        ));
+        true
+    }
+
+    /// A flush's claim on `(name, key)` ended (see [`FlushClaim`]).
+    fn flush_unclaim(&mut self, name: &str, key: &str) {
+        if let Some(i) = self
+            .sending
+            .iter()
+            .position(|(n, k, flush, _)| flush.is_some() && n == name && k == key)
+        {
+            self.sending.remove(i);
+        }
+    }
+
+    /// A fresh send of `(name, key)` is about to go to XAPI: claimed (`Go`,
+    /// ended by [`PendingAlerts::fresh_end`]) unless a flush is sending the
+    /// same message right now (`Busy`).
+    fn fresh_begin(&mut self, name: &str, key: &str) -> FreshSend {
+        let flushing = self
+            .sending
+            .iter()
+            .find_map(|(n, k, flush, _)| flush.as_ref().filter(|_| n == name && k == key));
+        if let Some(body) = flushing {
+            return FreshSend::Busy(body.clone());
+        }
+        self.sending
+            .push((name.to_string(), key.to_string(), None, None));
+        FreshSend::Go
+    }
+
+    /// The text a flush is sending as `(name, key)` was raised again at
+    /// `at` (a new event with the same text): if that send fails, the copy
+    /// put back counts its age from this raise (see `flush_one_in`).
+    fn raised_during_flush(&mut self, name: &str, key: &str, at: std::time::Instant) {
+        if let Some(e) = self
+            .sending
+            .iter_mut()
+            .find(|(n, k, flush, _)| flush.is_some() && n == name && k == key)
+        {
+            e.3 = Some(at);
+        }
+    }
+
+    /// When the text a flush is sending as `(name, key)` was last raised
+    /// again during the send, if it was.
+    fn flush_raised_again(&self, name: &str, key: &str) -> Option<std::time::Instant> {
+        self.sending
+            .iter()
+            .find(|(n, k, flush, _)| flush.is_some() && n == name && k == key)
+            .and_then(|e| e.3)
+    }
+
+    /// A fresh send claimed by [`PendingAlerts::fresh_begin`] ended.
+    fn fresh_end(&mut self, name: &str, key: &str) {
+        if let Some(i) = self
+            .sending
+            .iter()
+            .position(|(n, k, flush, _)| flush.is_none() && n == name && k == key)
+        {
+            self.sending.remove(i);
+        }
+    }
+
+    /// Whether the timed retry has something to deliver at `now`: an alert
+    /// not raised again for `HELD_RETRY_QUIET`. `parked`: a host is parked,
+    /// so an advice held for the park cannot go out and does not count (the
+    /// retry does not probe XAPI for it during the whole park).
+    fn retry_wanted(&self, now: std::time::Instant, parked: bool) -> bool {
+        self.items.iter().any(|(_, _, _, h)| {
+            !(parked && h.park) && now.saturating_duration_since(h.at) >= HELD_RETRY_QUIET
+        })
+    }
+
+    /// Whether a flush already took `(name, key)` and has not ended: a
+    /// newer version raised meanwhile waits for it (two flushes never
+    /// carry one message at once).
+    fn taken(in_flight: &[(String, String)], name: &str, key: &str) -> bool {
+        in_flight.iter().any(|(n, k)| n == name && k == key)
+    }
+
+    /// The timed retry's take: after the age limit, up to `max` alerts not
+    /// raised again for `HELD_RETRY_QUIET`, removed from the set as
+    /// [`PendingAlerts::take_at`] does.
+    fn take_quiet_at(
+        &mut self,
+        max: usize,
+        now: std::time::Instant,
+    ) -> Vec<(String, String, String, Held)> {
+        self.expire_at(now);
+        let mut out = Vec::new();
+        let in_flight = &mut self.in_flight;
+        self.items.retain(|(n, k, b, h)| {
+            if out.len() < max
+                && now.saturating_duration_since(h.at) >= HELD_RETRY_QUIET
+                && !Self::taken(in_flight, n, k)
+            {
+                in_flight.push((n.clone(), k.clone()));
+                out.push((n.clone(), k.clone(), b.clone(), *h));
+                false
+            } else {
+                true
+            }
+        });
+        out
     }
 
     /// A taken alert the flush could not send goes back, keeping its age,
@@ -2287,7 +2440,7 @@ impl PendingAlerts {
         let mut out = Vec::new();
         let in_flight = &mut self.in_flight;
         self.items.retain(|(n, k, b, h)| {
-            if !(n == name && k == key) && out.len() < max {
+            if !(n == name && k == key) && out.len() < max && !Self::taken(in_flight, n, k) {
                 in_flight.push((n.clone(), k.clone()));
                 out.push((n.clone(), k.clone(), b.clone(), *h));
                 false
@@ -2321,7 +2474,192 @@ static PENDING_ALERTS: std::sync::Mutex<PendingAlerts> = std::sync::Mutex::new(P
     items: Vec::new(),
     in_flight: Vec::new(),
     withdrawn: Vec::new(),
+    sending: Vec::new(),
 });
+
+/// Pacing of the timed retry of held alerts: when the next attempt may
+/// start, and whether one is running (never two at once).
+#[derive(Debug, Default)]
+struct HeldRetry {
+    next_at: Option<std::time::Instant>,
+    running: bool,
+}
+
+impl HeldRetry {
+    /// Whether an attempt starts now: none running, its pace reached, an
+    /// alert waiting for it (`wanted`) and the alert gate open (the gate
+    /// paces the probes while XAPI does not answer). Marks it running.
+    fn start(&mut self, now: std::time::Instant, wanted: bool, gate_open: bool) -> bool {
+        if self.running || self.next_at.is_some_and(|t| now < t) || !wanted || !gate_open {
+            return false;
+        }
+        self.next_at = Some(now + HELD_RETRY_EVERY);
+        self.running = true;
+        true
+    }
+}
+
+static HELD_RETRY: std::sync::Mutex<HeldRetry> = std::sync::Mutex::new(HeldRetry {
+    next_at: None,
+    running: false,
+});
+
+/// Ends the running mark of a timed retry, also if its task panics.
+struct HeldRetryRunning;
+
+impl Drop for HeldRetryRunning {
+    fn drop(&mut self) {
+        if let Ok(mut r) = HELD_RETRY.lock() {
+            r.running = false;
+        }
+    }
+}
+
+/// Retry held alerts without waiting for another alert (called on every
+/// daemon tick): about every `HELD_RETRY_EVERY` while an alert has not been
+/// raised again for `HELD_RETRY_QUIET`, once the alert gate lets XAPI be
+/// probed. The attempt runs in the background, so a tick never waits on
+/// XAPI; it probes XAPI as a send does (feeding the same gate), then
+/// delivers up to `HELD_FLUSH_BATCH` alerts with the age limit, withdrawals
+/// and park routing applied as in the flush after a send.
+pub fn retry_held_alerts() {
+    let now = std::time::Instant::now();
+    let parked = crate::arbitration::advice_held();
+    let wanted = PENDING_ALERTS
+        .lock()
+        .map(|p| p.retry_wanted(now, parked))
+        .unwrap_or(false);
+    let gate_open = ALERT_GATE.lock().map(|g| g.open(now)).unwrap_or(true);
+    let start = HELD_RETRY
+        .lock()
+        .map(|mut r| r.start(now, wanted, gate_open))
+        .unwrap_or(false);
+    if !start {
+        return;
+    }
+    let running = HeldRetryRunning;
+    // Test builds never reach XAPI in the background; tests drive
+    // `retry_held_in` directly.
+    if cfg!(test) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _running = running;
+        retry_held_in(
+            &PENDING_ALERTS,
+            &ALERT_GATE,
+            &LiveXapi,
+            std::time::Instant::now(),
+        )
+        .await;
+    });
+}
+
+/// One timed-retry attempt over `pending`: probe XAPI (through `gate`),
+/// then deliver what has been quiet long enough. How many were delivered.
+async fn retry_held_in<X: AlertXapi>(
+    pending: &std::sync::Mutex<PendingAlerts>,
+    gate: &std::sync::Mutex<AlertGate>,
+    xapi: &X,
+    now: std::time::Instant,
+) -> usize {
+    if !gate.lock().map(|g| g.open(now)).unwrap_or(true) {
+        return 0;
+    }
+    let Some(host_uuid) = xapi.host_uuid().await else {
+        let _ = gate.lock().map(|mut g| g.unreachable(now));
+        debug!("held-back XAPI alerts: XAPI still not answering; retrying later");
+        return 0;
+    };
+    if let Ok(mut g) = gate.lock() {
+        g.reachable();
+    }
+    let held = pending
+        .lock()
+        .map(|mut p| p.take_quiet_at(HELD_FLUSH_BATCH, now))
+        .unwrap_or_default();
+    flush_batch_in(pending, gate, xapi, &host_uuid, held).await
+}
+
+/// Deliver alerts a flush took from `pending`, one after the other. Each
+/// ends its in-flight mark once handled, and every mark left ends if the
+/// task stops half-way (a panic), so no message stays taken for good. How
+/// many were delivered.
+async fn flush_batch_in<X: AlertXapi>(
+    pending: &std::sync::Mutex<PendingAlerts>,
+    gate: &std::sync::Mutex<AlertGate>,
+    xapi: &X,
+    host_uuid: &str,
+    held: Vec<(String, String, String, Held)>,
+) -> usize {
+    struct InFlight<'a> {
+        pending: &'a std::sync::Mutex<PendingAlerts>,
+        keys: Vec<(String, String)>,
+    }
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut p) = self.pending.lock() {
+                for (n, k) in &self.keys {
+                    p.flush_end(n, k);
+                }
+            }
+        }
+    }
+    let mut marks = InFlight {
+        pending,
+        keys: held
+            .iter()
+            .map(|(n, k, _, _)| (n.clone(), k.clone()))
+            .collect(),
+    };
+    let mut delivered = 0;
+    for (n, k, b, h) in held {
+        // A `message-create` that timed out closed the gate: the rest of
+        // the batch goes back (keeping its age) instead of each waiting out
+        // the same timeout.
+        if !gate
+            .lock()
+            .map(|g| g.open(std::time::Instant::now()))
+            .unwrap_or(true)
+        {
+            if let Ok(mut p) = pending.lock() {
+                p.flush_requeue(&n, &k, &b, h);
+                p.flush_end(&n, &k);
+            }
+            marks.keys.retain(|(mn, mk)| !(*mn == n && *mk == k));
+            continue;
+        }
+        if flush_one_in(pending, gate, xapi, host_uuid, &n, &k, &b, h).await {
+            delivered += 1;
+        }
+        if let Ok(mut p) = pending.lock() {
+            p.flush_end(&n, &k);
+        }
+        marks.keys.retain(|(mn, mk)| !(*mn == n && *mk == k));
+    }
+    delivered
+}
+
+/// What alert delivery needs from XAPI: this host's uuid (also the
+/// reachability probe) and `xe message-create`. A trait so tests can stand
+/// in for XAPI.
+trait AlertXapi {
+    async fn host_uuid(&self) -> Option<String>;
+    async fn message_create(&self, host_uuid: &str, name: &str, body: &str) -> Result<(), String>;
+}
+
+/// The real XAPI, through `xe`.
+struct LiveXapi;
+
+impl AlertXapi for LiveXapi {
+    async fn host_uuid(&self) -> Option<String> {
+        local_host_param("uuid").await.filter(|u| !u.is_empty())
+    }
+
+    async fn message_create(&self, host_uuid: &str, name: &str, body: &str) -> Result<(), String> {
+        message_create(host_uuid, name, body).await
+    }
+}
 
 /// Withdraw a held-back alert `(name, key)` (`key` as passed to the keyed
 /// send) that no longer holds, so it is never delivered late. Whether a held
@@ -2392,16 +2730,16 @@ static UNDELIVERED_TRACE: std::sync::Mutex<PerNameLimiter> =
 /// An alert XAPI could not take: never dropped silently. Warn and write it to
 /// the kernel log (paced per alert name), and keep it for delivery once XAPI
 /// answers again.
-fn undelivered(name: &str, key: &str, body: &str, why: &str) {
-    undelivered_since(name, key, body, why, std::time::Instant::now());
-}
-
-/// [`undelivered`] for an alert held since `since` (a held alert whose
-/// delivery failed keeps its age).
-fn undelivered_since(name: &str, key: &str, body: &str, why: &str, since: std::time::Instant) {
+fn undelivered_in(
+    pending: &std::sync::Mutex<PendingAlerts>,
+    name: &str,
+    key: &str,
+    body: &str,
+    why: &str,
+) {
     undelivered_log(name, key, body, why);
-    if let Ok(mut p) = PENDING_ALERTS.lock() {
-        p.push_at(name, key, body, false, since);
+    if let Ok(mut p) = pending.lock() {
+        p.push_at(name, key, body, false, std::time::Instant::now());
     }
 }
 
@@ -2426,7 +2764,21 @@ fn undelivered_log(name: &str, key: &str, body: &str, why: &str) {
 
 /// Keep an HA-disable advice back while a host is parked (logged once per
 /// pacing interval), for delivery once none is.
-fn hold_ha_advice(name: &str, key: &str, body: &str, view: crate::arbitration::PartitionView) {
+fn hold_ha_advice_in(
+    pending: &std::sync::Mutex<PendingAlerts>,
+    name: &str,
+    key: &str,
+    body: &str,
+    view: crate::arbitration::PartitionView,
+) {
+    hold_ha_advice_log(name, key, body, view);
+    if let Ok(mut p) = pending.lock() {
+        p.push_at(name, key, body, true, std::time::Instant::now());
+    }
+}
+
+/// [`hold_ha_advice_in`]'s log line (paced), without queuing.
+fn hold_ha_advice_log(name: &str, key: &str, body: &str, view: crate::arbitration::PartitionView) {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2440,25 +2792,32 @@ fn hold_ha_advice(name: &str, key: &str, body: &str, view: crate::arbitration::P
               "alert advising an HA disable held back while a host is parked by XAPI; \
                delivered once no host is parked");
     }
-    if let Ok(mut p) = PENDING_ALERTS.lock() {
-        p.push_at(name, key, body, true, std::time::Instant::now());
-    }
 }
 
-/// [`hold_ha_advice`] for an advice a flush took: back in the queue for the
-/// park, unless withdrawn meanwhile or a newer version is queued.
-fn hold_ha_advice_requeue(
+/// [`hold_ha_advice_in`] for an advice a flush took: back in the queue for
+/// the park, keeping when it was raised (an advice held for a park is not
+/// aged out; the timed retry reads how long it has been quiet), unless
+/// withdrawn meanwhile or a newer version is queued or being sent.
+fn hold_ha_advice_requeue_in(
+    pending: &std::sync::Mutex<PendingAlerts>,
     name: &str,
     key: &str,
     body: &str,
+    held: Held,
     view: crate::arbitration::PartitionView,
 ) {
-    let fresh = PENDING_ALERTS
+    let requeued = pending
         .lock()
-        .map(|p| !p.flush_skip(name, key))
+        .map(|mut p| {
+            let fresh = !p.flush_skip(name, key);
+            if fresh {
+                p.push_at(name, key, body, true, held.at);
+            }
+            fresh
+        })
         .unwrap_or(false);
-    if fresh {
-        hold_ha_advice(name, key, body, view);
+    if requeued {
+        hold_ha_advice_log(name, key, body, view);
     }
 }
 
@@ -2470,6 +2829,9 @@ pub fn alert_is_held(name: &str, key: &str) -> bool {
         .map(|p| p.items.iter().any(|(n, k, _, _)| n == name && k == key))
         .unwrap_or(false)
 }
+
+/// `message_create`'s error when `xe` did not finish within its bound.
+const MESSAGE_CREATE_TIMED_OUT: &str = "timed out (60s); toolstack wedged?";
 
 async fn message_create(host_uuid: &str, name: &str, body: &str) -> Result<(), String> {
     let body = xe_message_body(body);
@@ -2488,7 +2850,7 @@ async fn message_create(host_uuid: &str, name: &str, body: &str) -> Result<(), S
     )
     .await;
     match result {
-        Err(_) => Err("timed out (60s); toolstack wedged?".to_string()),
+        Err(_) => Err(MESSAGE_CREATE_TIMED_OUT.to_string()),
         Ok(Err(e)) => Err(e.to_string()),
         Ok(Ok(out)) if out.status.success() => Ok(()),
         Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
@@ -2543,12 +2905,74 @@ pub async fn send_xapi_alert_advising_ha_disable_unqueued(body: &str) -> bool {
     send_alert_as("twinstor_degraded", &ha_advice_key(body), body, false).await
 }
 
+/// [`send_xapi_alert_keyed`], not queued when undelivered (see
+/// [`send_xapi_alert_unqueued`]): for an alert whose caller keeps it owed
+/// itself, durably, and raises it again until this returns true. Test
+/// builds stand in for it at the caller.
+#[cfg_attr(test, allow(dead_code))]
+pub async fn send_xapi_alert_keyed_unqueued(key: &str, body: &str) -> bool {
+    send_alert_as("twinstor_degraded", key, body, false).await
+}
+
 /// [`send_alert_keyed`]; `queue`: kept for later delivery when undelivered.
 async fn send_alert_as(name: &str, key: &str, body: &str, queue: bool) -> bool {
     // The manual commands name the SR by its uuid when this host has it
     // recorded; the placeholder stays only when it does not.
     let filled = fill_sr_uuid(body, read_recorded_sr_uuid().as_deref());
-    let body = filled.as_str();
+    let host_uuid = match send_alert_in(
+        &PENDING_ALERTS,
+        &ALERT_GATE,
+        &LiveXapi,
+        name,
+        key,
+        &filled,
+        queue,
+    )
+    .await
+    {
+        AlertSent::No => return false,
+        AlertSent::Now(host_uuid) => host_uuid,
+    };
+    // XAPI answers again: deliver what an outage held back (a few per call,
+    // each bounded), in the background, so a caller on a critical path (a
+    // split-brain resolution) never waits on them.
+    let held = PENDING_ALERTS
+        .lock()
+        .map(|mut p| p.take(name, key, HELD_FLUSH_BATCH))
+        .unwrap_or_default();
+    if !held.is_empty() && !cfg!(test) {
+        tokio::spawn(async move {
+            flush_batch_in(&PENDING_ALERTS, &ALERT_GATE, &LiveXapi, &host_uuid, held).await;
+        });
+    } else if let Ok(mut p) = PENDING_ALERTS.lock() {
+        for (n, k, _, _) in &held {
+            p.flush_end(n, k);
+        }
+    }
+    true
+}
+
+/// How a fresh send ended.
+#[derive(Debug, PartialEq, Eq)]
+enum AlertSent {
+    /// Not delivered (held back for later when queued).
+    No,
+    /// Delivered now; this host's uuid.
+    Now(String),
+}
+
+/// The send itself, over `pending`, `gate` and `xapi`: routing, the
+/// claim against a flush of the same message, the gate, the probe, then
+/// `xe message-create`.
+async fn send_alert_in<X: AlertXapi>(
+    pending: &std::sync::Mutex<PendingAlerts>,
+    gate: &std::sync::Mutex<AlertGate>,
+    xapi: &X,
+    name: &str,
+    key: &str,
+    body: &str,
+    queue: bool,
+) -> AlertSent {
     // Advice to disable HA (pool-wide or locally) releases a host XAPI parks
     // in its HA startup loop as a second master: held back (not delivered)
     // while a host is parked, otherwise prefixed with when it is safe.
@@ -2559,119 +2983,196 @@ async fn send_alert_as(name: &str, key: &str, body: &str, queue: bool) -> bool {
             crate::arbitration::AlertRoute::Send(b) => b,
             crate::arbitration::AlertRoute::Hold => {
                 if queue {
-                    hold_ha_advice(name, key, body, view);
+                    hold_ha_advice_in(pending, name, key, body, view);
                 }
-                return false;
+                return AlertSent::No;
             }
         };
     let body = routed.as_str();
     let undelivered = |name: &str, key: &str, body: &str, why: &str| {
         if queue {
-            undelivered(name, key, body, why);
+            undelivered_in(pending, name, key, body, why);
         } else {
             undelivered_log(name, key, body, why);
         }
     };
+    // Never at once with a flush of the same message, and never waiting
+    // for one: the flush delivers this text (or puts it back if XAPI does
+    // not take it); a newer text is held for after it.
+    let found = pending
+        .lock()
+        .map(|mut p| {
+            let found = p.fresh_begin(name, key);
+            // A new raise of the same text: if the flush's send fails, the
+            // copy it puts back is as young as this raise. Noted under the
+            // same lock, while the flush still holds its claim.
+            if matches!(&found, FreshSend::Busy(flushing) if flushing == body) {
+                p.raised_during_flush(name, key, std::time::Instant::now());
+            }
+            found
+        })
+        .unwrap_or(FreshSend::Go);
+    if let FreshSend::Busy(flushing) = found {
+        if flushing == body {
+            debug!(alert = %name, "XAPI alert being delivered from the held-back set right now");
+        } else {
+            undelivered(
+                name,
+                key,
+                body,
+                "an older version is being delivered right now",
+            );
+        }
+        return AlertSent::No;
+    }
+    let _claim = FreshClaim {
+        pending,
+        name: name.to_string(),
+        key: key.to_string(),
+    };
     let now = std::time::Instant::now();
-    if !ALERT_GATE.lock().map(|g| g.open(now)).unwrap_or(true) {
+    if !gate.lock().map(|g| g.open(now)).unwrap_or(true) {
         undelivered(
             name,
             key,
             body,
             "XAPI could not name this host recently (retrying with backoff)",
         );
-        return false;
+        return AlertSent::No;
     }
     // The local query doubles as the reachability probe the gate needs: it
     // reads empty when XAPI does not answer.
-    let host_uuid = local_host_param("uuid").await.unwrap_or_default();
-
-    if host_uuid.is_empty() {
-        let _ = ALERT_GATE.lock().map(|mut g| g.unreachable(now));
+    let Some(host_uuid) = xapi.host_uuid().await else {
+        let _ = gate.lock().map(|mut g| g.unreachable(now));
         undelivered(name, key, body, "host UUID not found (XAPI not answering)");
-        return false;
-    }
-    if let Ok(mut g) = ALERT_GATE.lock() {
+        return AlertSent::No;
+    };
+    if let Ok(mut g) = gate.lock() {
         g.reachable();
     }
-    let sent = match message_create(&host_uuid, name, body).await {
+    match xapi.message_create(&host_uuid, name, body).await {
         Ok(()) => {
             info!(alert = %name, body = %log_body(body), "XAPI alert sent");
-            if let Ok(mut p) = PENDING_ALERTS.lock() {
+            if let Ok(mut p) = pending.lock() {
                 p.delivered(name, key);
             }
+            AlertSent::Now(host_uuid)
+        }
+        Err(e) => {
+            message_create_failed(gate, &e);
+            undelivered(name, key, body, &e);
+            AlertSent::No
+        }
+    }
+}
+
+/// A `message-create` that timed out closes the alert gate as an XAPI
+/// that does not answer would: the sends that follow are refused at once
+/// (and held) instead of each waiting out the same timeout, until the
+/// gate's next probe finds XAPI answering.
+fn message_create_failed(gate: &std::sync::Mutex<AlertGate>, error: &str) {
+    if error == MESSAGE_CREATE_TIMED_OUT {
+        let _ = gate
+            .lock()
+            .map(|mut g| g.unreachable(std::time::Instant::now()));
+    }
+}
+
+/// A flush's claim on its message (see [`PendingAlerts::flush_begin`]),
+/// released when dropped, also if the flush stops half-way.
+struct FlushClaim<'a> {
+    pending: &'a std::sync::Mutex<PendingAlerts>,
+    name: &'a str,
+    key: &'a str,
+}
+
+impl Drop for FlushClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut p) = self.pending.lock() {
+            p.flush_unclaim(self.name, self.key);
+        }
+    }
+}
+
+/// A fresh send's claim on its message (see [`PendingAlerts::fresh_begin`]),
+/// released when dropped.
+struct FreshClaim<'a> {
+    pending: &'a std::sync::Mutex<PendingAlerts>,
+    name: String,
+    key: String,
+}
+
+impl Drop for FreshClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut p) = self.pending.lock() {
+            p.fresh_end(&self.name, &self.key);
+        }
+    }
+}
+
+/// Deliver one alert a flush (after a send, or the timed retry) took from
+/// `pending`. Whether XAPI took it.
+#[allow(clippy::too_many_arguments)]
+async fn flush_one_in<X: AlertXapi>(
+    pending: &std::sync::Mutex<PendingAlerts>,
+    gate: &std::sync::Mutex<AlertGate>,
+    xapi: &X,
+    host_uuid: &str,
+    n: &str,
+    k: &str,
+    b: &str,
+    h: Held,
+) -> bool {
+    // The age limit again at delivery: nothing older goes out.
+    if stale_held(n, b, &h, std::time::Instant::now()) {
+        return false;
+    }
+    // Advice routed again at delivery: still held while a host is parked.
+    let view = crate::arbitration::current();
+    let advice = k.starts_with(crate::arbitration::HA_DISABLE_ADVICE_KEY);
+    let routed = match crate::arbitration::route_alert(crate::arbitration::advice_held(), advice, b)
+    {
+        crate::arbitration::AlertRoute::Send(b) => b,
+        crate::arbitration::AlertRoute::Hold => {
+            hold_ha_advice_requeue_in(pending, n, k, b, h, view);
+            return false;
+        }
+    };
+    // Withdrawn after it was taken, a newer version queued, or the same
+    // message being sent fresh: dropped. Otherwise claimed under the same
+    // lock, so a fresh send of it starting meanwhile does not send it too.
+    if !pending
+        .lock()
+        .map(|mut p| p.flush_begin(n, k, &routed))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let claim = FlushClaim {
+        pending,
+        name: n,
+        key: k,
+    };
+    let result = xapi.message_create(host_uuid, n, &routed).await;
+    let ok = match result {
+        Ok(()) => {
+            info!(alert = %n, body = %log_body(&routed), "held-back XAPI alert delivered");
             true
         }
         Err(e) => {
-            undelivered(name, key, body, &e);
+            message_create_failed(gate, &e);
+            undelivered_log(n, k, &routed, &e);
+            if let Ok(mut p) = pending.lock() {
+                // Put back as old as its latest raise: one raised again
+                // during the send (a new event) keeps its full age limit.
+                let at = p.flush_raised_again(n, k).map_or(h.at, |t| t.max(h.at));
+                p.flush_requeue(n, k, b, Held { at, ..h });
+            }
             false
         }
     };
-    // XAPI answers again: deliver what an outage held back (a few per call,
-    // each bounded), in the background, so a caller on a critical path (a
-    // split-brain resolution) never waits on them.
-    if sent {
-        let held = PENDING_ALERTS
-            .lock()
-            .map(|mut p| p.take(name, key, 4))
-            .unwrap_or_default();
-        if !held.is_empty() && !cfg!(test) {
-            tokio::spawn(async move {
-                for (n, k, b, h) in held {
-                    flush_one(&host_uuid, &n, &k, &b, h).await;
-                    if let Ok(mut p) = PENDING_ALERTS.lock() {
-                        p.flush_end(&n, &k);
-                    }
-                }
-            });
-        } else if let Ok(mut p) = PENDING_ALERTS.lock() {
-            for (n, k, _, _) in &held {
-                p.flush_end(n, k);
-            }
-        }
-    }
-    sent
-}
-
-/// Deliver one alert a flush took from the queue.
-async fn flush_one(host_uuid: &str, n: &str, k: &str, b: &str, h: Held) {
-    {
-        // The age limit again at delivery: nothing older goes out.
-        if stale_held(n, b, &h, std::time::Instant::now()) {
-            return;
-        }
-        // Withdrawn after it was taken, or a newer version queued.
-        if PENDING_ALERTS
-            .lock()
-            .map(|p| p.flush_skip(n, k))
-            .unwrap_or(false)
-        {
-            return;
-        }
-        // Advice routed again at delivery: still held while a
-        // host is parked.
-        let view = crate::arbitration::current();
-        let advice = k.starts_with(crate::arbitration::HA_DISABLE_ADVICE_KEY);
-        let routed =
-            match crate::arbitration::route_alert(crate::arbitration::advice_held(), advice, b) {
-                crate::arbitration::AlertRoute::Send(b) => b,
-                crate::arbitration::AlertRoute::Hold => {
-                    hold_ha_advice_requeue(n, k, b, view);
-                    return;
-                }
-            };
-        match message_create(host_uuid, n, &routed).await {
-            Ok(()) => {
-                info!(alert = %n, body = %log_body(&routed), "held-back XAPI alert delivered")
-            }
-            Err(e) => {
-                undelivered_log(n, k, &routed, &e);
-                if let Ok(mut p) = PENDING_ALERTS.lock() {
-                    p.flush_requeue(n, k, b, h);
-                }
-            }
-        }
-    }
+    drop(claim);
+    ok
 }
 
 /// Last-resort operator channel for an undeliverable alert. A pool-wide xapi
@@ -3117,6 +3618,404 @@ mod alert_delivery_tests {
             p.push(&format!("n{i}"), "x", "x");
         }
         assert_eq!(p.items.len(), PENDING_ALERTS_MAX, "bounded");
+    }
+}
+
+#[cfg(test)]
+mod held_retry_tests {
+    use super::{
+        ALERT_GATE_MAX, AlertGate, AlertSent, AlertXapi, FreshSend, HELD_RETRY_EVERY,
+        HELD_RETRY_QUIET, HeldRetry, PENDING_ALERT_MAX_AGE, PendingAlerts, flush_one_in,
+        retry_held_in, send_alert_in,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// XAPI as the sender sees it: answering or not, the messages it took,
+    /// and optionally a hold every `message-create` waits on.
+    #[derive(Default)]
+    struct FakeXapi {
+        up: AtomicBool,
+        sent: Mutex<Vec<(String, String)>>,
+        hold: Option<Arc<tokio::sync::Notify>>,
+        time_out: AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeXapi {
+        fn up(up: bool) -> Self {
+            let x = Self::default();
+            x.up.store(up, Ordering::SeqCst);
+            x
+        }
+        fn sent(&self) -> Vec<(String, String)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl AlertXapi for FakeXapi {
+        async fn host_uuid(&self) -> Option<String> {
+            self.up
+                .load(Ordering::SeqCst)
+                .then(|| "00000000-host".to_string())
+        }
+        async fn message_create(&self, _host: &str, name: &str, body: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(h) = &self.hold {
+                h.notified().await;
+            }
+            if self.time_out.load(Ordering::SeqCst) {
+                return Err(super::MESSAGE_CREATE_TIMED_OUT.into());
+            }
+            if !self.up.load(Ordering::SeqCst) {
+                return Err("XAPI not answering".into());
+            }
+            self.sent
+                .lock()
+                .unwrap()
+                .push((name.to_string(), body.to_string()));
+            Ok(())
+        }
+    }
+
+    const NAME: &str = "twinstor_degraded";
+
+    /// An alert raised once, whose only send failed while XAPI did not
+    /// answer: the timed retry delivers it once XAPI answers again, with no
+    /// other alert sent, and only once.
+    #[tokio::test]
+    async fn a_held_alert_is_delivered_by_the_timed_retry_once_xapi_answers() {
+        let pending = Mutex::new(PendingAlerts::default());
+        let gate = Mutex::new(AlertGate::default());
+        let x = FakeXapi::up(false);
+        let sent = send_alert_in(&pending, &gate, &x, NAME, "k", "one-shot", true).await;
+        assert_eq!(sent, AlertSent::No);
+        assert_eq!(pending.lock().unwrap().items.len(), 1, "held");
+        let t0 = Instant::now();
+        // XAPI still down: nothing delivered, still held.
+        let t1 = t0 + HELD_RETRY_QUIET + ALERT_GATE_MAX;
+        assert_eq!(retry_held_in(&pending, &gate, &x, t1).await, 0);
+        assert_eq!(pending.lock().unwrap().items.len(), 1);
+        // The gate paces the next probe.
+        x.up.store(true, Ordering::SeqCst);
+        assert_eq!(
+            retry_held_in(&pending, &gate, &x, t1 + Duration::from_secs(1)).await,
+            0
+        );
+        assert!(x.sent().is_empty());
+        // XAPI answers: delivered at the next attempt.
+        let t2 = t1 + ALERT_GATE_MAX;
+        assert_eq!(retry_held_in(&pending, &gate, &x, t2).await, 1);
+        assert_eq!(x.sent(), vec![(NAME.to_string(), "one-shot".to_string())]);
+        {
+            let p = pending.lock().unwrap();
+            assert!(p.items.is_empty() && p.in_flight.is_empty() && p.sending.is_empty());
+        }
+        assert_eq!(
+            retry_held_in(&pending, &gate, &x, t2 + HELD_RETRY_EVERY).await,
+            0
+        );
+        assert_eq!(x.sent().len(), 1);
+    }
+
+    /// The timed retry leaves an alert its caller keeps raising to the
+    /// caller, and an unqueued alert is never held at all.
+    #[tokio::test]
+    async fn the_timed_retry_leaves_a_recently_raised_alert_to_its_caller() {
+        let pending = Mutex::new(PendingAlerts::default());
+        let gate = Mutex::new(AlertGate::default());
+        let t0 = Instant::now();
+        pending
+            .lock()
+            .unwrap()
+            .push_at(NAME, "k", "raised again", false, t0);
+        let x = FakeXapi::up(true);
+        assert_eq!(retry_held_in(&pending, &gate, &x, t0).await, 0);
+        assert!(!pending.lock().unwrap().retry_wanted(t0, false));
+        assert_eq!(pending.lock().unwrap().items.len(), 1);
+        assert!(
+            pending
+                .lock()
+                .unwrap()
+                .retry_wanted(t0 + HELD_RETRY_QUIET, false)
+        );
+        // Unqueued: its caller is the retry.
+        let down = FakeXapi::up(false);
+        let gate = Mutex::new(AlertGate::default());
+        let pending = Mutex::new(PendingAlerts::default());
+        let sent = send_alert_in(&pending, &gate, &down, NAME, "o", "owed", false).await;
+        assert_eq!(sent, AlertSent::No);
+        assert!(pending.lock().unwrap().items.is_empty());
+    }
+
+    /// The age limit still applies: an ordinary alert held past it is
+    /// dropped, not delivered by the timed retry.
+    #[tokio::test]
+    async fn the_timed_retry_never_delivers_an_alert_past_the_age_limit() {
+        let pending = Mutex::new(PendingAlerts::default());
+        let gate = Mutex::new(AlertGate::default());
+        let x = FakeXapi::up(false);
+        assert_eq!(
+            send_alert_in(&pending, &gate, &x, NAME, "k", "stale", true).await,
+            AlertSent::No
+        );
+        x.up.store(true, Ordering::SeqCst);
+        let late = Instant::now() + PENDING_ALERT_MAX_AGE;
+        assert_eq!(retry_held_in(&pending, &gate, &x, late).await, 0);
+        assert!(x.sent().is_empty());
+        assert!(pending.lock().unwrap().items.is_empty(), "dropped");
+    }
+
+    /// The pace: one attempt at a time, at most every `HELD_RETRY_EVERY`,
+    /// only with something to deliver and the gate open.
+    #[test]
+    fn the_timed_retry_is_paced() {
+        let t0 = Instant::now();
+        let mut r = HeldRetry::default();
+        assert!(!r.start(t0, false, true), "nothing to deliver");
+        assert!(!r.start(t0, true, false), "gate closed");
+        assert!(r.start(t0, true, true));
+        assert!(!r.start(t0 + HELD_RETRY_EVERY, true, true), "one at a time");
+        r.running = false;
+        assert!(!r.start(t0 + HELD_RETRY_EVERY / 2, true, true), "paced");
+        assert!(r.start(t0 + HELD_RETRY_EVERY, true, true));
+    }
+
+    /// The timed retry and a fresh send of the same message never both
+    /// reach XAPI at once: a fresh send that delivers it first makes the
+    /// retry drop its taken copy, and a fresh send claimed first makes a
+    /// flush drop its copy.
+    #[tokio::test]
+    async fn a_fresh_send_and_a_flush_never_send_one_message_at_once() {
+        let t0 = Instant::now();
+        let later = t0 + HELD_RETRY_QUIET;
+        let gate = Mutex::new(AlertGate::default());
+        let x = FakeXapi::up(true);
+        // The retry took it; the caller's own send gets there first.
+        let pending = Mutex::new(PendingAlerts::default());
+        pending.lock().unwrap().push_at(NAME, "k", "a", false, t0);
+        let taken = pending.lock().unwrap().take_quiet_at(4, later);
+        assert_eq!(taken.len(), 1);
+        let sent = send_alert_in(&pending, &gate, &x, NAME, "k", "a", true).await;
+        assert!(matches!(sent, AlertSent::Now(_)));
+        let (n, k, b, h) = taken.into_iter().next().unwrap();
+        assert!(!flush_one_in(&pending, &gate, &x, "h", &n, &k, &b, h).await);
+        pending.lock().unwrap().flush_end(&n, &k);
+        assert_eq!(x.sent().len(), 1);
+        // A fresh send claimed first: the flush drops its copy.
+        let mut p = PendingAlerts::default();
+        assert_eq!(p.fresh_begin(NAME, "k"), FreshSend::Go);
+        assert!(!p.flush_begin(NAME, "k", "a"));
+        p.fresh_end(NAME, "k");
+        assert!(p.flush_begin(NAME, "k", "a"));
+        assert_eq!(p.fresh_begin(NAME, "k"), FreshSend::Busy("a".into()));
+        p.flush_unclaim(NAME, "k");
+        assert!(p.sending.is_empty());
+    }
+
+    /// A fresh send while a flush is in `message-create` with the same
+    /// message returns at once, not delivered: the same text is left to
+    /// the flush (put back if XAPI does not take it), a newer text is held
+    /// for after it.
+    #[tokio::test]
+    async fn a_fresh_send_never_waits_for_a_flush() {
+        let t0 = Instant::now();
+        let later = t0 + HELD_RETRY_QUIET;
+        let gate = Mutex::new(AlertGate::default());
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let x = FakeXapi {
+            hold: Some(hold.clone()),
+            ..FakeXapi::up(true)
+        };
+        let pending = Mutex::new(PendingAlerts::default());
+        pending.lock().unwrap().push_at(NAME, "k", "a", false, t0);
+        let (delivered, (same, newer)) =
+            tokio::join!(retry_held_in(&pending, &gate, &x, later), async {
+                // The retry is now waiting in `message-create`.
+                tokio::task::yield_now().await;
+                let same = send_alert_in(&pending, &gate, &x, NAME, "k", "a", true).await;
+                assert!(
+                    pending.lock().unwrap().items.is_empty(),
+                    "the same text is not held twice"
+                );
+                let newer = send_alert_in(&pending, &gate, &x, NAME, "k", "b", true).await;
+                hold.notify_one();
+                (same, newer)
+            });
+        assert_eq!((same, newer), (AlertSent::No, AlertSent::No));
+        assert_eq!(delivered, 1);
+        assert_eq!(x.sent(), vec![(NAME.to_string(), "a".to_string())]);
+        let p = pending.lock().unwrap();
+        assert!(p.sending.is_empty());
+        let held: Vec<&str> = p.items.iter().map(|(_, _, b, _)| b.as_str()).collect();
+        assert_eq!(held, ["b"], "the newer text waits for its own delivery");
+    }
+
+    /// The same text raised again (a new event) while a flush sends it,
+    /// and that send fails: the copy put back is as young as the new
+    /// raise, so the new event's alert keeps its full age limit.
+    #[tokio::test]
+    async fn a_failed_flush_keeps_the_age_of_a_raise_during_its_send() {
+        let t0 = Instant::now();
+        let later = t0 + HELD_RETRY_QUIET;
+        let gate = Mutex::new(AlertGate::default());
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let x = FakeXapi {
+            hold: Some(hold.clone()),
+            ..FakeXapi::up(true)
+        };
+        let pending = Mutex::new(PendingAlerts::default());
+        pending.lock().unwrap().push_at(NAME, "k", "a", false, t0);
+        let (delivered, (raised_at, sent)) =
+            tokio::join!(retry_held_in(&pending, &gate, &x, later), async {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(5));
+                let raised_at = Instant::now();
+                let sent = send_alert_in(&pending, &gate, &x, NAME, "k", "a", true).await;
+                // XAPI fails the flush's send.
+                x.up.store(false, Ordering::SeqCst);
+                hold.notify_one();
+                (raised_at, sent)
+            });
+        assert_eq!((delivered, sent), (0, AlertSent::No));
+        let p = pending.lock().unwrap();
+        assert_eq!(p.items.len(), 1);
+        let held = p.items[0].3;
+        assert!(
+            held.at >= raised_at && held.at > t0,
+            "aged from the new raise"
+        );
+        assert!(p.sending.is_empty() && p.in_flight.is_empty());
+    }
+
+    /// A `message-create` timeout ends the batch: the rest goes back with
+    /// its age instead of each waiting out the timeout.
+    #[tokio::test]
+    async fn a_batch_stops_after_a_message_create_timeout() {
+        let t0 = Instant::now();
+        let later = t0 + HELD_RETRY_QUIET;
+        let gate = Mutex::new(AlertGate::default());
+        let x = FakeXapi {
+            time_out: AtomicBool::new(true),
+            ..FakeXapi::up(true)
+        };
+        let pending = Mutex::new(PendingAlerts::default());
+        for k in ["a", "b", "c"] {
+            pending.lock().unwrap().push_at(NAME, k, k, false, t0);
+        }
+        assert_eq!(retry_held_in(&pending, &gate, &x, later).await, 0);
+        assert_eq!(x.calls.load(Ordering::SeqCst), 1, "one timeout, not three");
+        assert!(!gate.lock().unwrap().open(Instant::now()));
+        let p = pending.lock().unwrap();
+        assert_eq!(p.items.len(), 3, "all put back");
+        assert!(p.items.iter().all(|(_, _, _, h)| h.at == t0));
+        assert!(p.in_flight.is_empty() && p.sending.is_empty());
+    }
+
+    /// A new event raising the same fixed text after a flush delivered the
+    /// old copy is sent: nothing remembers a delivery.
+    #[tokio::test]
+    async fn the_same_text_raised_again_after_a_flush_is_sent() {
+        let t0 = Instant::now();
+        let gate = Mutex::new(AlertGate::default());
+        let x = FakeXapi::up(true);
+        let pending = Mutex::new(PendingAlerts::default());
+        pending
+            .lock()
+            .unwrap()
+            .push_at(NAME, "auto-resolved", "auto-resolved", false, t0);
+        assert_eq!(
+            retry_held_in(&pending, &gate, &x, t0 + HELD_RETRY_QUIET).await,
+            1
+        );
+        // Five minutes later (the age of the delivery does not matter).
+        let sent = send_alert_in(
+            &pending,
+            &gate,
+            &x,
+            NAME,
+            "auto-resolved",
+            "auto-resolved",
+            true,
+        )
+        .await;
+        assert!(matches!(sent, AlertSent::Now(_)));
+        assert_eq!(x.sent().len(), 2);
+    }
+
+    /// Two flushes never carry one message: a held alert taken by one is
+    /// not taken by another until the first ends, also when a newer
+    /// version was raised meanwhile.
+    #[test]
+    fn two_flushes_never_take_one_message() {
+        let t0 = Instant::now();
+        let later = t0 + HELD_RETRY_QUIET;
+        let mut p = PendingAlerts::default();
+        p.push_at(NAME, "k", "a", false, t0);
+        assert_eq!(p.take_quiet_at(4, later).len(), 1);
+        p.push_at(NAME, "k", "a, newer", false, t0);
+        assert!(p.take_quiet_at(4, later).is_empty());
+        assert!(p.take_at("other", "x", 4, later).is_empty());
+        assert!(p.flush_skip(NAME, "k"), "the first flush drops its copy");
+        p.flush_end(NAME, "k");
+        let taken = p.take_quiet_at(4, later);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].2, "a, newer");
+    }
+
+    /// A `message-create` that timed out closes the alert gate as an XAPI
+    /// that does not answer: the next sends are held at once instead of
+    /// each waiting out the timeout.
+    #[tokio::test]
+    async fn a_message_create_timeout_closes_the_gate() {
+        let gate = Mutex::new(AlertGate::default());
+        let x = FakeXapi {
+            time_out: AtomicBool::new(true),
+            ..FakeXapi::up(true)
+        };
+        let pending = Mutex::new(PendingAlerts::default());
+        let sent = send_alert_in(&pending, &gate, &x, NAME, "k", "a", true).await;
+        assert_eq!(sent, AlertSent::No);
+        assert!(!gate.lock().unwrap().open(Instant::now()));
+        // Another failure does not close it.
+        let gate = Mutex::new(AlertGate::default());
+        x.time_out.store(false, Ordering::SeqCst);
+        x.up.store(true, Ordering::SeqCst);
+        super::message_create_failed(&gate, "Syntax error");
+        assert!(gate.lock().unwrap().open(Instant::now()));
+    }
+
+    /// While a host is parked, an advice held for the park does not make
+    /// the timed retry probe XAPI; any other quiet alert still does.
+    #[test]
+    fn a_parked_advice_does_not_keep_the_retry_probing() {
+        let t0 = Instant::now();
+        let later = t0 + HELD_RETRY_QUIET;
+        let mut p = PendingAlerts::default();
+        p.push_at(NAME, "advice", "advice", true, t0);
+        assert!(!p.retry_wanted(later, true));
+        assert!(p.retry_wanted(later, false), "the park ended");
+        p.push_at(NAME, "other", "other", false, t0);
+        assert!(p.retry_wanted(later, true));
+    }
+
+    /// A flush's claim ends when it is dropped, also on a panic between
+    /// the claim and the end of the send.
+    #[test]
+    fn a_flush_claim_ends_when_dropped() {
+        let pending = Mutex::new(PendingAlerts::default());
+        assert!(pending.lock().unwrap().flush_begin(NAME, "k", "a"));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = super::FlushClaim {
+                pending: &pending,
+                name: NAME,
+                key: "k",
+            };
+            panic!("in the send");
+        }));
+        assert!(unwound.is_err());
+        assert!(pending.lock().unwrap().sending.is_empty());
     }
 }
 

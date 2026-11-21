@@ -257,6 +257,9 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
         "/var/lib/twinstor/boot-gate-peer-served.tmp",
         "/var/lib/twinstor/boot-gate-yielded.tmp",
         "/var/lib/twinstor/resync-skipped.tmp",
+        // An alert still owed to XAPI: about this install's pool only.
+        "/var/lib/twinstor/resync-skip-alert",
+        "/var/lib/twinstor/resync-skip-alert.tmp",
         "/run/twinstor/discard-offer-parked",
         "/run/twinstor/steer-pending",
         // The recorded SR uuid: the SR is destroyed above, and a stale record
