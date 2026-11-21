@@ -109,21 +109,49 @@ fn peer_served_still_applies(recorded: Option<Option<u64>>, current: Option<u64>
     }
 }
 
+/// Boot-gate memory: this node's fence-peer handler yielded (froze, served
+/// nothing) while the pair was disconnected, so the peer could keep serving
+/// without it. Recorded by the daemon once the yield has held for
+/// `YIELD_BEHIND_AFTER`, in the peer-served memory's format: keyed by this
+/// node's DRBD current generation and void once that moves (this node served
+/// or resynced since). Durable, so a host fenced during the yield cannot come
+/// back and promote a copy its peer may have moved past. Cleared once the
+/// pair is Connected again.
+fn yielded_behind_marker() -> String {
+    std::env::var("TWINSTOR_YIELDED_BEHIND_MARKER")
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/boot-gate-yielded"))
+}
+
+/// A private memory file per test state machine, so tests never share state
+/// (or touch /var/lib).
+fn test_memory_path(tag: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    crate::heal_state::test_tmp_dir()
+        .join(format!(
+            "twinstor-test-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+        .to_string_lossy()
+        .to_string()
+}
+
 /// The memory file a new state machine uses: the real one, or in tests a
-/// private path per machine so tests never share state (or touch /run).
+/// private path per machine.
 fn peer_served_path_for_new() -> String {
     if cfg!(test) {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        return crate::heal_state::test_tmp_dir()
-            .join(format!(
-                "twinstor-test-peer-served-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ))
-            .to_string_lossy()
-            .to_string();
+        return test_memory_path("peer-served");
     }
     peer_served_marker()
+}
+
+/// The yielded-behind memory file a new state machine uses (see
+/// `peer_served_path_for_new`).
+fn yielded_behind_path_for_new() -> String {
+    if cfg!(test) {
+        return test_memory_path("yielded");
+    }
+    yielded_behind_marker()
 }
 
 /// Marker written by the fence-peer handler when it yields (no ping target
@@ -7302,6 +7330,12 @@ const BOOT_GATE_BOOTING_CEILING: Duration = Duration::from_secs(600);
 const BOOT_GATE_CONNECT_EVERY: Duration = Duration::from_secs(60);
 /// xapi's local database file (the fenced former master's view of the pool).
 const XAPI_STATE_DB: &str = "/var/xapi/state.db";
+/// How long a fence-peer yield must stay in force, the pair still
+/// disconnected, before this node records that its copy may be behind (see
+/// `yielded_behind_marker`). A host fenced after cutting itself off lives
+/// frozen through the HA timeout (60 s or more); a site whose network went
+/// down only seconds before its power is not marked.
+const YIELD_BEHIND_AFTER: Duration = Duration::from_secs(20);
 
 /// Whether `ip` is one of this host's own addresses (the kernel routes it as
 /// `local`). Unknown (the `ip` call failed) reads as local, so a probe target
@@ -7371,19 +7405,78 @@ enum BootGate {
     /// promotes alone automatically. It rejoins when replication returns; if
     /// the peer is lost for good, an operator forces it (see the alert).
     HoldPeerServedBefore,
+    /// This node's fence-peer handler yielded while the pair was
+    /// disconnected, nothing has connected since, this node's generation is
+    /// unchanged and its disk is not UpToDate (in practice: re-attached since,
+    /// see `yielded_behind_holds`): the peer may have kept serving, so this
+    /// copy may be behind. Same handling as `HoldPeerServedBefore`.
+    HoldYieldedBefore,
+}
+
+/// Whether the yielded-behind memory holds a lone promote: only while this
+/// node's disk is not UpToDate. A disk that stays attached stays UpToDate
+/// across a disconnect whoever fenced whom, so this limits the hold to a copy
+/// re-attached since (a reboot): DRBD then reports it Consistent unless its
+/// metadata records that this node fenced the peer, i.e. kept writing.
+fn yielded_behind_holds(memory: bool, disk: DiskState) -> bool {
+    memory && disk != DiskState::UpToDate
+}
+
+/// The pair is connected again for the boot-gate memories: Connected with
+/// the peer's disk known and this copy's I/O not frozen. DRBD reads
+/// Connected for a moment before the handshake decides (peer disk still
+/// unknown), and an aborted handshake (a split-brain) never gets further.
+fn reconnected_for_memory(st: &DrbdStatus) -> bool {
+    st.connection == ConnectionState::Connected
+        && !st.suspended_user
+        && !matches!(st.peer_disk, None | Some(DiskState::Unknown))
+}
+
+/// This node serves its own copy: Primary, I/O not frozen, disk UpToDate.
+/// Never true during a fence-peer yield (its I/O is suspended).
+fn serving_own_copy(st: &DrbdStatus) -> bool {
+    st.role == Role::Primary && !st.suspended_any && st.disk == DiskState::UpToDate
+}
+
+/// Whether a fence-peer yield holds this node's copy right now: the handler's
+/// yield marker is present, its I/O suspend is in place, the pair is not
+/// Connected, and there is a local copy that could later be promoted.
+fn yield_in_force(marker: bool, st: &DrbdStatus) -> bool {
+    marker
+        && st.suspended_user
+        && st.connection != ConnectionState::Connected
+        && matches!(st.disk, DiskState::UpToDate | DiskState::Consistent)
+}
+
+/// One pass of the yielded-behind recorder: when the current yield was first
+/// seen in force (`None` once it is not), and whether to record it now.
+fn yield_behind_step(
+    since: Option<std::time::Instant>,
+    in_force: bool,
+    now: std::time::Instant,
+    after: Duration,
+) -> (Option<std::time::Instant>, bool) {
+    if !in_force {
+        return (None, false);
+    }
+    let since = since.unwrap_or(now);
+    (Some(since), now.duration_since(since) >= after)
 }
 
 /// Decide whether a node that would promote alone (not Connected; a
 /// split-brain marker does not exempt it) may do so. `peer_served_before`:
 /// the peer was seen serving, with no Connected since and this node's DRBD
-/// generation unchanged (the memory never lapses on its own). `last_evidence`
-/// is when a holding reading was last seen; `booting_since` is when the
-/// beacon-only reading was first seen in this gate episode.
+/// generation unchanged (the memory never lapses on its own).
+/// `yielded_before`: the same for this node's own fence-peer yield, already
+/// gated on the disk state (`yielded_behind_holds`). `last_evidence` is when
+/// a holding reading was last seen; `booting_since` is when the beacon-only
+/// reading was first seen in this gate episode.
 #[allow(clippy::too_many_arguments)]
 fn boot_gate_decision(
     ev: PeerLifeEvidence,
     is_keeper: bool,
     peer_served_before: bool,
+    yielded_before: bool,
     last_evidence: Option<std::time::Instant>,
     booting_since: Option<std::time::Instant>,
     now: std::time::Instant,
@@ -7395,6 +7488,9 @@ fn boot_gate_decision(
     }
     if peer_served_before {
         return BootGate::HoldPeerServedBefore;
+    }
+    if yielded_before {
+        return BootGate::HoldYieldedBefore;
     }
     let booting_wait = ev.beacon
         && !is_keeper
@@ -7432,7 +7528,8 @@ fn boot_gate_hold_class(d: BootGate) -> u8 {
     match d {
         BootGate::Proceed => 0,
         BootGate::HoldPeerBooting => 1,
-        BootGate::HoldPeerAlive | BootGate::HoldPeerServedBefore | BootGate::HoldClearing => 2,
+        BootGate::HoldPeerAlive | BootGate::HoldClearing => 2,
+        BootGate::HoldPeerServedBefore | BootGate::HoldYieldedBefore => 3,
     }
 }
 
@@ -7461,6 +7558,7 @@ fn boot_gate_texts(decision: BootGate, held: Duration) -> (String, String) {
             ),
         ),
         BootGate::HoldPeerServedBefore => unreachable!("worded by boot_gate_served_before_texts"),
+        BootGate::HoldYieldedBefore => unreachable!("worded by boot_gate_yielded_texts"),
         BootGate::HoldClearing => (
             format!(
                 "boot gate: the peer was alive moments ago; confirming it is gone before serving alone (held {mins} min)"
@@ -7505,6 +7603,25 @@ fn boot_gate_served_before_texts(held: Duration, peer: &str, drbd_res: &str) -> 
              is permanently lost (its disks are gone for good), make this node serve by running \
              on it: `drbdadm primary --force {drbd_res}`. The daemon then brings storage up \
              from this copy, and any writes made only on {peer} are lost. Held {mins} min."
+        ),
+    )
+}
+
+/// Status summary and alert for the yielded-behind hold. The alert carries
+/// nothing that changes between sends, so repeats deduplicate.
+fn boot_gate_yielded_texts(peer: &str, drbd_res: &str) -> (String, String) {
+    (
+        format!(
+            "boot gate: this node stood aside when it lost {peer} and has not been connected to \
+             it since; its copy may be behind, so it will not serve alone"
+        ),
+        format!(
+            "TwinStor: this node lost replication to {peer} and stood aside (it froze and served \
+             nothing) while {peer} could keep serving. They have not been connected since, so \
+             this copy may lack writes acknowledged on {peer}. It will not serve alone; it rejoins \
+             and serves automatically once {peer} is back and the resync completes. If {peer} is \
+             permanently lost, run on this node: `drbdadm primary --force {drbd_res}`. Writes \
+             made only on {peer} are then lost."
         ),
     )
 }
@@ -10642,6 +10759,8 @@ pub struct StateMachine {
     boot_gate_evidence_at: Option<std::time::Instant>,
     boot_gate_since: Option<std::time::Instant>,
     boot_gate_alert_at: Option<std::time::Instant>,
+    /// Hold classes already alerted in this gate episode (bit per class).
+    boot_gate_alerted: u8,
     boot_gate_last: Option<BootGate>,
     /// First beacon-only (peer booting) reading of this gate episode.
     boot_gate_booting_since: Option<std::time::Instant>,
@@ -10652,6 +10771,13 @@ pub struct StateMachine {
     /// Boot-gate memory (see `peer_served_marker`), mirrored from its file.
     peer_served_before: bool,
     peer_served_path: String,
+    /// Yielded-behind memory (see `yielded_behind_marker`), mirrored from its
+    /// file, and when the current fence-peer yield was first seen in force.
+    yielded_behind: bool,
+    yielded_behind_path: String,
+    /// The generation the yielded-behind record holds, when readable.
+    yielded_behind_gen: Option<u64>,
+    yield_in_force_since: Option<std::time::Instant>,
     // Arbitrated mode (a direct replication link exists) vs fate-shared. Cached at
     // construction from DIRECT_PEER_PATH; the mode is a setup-time property. Gates
     // the fate-shared-only lone-survivor holds. Overridable in tests.
@@ -11572,12 +11698,17 @@ impl StateMachine {
             boot_gate_evidence_at: None,
             boot_gate_since: None,
             boot_gate_alert_at: None,
+            boot_gate_alerted: 0,
             boot_gate_last: None,
             boot_gate_booting_since: None,
             boot_gate_connect_at: None,
             boot_gate_db_peer: None,
             peer_served_before: false,
             peer_served_path: String::new(),
+            yielded_behind: false,
+            yielded_behind_path: String::new(),
+            yielded_behind_gen: None,
+            yield_in_force_since: None,
             arbitrated: std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists(),
             episode: None,
             episode_path: open_episode_marker(),
@@ -11752,6 +11883,7 @@ impl StateMachine {
         // restart and a reboot (durable file, keyed by the DRBD generation).
         sm.peer_served_path = peer_served_path_for_new();
         sm.peer_served_before = std::path::Path::new(&sm.peer_served_path).exists();
+        sm.load_yielded_behind(yielded_behind_path_for_new());
         (sm, state_rx)
     }
 
@@ -11837,6 +11969,7 @@ impl StateMachine {
               split_guests = %file_brief(&self.split_guests_path),
               boundary_record = %file_brief(&self.boundary_path),
               boot_gate_peer_served = %file_brief(&self.peer_served_path),
+              boot_gate_yielded = %file_brief(&self.yielded_behind_path),
               steer_pending = %file_brief(&self.steer_pending_path),
               fs_freeze_off = %file_brief(&self.fs_freeze_off_path),
               peer_fs_freeze = %file_brief(&self.peer_fs_freeze_path),
@@ -12622,6 +12755,7 @@ impl StateMachine {
                 self.steer_restore_tick(connected).await;
             }
             self.log_fence_verdict().await;
+            self.note_yield_in_force().await;
             step!(self, "check_peer_object", self.check_peer_object().await);
             step!(self, "fence_peer_portal", self.fence_peer_portal().await);
             if self.own_target_cut_at.is_some() {
@@ -12745,8 +12879,12 @@ impl StateMachine {
         }
         self.last_connection = Some(status.connection);
         self.note_connection(&status);
-        if status.connection == crate::drbd::ConnectionState::Connected {
+        if reconnected_for_memory(&status) {
             self.forget_peer_served("connected");
+            self.forget_yielded_behind("connected");
+        }
+        if serving_own_copy(&status) {
+            self.forget_yielded_behind("serving");
         }
 
         // React to the DRBD connection edge to keep guest I/O on the local path.
@@ -17588,15 +17726,16 @@ impl StateMachine {
             // never gets here as a lone Primary. Runs before the fate-shared
             // hold so that hold's grace only counts time with no live peer.
             if status.connection != ConnectionState::Connected {
-                if self.boot_gate_holds().await {
+                if self.boot_gate_holds(status.disk).await {
                     // Not Connected: the sole-survivor wedge shape is broken;
                     // reset its clocks (see the init_standalone_tick Hold arm).
                     self.cd_reset();
                     return Ok(false);
                 }
             } else {
-                if status.connection == ConnectionState::Connected {
+                if reconnected_for_memory(&status) {
                     self.forget_peer_served("connected");
+                    self.forget_yielded_behind("connected");
                 }
                 self.clear_boot_gate();
             }
@@ -17805,6 +17944,7 @@ impl StateMachine {
                       yield_latch = %file_brief(&self.latch_path),
                       win_record = %file_brief(&self.win_path),
                       peer_served_before = self.peer_served_before,
+                      yielded_behind = self.yielded_behind,
                       fs_hold_since = ?self.fs_serve_hold_since.map(|t| t.elapsed().as_secs()),
                       "try_go_online: promoting to Primary");
             }
@@ -17829,6 +17969,12 @@ impl StateMachine {
             // The boot gate's remembered-serving-peer hold ends here too: the
             // node serves (the operator forced it, or it never stopped).
             self.forget_peer_served("primary");
+            // The yielded-behind memory too once this copy serves, never
+            // while a yield still freezes it (a daemon restarted during the
+            // yield): the host may yet be fenced from that state.
+            if serving_own_copy(&status) {
+                self.forget_yielded_behind("serving");
+            }
         }
 
         // Do not advertise the iSCSI target until the local replica is safe
@@ -18252,6 +18398,100 @@ impl StateMachine {
         );
     }
 
+    /// Record, durably, that this node's copy may be behind its peer: a
+    /// fence-peer yield has held for `YIELD_BEHIND_AFTER` with the pair still
+    /// disconnected (see `yielded_behind_marker`). Only a readable generation
+    /// is recorded, so the memory is bound to this exact copy; an unreadable
+    /// one is retried next pass. A record of another generation (this copy
+    /// served, then yielded again) is rewritten. Runs every pass and costs
+    /// one stat unless the handler's yield marker exists.
+    async fn note_yield_in_force(&mut self) {
+        let marker = std::path::Path::new(&self.yield_path).exists();
+        let in_force = marker
+            && self
+                .drbd
+                .status()
+                .await
+                .is_ok_and(|st| yield_in_force(true, &st));
+        let (since, record) = yield_behind_step(
+            self.yield_in_force_since,
+            in_force,
+            std::time::Instant::now(),
+            YIELD_BEHIND_AFTER,
+        );
+        self.yield_in_force_since = since;
+        if !record {
+            return;
+        }
+        let Some(current) = self.drbd.local_current_uuid().await else {
+            return;
+        };
+        if self.yielded_behind && self.yielded_behind_gen == Some(current) {
+            return;
+        }
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let content = format!(
+            "# fence-peer yield in force; not connected since\ncurrent={current:016X}\nat={at}\n"
+        );
+        if let Err(e) = write_file_durably(&self.yielded_behind_path, &content) {
+            if self
+                .log_pace
+                .due("yielded_behind_write", Duration::from_secs(600))
+            {
+                warn!(error = %e, "boot gate: could not persist the yielded-behind memory; retrying");
+            }
+            return;
+        }
+        self.yielded_behind = true;
+        self.yielded_behind_gen = Some(current);
+        warn!(
+            heal_event = "boot_gate_yielded",
+            memory = "set",
+            generation = %format!("{current:016X}"),
+            "boot gate: this node's fence-peer yield has held with the pair disconnected; its copy \
+               may fall behind the peer's, so it will not serve alone until it has reconnected (or \
+               an operator forces it)"
+        );
+    }
+
+    /// Read the yielded-behind memory back at startup: it survives a daemon
+    /// restart and a reboot.
+    fn load_yielded_behind(&mut self, path: String) {
+        self.yielded_behind = std::path::Path::new(&path).exists();
+        self.yielded_behind_gen = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| parse_peer_served(&t))
+            .flatten();
+        self.yielded_behind_path = path;
+    }
+
+    /// End the yielded-behind memory: DRBD Connected again, this node
+    /// serving, its generation moved, or its record unreadable.
+    fn forget_yielded_behind(&mut self, why: &'static str) {
+        if !self.yielded_behind {
+            return;
+        }
+        self.yielded_behind = false;
+        self.yielded_behind_gen = None;
+        let _ = std::fs::remove_file(&self.yielded_behind_path);
+        info!(
+            heal_event = "boot_gate_yielded",
+            memory = "cleared",
+            why,
+            "boot gate: yielded-behind memory cleared"
+        );
+    }
+
+    /// The boot gate's alert for `decision` reached XAPI: its class counts as
+    /// alerted for the rest of the episode.
+    fn boot_gate_alert_delivered(&mut self, decision: BootGate) {
+        self.boot_gate_alert_at = Some(std::time::Instant::now());
+        self.boot_gate_alerted |= 1 << boot_gate_hold_class(decision);
+    }
+
     /// Forget the boot gate's episode: the pair connected or the node is
     /// serving, so a later solo-promote decision starts from fresh evidence.
     fn clear_boot_gate(&mut self) {
@@ -18259,6 +18499,7 @@ impl StateMachine {
         self.boot_gate_evidence_at = None;
         self.boot_gate_since = None;
         self.boot_gate_alert_at = None;
+        self.boot_gate_alerted = 0;
         self.boot_gate_last = None;
         self.boot_gate_booting_since = None;
         self.boot_gate_connect_at = None;
@@ -18272,7 +18513,8 @@ impl StateMachine {
     /// guest. Returns `true` when the promote must be held this tick. With no
     /// evidence at all the existing timers apply unchanged, so a host
     /// returning alone from a full power loss still recovers by itself.
-    async fn boot_gate_holds(&mut self) -> bool {
+    /// `disk` is this node's disk state (see `yielded_behind_holds`).
+    async fn boot_gate_holds(&mut self, disk: DiskState) -> bool {
         let now = std::time::Instant::now();
         if self.boot_gate_db_peer.is_none() && !cfg!(test) {
             let this = xapi::local_host_uuid().await;
@@ -18325,10 +18567,25 @@ impl StateMachine {
                 self.forget_peer_served("generation changed");
             }
         }
+        // The same for this node's own yield. Its record always holds a
+        // generation; one that cannot be read back falls back to the plain
+        // path (an unreadable current generation still holds this pass).
+        if self.yielded_behind {
+            let recorded = std::fs::read_to_string(&self.yielded_behind_path)
+                .ok()
+                .and_then(|t| parse_peer_served(&t));
+            if !matches!(recorded, Some(Some(_))) {
+                self.forget_yielded_behind("record unreadable");
+            } else if !peer_served_still_applies(recorded, self.drbd.local_current_uuid().await) {
+                self.forget_yielded_behind("generation changed");
+            }
+        }
+        let yielded_before = yielded_behind_holds(self.yielded_behind, disk);
         let decision = boot_gate_decision(
             ev,
             is_keeper,
             self.peer_served_before,
+            yielded_before,
             self.boot_gate_evidence_at,
             self.boot_gate_booting_since,
             now,
@@ -18350,13 +18607,14 @@ impl StateMachine {
                 beacon = ev.beacon,
                 peer_backing_gone = ev.peer_backing_gone,
                 is_keeper,
+                yielded_before,
                 "boot gate: solo-promote decision changed"
             );
-            // A new class of hold (peer booting versus peer alive, remembered
-            // or clearing) gets its own alert; a probe miss flipping between
-            // readings of the same class does not re-alert.
-            if self.boot_gate_last.map(boot_gate_hold_class) != Some(boot_gate_hold_class(decision))
-            {
+            // A class of hold (peer booting, peer alive or clearing,
+            // remembered) not yet alerted in this episode gets its own alert;
+            // a probe miss flipping back to a class already alerted does not
+            // re-alert.
+            if self.boot_gate_alerted & (1 << boot_gate_hold_class(decision)) == 0 {
                 self.boot_gate_alert_at = None;
             }
             self.boot_gate_last = Some(decision);
@@ -18364,6 +18622,7 @@ impl StateMachine {
         if decision == BootGate::Proceed {
             self.boot_gate_since = None;
             self.boot_gate_alert_at = None;
+            self.boot_gate_alerted = 0;
             self.clear_heal_state_if_stage("boot_gate_hold");
             return false;
         }
@@ -18377,16 +18636,18 @@ impl StateMachine {
         self.fs_isolated_since = None;
         self.fs_isolated_alert_at = None;
         let held = now.duration_since(since);
-        let (summary, alert) = if decision == BootGate::HoldPeerServedBefore {
-            boot_gate_served_before_texts(
-                held,
-                &self.config.node.peer,
-                &format!("twinstor-{}", self.config.storage.drbd_resource),
-            )
-        } else {
-            boot_gate_texts(decision, held)
+        let res = format!("twinstor-{}", self.config.storage.drbd_resource);
+        let (summary, alert) = match decision {
+            BootGate::HoldPeerServedBefore => {
+                boot_gate_served_before_texts(held, &self.config.node.peer, &res)
+            }
+            BootGate::HoldYieldedBefore => boot_gate_yielded_texts(&self.config.node.peer, &res),
+            _ => boot_gate_texts(decision, held),
         };
-        let next = if decision == BootGate::HoldPeerServedBefore {
+        let next = if matches!(
+            decision,
+            BootGate::HoldPeerServedBefore | BootGate::HoldYieldedBefore
+        ) {
             format!(
                 "restore the replication path between the hosts; this node rejoins as a sync target \
                  by itself. Only if the peer is lost for good: `drbdadm primary --force twinstor-{}` \
@@ -18404,7 +18665,7 @@ impl StateMachine {
         {
             let delivered = xapi::send_xapi_alert_keyed("boot-gate", &alert).await;
             if delivered {
-                self.boot_gate_alert_at = Some(std::time::Instant::now());
+                self.boot_gate_alert_delivered(decision);
             }
         }
         // Keep a connect pending so DRBD connects soon after replication
@@ -18500,7 +18761,9 @@ impl StateMachine {
             self.fs_isolated_alert_at = None;
             self.clear_heal_state_if_stage("fateshared_isolated");
             self.clear_heal_state_if_stage("fateshared_no_tiebreaker");
-            self.forget_peer_served("connected");
+            if reconnected_for_memory(status) {
+                self.forget_peer_served("connected");
+            }
             self.clear_boot_gate();
             return InitSaOutcome::Continue;
         }
@@ -27134,9 +27397,9 @@ impl StateMachine {
                  that fork, so it does not promote on its own: the peer may hold the newer copy \
                  and may already serve it. It waits for the peer to reconnect, then resyncs from \
                  it. If the peer is gone for good and this copy must serve: rm -f \
-                 /var/lib/twinstor/yield-loser-latched /run/twinstor/fence-yielded; systemctl \
-                 restart twinstor. The node then serves its own copy, without the writes the \
-                 peer made after the split.",
+                 /var/lib/twinstor/yield-loser-latched /run/twinstor/fence-yielded \
+                 /var/lib/twinstor/boot-gate-yielded; systemctl restart twinstor. The node then \
+                 serves its own copy, without the writes the peer made after the split.",
             )
             .await;
             if delivered {
@@ -32057,8 +32320,9 @@ impl StateMachine {
                          Special case needing an operator decision: if both nodes show this \
                          alert, both yielded to each other (mutual yield) and neither will \
                          serve. Pick the survivor (the node with the data you want), remove \
-                         its yield markers (rm /run/twinstor/fence-yielded \
-                         /var/lib/twinstor/yield-loser-latched), and it promotes; the other \
+                         its yield markers (rm -f /run/twinstor/fence-yielded \
+                         /var/lib/twinstor/yield-loser-latched \
+                         /var/lib/twinstor/boot-gate-yielded), and it promotes; the other \
                          resyncs from it automatically. Full procedure: FAQ, 'Both nodes yielded'. \
                          Doing nothing is safe: no data is discarded while holding.",
                     )
@@ -36819,7 +37083,7 @@ poll_interval_ms = 10
         let grace = BOOT_GATE_CLEAR_GRACE;
         let ceil = BOOT_GATE_BOOTING_CEILING;
         let d = |ev, keeper, last, booting| {
-            boot_gate_decision(ev, keeper, false, last, booting, now, grace, ceil)
+            boot_gate_decision(ev, keeper, false, false, last, booting, now, grace, ceil)
         };
         let none = PeerLifeEvidence::default();
         let portal = PeerLifeEvidence {
@@ -36941,6 +37205,7 @@ poll_interval_ms = 10
                         ev,
                         keeper,
                         false,
+                        false,
                         long_ago,
                         Some(now - ceil * 2),
                         now,
@@ -36954,6 +37219,7 @@ poll_interval_ms = 10
                         ev,
                         keeper,
                         true,
+                        false,
                         long_ago,
                         Some(now - ceil * 2),
                         now,
@@ -36970,7 +37236,7 @@ poll_interval_ms = 10
                 ..none
             };
             assert_eq!(
-                boot_gate_decision(portal, keeper, true, None, None, now, grace, ceil),
+                boot_gate_decision(portal, keeper, true, false, None, None, now, grace, ceil),
                 BootGate::HoldPeerAlive
             );
         }
@@ -36978,6 +37244,7 @@ poll_interval_ms = 10
         assert_eq!(
             boot_gate_decision(
                 beacon,
+                false,
                 false,
                 false,
                 Some(now - grace - Duration::from_secs(1)),
@@ -37036,6 +37303,578 @@ poll_interval_ms = 10
     }
 
     #[test]
+    fn a_yield_held_copy_never_promotes_alone_unless_drbd_proves_it_fenced_the_peer() {
+        let now = clock_with_past();
+        let (grace, ceil) = (BOOT_GATE_CLEAR_GRACE, BOOT_GATE_BOOTING_CEILING);
+        let none = PeerLifeEvidence::default();
+        let beacon = PeerLifeEvidence {
+            beacon: true,
+            ..none
+        };
+        let no_replica = PeerLifeEvidence {
+            beacon: true,
+            peer_backing_gone: true,
+            ..none
+        };
+        let portal = PeerLifeEvidence {
+            portal: true,
+            ..none
+        };
+        let long_ago = Some(now - grace * 100);
+        for keeper in [true, false] {
+            // The peer is dark (or only its daemon answers, or it has no
+            // replica): with the memory, never alone, however long ago.
+            for ev in [none, beacon, no_replica] {
+                assert_eq!(
+                    boot_gate_decision(
+                        ev,
+                        keeper,
+                        false,
+                        true,
+                        long_ago,
+                        Some(now - ceil * 2),
+                        now,
+                        grace,
+                        ceil
+                    ),
+                    BootGate::HoldYieldedBefore,
+                    "keeper={keeper} ev={ev:?}"
+                );
+            }
+            // A peer serving right now, or remembered serving, keeps its own hold.
+            assert_eq!(
+                boot_gate_decision(portal, keeper, false, true, None, None, now, grace, ceil),
+                BootGate::HoldPeerAlive
+            );
+            assert_eq!(
+                boot_gate_decision(none, keeper, true, true, None, None, now, grace, ceil),
+                BootGate::HoldPeerServedBefore
+            );
+        }
+        // Without the memory: today's path (a lone host back from a full power
+        // loss with the pair in sync).
+        assert_eq!(
+            boot_gate_decision(none, true, false, false, None, None, now, grace, ceil),
+            BootGate::Proceed
+        );
+        // Only an UpToDate disk (DRBD recorded this node fencing the peer, so
+        // it kept writing) passes the memory.
+        assert!(yielded_behind_holds(true, DiskState::Consistent));
+        assert!(yielded_behind_holds(true, DiskState::Outdated));
+        assert!(!yielded_behind_holds(true, DiskState::UpToDate));
+        assert!(!yielded_behind_holds(false, DiskState::Consistent));
+        assert_eq!(
+            boot_gate_hold_class(BootGate::HoldYieldedBefore),
+            boot_gate_hold_class(BootGate::HoldPeerServedBefore)
+        );
+        let (s, a) = boot_gate_yielded_texts("node-b", "twinstor-data");
+        assert!(
+            s.contains("may be behind")
+                && a.contains("will not serve alone")
+                && a.contains("once node-b is back")
+                && a.contains("`drbdadm primary --force twinstor-data`")
+                && a.contains("Writes made only on node-b are then lost"),
+            "{s} / {a}"
+        );
+    }
+
+    fn yield_frozen_status() -> DrbdStatus {
+        DrbdStatus {
+            role: Role::Primary,
+            peer_role: None,
+            connection: ConnectionState::Connecting,
+            disk: DiskState::UpToDate,
+            peer_disk: None,
+            suspended_user: true,
+            suspended_fencing: false,
+            suspended_any: true,
+            replication: None,
+            resync_done: None,
+        }
+    }
+
+    #[test]
+    fn a_yield_is_recorded_only_while_it_holds_a_disconnected_copy() {
+        let frozen = yield_frozen_status();
+        assert!(yield_in_force(true, &frozen));
+        assert!(!yield_in_force(false, &frozen), "no handler yield marker");
+        assert!(
+            !yield_in_force(
+                true,
+                &DrbdStatus {
+                    suspended_user: false,
+                    ..frozen.clone()
+                }
+            ),
+            "suspend lifted: the marker is from an earlier episode"
+        );
+        assert!(
+            !yield_in_force(
+                true,
+                &DrbdStatus {
+                    connection: ConnectionState::Connected,
+                    ..frozen.clone()
+                }
+            ),
+            "connected: the writes replicate"
+        );
+        assert!(yield_in_force(
+            true,
+            &DrbdStatus {
+                connection: ConnectionState::StandAlone,
+                disk: DiskState::Consistent,
+                ..frozen.clone()
+            }
+        ));
+        assert!(
+            !yield_in_force(
+                true,
+                &DrbdStatus {
+                    disk: DiskState::Inconsistent,
+                    ..frozen.clone()
+                }
+            ),
+            "no promotable copy here"
+        );
+        let now = clock_with_past();
+        let after = YIELD_BEHIND_AFTER;
+        assert_eq!(
+            yield_behind_step(None, true, now, after),
+            (Some(now), false)
+        );
+        let young = now - after + Duration::from_secs(1);
+        assert_eq!(
+            yield_behind_step(Some(young), true, now, after),
+            (Some(young), false)
+        );
+        assert_eq!(
+            yield_behind_step(Some(now - after), true, now, after),
+            (Some(now - after), true)
+        );
+        assert_eq!(
+            yield_behind_step(Some(now - after * 10), false, now, after),
+            (None, false),
+            "a yield that ends restarts the count"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_yield_memory_is_recorded_once_survives_restart_and_ends_when_connected() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(yield_frozen_status()));
+        *drbd.current_uuid.lock().unwrap() = Some(0xABCD_0000_0000_1230);
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        let marker = test_memory_path("yield-marker");
+        sm.yield_path = marker.clone();
+        let path = sm.yielded_behind_path.clone();
+        sm.note_yield_in_force().await;
+        assert!(
+            sm.yield_in_force_since.is_none() && !sm.yielded_behind,
+            "no yield marker"
+        );
+        std::fs::write(&marker, "yield\n").unwrap();
+        sm.note_yield_in_force().await;
+        assert!(
+            sm.yield_in_force_since.is_some() && !sm.yielded_behind,
+            "not before the yield has held"
+        );
+        let held = std::time::Instant::now()
+            .checked_sub(YIELD_BEHIND_AFTER)
+            .expect("host up longer than the debounce");
+        sm.yield_in_force_since = Some(held);
+        *drbd.current_uuid.lock().unwrap() = None;
+        sm.note_yield_in_force().await;
+        assert!(
+            !sm.yielded_behind && !std::path::Path::new(&path).exists(),
+            "never recorded without a generation"
+        );
+        *drbd.current_uuid.lock().unwrap() = Some(0xABCD_0000_0000_1230);
+        sm.note_yield_in_force().await;
+        assert!(sm.yielded_behind);
+        assert_eq!(
+            parse_peer_served(&std::fs::read_to_string(&path).unwrap()),
+            Some(Some(0xABCD_0000_0000_1230)),
+            "keyed by this node's generation"
+        );
+        // The same generation is not written again; another one (this copy
+        // served since, then yielded again) is.
+        std::fs::write(&path, "# kept\ncurrent=ABCD000000001230\n").unwrap();
+        sm.note_yield_in_force().await;
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# kept"));
+        *drbd.current_uuid.lock().unwrap() = Some(0xABCD_0000_0000_4560);
+        sm.note_yield_in_force().await;
+        assert_eq!(
+            parse_peer_served(&std::fs::read_to_string(&path).unwrap()),
+            Some(Some(0xABCD_0000_0000_4560))
+        );
+        assert_eq!(sm.yielded_behind_gen, Some(0xABCD_0000_0000_4560));
+        // A restarted daemon or a rebooted host reads it back (the
+        // constructor's loader, pointed at this file).
+        let (mut again, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        assert!(
+            !again.yielded_behind,
+            "a fresh test machine has its own file"
+        );
+        again.load_yielded_behind(path.clone());
+        assert!(again.yielded_behind);
+        assert_eq!(again.yielded_behind_gen, Some(0xABCD_0000_0000_4560));
+        again.forget_yielded_behind("connected");
+        assert!(!again.yielded_behind && !std::path::Path::new(&path).exists());
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn the_memories_end_only_on_a_decided_connection_or_a_serving_copy() {
+        let up = DrbdStatus {
+            role: Role::Primary,
+            connection: ConnectionState::Connected,
+            peer_disk: Some(DiskState::UpToDate),
+            suspended_user: false,
+            suspended_any: false,
+            ..yield_frozen_status()
+        };
+        assert!(reconnected_for_memory(&up));
+        for undecided in [None, Some(DiskState::Unknown)] {
+            assert!(
+                !reconnected_for_memory(&DrbdStatus {
+                    peer_disk: undecided,
+                    ..up.clone()
+                }),
+                "Connected before the handshake decides (or an aborted one): {undecided:?}"
+            );
+        }
+        assert!(!reconnected_for_memory(&DrbdStatus {
+            suspended_user: true,
+            ..up.clone()
+        }));
+        assert!(!reconnected_for_memory(&DrbdStatus {
+            connection: ConnectionState::StandAlone,
+            ..up.clone()
+        }));
+        let alone = DrbdStatus {
+            connection: ConnectionState::Connecting,
+            peer_disk: None,
+            ..up.clone()
+        };
+        assert!(serving_own_copy(&alone));
+        assert!(
+            !serving_own_copy(&yield_frozen_status()),
+            "a yield in force is not serving"
+        );
+        assert!(!serving_own_copy(&DrbdStatus {
+            role: Role::Secondary,
+            ..alone.clone()
+        }));
+        assert!(!serving_own_copy(&DrbdStatus {
+            disk: DiskState::Consistent,
+            ..alone.clone()
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rebooted_copy_with_a_yield_record_is_not_promoted() {
+        // The peer on loopback: the rejoin gate's ping stays on this host.
+        let mut config = (*test_config()).clone();
+        config.network.peer_address = "127.0.0.1".parse().unwrap();
+        let rebooted = DrbdStatus {
+            role: Role::Secondary,
+            connection: ConnectionState::StandAlone,
+            disk: DiskState::Consistent,
+            suspended_user: false,
+            suspended_any: false,
+            ..yield_frozen_status()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(rebooted.clone()));
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        let (mut sm, _) = StateMachine::new(
+            std::sync::Arc::new(config),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        write_file_durably(&sm.yielded_behind_path, "current=0000000000000010\n").unwrap();
+        let path = sm.yielded_behind_path.clone();
+        sm.load_yielded_behind(path);
+        sm.arbitrated = false;
+        // StandAlone: the Init StandAlone heal holds a Consistent copy before
+        // the boot gate, record or not.
+        assert!(!sm.try_go_online().await.unwrap());
+        // The usual shape after a reboot with the peer dark: Connecting, the
+        // startup connect wait over. The boot gate holds it on the record.
+        drbd.set_status(DrbdStatus {
+            connection: ConnectionState::Connecting,
+            ..rebooted
+        });
+        sm.connect_waited = true;
+        sm.rejoin_rearm_used = true;
+        for _ in 0..3 {
+            // No peer evidence, reused from a fresh reading (no probe here).
+            sm.boot_gate_cache = Some((std::time::Instant::now(), PeerLifeEvidence::default()));
+            sm.boot_gate_evidence_at = None;
+            sm.fs_serve_hold_since = Some(std::time::Instant::now());
+            assert!(!sm.try_go_online().await.unwrap());
+        }
+        assert!(
+            !drbd.calls().contains(&"primary") && !drbd.calls().contains(&"force_primary"),
+            "calls: {:?}",
+            drbd.calls()
+        );
+        assert_eq!(sm.boot_gate_last, Some(BootGate::HoldYieldedBefore));
+        assert!(sm.yielded_behind);
+        let _ = std::fs::remove_file(&sm.yielded_behind_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_reading_before_the_handshake_decides_keeps_the_yield_record() {
+        let undecided = DrbdStatus {
+            connection: ConnectionState::Connected,
+            disk: DiskState::Consistent,
+            peer_disk: None,
+            ..connecting_secondary()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(undecided.clone()));
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        // The promote that follows a Connected pass fails here, so the node
+        // stays Secondary and every pass reaches the Connected branch.
+        drbd.fail_primary.store(true, Ordering::Relaxed);
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        write_file_durably(&sm.yielded_behind_path, "current=0000000000000010\n").unwrap();
+        let path = sm.yielded_behind_path.clone();
+        sm.load_yielded_behind(path.clone());
+        let _ = sm.try_go_online().await;
+        assert!(
+            sm.yielded_behind && std::path::Path::new(&path).exists(),
+            "peer disk not known yet: kept"
+        );
+        drbd.set_status(DrbdStatus {
+            disk: DiskState::UpToDate,
+            peer_disk: Some(DiskState::UpToDate),
+            ..undecided
+        });
+        let _ = sm.try_go_online().await;
+        assert!(!sm.yielded_behind && !std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_miss_flipping_between_hold_classes_alerts_once_per_class() {
+        let held = DrbdStatus {
+            role: Role::Secondary,
+            disk: DiskState::Consistent,
+            suspended_user: false,
+            suspended_any: false,
+            ..yield_frozen_status()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(held));
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        sm.arbitrated = false;
+        sm.boot_gate_since = Some(
+            std::time::Instant::now()
+                .checked_sub(CANNOT_ONLINE_ALERT_AFTER)
+                .expect("host up longer than the alert delay"),
+        );
+        let alive = PeerLifeEvidence {
+            portal: true,
+            ..Default::default()
+        };
+        let mut alerts = 0;
+        // Alive, then a missed portal probe (the remembered hold), alive
+        // again, missed again.
+        for portal_answers in [true, false, true, false] {
+            let ev = if portal_answers {
+                alive
+            } else {
+                PeerLifeEvidence::default()
+            };
+            sm.boot_gate_cache = Some((std::time::Instant::now(), ev));
+            sm.boot_gate_evidence_at = None;
+            sm.fs_serve_hold_since = Some(std::time::Instant::now());
+            assert!(sm.boot_gate_holds(DiskState::Consistent).await);
+            // An alert that came due this pass (XAPI is absent in tests, so
+            // it is still unsent): count it and deliver it here.
+            if sm.boot_gate_alert_at.is_none() {
+                alerts += 1;
+                let decision = sm.boot_gate_last.unwrap();
+                sm.boot_gate_alert_delivered(decision);
+            }
+        }
+        assert_eq!(sm.boot_gate_last, Some(BootGate::HoldPeerServedBefore));
+        assert_eq!(
+            alerts, 2,
+            "the live-peer alert, then one force-command alert; later flips are quiet"
+        );
+        let _ = std::fs::remove_file(&sm.peer_served_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn check_health_ends_the_yield_memory_only_on_a_decided_link_or_a_serving_copy() {
+        let decided = DrbdStatus {
+            role: Role::Secondary,
+            ..online_with_peer()
+        };
+        let serving_alone = DrbdStatus {
+            connection: ConnectionState::Connecting,
+            peer_role: None,
+            peer_disk: None,
+            ..online_with_peer()
+        };
+        let undecided = DrbdStatus {
+            role: Role::Secondary,
+            disk: DiskState::Consistent,
+            peer_disk: None,
+            ..online_with_peer()
+        };
+        for (st, cleared) in [
+            (decided, true),
+            (serving_alone, true),
+            (yield_frozen_status(), false),
+            (undecided, false),
+        ] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.current_uuid.lock().unwrap() = Some(0x10);
+            let (mut sm, _) = StateMachine::new(
+                test_config(),
+                Box::new(ArcDrbd(drbd.clone())),
+                Box::new(MockIscsi::new()),
+            );
+            write_file_durably(&sm.yielded_behind_path, "current=0000000000000010\n").unwrap();
+            let path = sm.yielded_behind_path.clone();
+            sm.load_yielded_behind(path.clone());
+            sm.check_health().await;
+            assert_eq!(
+                !sm.yielded_behind && !std::path::Path::new(&path).exists(),
+                cleared,
+                "{st:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_yield_record_falls_back_to_the_plain_path() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(yield_frozen_status()));
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        sm.arbitrated = false;
+        for corrupt in ["garbage\n", "current=unknown\n", ""] {
+            std::fs::write(&sm.yielded_behind_path, corrupt).unwrap();
+            let path = sm.yielded_behind_path.clone();
+            sm.load_yielded_behind(path);
+            sm.boot_gate_cache = Some((std::time::Instant::now(), PeerLifeEvidence::default()));
+            sm.boot_gate_evidence_at = None;
+            sm.fs_serve_hold_since = Some(std::time::Instant::now());
+            assert!(
+                !sm.boot_gate_holds(DiskState::Consistent).await,
+                "{corrupt:?} must not hold"
+            );
+            assert!(!sm.yielded_behind && !std::path::Path::new(&sm.yielded_behind_path).exists());
+        }
+        // A readable record with this node's generation unreadable right now
+        // still holds this pass.
+        write_file_durably(&sm.yielded_behind_path, "current=0000000000000010\n").unwrap();
+        let path = sm.yielded_behind_path.clone();
+        sm.load_yielded_behind(path);
+        *drbd.current_uuid.lock().unwrap() = None;
+        sm.boot_gate_cache = Some((std::time::Instant::now(), PeerLifeEvidence::default()));
+        sm.fs_serve_hold_since = Some(std::time::Instant::now());
+        assert!(sm.boot_gate_holds(DiskState::Consistent).await);
+        assert!(sm.yielded_behind);
+        let _ = std::fs::remove_file(&sm.yielded_behind_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_yield_record_write_is_retried() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(yield_frozen_status()));
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        let marker = test_memory_path("yield-marker");
+        std::fs::write(&marker, "yield\n").unwrap();
+        sm.yield_path = marker.clone();
+        // Its directory is a regular file: the durable write fails.
+        let blocker = test_memory_path("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let good = sm.yielded_behind_path.clone();
+        sm.yielded_behind_path = format!("{blocker}/boot-gate-yielded");
+        sm.yield_in_force_since = Some(
+            std::time::Instant::now()
+                .checked_sub(YIELD_BEHIND_AFTER)
+                .expect("host up longer than the debounce"),
+        );
+        sm.note_yield_in_force().await;
+        assert!(!sm.yielded_behind, "not set in memory without the file");
+        assert!(sm.yield_in_force_since.is_some(), "the yield keeps its age");
+        sm.yielded_behind_path = good.clone();
+        sm.note_yield_in_force().await;
+        assert!(sm.yielded_behind && std::path::Path::new(&good).exists());
+        for f in [&marker, &blocker, &good] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_boot_gate_holds_a_yield_held_copy_until_drbd_shows_it_is_not_behind() {
+        let consistent = DrbdStatus {
+            role: Role::Secondary,
+            disk: DiskState::Consistent,
+            suspended_user: false,
+            suspended_any: false,
+            ..yield_frozen_status()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(consistent));
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        write_file_durably(&sm.yielded_behind_path, "current=0000000000000010\n").unwrap();
+        sm.yielded_behind = true;
+        sm.arbitrated = false;
+        // No peer evidence, reused from a fresh reading (no probe in a test).
+        fn quiet(sm: &mut StateMachine) {
+            sm.boot_gate_cache = Some((std::time::Instant::now(), PeerLifeEvidence::default()));
+            sm.boot_gate_evidence_at = None;
+            sm.fs_serve_hold_since = Some(std::time::Instant::now());
+        }
+        quiet(&mut sm);
+        assert!(sm.boot_gate_holds(DiskState::Consistent).await);
+        assert_eq!(sm.boot_gate_last, Some(BootGate::HoldYieldedBefore));
+        quiet(&mut sm);
+        assert!(
+            !sm.boot_gate_holds(DiskState::UpToDate).await,
+            "UpToDate: DRBD recorded this node fencing the peer"
+        );
+        assert!(sm.yielded_behind, "kept while the generation is unchanged");
+        // This node's generation moved (it served or resynced since): void.
+        *drbd.current_uuid.lock().unwrap() = Some(0x20);
+        quiet(&mut sm);
+        assert!(!sm.boot_gate_holds(DiskState::Consistent).await);
+        assert!(!sm.yielded_behind && !std::path::Path::new(&sm.yielded_behind_path).exists());
+    }
+
+    #[test]
     fn wait_released_only_by_destroyed_backing_and_portal_remembered() {
         use crate::peer_signal::PeerBacking;
         assert_eq!(beacon_backing_reading(PeerBacking::Destroyed), (true, true));
@@ -37066,9 +37905,15 @@ poll_interval_ms = 10
     #[test]
     fn boot_gate_alerts_once_per_hold_class() {
         use BootGate::*;
-        assert_eq!(
+        // A remembered hold is its own class: moving to it from a live-peer
+        // hold (the peer went dark) sends its alert with the force command.
+        assert_ne!(
             boot_gate_hold_class(HoldPeerAlive),
             boot_gate_hold_class(HoldPeerServedBefore)
+        );
+        assert_eq!(
+            boot_gate_hold_class(HoldPeerServedBefore),
+            boot_gate_hold_class(HoldYieldedBefore)
         );
         assert_eq!(
             boot_gate_hold_class(HoldPeerAlive),
@@ -40111,7 +40956,7 @@ poll_interval_ms = 10
         };
         sm.boot_gate_cache = Some((std::time::Instant::now(), alive));
         assert!(
-            sm.boot_gate_holds().await,
+            sm.boot_gate_holds(DiskState::UpToDate).await,
             "a serving peer holds the solo promote"
         );
         assert!(
@@ -40125,7 +40970,7 @@ poll_interval_ms = 10
         });
         sm.boot_gate_connect_at = None;
         sm.boot_gate_cache = Some((std::time::Instant::now(), alive));
-        assert!(sm.boot_gate_holds().await);
+        assert!(sm.boot_gate_holds(DiskState::UpToDate).await);
         assert!(
             drbd.calls().contains(&"connect"),
             "StandAlone: reconnect: {:?}",

@@ -2350,7 +2350,10 @@ async fn run_status(config: Arc<Config>, json: bool, plain: bool) -> Result<()> 
         }
         println!(
             "{cont}{}",
-            st.bold("auto-recovery in progress; do not run manual drbdadm/xe recovery commands")
+            st.bold(
+                "auto-recovery in progress; do not run manual drbdadm/xe recovery commands \
+                 other than one named on the next: line"
+            )
         );
     }
 
