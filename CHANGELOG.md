@@ -7,6 +7,218 @@ TwinStor is in the 0.x tech-preview series: treat every release as
 potentially behaviour-changing and read the notes before upgrading a live
 pool.
 
+## [0.7.6] - 2026-11-21
+
+A returning host whose resync DRBD skipped is no longer served: TwinStor
+detects the skip, rebuilds that copy with a full resync, and only then
+serves it. A host that stood aside while its peer kept serving no longer
+comes back and serves its older copy alone, and in arbitrated mode a
+survivor frozen after XHA fenced its peer resumes sooner once the fenced
+host is back. The DRBD configuration version is now 8; `upgrade-apply`
+migrates it live (see Upgrading).
+
+### Storage
+- **A resync that DRBD skipped is detected and rebuilt.** With the DRBD
+  version shipped in XCP-ng 8.3 (9.2.16), a connection drop while a
+  returning host negotiates its resync can make DRBD skip that resync on
+  the next reconnect and mark the host's stale copy UpToDate. Earlier
+  TwinStor versions could then promote and serve that copy, and writes the
+  peer had acknowledged were lost. TwinStor now reads this from the
+  kernel log, records it in `/var/lib/twinstor/resync-skipped`, keeps the
+  copy from being promoted or exported, rebuilds it with a full resync
+  from the peer (`drbdadm invalidate`), and serves it only once that
+  resync is under way and the copy is UpToDate again. The record survives
+  a daemon restart and a reboot, and is cleared only by that full resync.
+- **No promote while a resync from an UpToDate peer is pending.** A
+  returning host is promoted only once its resync has started, no longer
+  while it still waits for the bitmap exchange. Its iSCSI target still
+  starts only once its copy is UpToDate.
+- **Arbitrated pools: the skip is prevented in the usual case.** When the
+  connection drops before the returning host's resync has started,
+  TwinStor re-creates that host's DRBD connection before DRBD reconnects,
+  so the next handshake runs the normal short resync instead of skipping
+  it. The full rebuild above remains the fallback.
+- **DRBD configuration version 8: `max-buffers 16384`.** DRBD's default
+  (2048 pages) kept a full resync far below the link speed. The new value
+  is applied live by `upgrade-apply`, with no reconnect, and each host
+  uses its own value. Full resyncs are several times faster once both
+  hosts are upgraded: on the test rig (NVMe, 40 GbE link) a 466 GiB full
+  resync took 16 minutes, against 70 to 76 minutes before.
+- **A host that stood aside no longer serves an old copy alone.** When a
+  host loses replication and its fence-peer handler makes it stand aside
+  (frozen, serving nothing) while the peer can keep serving, TwinStor now
+  records that on disk (`/var/lib/twinstor/boot-gate-yielded`) once the
+  stand-aside has lasted 20 s with the pair still disconnected; in tests the
+  record was written about 28 s after the host stood aside. The record also
+  survives the steps TwinStor itself takes later on a host that is still
+  standing aside: in fate-shared mode the freeze budget resumes that host's
+  I/O to stop its guests, which starts a new DRBD generation, and the record
+  is marked on disk before that so it still holds at the next boot. If that
+  host is then fenced or rebooted and comes back while the peer is down, it
+  no longer promotes its copy alone, which silently dropped every write the
+  peer had acknowledged in between. It holds its storage, raises an alert,
+  and rejoins and serves by itself as soon as the peer is back and the
+  resync completes. If the peer is lost for good, run
+  `drbdadm primary --force twinstor-<resource>` on the held host; writes
+  made only on the peer are then lost. The record is cleared once the pair
+  is connected again, or once the host has served its own copy since. A host
+  whose DRBD disk comes back UpToDate (it fenced the peer and kept writing)
+  is not held. When both hosts lose power, recovery is unchanged if
+  replication was still connected, or was lost less than about 20 s before
+  the power went and TwinStor had not yet begun to step that host down.
+- Arbitrated mode: when XHA fenced one host and the survivor froze its own
+  I/O on the disconnect, the survivor now resumes sooner once the fenced
+  host is back. Once DRBD has reconnected with the survivor as the resync
+  source (or with nothing to resync), TwinStor re-checks the lift every
+  second until the connection has held 5 s, instead of once per regular
+  pass, which takes several seconds during a management cut. The
+  conditions are unchanged (the pair connected, no split-brain, the
+  survivor the resync source or nothing to resync, the connection held
+  5 s) and are all re-read at every check; the second confirming read now
+  comes one second after the first instead of one pass later. A survivor
+  still frozen when the returning host starts a full rebuild is lifted the
+  same way. On the test rig, I/O resumed 6 to 10 s after DRBD reconnected
+  (20 to 23 s with 0.7.5).
+
+### Alerts and status
+- A skipped resync raises an alert. In the usual case the rebuild starts
+  at once, and the alert says so: this host's copy is being rebuilt with a
+  full resync from the peer, the pool runs on a single copy until it
+  completes, no action is needed, and the peer must not be powered off
+  meanwhile. While the rebuild waits (the peer not UpToDate, a split-brain
+  or an operator discard pending), an alert says what it waits for, and a
+  new one is sent when the reason changes (at most every 10 minutes). When
+  the rebuild starts, the "being rebuilt" alert is sent unless the daemon
+  itself delivered one of these waiting alerts for the skip; one delivered
+  later from the held-back alerts can be followed by it. If the record
+  cannot be written, the alert says the copy is held and names the file,
+  so the filesystem holding it can be checked. A host just fenced and
+  rebooted usually finds XAPI not answering yet when its rebuild starts:
+  the "being rebuilt" alert is then raised again every 30 s, also after a
+  daemon restart, for as long as the rebuild runs. If the rebuild
+  completes and nothing about the skip had reached XAPI, a single alert
+  says so instead, in the past tense: DRBD skipped the resync this host's
+  copy needed, TwinStor rebuilt the copy with a full resync from the peer,
+  the resync has completed, and no action is needed. That alert waits
+  until the pair is connected with both copies UpToDate. A copy an
+  operator forced out of its rebuild, in the boot the daemon finds it,
+  gets no such alert. The alert is itself dropped if XAPI stays
+  unreachable 15 more minutes.
+- On a host that is already Primary when the daemon starts and whose
+  kernel log shows a skipped resync (a release without this check promoted
+  it), TwinStor changes nothing, because the copy may be serving, and
+  raises an alert recommending `drbdadm verify twinstor-<resource>`, or a
+  rebuild with `drbdadm invalidate` in a maintenance window.
+- `twinstor status` shows the rebuild hold as the `resync_skip_repair`
+  stage, the startup line logs `resync_skip=`, and
+  `twinstor upgrade-apply --check` refuses while a record is open.
+- The alert for a DRBD configuration older than the binary expects no
+  longer names what the newer template adds; it asks to run
+  `twinstor upgrade-apply` or `twinstor regenerate-config` on each host,
+  one at a time.
+- An alert XAPI could not take is now retried by the daemon itself once
+  XAPI answers again, no longer only after another alert is sent: the first
+  retry comes up to about two minutes after XAPI is back, then about every
+  30 s. This applies to alerts not raised again for about a minute (one
+  raised again is sent by its own next attempt). It is not attempted in the
+  first two minutes of a split-brain or of a freeze, while this host's own
+  I/O is frozen in freeze mode, or while the pool master does not answer.
+  Undelivered alerts are still dropped after 15 minutes.
+- While a host is held alone, `twinstor status` on that host shows the hold
+  on its `auto-heal:` line and the force command on its `next:` line, and
+  the daemon log records it. The status line asking not to run manual
+  recovery commands now makes an exception for a command named on the
+  `next:` line.
+- The way out given by the alert for a host held as the loser of a
+  split-brain now also removes `/var/lib/twinstor/boot-gate-yielded`, so a
+  host that followed it after a reboot is not then held by the new record.
+- The recovery steps in the alert for a split-brain where both hosts hold
+  as the loser no longer ask to stop when the dry run
+  (`drbdadm -d adjust`) prints a `drbdsetup net-options` line. That line
+  is expected, on fate-shared pools in every case: TwinStor sets some
+  connection options at run time, and the steps re-create the connection
+  from the configuration file anyway.
+
+### Known limitations
+- While a copy is rebuilt after a skipped resync, the pool runs on the
+  peer's copy alone. Do not power off or restart the peer until the
+  resync completes (`twinstor status`).
+- If the peer is lost for good during a rebuild, run
+  `drbdadm primary --force twinstor-<resource>` on the held host, accepting
+  that recent writes may be missing. Do it while the TwinStor daemon is
+  running: it then serves that copy for the rest of the boot. A force made
+  while the daemon is stopped is not seen if the host reboots first, and
+  the copy is held again.
+- Do not downgrade a host while `/var/lib/twinstor/resync-skipped`
+  exists: an older release ignores it and can serve the stale copy. Wait
+  until the rebuild has completed and the file is gone.
+- During a rolling upgrade, a host still running 0.7.5 or earlier has no
+  skipped-resync defence until it is upgraded.
+- Fate-shared pools do not get the connection re-creation: a skip there is
+  always repaired by the full rebuild.
+- The connection drop that leads to a skip comes from DRBD itself. It can
+  still cost a second reboot of the returning host, or a longer freeze of
+  the survivor, before the pair heals.
+- The alert for a skipped resync on a host that was already Primary is
+  raised again after each daemon restart in the same boot. TwinStor never
+  rebuilds that copy by itself.
+- If XAPI does not answer from the skip until 15 minutes after the rebuild
+  completed, no alert about the skip reaches XAPI; only the daemon log
+  records it.
+- If the kernel log cannot be read, TwinStor holds the promote for 60 s
+  from the first failure in a row, then proceeds without the check, with
+  a warning.
+- During a rebuild the peer holds the only valid copy. If it loses power,
+  writes it acknowledged just before can be lost when its drives do not
+  keep completed writes. Drives with power-loss protection, or a UPS, are
+  recommended.
+- In rare cases a copy is rebuilt with a second full resync (the daemon
+  stopped between the invalidate and its record, or a host rebooted while
+  the record was still open). This costs time, not data.
+- A host that dies abruptly while the pair is in sync (a crash, a power
+  loss of that host alone, an HA fence while replication was still
+  connected, a reboot) keeps no record of it. If its peer keeps serving and
+  then goes down before that host is back and resynced, the host still
+  promotes its own copy alone when it returns, and the writes the peer
+  made in between are lost. Nothing on the returning host tells this apart
+  from both hosts losing power together.
+- If the network goes down more than about 20 s before both hosts lose
+  power (for example hosts on a UPS and the switch not), both hosts record
+  that they stood aside. If only one of them comes back, it holds its
+  storage even though its copy is current, until the other host returns or
+  an operator runs `drbdadm primary --force twinstor-<resource>` on it.
+- After a whole-switch outage longer than about 20 s in which both hosts
+  stood aside, if one host is then lost for good and the other reboots,
+  the survivor holds its storage and needs
+  `drbdadm primary --force twinstor-<resource>` to serve again.
+- A host that stood aside and afterwards kept or was forced to serve its own
+  copy, and is reset or powered off within seconds, before TwinStor has seen
+  it serving, can hold its storage at a boot with the peer down. The same
+  applies if the pair reconnected and resynced only while the TwinStor
+  daemon was stopped. `drbdadm primary --force twinstor-<resource>` on that
+  host is the way out.
+- The hold's alert may not reach the pool's message list: XAPI is not
+  available on a host held alone. `twinstor status` and the log on that
+  host show the hold regardless.
+- Arbitrated mode: the survivor's frozen I/O still waits for the fenced
+  host to boot and reconnect, then for the connection to hold 5 s. After
+  the lift, the guests' I/O returns once iSCSI has logged the survivor's
+  path back in and multipath has reinstated it, on their own retry timers.
+  The whole freeze must still end within the pool's HA timeout, or XHA
+  resets the survivor and both hosts reboot; a fenced host that does not
+  boot and reconnect well within that timeout still sees both hosts reboot.
+- The other limitations of 0.7.5 are unchanged.
+
+### Upgrading
+- Upgrade the two hosts one after the other with `twinstor upgrade-apply`.
+  No change to the TwinStor configuration file is needed, and it is not
+  rewritten.
+- The DRBD configuration version is now 8 (`max-buffers 16384`).
+  `twinstor upgrade-apply` migrates the resource file live, as for 0.7.5;
+  a pool upgraded from 0.7.4 or earlier also gets the 0.7.5 migration (see
+  0.7.5, Upgrading).
+- A 0.7.5 peer keeps its own behaviour until it is upgraded.
+
 ## [0.7.5] - 2026-11-19
 
 TwinStor no longer changes pool HA across a management partition, its HA
