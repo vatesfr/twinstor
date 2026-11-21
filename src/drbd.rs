@@ -250,6 +250,24 @@ pub trait DrbdControl: Send + Sync {
             pair,
         })
     }
+    /// Re-create this node's peer connection object (del-peer, then the
+    /// resource file's new-peer, new-path and peer-device-options lines,
+    /// without connecting). DRBD keeps the RECONNECT bit on a connection
+    /// object once it has been Connected and lost, and a reconnect between
+    /// two objects that both carry it can drop an owed resync (`no-sync by
+    /// rule=reconnected`); a new object starts without it. The bitmap slot
+    /// and its bits stay. Refused unless `recreate_shape_ok`, checked first
+    /// and again right before the delete (see `guarded_recreate`). The
+    /// caller re-applies its live options and connects. Default: refused,
+    /// nothing done.
+    async fn recreate_connection(&self) -> RecreateOutcome {
+        RecreateOutcome::Refused("not supported".to_string())
+    }
+    /// Out-of-sync KiB toward the peer (`drbdsetup status --statistics`),
+    /// `None` when unreadable. Logging only. Default `None`.
+    async fn out_of_sync_kib(&self) -> Option<u64> {
+        None
+    }
     /// One bounded read of this boot's kernel log, walked for a resync DRBD
     /// decided toward this copy and then never ran (see `scan_resync_skip`).
     /// Default: nothing owed, so test doubles need not implement it.
@@ -679,57 +697,30 @@ impl DrbdControl for DrbdController {
                 st.suspended_fencing
             );
         }
-        // The re-add goes through `adjust`, which would also apply any drift
-        // between the resource file and the kernel. Only the connection
-        // itself may change here: refuse otherwise (the regenerate-config
-        // hazard of applying a changed resource file to a live resource).
-        let dry = crate::cmd::cmd_output_for("drbdadm", &["-d", "adjust", &self.resource], 30)
-            .await
-            .context("running drbdadm -d adjust")?;
-        // Option lines are allowed: the daemon re-applies its live options
-        // right after the re-creation, before it connects (a resource file
-        // older than the live safety policies always shows them).
-        if let Some(other) = dry_run_commands(&dry).into_iter().find(|l| {
-            !["connect", "new-path", "net-options", "resource-options"]
-                .iter()
-                .any(|c| l.starts_with(&format!("drbdsetup {c} ")))
-        }) {
-            anyhow::bail!(
-                "drbdadm adjust would change more than the connection ({other}); \
-                 not re-creating the peer object"
-            );
-        }
-        let node_id = peer_node_id(&self.resource)
-            .await
-            .context("peer node-id unreadable (drbdsetup events2)")?;
-        warn!(resource = %self.resource, peer_node_id = node_id,
-              "withdrawing this node's pending discard offer: re-creating the peer \
-               connection object (del-peer, then new-peer/new-path without connecting)");
-        crate::cmd::run_cmd_for(
-            "drbdsetup",
-            &["del-peer", &self.resource, &node_id.to_string()],
-            30,
+        self.del_peer_and_recreate(
+            "withdrawing this node's pending discard offer: re-creating the peer \
+             connection object (del-peer, then new-peer/new-path without connecting)",
         )
-        .await
-        .context("drbdsetup del-peer")?;
-        // The peer object is gone now: re-create it, retrying, because a node
-        // left without one is unreplicated (the periodic check repairs it
-        // too, see `peer_object_missing`).
-        let mut last = Ok(());
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            last = self.recreate_peer_object().await;
-            if last.is_ok() {
-                break;
-            }
-        }
-        last.context("re-creating the peer object after del-peer")?;
+        .await?;
         match self.discard_offer_pending().await {
             Some(true) => anyhow::bail!("discard offer still pending after re-creating the peer"),
             _ => Ok(()),
         }
+    }
+
+    async fn recreate_connection(&self) -> RecreateOutcome {
+        guarded_recreate(&ControllerOps(self), std::time::Duration::from_secs(2)).await
+    }
+
+    async fn out_of_sync_kib(&self) -> Option<u64> {
+        let out = crate::cmd::cmd_output_for(
+            "drbdsetup",
+            &["status", &self.resource, "--statistics"],
+            10,
+        )
+        .await
+        .ok()?;
+        parse_out_of_sync_kib(&out)
     }
 
     async fn handshake_gen(&self) -> Result<Option<HandshakeGen>> {
@@ -767,6 +758,207 @@ impl DrbdControl for DrbdController {
         // a large device takes longer than the usual drbdadm bound.
         crate::cmd::run_cmd_for("drbdadm", &["invalidate", &self.resource], 60).await
     }
+}
+
+impl DrbdController {
+    /// Delete the peer connection object and re-create it from the resource
+    /// file without connecting (see `recreate_peer_object`). The re-add goes
+    /// through the lines of a dry-run `adjust`, which would also apply any
+    /// drift between the resource file and the kernel: only the connection
+    /// itself may change, so anything else refuses before the delete (the
+    /// regenerate-config hazard of applying a changed resource file to a
+    /// live resource). Option lines are allowed: the caller re-applies its
+    /// live options right after, before it connects. Every command is
+    /// bounded; the re-creation is retried, because a node left without a
+    /// peer object is unreplicated (the periodic check repairs it too).
+    async fn del_peer_and_recreate(&self, why: &str) -> Result<()> {
+        let dry = crate::cmd::cmd_output_for("drbdadm", &["-d", "adjust", &self.resource], 30)
+            .await
+            .context("running drbdadm -d adjust")?;
+        if let Some(other) = dry_run_beyond_connection(&dry) {
+            anyhow::bail!(
+                "drbdadm adjust would change more than the connection ({other}); \
+                 not re-creating the peer object"
+            );
+        }
+        let node_id = peer_node_id(&self.resource)
+            .await
+            .context("peer node-id unreadable (drbdsetup events2)")?;
+        warn!(resource = %self.resource, peer_node_id = node_id, "{why}");
+        crate::cmd::run_cmd_for(
+            "drbdsetup",
+            &["del-peer", &self.resource, &node_id.to_string()],
+            30,
+        )
+        .await
+        .context("drbdsetup del-peer")?;
+        let mut last = Ok(());
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            last = self.recreate_peer_object().await;
+            if last.is_ok() {
+                break;
+            }
+        }
+        last.context("re-creating the peer object after del-peer")
+    }
+}
+
+/// A dry-run adjust line that would change more than the connection (its
+/// paths and its net or resource options), if any.
+fn dry_run_beyond_connection(dry: &str) -> Option<String> {
+    dry_run_commands(dry)
+        .into_iter()
+        .find(|l| {
+            !["connect", "new-path", "net-options", "resource-options"]
+                .iter()
+                .any(|c| l.starts_with(&format!("drbdsetup {c} ")))
+        })
+        .map(str::to_string)
+}
+
+/// How a connection re-creation ended (see `guarded_recreate`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecreateOutcome {
+    /// Deleted and re-created from the resource file, not connected yet.
+    Done,
+    /// Refused before anything was deleted: nothing changed.
+    Refused(String),
+    /// The delete ran (or may have) and the re-creation did not finish: the
+    /// caller must restore the peer object and connect.
+    FailedAfterDelete(String),
+}
+
+/// The returner shape a connection re-creation requires: a Secondary
+/// whose disk is Outdated or Consistent (its owed resync not started), I/O
+/// not suspended (deleting the connection would lift a fencing freeze),
+/// and the connection Connecting, DRBD's own state after a drop (never a
+/// connected pair, never a StandAlone resource another flow owns).
+pub fn recreate_shape_ok(st: &DrbdStatus) -> bool {
+    st.role == Role::Secondary
+        && matches!(st.disk, DiskState::Outdated | DiskState::Consistent)
+        && st.connection == ConnectionState::Connecting
+        && !st.suspended_any
+}
+
+/// How long the dry-run adjust of a connection re-creation may take: the
+/// whole sequence must fit before DRBD's next reconnect.
+const RECREATE_DRY_RUN_SECS: u64 = 5;
+
+/// The steps of a connection re-creation, behind a seam so the ordering of
+/// its checks is unit-tested.
+#[async_trait::async_trait]
+trait RecreateOps: Send + Sync {
+    async fn status(&self) -> Result<DrbdStatus>;
+    async fn dry_run_adjust(&self, bound_secs: u64) -> Result<String>;
+    async fn peer_node_id(&self) -> Option<u32>;
+    async fn del_peer(&self, node_id: u32) -> Result<()>;
+    async fn recreate_peer_object(&self) -> Result<()>;
+}
+
+/// Re-create the connection object, refusing before the delete unless every
+/// check passes: the shape, a dry-run adjust (bounded to
+/// `RECREATE_DRY_RUN_SECS`) proposing nothing beyond the connection, a
+/// readable peer node-id, and the shape again on a status read right
+/// before `del-peer`: DRBD may have reconnected during the dry run, and a
+/// delete then would cut a live connection. After the delete, the
+/// re-creation is retried (`retry_sleep` between attempts).
+async fn guarded_recreate(
+    ops: &dyn RecreateOps,
+    retry_sleep: std::time::Duration,
+) -> RecreateOutcome {
+    let refuse = |why: String| RecreateOutcome::Refused(why);
+    match ops.status().await {
+        Ok(st) if recreate_shape_ok(&st) => {}
+        Ok(st) => {
+            return refuse(format!(
+                "not the shape: role {:?}, disk {:?}, connection {:?}, suspended {}",
+                st.role, st.disk, st.connection, st.suspended_any
+            ));
+        }
+        Err(e) => return refuse(format!("status unreadable: {e}")),
+    }
+    let dry = match ops.dry_run_adjust(RECREATE_DRY_RUN_SECS).await {
+        Ok(d) => d,
+        Err(e) => return refuse(format!("dry-run adjust: {e}")),
+    };
+    if let Some(other) = dry_run_beyond_connection(&dry) {
+        return refuse(format!(
+            "adjust would change more than the connection ({other})"
+        ));
+    }
+    let Some(node_id) = ops.peer_node_id().await else {
+        return refuse("peer node-id unreadable".to_string());
+    };
+    match ops.status().await {
+        Ok(st) if recreate_shape_ok(&st) => {}
+        Ok(st) => {
+            return refuse(format!(
+                "the state changed before the delete: role {:?}, disk {:?}, connection {:?}",
+                st.role, st.disk, st.connection
+            ));
+        }
+        Err(e) => return refuse(format!("status unreadable before the delete: {e}")),
+    }
+    if let Err(e) = ops.del_peer(node_id).await {
+        return RecreateOutcome::FailedAfterDelete(format!("drbdsetup del-peer: {e}"));
+    }
+    let mut last = Ok(());
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(retry_sleep).await;
+        }
+        last = ops.recreate_peer_object().await;
+        if last.is_ok() {
+            return RecreateOutcome::Done;
+        }
+    }
+    RecreateOutcome::FailedAfterDelete(format!(
+        "re-creating the peer object after del-peer: {}",
+        last.err().map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+/// `RecreateOps` on the real controller.
+struct ControllerOps<'a>(&'a DrbdController);
+
+#[async_trait::async_trait]
+impl RecreateOps for ControllerOps<'_> {
+    async fn status(&self) -> Result<DrbdStatus> {
+        DrbdControl::status(self.0).await
+    }
+    async fn dry_run_adjust(&self, bound_secs: u64) -> Result<String> {
+        crate::cmd::cmd_output_for("drbdadm", &["-d", "adjust", &self.0.resource], bound_secs)
+            .await
+            .context("running drbdadm -d adjust")
+    }
+    async fn peer_node_id(&self) -> Option<u32> {
+        peer_node_id(&self.0.resource).await
+    }
+    async fn del_peer(&self, node_id: u32) -> Result<()> {
+        warn!(resource = %self.0.resource, peer_node_id = node_id,
+              "re-creating the peer connection object so the owed resync is not dropped \
+               (del-peer, then new-peer/new-path/peer-device-options without connecting)");
+        crate::cmd::run_cmd_for(
+            "drbdsetup",
+            &["del-peer", &self.0.resource, &node_id.to_string()],
+            30,
+        )
+        .await
+    }
+    async fn recreate_peer_object(&self) -> Result<()> {
+        DrbdControl::recreate_peer_object(self.0).await
+    }
+}
+
+/// The out-of-sync KiB of `drbdsetup status --statistics` (the first peer
+/// device's `out-of-sync:` field).
+pub fn parse_out_of_sync_kib(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .find_map(|w| w.strip_prefix("out-of-sync:"))
+        .and_then(|v| v.parse().ok())
 }
 
 /// Parse the `path` lines of `drbdsetup events2 --now` output:
@@ -1019,6 +1211,12 @@ pub struct SkipScan {
     /// Inconsistent, a reconnect cleared the bitmap: that full bitmap is
     /// gone, so a resync that follows is not the full one.
     pub invalidate_cleared: bool,
+    /// How many times a debt opened in this boot, and how many times the
+    /// connection dropped (a local replication transition from `WFBitMapT`
+    /// or `StartingSyncT` to `Off`) while the current one is open. Together
+    /// they name one drop.
+    pub owed_openings: usize,
+    pub owed_drops: usize,
 }
 
 impl SkipScan {
@@ -1114,6 +1312,7 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
         };
         let message = message.trim();
         if context.trim() == resource && message == FORCED_UP_TO_DATE {
+            scan.owed_drops = 0;
             scan.owed_open = false;
             scan.owed_evidence.clear();
             scan.skip_evidence.clear();
@@ -1161,10 +1360,18 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
                 after_starting_sync_t = false;
             }
             if inconsistent || from == "Inconsistent" {
+                scan.owed_drops = 0;
                 scan.owed_open = false;
                 scan.owed_evidence.clear();
                 scan.skip_evidence.clear();
             }
+        }
+        if let Some((from, to)) = state_change(message, "repl(")
+            && scan.owed_open
+            && matches!(from, "WFBitMapT" | "StartingSyncT")
+            && to == "Off"
+        {
+            scan.owed_drops += 1;
         }
         if let Some((_, to)) = state_change(message, "repl(")
             && to == "StartingSyncT"
@@ -1176,6 +1383,7 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
             && matches!(to, "WFBitMapS" | "StartingSyncS" | "SyncSource")
             && scan.skip_evidence.is_empty()
         {
+            scan.owed_drops = 0;
             scan.owed_open = false;
             scan.owed_evidence.clear();
             scan.skip_evidence.clear();
@@ -1186,6 +1394,8 @@ pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
         {
             if !scan.owed_open {
                 scan.skip_evidence.clear();
+                scan.owed_openings += 1;
+                scan.owed_drops = 0;
             }
             scan.owed_open = true;
             scan.owed_evidence = [last_self, last_peer, last_compare, Some(record)]
@@ -2656,6 +2866,211 @@ exists path name:twinstor-data peer-node-id:1 conn-name:twinstor-2 local:ipv4:19
         assert!(!scan.owed_open && !scan.invalidate_cleared, "{scan:?}");
     }
 
+    /// The log up to and including its first line that contains `marker`.
+    fn through(log: &str, marker: &str) -> String {
+        let mut out = Vec::new();
+        for l in log.lines() {
+            out.push(l);
+            if l.contains(marker) {
+                break;
+            }
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn a_drop_before_the_owed_resync_started_is_seen() {
+        for log in [RECREATE_R1, RECREATE_R3, RECREATE_R5, RECREATE_R6] {
+            let at_drop = through(log, "repl( WFBitMapT -> Off )");
+            let scan = scan_resync_skip(&at_drop, "twinstor-data");
+            assert!(scan.owed_open && scan.skip_evidence.is_empty(), "{scan:?}");
+            assert_eq!((scan.owed_openings, scan.owed_drops), (1, 1));
+            // The next handshake (after the re-creation) opens no new debt and
+            // counts no new drop: the same drop.
+            let next = through(log, "Outdated/UpToDate");
+            let scan = scan_resync_skip(&next, "twinstor-data");
+            assert_eq!((scan.owed_openings, scan.owed_drops), (1, 1));
+        }
+        // Once the resync ran, nothing is owed.
+        for log in [RECREATE_R1, RECREATE_R5, RECREATE_R6] {
+            let scan = scan_resync_skip(log, "twinstor-data");
+            assert!(!scan.owed_open && scan.owed_drops == 0, "{scan:?}");
+        }
+    }
+
+    #[test]
+    fn no_drop_is_seen_in_the_control_runs_or_after_the_resync_started() {
+        for log in [RECREATE_R2, RECREATE_R4] {
+            let lines: Vec<&str> = log.lines().collect();
+            for i in 0..lines.len() {
+                let scan = scan_resync_skip(&lines[..=i].join("\n"), "twinstor-data");
+                assert_eq!(scan.owed_drops, 0, "{}", lines[i]);
+            }
+        }
+        // The second drop of the third run came from SyncTarget, after the
+        // copy went Inconsistent: nothing owed, no drop.
+        let second = through(RECREATE_R3, "repl( SyncTarget -> Off )");
+        let scan = scan_resync_skip(&second, "twinstor-data");
+        assert!(!scan.owed_open && scan.owed_drops == 0, "{scan:?}");
+    }
+
+    #[test]
+    fn a_drop_followed_by_a_skip_carries_the_skip_evidence() {
+        // The reset capture: the drop, then no-sync by rule=reconnected.
+        let scan = scan_resync_skip(RESET_RETURNER, "twinstor-data");
+        assert_eq!(scan.owed_drops, 1);
+        assert!(!scan.skip_evidence.is_empty());
+    }
+
+    #[test]
+    fn out_of_sync_is_read_from_the_statistics() {
+        assert_eq!(
+            parse_out_of_sync_kib(RECREATE_R1_AFTER_DROP_STATUS),
+            Some(1306624)
+        );
+        assert_eq!(parse_out_of_sync_kib("no statistics"), None);
+    }
+
+    /// `RecreateOps` with scripted status reads, recording each step.
+    struct FakeRecreate {
+        statuses: std::sync::Mutex<std::collections::VecDeque<DrbdStatus>>,
+        dry: String,
+        recreate_fails: bool,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl FakeRecreate {
+        fn new(statuses: Vec<DrbdStatus>, dry: &str) -> Self {
+            Self {
+                statuses: std::sync::Mutex::new(statuses.into()),
+                dry: dry.to_string(),
+                recreate_fails: false,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RecreateOps for FakeRecreate {
+        async fn status(&self) -> Result<DrbdStatus> {
+            self.calls.lock().unwrap().push("status");
+            self.statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no status"))
+        }
+        async fn dry_run_adjust(&self, bound_secs: u64) -> Result<String> {
+            assert_eq!(bound_secs, RECREATE_DRY_RUN_SECS);
+            self.calls.lock().unwrap().push("dry_run_adjust");
+            Ok(self.dry.clone())
+        }
+        async fn peer_node_id(&self) -> Option<u32> {
+            self.calls.lock().unwrap().push("peer_node_id");
+            Some(0)
+        }
+        async fn del_peer(&self, _node_id: u32) -> Result<()> {
+            self.calls.lock().unwrap().push("del_peer");
+            Ok(())
+        }
+        async fn recreate_peer_object(&self) -> Result<()> {
+            self.calls.lock().unwrap().push("recreate_peer_object");
+            if self.recreate_fails {
+                anyhow::bail!("new-path failed");
+            }
+            Ok(())
+        }
+    }
+
+    fn after_drop() -> DrbdStatus {
+        parse_drbdadm_text(RECREATE_R1_AFTER_DROP_STATUS).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_re_creation_deletes_only_after_every_check_passed() {
+        let ops = FakeRecreate::new(vec![after_drop(), after_drop()], "");
+        let out = guarded_recreate(&ops, std::time::Duration::ZERO).await;
+        assert_eq!(out, RecreateOutcome::Done);
+        assert_eq!(
+            ops.calls(),
+            vec![
+                "status",
+                "dry_run_adjust",
+                "peer_node_id",
+                "status",
+                "del_peer",
+                "recreate_peer_object"
+            ]
+        );
+        // A Consistent disk is the same shape.
+        let consistent = DrbdStatus {
+            disk: DiskState::Consistent,
+            ..after_drop()
+        };
+        let ops = FakeRecreate::new(vec![consistent.clone(), consistent], "");
+        assert_eq!(
+            guarded_recreate(&ops, std::time::Duration::ZERO).await,
+            RecreateOutcome::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_during_the_dry_run_refuses_before_the_delete() {
+        let connected = DrbdStatus {
+            connection: ConnectionState::Connected,
+            ..after_drop()
+        };
+        let ops = FakeRecreate::new(vec![after_drop(), connected], "");
+        let out = guarded_recreate(&ops, std::time::Duration::ZERO).await;
+        assert!(matches!(out, RecreateOutcome::Refused(_)), "{out:?}");
+        assert!(!ops.calls().contains(&"del_peer"), "{:?}", ops.calls());
+        // Not the shape at the first read: nothing else runs.
+        let ops = FakeRecreate::new(
+            vec![DrbdStatus {
+                role: Role::Primary,
+                ..after_drop()
+            }],
+            "",
+        );
+        assert!(matches!(
+            guarded_recreate(&ops, std::time::Duration::ZERO).await,
+            RecreateOutcome::Refused(_)
+        ));
+        assert_eq!(ops.calls(), vec!["status"]);
+        // A dry run that would change more than the connection.
+        let ops = FakeRecreate::new(
+            vec![after_drop(), after_drop()],
+            "drbdsetup peer-device-options twinstor-data 1 0 --c-min-rate=250M\n",
+        );
+        assert!(matches!(
+            guarded_recreate(&ops, std::time::Duration::ZERO).await,
+            RecreateOutcome::Refused(_)
+        ));
+        assert!(!ops.calls().contains(&"del_peer"));
+    }
+
+    #[tokio::test]
+    async fn a_re_creation_that_fails_after_the_delete_says_so() {
+        let mut ops = FakeRecreate::new(vec![after_drop(), after_drop()], "");
+        ops.recreate_fails = true;
+        let out = guarded_recreate(&ops, std::time::Duration::ZERO).await;
+        assert!(
+            matches!(out, RecreateOutcome::FailedAfterDelete(_)),
+            "{out:?}"
+        );
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|c| **c == "recreate_peer_object")
+                .count(),
+            3,
+            "retried"
+        );
+    }
+
     #[test]
     fn starting_sync_source_is_parsed() {
         assert_eq!(
@@ -2954,4 +3369,170 @@ Nov 19 01:20:32 xcp-ng-demo-2 kernel: [   26.561587] drbd twinstor-data/0 drbd0 
 [Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( StartingSyncT -> SyncTarget ) [start-sync]
 [Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 488371640 KB [122092910 bits set]).
 "#;
+
+    /// Re-creation trial, run with a drop: the first connection dropped in WFBitMapT, a watcher re-created the connection object, the next handshake decided a bitmap resync.
+    pub(crate) const RECREATE_R1: &str = r#"
+[Fri Nov 20 21:00:00 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 21:00:00 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 6C9754469EE82356:0000000000000000:9682FA4918D7560C:6C1968AD452C67A6 bits:326656 flags:22
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 6C9754469EE82356:0000000000000000:F16673A3BCADEAB0:8BF085A04E3B8428 bits:0 flags:1120
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 21:00:03 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 21:00:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[Fri Nov 20 21:00:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 21:00:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 6C9754469EE82356:0000000000000000:9682FA4918D7560C:6C1968AD452C67A6 bits:326656 flags:22
+[Fri Nov 20 21:00:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 6C9754469EE82356:0000000000000000:F16673A3BCADEAB0:8BF085A04E3B8428 bits:6 flags:1120
+[Fri Nov 20 21:00:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 21:00:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Outdated/UpToDate)
+[Fri Nov 20 21:00:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 21:00:22 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 21:00:22 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 21:00:22 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1306624 KB [326656 bits set]).
+[Fri Nov 20 21:00:23 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 21:00:24 2026] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 1 sec; paused 0 sec; 1306624 K/sec)
+[Fri Nov 20 21:00:24 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+"#;
+
+    /// Re-creation trial, control run: one connection, no drop.
+    pub(crate) const RECREATE_R2: &str = r#"
+[Fri Nov 20 21:51:13 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 21:51:13 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: self F84C9901D05D879E:0000000000000000:3E0B5D2DA0DF1F2A:8BF085A04E3B8428 bits:378880 flags:22
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer F84C9901D05D879F:0000000000000000:3236F8FD6E62F01C:6C9754469EE82356 bits:0 flags:1120
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 21:51:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 21:51:26 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 21:51:26 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 21:51:26 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1515520 KB [378880 bits set]).
+[Fri Nov 20 21:51:26 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 21:51:28 2026] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 2 sec; paused 0 sec; 757760 K/sec)
+[Fri Nov 20 21:51:28 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+"#;
+
+    /// Re-creation trial, a drop at WFBitMapT (re-created), then a second drop at the start of the resync, from SyncTarget.
+    pub(crate) const RECREATE_R3: &str = r#"
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: self CF23A8EF9CEC1376:0000000000000000:D01F11D3FBE8643C:F2496922BBE15A54 bits:330752 flags:22
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer CF23A8EF9CEC1377:0000000000000000:F84C9901D05D879E:3236F8FD6E62F01C bits:0 flags:1120
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 22:09:51 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[Fri Nov 20 22:10:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 22:10:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: self CF23A8EF9CEC1376:0000000000000000:D01F11D3FBE8643C:F2496922BBE15A54 bits:330752 flags:22
+[Fri Nov 20 22:10:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer CF23A8EF9CEC1377:0000000000000000:F84C9901D05D879E:3236F8FD6E62F01C bits:7 flags:1120
+[Fri Nov 20 22:10:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 22:10:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Outdated/UpToDate)
+[Fri Nov 20 22:10:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 22:10:08 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 22:10:08 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 22:10:08 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1323008 KB [330752 bits set]).
+[Fri Nov 20 22:10:08 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( SyncTarget -> Off )
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 5F1CD83CB4C8EAA4:0000000000000000:CF23A8EF9CEC1376:D01F11D3FBE8643C bits:330752 flags:126
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 5F1CD83CB4C8EAA5:CF23A8EF9CEC1377:F84C9901D05D879E:3236F8FD6E62F01C bits:330752 flags:1120
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-use-bitmap by rule=sync-target-peer-missed-finish
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 22:10:17 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1323008 KB [330752 bits set]).
+[Fri Nov 20 22:10:18 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 22:10:20 2026] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 3 sec; paused 0 sec; 441004 K/sec)
+[Fri Nov 20 22:10:20 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+"#;
+
+    /// Re-creation trial, second control run: no drop.
+    pub(crate) const RECREATE_R4: &str = r#"
+[Fri Nov 20 22:27:51 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 22:27:51 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 5F1CD83CB4C8EAA4:0000000000000000:F5E6474535DF434E:6C1968AD452C67A6 bits:335872 flags:22
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 5F1CD83CB4C8EAA5:0000000000000000:CF23A8EF9CEC1376:F84C9901D05D879E bits:0 flags:1120
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 22:27:52 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 22:28:01 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 22:28:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 22:28:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1343488 KB [335872 bits set]).
+[Fri Nov 20 22:28:01 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 22:28:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 3 sec; paused 0 sec; 447832 K/sec)
+[Fri Nov 20 22:28:04 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+"#;
+
+    /// Re-creation trial, run with a drop (re-created).
+    pub(crate) const RECREATE_R5: &str = r#"
+[Fri Nov 20 22:46:29 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 22:46:29 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 374AF18577A4F92A:0000000000000000:3E0B5D2DA0DF1F2A:8BF085A04E3B8428 bits:322560 flags:22
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 374AF18577A4F92B:0000000000000000:5F1CD83CB4C8EAA4:CF23A8EF9CEC1376 bits:0 flags:1120
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 22:46:35 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[Fri Nov 20 22:46:44 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 22:46:44 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 374AF18577A4F92A:0000000000000000:3E0B5D2DA0DF1F2A:8BF085A04E3B8428 bits:322560 flags:22
+[Fri Nov 20 22:46:44 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 374AF18577A4F92B:0000000000000000:5F1CD83CB4C8EAA4:CF23A8EF9CEC1376 bits:4 flags:1120
+[Fri Nov 20 22:46:44 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 22:46:44 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Outdated/UpToDate)
+[Fri Nov 20 22:46:44 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 22:46:53 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 22:46:53 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 22:46:53 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1290240 KB [322560 bits set]).
+[Fri Nov 20 22:46:53 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 22:46:54 2026] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 1 sec; paused 0 sec; 1290240 K/sec)
+[Fri Nov 20 22:46:54 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+"#;
+
+    /// Re-creation trial, run with a drop (re-created).
+    pub(crate) const RECREATE_R6: &str = r#"
+[Fri Nov 20 23:04:57 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 23:04:57 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: self AC878F2FD1351258:0000000000000000:73810E8073DBD92A:44F29F9A8FEC839C bits:327680 flags:22
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer AC878F2FD1351259:0000000000000000:374AF18577A4F92A:5F1CD83CB4C8EAA4 bits:0 flags:1120
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 23:05:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[Fri Nov 20 23:05:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 23:05:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: self AC878F2FD1351258:0000000000000000:73810E8073DBD92A:44F29F9A8FEC839C bits:327680 flags:22
+[Fri Nov 20 23:05:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer AC878F2FD1351259:0000000000000000:374AF18577A4F92A:5F1CD83CB4C8EAA4 bits:3 flags:1120
+[Fri Nov 20 23:05:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 23:05:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Outdated/UpToDate)
+[Fri Nov 20 23:05:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 23:05:23 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 23:05:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 23:05:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 1310720 KB [327680 bits set]).
+[Fri Nov 20 23:05:23 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 23:05:26 2026] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 3 sec; paused 0 sec; 436908 K/sec)
+[Fri Nov 20 23:05:26 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+"#;
+
+    /// The same run's returner a moment after the drop (`drbdsetup status
+    /// --verbose --statistics`, verbatim): Secondary, Outdated, Connecting.
+    pub(crate) const RECREATE_R1_AFTER_DROP_STATUS: &str =
+        "twinstor-data node-id:1 role:Secondary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:Outdated
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:0 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-1 node-id:0 connection:Connecting role:Unknown tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Off peer-disk:DUnknown resync-suspended:no
+        received:0 sent:0 out-of-sync:1306624 pending:0 unacked:0
+";
 }

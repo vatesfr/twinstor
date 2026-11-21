@@ -229,6 +229,38 @@ pub(crate) fn resync_skip_marker() -> String {
         .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/resync-skipped"))
 }
 
+/// How many times this boot the daemon re-created the returner's connection
+/// object (see `recreate_returner_connection`), and the last drop it acted
+/// on. On tmpfs: a reboot starts the count afresh, a daemon restart keeps it.
+fn resync_recreate_marker() -> String {
+    crate::heal_state::state_path("/run/twinstor/resync-recreate")
+}
+
+/// At most this many connection re-creations per boot; past it, the
+/// resync-skip detection and its invalidate remain.
+const RECREATE_MAX_PER_BOOT: u32 = 3;
+
+/// The connection re-creation reads the kernel log on every pass only for
+/// this long after the daemon starts or the copy's disk or connection state
+/// changes, and while the log shows an open debt with no drop yet; outside
+/// those windows at most once per this interval.
+const RECREATE_SCAN_WINDOW: Duration = Duration::from_secs(30);
+
+/// The re-creation record's count and last drop for `boot_id` (`(0, None)`
+/// for another boot or an unreadable file).
+fn parse_recreate_record(text: &str, boot_id: &str) -> (u32, Option<(usize, usize)>) {
+    let field = |k: &str| text.lines().find_map(|l| l.trim().strip_prefix(k));
+    if field("boot_id=") != Some(boot_id) {
+        return (0, None);
+    }
+    let count = field("count=").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let key = field("drop=").and_then(|v| {
+        let (o, d) = v.split_once(':')?;
+        Some((o.parse().ok()?, d.parse().ok()?))
+    });
+    (count, key)
+}
+
 /// The resync-skip record a new state machine uses (see
 /// `peer_served_path_for_new`).
 fn resync_skip_path_for_new() -> String {
@@ -391,6 +423,20 @@ fn resync_skip_repaired_alert_text(peer: &str) -> String {
          detected it and is rebuilding this host's copy with a full resync from {peer}. Until \
          that resync completes the pool runs on a single copy, the one on {peer}. No action \
          needed; do not power off or restart {peer} meanwhile."
+    )
+}
+
+/// The alert for a skip whose record could not be written (see
+/// `resync_skip_step`): the copy is held down, and the rebuild cannot be set
+/// up until the record is written.
+fn resync_skip_unrecorded_alert_text(peer: &str, path: &str) -> String {
+    format!(
+        "After a connection drop, DRBD skipped the resync this host's copy needed. TwinStor \
+         holds this copy down (no promote, no iSCSI target), but it could not write its record \
+         of the skip to {path}, so it cannot start the rebuild yet. Check that the filesystem \
+         holding {path} is mounted read-write and not full; TwinStor retries and starts the \
+         rebuild once the record is written. Until then the pool runs on a single copy, the \
+         one on {peer}; do not power off or restart {peer}."
     )
 }
 
@@ -11157,6 +11203,19 @@ pub struct StateMachine {
     /// A skip found but not recorded (see `resync_skip_step`) was alerted;
     /// reset by a clean check.
     skip_unrecorded_alerted: bool,
+    /// Connection re-creations (see `recreate_returner_connection`): the
+    /// record file, and its count and last drop kept in memory too (the cap
+    /// holds in this run even if the file cannot be written).
+    recreate_path: String,
+    recreate_count: u32,
+    recreate_last: Option<(usize, usize)>,
+    /// Its kernel-log pacing (see `RECREATE_SCAN_WINDOW`): every pass until,
+    /// the last disk and connection state seen, the last read, and whether
+    /// that read showed an open debt with no drop yet.
+    recreate_scan_until: Option<std::time::Instant>,
+    recreate_seen: Option<(DiskState, ConnectionState)>,
+    recreate_scan_at: Option<std::time::Instant>,
+    recreate_armed: bool,
     /// Tests: the resync-skip alerts sent, and whether they reach XAPI.
     #[cfg(test)]
     skip_alerts: Vec<String>,
@@ -12113,6 +12172,13 @@ impl StateMachine {
             skip_scan_fail_open_logged: false,
             resync_skip_alert_at: None,
             skip_unrecorded_alerted: false,
+            recreate_path: test_private_path("resync-recreate", resync_recreate_marker()),
+            recreate_count: 0,
+            recreate_last: None,
+            recreate_scan_until: Some(std::time::Instant::now() + RECREATE_SCAN_WINDOW),
+            recreate_seen: None,
+            recreate_scan_at: None,
+            recreate_armed: false,
             #[cfg(test)]
             skip_alerts: Vec::new(),
             #[cfg(test)]
@@ -17357,6 +17423,13 @@ impl StateMachine {
             warn!(error = %e, "re-creating the peer object failed; retrying in a minute");
             return;
         }
+        self.after_peer_recreate().await;
+    }
+
+    /// After the peer object was re-created from the resource file: its net
+    /// options came back from the file, so the live safety policies and the
+    /// freeze settings are applied again before the connect.
+    async fn after_peer_recreate(&mut self) {
         self.config_enforced = false;
         self.enforce_live_safety_policies().await;
         self.enforce_freeze_connect_int().await;
@@ -17530,12 +17603,12 @@ impl StateMachine {
         if let Some(deployed) = self.stale_res_version {
             // v5+ configs already persist the split-brain safety policies,
             // so telling an operator mid-upgrade that they "were applied
-            // live" would suggest an exposure that does not exist. From v5
-            // up, only the online-verify algorithm is missing.
+            // live" would suggest an exposure that does not exist. What the
+            // newer template adds differs by version, so the text names none.
             let (log_what, alert_what) = if deployed >= 5 {
                 (
-                    "the on-disk .res predates the online-verify template (verify-alg); safety policies already persisted",
-                    "TwinStor: the on-disk DRBD config predates this binary's template (it lacks the online-verify algorithm; all data-safety policies are already persisted and active). Run `twinstor regenerate-config` on each node to enable `drbdadm verify` out of the box.",
+                    "the on-disk .res is older than this binary's template; safety policies already persisted",
+                    "TwinStor: the DRBD config on this host is older than this TwinStor version expects (all data-safety policies are already persisted and active). Run `twinstor upgrade-apply` or `twinstor regenerate-config` on each node, one node at a time, to adopt the current template.",
                 )
             } else {
                 (
@@ -17978,6 +18051,16 @@ impl StateMachine {
         // `resync_skip_step`): detection, the record, and the invalidate run
         // here whatever holds below. It never returns by itself; the hold
         // before the promote and the guard before the target start read it.
+        // A returner whose owed resync has not started and whose connection
+        // just dropped: re-create its connection object before DRBD
+        // reconnects (see `recreate_returner_connection`). The pass ends there
+        // so nothing below acts on the status read before it.
+        if self.recreate_returner_connection(&status).await {
+            // The sole-survivor wedge shape (Connected) is not current; reset
+            // its clocks as the other holds do.
+            self.cd_reset();
+            return Ok(false);
+        }
         let skip_hold = self.resync_skip_step(&status, true).await;
 
         // Init-side StandAlone heal: a node that boots StandAlone with a
@@ -18919,6 +19002,226 @@ impl StateMachine {
         matches!(self.skip_record(), SkipRecord::Active { .. })
     }
 
+    /// Re-create the connection object of a returner whose owed resync has
+    /// not started, right after its connection dropped, before DRBD
+    /// reconnects (about 9 s later). DRBD sets the RECONNECT bit on a
+    /// connection object that goes from Connected to down and never clears
+    /// it; when both objects carry it, the next handshake between equal
+    /// generations can decide `no-sync by rule=reconnected` and drop the owed
+    /// resync. A new object starts without it and keeps the bitmap, so the
+    /// next handshake decides the usual bitmap resync. Runs on every pass of
+    /// bring-up, ahead of every hold; returns `true` when it acted (the pass
+    /// ends there).
+    ///
+    /// Acts only when every condition holds, otherwise leaves it to the
+    /// resync-skip detection and its invalidate:
+    /// - arbitrated mode;
+    /// - this copy: Secondary, disk Outdated or Consistent, connection
+    ///   Connecting (DRBD's own state after a drop), I/O not suspended, no
+    ///   target exported by this daemon;
+    /// - no other flow owns the copy or the connection: no split-brain,
+    ///   operator-discard, parked discard offer, yield latch or crash
+    ///   boundary record, no resync-skip record, no StandAlone heal under
+    ///   way, no steered connect waiting for its path restore;
+    /// - this boot's kernel log (read every pass within
+    ///   `RECREATE_SCAN_WINDOW` of the daemon start or of a disk or connection
+    ///   change, and while a debt is open with no drop yet; otherwise at most
+    ///   once per window): a debt open (WFBitMapT or StartingSyncT reached,
+    ///   the disk not Inconsistent since), at least one drop from that state
+    ///   since, no skip record since it opened, and that drop not already
+    ///   acted on;
+    /// - at most `RECREATE_MAX_PER_BOOT` per boot;
+    /// - the status read again after the log still shows the shape; the
+    ///   controller checks it once more right before the delete
+    ///   (`drbd::guarded_recreate`), and a refusal there changes nothing.
+    async fn recreate_returner_connection(&mut self, status: &DrbdStatus) -> bool {
+        // Arbitrated mode only: in fate-shared mode freeze mode reconnects
+        // two seconds after a drop, too close for this step, and the mode is
+        // untested; the resync-skip detection covers it.
+        if !self.arbitrated {
+            if self
+                .log_pace
+                .due("recreate_connection_mode", Duration::from_secs(3600))
+            {
+                debug!(
+                    heal_event = "resync_skip",
+                    action = "recreate_connection",
+                    "connection re-creation is arbitrated-only; the resync-skip detection \
+                        covers this fate-shared pool"
+                );
+            }
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let seen = (status.disk, status.connection);
+        if self.recreate_seen.is_some_and(|s| s != seen) {
+            self.recreate_scan_until = Some(now + RECREATE_SCAN_WINDOW);
+        }
+        self.recreate_seen = Some(seen);
+        // Connecting only: DRBD goes there by itself after a drop, and a
+        // StandAlone resource belongs to a split-brain or an operator.
+        let shape = crate::drbd::recreate_shape_ok;
+        if !shape(status) || self.iscsi.is_active() {
+            return false;
+        }
+        let owned = [
+            &self.marker_path,
+            &self.discard_request_path,
+            &self.offer_path,
+            &self.latch_path,
+            &self.boundary_path,
+        ]
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
+        if owned
+            || self.skip_record() != SkipRecord::Absent
+            || self.standalone_since.is_some()
+            || self.steer_restore_at.is_some()
+        {
+            return false;
+        }
+        // The kernel log every pass while a drop can matter (see
+        // `RECREATE_SCAN_WINDOW`), otherwise at most twice a minute. The rig
+        // shape (a drop within seconds of the boot connect) falls in the
+        // window after the daemon start or after the disk went Outdated at
+        // the first handshake, so it is read on the first pass after it.
+        let in_window = self.recreate_armed
+            || self.recreate_scan_until.is_some_and(|t| now < t)
+            || self
+                .recreate_scan_at
+                .is_none_or(|t| t.elapsed() >= RECREATE_SCAN_WINDOW);
+        if !in_window {
+            return false;
+        }
+        self.recreate_scan_at = Some(now);
+        let Ok(scan) = self.drbd.resync_skip_scan().await else {
+            return false;
+        };
+        self.recreate_armed =
+            scan.owed_open && scan.skip_evidence.is_empty() && scan.owed_drops == 0;
+        if !scan.owed_open || !scan.skip_evidence.is_empty() || scan.owed_drops == 0 {
+            return false;
+        }
+        // The drop as this boot's kernel log names it: which debt (how many
+        // opened in this boot) and which drop of it. Counted only from what
+        // the ring buffer still holds: after a wrap a drop can read as new
+        // (one more re-creation, within the cap) or as one already handled
+        // (no re-creation; the resync-skip backstop remains).
+        let drop = (scan.owed_openings, scan.owed_drops);
+        let (filed, filed_last) = std::fs::read_to_string(&self.recreate_path)
+            .map(|t| parse_recreate_record(&t, &self.boot_id))
+            .unwrap_or((0, None));
+        let count = filed.max(self.recreate_count);
+        if self.recreate_last == Some(drop) || filed_last == Some(drop) {
+            return false;
+        }
+        if count >= RECREATE_MAX_PER_BOOT {
+            if self
+                .log_pace
+                .due("recreate_connection_cap", Duration::from_secs(600))
+            {
+                info!(
+                    heal_event = "resync_skip",
+                    action = "recreate_connection",
+                    result = "capped",
+                    count,
+                    "connection re-creation: the cap for this boot is reached; the resync-skip \
+                       detection and its invalidate remain"
+                );
+            }
+            return false;
+        }
+        match self.drbd.status().await {
+            Ok(st) if shape(&st) => {}
+            _ => return false,
+        }
+        // Counted before acting: the cap holds even if the daemon stops
+        // half-way.
+        self.recreate_count = count + 1;
+        self.recreate_last = Some(drop);
+        let _ = write_file_durably(
+            &self.recreate_path,
+            &format!(
+                "count={}\ndrop={}:{}\nboot_id={}\n",
+                count + 1,
+                drop.0,
+                drop.1,
+                self.boot_id
+            ),
+        );
+        let started = std::time::Instant::now();
+        let before = self.drbd.out_of_sync_kib().await;
+        // Re-creating the peer object puts the resource file's fencing back:
+        // the handler's flag drops first and comes back with the freeze
+        // policy, before the connect (as in `check_peer_object`).
+        self.sync_freeze_flag(false);
+        let outcome = match self.drbd.recreate_connection().await {
+            crate::drbd::RecreateOutcome::Done => {
+                self.after_peer_recreate().await;
+                "ok"
+            }
+            crate::drbd::RecreateOutcome::Refused(why) => {
+                // Nothing was deleted: nothing to repair or reconnect.
+                info!(heal_event = "resync_skip", action = "recreate_connection",
+                      result = "refused", why = %why,
+                      "connection re-creation refused before anything changed");
+                "refused"
+            }
+            crate::drbd::RecreateOutcome::FailedAfterDelete(why) => {
+                warn!(heal_event = "resync_skip", action = "recreate_connection",
+                      result = "failed", error = %why,
+                      "connection re-creation failed after the delete; restoring the peer \
+                       object and reconnecting");
+                self.repair_peer_after_failed_recreate().await;
+                "failed"
+            }
+        };
+        let after = self.drbd.out_of_sync_kib().await;
+        warn!(
+            heal_event = "resync_skip",
+            action = "recreate_connection",
+            result = outcome,
+            out_of_sync_before_kib = ?before,
+            out_of_sync_after_kib = ?after,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            count = count + 1,
+            openings = drop.0,
+            drops = drop.1,
+            "connection re-created: the owed resync toward this copy had not started when the \
+             connection dropped; a new connection object makes the next handshake decide the \
+             usual resync instead of dropping it"
+        );
+        true
+    }
+
+    /// A connection re-creation failed half-way: make sure the node ends
+    /// with a peer object and a connect attempt. The object is re-created
+    /// from the resource file when it is missing (the periodic repair's
+    /// path), otherwise `drbdadm adjust` puts back any path or option a
+    /// partial re-creation left out; then the live options and the connect.
+    /// The periodic peer-object check runs again on the next pass too.
+    async fn repair_peer_after_failed_recreate(&mut self) {
+        self.path_check_at = None;
+        match self.drbd.peer_object_missing().await {
+            Ok(true) => {
+                if let Err(e) = self.drbd.recreate_peer_object().await {
+                    warn!(heal_event = "resync_skip", action = "recreate_connection",
+                          error = %e,
+                          "re-creating the peer object after a failed re-creation failed too; \
+                           the periodic peer-object check retries");
+                    return;
+                }
+            }
+            _ => {
+                if let Err(e) = self.drbd.restore_paths().await {
+                    warn!(heal_event = "resync_skip", action = "recreate_connection",
+                          error = %e, "drbdadm adjust after a failed re-creation failed");
+                }
+            }
+        }
+        self.after_peer_recreate().await;
+    }
+
     /// The resync-skip step, early in `try_go_online` (right after the
     /// operator-discard block, before every other hold, so a hold such as the
     /// boot gate's can never keep the repair from running), and on every
@@ -18974,6 +19277,10 @@ impl StateMachine {
             SkipCheck::Unsure => true,
             SkipCheck::Skipped(scan, now) => {
                 if self.record_resync_skip(&scan).await {
+                    // The unrecorded alert already went out for this skip.
+                    if std::mem::take(&mut self.skip_unrecorded_alerted) {
+                        self.note_skip_alerted("");
+                    }
                     self.resync_skip_repair(&now, SkipInvalidated::No).await;
                     return false;
                 }
@@ -18990,7 +19297,7 @@ impl StateMachine {
                     let alert = if repaired {
                         resync_skip_repaired_alert_text(&peer)
                     } else {
-                        resync_skip_alert_text(&peer, &self.config.storage.drbd_resource, None)
+                        resync_skip_unrecorded_alert_text(&peer, &self.resync_skip_path)
                     };
                     let _ = self.send_skip_alert("resync-skip", &alert).await;
                 }
@@ -19205,16 +19512,25 @@ impl StateMachine {
         let _ = write_file_durably(&self.resync_skip_path, &kept);
     }
 
-    /// Our full resync is running and the record is about to end: the
-    /// skip's one alert, unless XAPI already has one for this record (the
-    /// record lived across passes). While connected this is the usual case:
-    /// the record ends a moment after it was written, before any notice.
-    async fn alert_skip_repaired(&mut self) {
-        if self.skip_alert_delivered().is_some() {
+    /// Our full resync is running: end the record, then raise the skip's
+    /// one alert unless XAPI already has one for this record (the record
+    /// lived across passes). While connected this is the usual case: the
+    /// record ends a moment after it was written, before any notice. The
+    /// record goes first so a slow XAPI cannot delay the clear (and the
+    /// promote that may follow in this pass); a delivered alert is noted so
+    /// a record that could not be removed is not alerted again each pass.
+    async fn forget_resync_skip_then_alert(&mut self, why: &'static str) {
+        let already = self.skip_alert_delivered().is_some();
+        self.forget_resync_skip(why);
+        if already {
             return;
         }
         let alert = resync_skip_repaired_alert_text(&self.config.node.peer);
-        let _ = self.send_skip_alert("resync-skip", &alert).await;
+        if self.send_skip_alert("resync-skip", &alert).await {
+            // Noted in the record too when it could not be removed, so a
+            // daemon restart does not send it again.
+            self.note_skip_alerted("");
+        }
     }
 
     /// Send a resync-skip alert (keyed: an undelivered one waits for XAPI
@@ -19262,8 +19578,7 @@ impl StateMachine {
         if invalidated != SkipInvalidated::No && resyncing(status) {
             match self.read_skip_scan().await {
                 Ok(scan) if !scan.invalidate_cleared => {
-                    self.alert_skip_repaired().await;
-                    self.forget_resync_skip("full resync");
+                    self.forget_resync_skip_then_alert("full resync").await;
                     return;
                 }
                 Ok(_) | Err(false) => reinvalidate = true,
@@ -19276,8 +19591,7 @@ impl StateMachine {
         if invalidated == SkipInvalidated::ThisBoot && status.disk == DiskState::UpToDate {
             match self.read_skip_scan().await {
                 Ok(scan) if !scan.owed_open && !scan.invalidate_cleared => {
-                    self.alert_skip_repaired().await;
-                    self.forget_resync_skip("full resync done");
+                    self.forget_resync_skip_then_alert("full resync done").await;
                     return;
                 }
                 Ok(_) | Err(false) => reinvalidate = true,
@@ -19323,8 +19637,7 @@ impl StateMachine {
         if held.is_none() && self.skip_invalidate(connected).await {
             match self.drbd.status().await {
                 Ok(st) if resyncing(&st) => {
-                    self.alert_skip_repaired().await;
-                    self.forget_resync_skip("full resync");
+                    self.forget_resync_skip_then_alert("full resync").await;
                     return;
                 }
                 _ => self.mark_skip_invalidated(),
@@ -35376,6 +35689,12 @@ mod tests {
         marker_at_invalidate: Mutex<Vec<bool>>,
         // `invalidate` fails (DRBD refuses it, for example during a resync).
         fail_invalidate: AtomicBool,
+        // `recreate_connection` fails half-way; whether the peer object then
+        // reads missing.
+        fail_recreate: AtomicBool,
+        peer_missing: AtomicBool,
+        // `recreate_connection` refuses before deleting anything.
+        refuse_recreate: AtomicBool,
     }
 
     impl MockDrbd {
@@ -35397,6 +35716,9 @@ mod tests {
                 skip_marker_probe: Mutex::new(None),
                 marker_at_invalidate: Mutex::new(Vec::new()),
                 fail_invalidate: AtomicBool::new(false),
+                fail_recreate: AtomicBool::new(false),
+                peer_missing: AtomicBool::new(false),
+                refuse_recreate: AtomicBool::new(false),
                 handshake: Mutex::new(None),
                 reads: Mutex::new(Vec::new()),
                 primary_called: AtomicBool::new(false),
@@ -35443,6 +35765,35 @@ mod tests {
                 .unwrap()
                 .clone()
                 .map_err(|e| anyhow::anyhow!(e))
+        }
+        async fn recreate_connection(&self) -> crate::drbd::RecreateOutcome {
+            self.record("recreate_connection");
+            if self.refuse_recreate.load(Ordering::Relaxed) {
+                return crate::drbd::RecreateOutcome::Refused("mock refusal".to_string());
+            }
+            // A new object, or a half-deleted one, is not connected.
+            self.status.lock().unwrap().connection = ConnectionState::StandAlone;
+            if self.fail_recreate.load(Ordering::Relaxed) {
+                return crate::drbd::RecreateOutcome::FailedAfterDelete(
+                    "mock drbdsetup new-path failed".to_string(),
+                );
+            }
+            crate::drbd::RecreateOutcome::Done
+        }
+        async fn out_of_sync_kib(&self) -> Option<u64> {
+            Some(1306624)
+        }
+        async fn peer_object_missing(&self) -> Result<bool> {
+            Ok(self.peer_missing.load(Ordering::Relaxed))
+        }
+        async fn recreate_peer_object(&self) -> Result<()> {
+            self.record("recreate_peer_object");
+            self.status.lock().unwrap().connection = ConnectionState::StandAlone;
+            Ok(())
+        }
+        async fn restore_paths(&self) -> Result<()> {
+            self.record("restore_paths");
+            Ok(())
         }
         async fn invalidate(&self) -> Result<()> {
             self.record("invalidate");
@@ -35657,6 +36008,21 @@ mod tests {
         }
         async fn invalidate(&self) -> Result<()> {
             self.0.invalidate().await
+        }
+        async fn recreate_connection(&self) -> crate::drbd::RecreateOutcome {
+            self.0.recreate_connection().await
+        }
+        async fn out_of_sync_kib(&self) -> Option<u64> {
+            self.0.out_of_sync_kib().await
+        }
+        async fn peer_object_missing(&self) -> Result<bool> {
+            self.0.peer_object_missing().await
+        }
+        async fn recreate_peer_object(&self) -> Result<()> {
+            self.0.recreate_peer_object().await
+        }
+        async fn restore_paths(&self) -> Result<()> {
+            self.0.restore_paths().await
         }
         async fn local_current_uuid(&self) -> Option<u64> {
             self.0.local_current_uuid().await
@@ -57090,6 +57456,8 @@ poll_interval_ms = 10
             self_bits: Some(145408),
             peer_bits: Some(7),
             invalidate_cleared: false,
+            owed_openings: 1,
+            owed_drops: 1,
         }
     }
 
@@ -58306,9 +58674,12 @@ poll_interval_ms = 10
         let _ = sm.try_go_online().await;
         assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
         assert!(started.load(Ordering::Relaxed), "served once UpToDate");
-        // A daemon restart in the same boot: nothing again.
+        // A daemon restart in the same boot, on the same record path: nothing
+        // again.
         drbd.set_status(rig_resyncing());
         let (mut again, _) = skip_sm(&drbd);
+        again.resync_skip_path = sm.resync_skip_path.clone();
+        again.boot_id = sm.boot_id.clone();
         let _ = again.try_go_online().await;
         assert!(again.skip_alerts.is_empty(), "{:?}", again.skip_alerts);
         assert_eq!(invalidates(&drbd), 1);
@@ -58344,6 +58715,441 @@ poll_interval_ms = 10
         assert_eq!(again.skip_record(), SkipRecord::Absent);
         assert!(again.skip_alerts.is_empty(), "{:?}", again.skip_alerts);
         let _ = std::fs::remove_file(&sm.resync_skip_path);
+    }
+
+    /// A skip whose record cannot be written: one alert saying the copy is
+    /// held and the record file cannot be written (no rebuild claimed), not
+    /// repeated, and no second alert once the record is written.
+    #[tokio::test]
+    async fn an_unwritable_record_is_alerted_once_as_held() {
+        use std::os::unix::fs::PermissionsExt;
+        // A read-only directory: the record reads absent, its write fails.
+        let read_only = |dir: &str, ro: bool| {
+            let mode = if ro { 0o555 } else { 0o755 };
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let dir = test_memory_path("skip-record-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        read_only(&dir, true);
+        let st = skipped_returner();
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.resync_skip_path = format!("{dir}/resync-skipped");
+        // Connected: held, no invalidate.
+        for _ in 0..3 {
+            assert!(sm.resync_skip_step(&st, true).await);
+        }
+        assert_eq!(invalidates(&drbd), 0);
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        let alert = sm.skip_alerts[0].clone();
+        assert!(alert.contains("holds this copy down") && alert.contains(&sm.resync_skip_path));
+        assert!(
+            !alert.contains("is rebuilding") && !alert.contains("Nothing to do"),
+            "{alert}"
+        );
+        // The record can be written again: recorded and repaired, no second
+        // alert for the same skip.
+        read_only(&dir, false);
+        assert!(!sm.resync_skip_step(&st, true).await);
+        assert_eq!(invalidates(&drbd), 1);
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+
+        // Disconnected and the invalidate refused: still no rebuild claimed.
+        let alone = DrbdStatus {
+            connection: ConnectionState::StandAlone,
+            peer_disk: None,
+            peer_role: None,
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(alone.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        drbd.fail_invalidate.store(true, Ordering::Relaxed);
+        let (mut sm, _) = skip_sm(&drbd);
+        let dir = test_memory_path("skip-record-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        read_only(&dir, true);
+        sm.resync_skip_path = format!("{dir}/resync-skipped");
+        assert!(sm.resync_skip_step(&alone, true).await);
+        assert_eq!(invalidates(&drbd), 1);
+        assert_eq!(sm.skip_alerts.len(), 1);
+        assert!(
+            !sm.skip_alerts[0].contains("is rebuilding"),
+            "{:?}",
+            sm.skip_alerts
+        );
+        read_only(&dir, false);
+    }
+
+    /// A state machine for the connection re-creation: arbitrated (the only
+    /// mode it acts in), private paths, target not started.
+    fn recreate_sm(drbd: &std::sync::Arc<MockDrbd>) -> (StateMachine, std::sync::Arc<AtomicBool>) {
+        let (mut sm, started) = skip_sm(drbd);
+        sm.arbitrated = true;
+        (sm, started)
+    }
+
+    /// The re-creation trial's first run, the returner right after the drop:
+    /// its kernel log through the drop, and its status then (verbatim).
+    fn recreate_drop() -> (DrbdStatus, crate::drbd::SkipScan) {
+        use crate::drbd::resync_skip_fixtures::{RECREATE_R1, RECREATE_R1_AFTER_DROP_STATUS};
+        let mut log = Vec::new();
+        for l in RECREATE_R1.lines() {
+            log.push(l);
+            if l.contains("repl( WFBitMapT -> Off )") {
+                break;
+            }
+        }
+        (
+            sample(RECREATE_R1_AFTER_DROP_STATUS),
+            capture_scan(&log.join("\n")),
+        )
+    }
+
+    fn recreates(drbd: &MockDrbd) -> usize {
+        drbd.calls()
+            .iter()
+            .filter(|c| **c == "recreate_connection")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_returner_whose_connection_dropped_before_its_resync_is_re_created() {
+        let (st, scan) = recreate_drop();
+        assert_eq!(
+            (st.role, st.disk, st.connection),
+            (
+                Role::Secondary,
+                DiskState::Outdated,
+                ConnectionState::Connecting
+            )
+        );
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(scan);
+        let (mut sm, started) = recreate_sm(&drbd);
+        assert!(!sm.try_go_online().await.unwrap());
+        let calls = drbd.calls();
+        let at = calls
+            .iter()
+            .position(|c| *c == "recreate_connection")
+            .expect("re-created");
+        assert!(
+            calls[at..].contains(&"connect"),
+            "then connected: {calls:?}"
+        );
+        assert!(!calls.contains(&"primary") && !calls.contains(&"disconnect"));
+        assert!(!started.load(Ordering::Relaxed));
+        let record = std::fs::read_to_string(&sm.recreate_path).unwrap();
+        assert!(
+            record.contains("count=1") && record.contains("drop=1:1"),
+            "{record}"
+        );
+        // The same drop is not acted on again: later passes, a daemon restart.
+        drbd.set_status(st.clone());
+        let _ = sm.try_go_online().await;
+        let (mut again, _) = recreate_sm(&drbd);
+        again.recreate_path = sm.recreate_path.clone();
+        again.boot_id = sm.boot_id.clone();
+        assert!(!again.recreate_returner_connection(&st).await);
+        assert_eq!(recreates(&drbd), 1);
+        assert_eq!(invalidates(&drbd), 0, "no backstop needed");
+    }
+
+    #[tokio::test]
+    async fn the_re_creation_stays_out_of_every_other_shape_and_flow() {
+        let (st, scan) = recreate_drop();
+        let shapes = [
+            (
+                "Primary",
+                DrbdStatus {
+                    role: Role::Primary,
+                    ..st.clone()
+                },
+            ),
+            (
+                "UpToDate",
+                DrbdStatus {
+                    disk: DiskState::UpToDate,
+                    ..st.clone()
+                },
+            ),
+            (
+                "Inconsistent",
+                DrbdStatus {
+                    disk: DiskState::Inconsistent,
+                    ..st.clone()
+                },
+            ),
+            (
+                "Connected",
+                DrbdStatus {
+                    connection: ConnectionState::Connected,
+                    ..st.clone()
+                },
+            ),
+            (
+                "StandAlone",
+                DrbdStatus {
+                    connection: ConnectionState::StandAlone,
+                    ..st.clone()
+                },
+            ),
+            (
+                "suspended",
+                DrbdStatus {
+                    suspended_any: true,
+                    suspended_fencing: true,
+                    ..st.clone()
+                },
+            ),
+        ];
+        for (why, shape) in shapes {
+            let drbd = std::sync::Arc::new(MockDrbd::new(shape.clone()));
+            *drbd.skip_scan.lock().unwrap() = Ok(scan.clone());
+            let (mut sm, _) = recreate_sm(&drbd);
+            assert!(!sm.recreate_returner_connection(&shape).await, "{why}");
+            assert_eq!(recreates(&drbd), 0, "{why}");
+        }
+        // A target this daemon exports (MockIscsi reads active).
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(scan.clone());
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(MockIscsi::new()),
+        );
+        sm.arbitrated = true;
+        assert!(!sm.recreate_returner_connection(&st).await, "target up");
+        // Another flow owns the copy or the connection.
+        for owner in [
+            "split-brain",
+            "discard",
+            "offer",
+            "latch",
+            "boundary",
+            "record",
+        ] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.skip_scan.lock().unwrap() = Ok(scan.clone());
+            let (mut sm, _) = recreate_sm(&drbd);
+            let path = match owner {
+                "split-brain" => sm.marker_path.clone(),
+                "discard" => sm.discard_request_path.clone(),
+                "offer" => sm.offer_path.clone(),
+                "latch" => sm.latch_path.clone(),
+                "boundary" => sm.boundary_path.clone(),
+                _ => sm.resync_skip_path.clone(),
+            };
+            if owner == "record" {
+                write_skip_record(&sm);
+            } else {
+                std::fs::write(&path, "x").unwrap();
+            }
+            assert!(!sm.recreate_returner_connection(&st).await, "{owner}");
+            assert_eq!(recreates(&drbd), 0, "{owner}");
+            let _ = std::fs::remove_file(&path);
+        }
+        // A StandAlone heal or a steered connect's path restore under way.
+        for which in ["standalone", "steer"] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.skip_scan.lock().unwrap() = Ok(scan.clone());
+            let (mut sm, _) = recreate_sm(&drbd);
+            if which == "standalone" {
+                sm.standalone_since = Some(std::time::Instant::now());
+            } else {
+                sm.steer_restore_at = Some(std::time::Instant::now());
+            }
+            assert!(!sm.recreate_returner_connection(&st).await, "{which}");
+        }
+        // The kernel log: no drop (control run), a skip already (the backstop
+        // owns it), a drop from SyncTarget.
+        use crate::drbd::resync_skip_fixtures::{RECREATE_R2, RECREATE_R3, RESET_RETURNER};
+        let second: Vec<&str> = RECREATE_R3
+            .lines()
+            .take_while(|l| !l.contains("repl( SyncTarget -> Off )"))
+            .chain(std::iter::once(
+                RECREATE_R3
+                    .lines()
+                    .find(|l| l.contains("repl( SyncTarget -> Off )"))
+                    .unwrap(),
+            ))
+            .collect();
+        for (why, log) in [
+            ("no drop", RECREATE_R2.to_string()),
+            ("skip evidence", RESET_RETURNER.to_string()),
+            ("drop from SyncTarget", second.join("\n")),
+        ] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(&log));
+            let (mut sm, _) = recreate_sm(&drbd);
+            assert!(!sm.recreate_returner_connection(&st).await, "{why}");
+        }
+        // The status read after the log no longer shows the shape.
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(scan.clone());
+        drbd.status_script.lock().unwrap().push_back(DrbdStatus {
+            connection: ConnectionState::Connected,
+            ..st.clone()
+        });
+        let (mut sm, _) = recreate_sm(&drbd);
+        assert!(
+            !sm.recreate_returner_connection(&st).await,
+            "reconnected meanwhile"
+        );
+        assert_eq!(recreates(&drbd), 0);
+    }
+
+    #[tokio::test]
+    async fn at_most_three_re_creations_per_boot() {
+        let (st, scan) = recreate_drop();
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        let (mut sm, _) = recreate_sm(&drbd);
+        for drops in 1..=4 {
+            *drbd.skip_scan.lock().unwrap() = Ok(crate::drbd::SkipScan {
+                owed_drops: drops,
+                ..scan.clone()
+            });
+            drbd.set_status(st.clone());
+            let acted = sm.recreate_returner_connection(&st).await;
+            assert_eq!(acted, drops <= 3, "drop {drops}");
+        }
+        assert_eq!(recreates(&drbd), 3);
+        // A daemon restart in the same boot keeps the count; a reboot does not.
+        *drbd.skip_scan.lock().unwrap() = Ok(crate::drbd::SkipScan {
+            owed_drops: 5,
+            ..scan.clone()
+        });
+        let (mut again, _) = recreate_sm(&drbd);
+        again.recreate_path = sm.recreate_path.clone();
+        again.boot_id = sm.boot_id.clone();
+        assert!(!again.recreate_returner_connection(&st).await, "same boot");
+        let (mut rebooted, _) = recreate_sm(&drbd);
+        rebooted.recreate_path = sm.recreate_path.clone();
+        rebooted.boot_id = "another-boot".to_string();
+        assert!(
+            rebooted.recreate_returner_connection(&st).await,
+            "a new boot"
+        );
+    }
+
+    /// A re-creation that fails half-way still ends with a peer object and a
+    /// connect attempt.
+    #[tokio::test]
+    async fn a_failed_re_creation_restores_the_peer_object_and_connects() {
+        for missing in [true, false] {
+            let (st, scan) = recreate_drop();
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.skip_scan.lock().unwrap() = Ok(scan);
+            drbd.fail_recreate.store(true, Ordering::Relaxed);
+            drbd.peer_missing.store(missing, Ordering::Relaxed);
+            let (mut sm, _) = recreate_sm(&drbd);
+            sm.path_check_at = Some(std::time::Instant::now());
+            assert!(sm.recreate_returner_connection(&st).await);
+            let calls = drbd.calls();
+            let repair = if missing {
+                "recreate_peer_object"
+            } else {
+                "restore_paths"
+            };
+            let at = calls.iter().position(|c| *c == repair).expect(repair);
+            assert!(calls[at..].contains(&"connect"), "{missing}: {calls:?}");
+            assert!(sm.path_check_at.is_none(), "the periodic check runs again");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_consistent_returner_is_re_created_too() {
+        let (st, scan) = recreate_drop();
+        let consistent = DrbdStatus {
+            disk: DiskState::Consistent,
+            ..st
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(consistent.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(scan);
+        let (mut sm, _) = recreate_sm(&drbd);
+        assert!(sm.recreate_returner_connection(&consistent).await);
+        assert_eq!(recreates(&drbd), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fate_shared_pool_never_re_creates_the_connection() {
+        let (st, scan) = recreate_drop();
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(scan);
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.arbitrated = false;
+        assert!(!sm.recreate_returner_connection(&st).await);
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(recreates(&drbd), 0);
+        assert_eq!(
+            drbd.skip_scans.load(Ordering::Relaxed),
+            0,
+            "not even scanned"
+        );
+    }
+
+    /// A refusal before anything was deleted changes nothing: no adjust, no
+    /// re-created object, no connect.
+    #[tokio::test]
+    async fn a_refused_re_creation_changes_nothing() {
+        let (st, scan) = recreate_drop();
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(scan);
+        drbd.refuse_recreate.store(true, Ordering::Relaxed);
+        let (mut sm, _) = recreate_sm(&drbd);
+        assert!(sm.recreate_returner_connection(&st).await);
+        let calls = drbd.calls();
+        assert_eq!(calls, vec!["recreate_connection"], "{calls:?}");
+    }
+
+    /// The kernel log is read every pass while a drop can matter, otherwise
+    /// at most once per window.
+    #[tokio::test]
+    async fn the_re_creation_reads_the_kernel_log_only_when_a_drop_can_matter() {
+        use crate::drbd::resync_skip_fixtures::RECREATE_R2;
+        let (st, _) = recreate_drop();
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        // A log with nothing owed (a control run, after its resync).
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(RECREATE_R2));
+        let (mut sm, _) = recreate_sm(&drbd);
+        let scans = |d: &MockDrbd| d.skip_scans.load(Ordering::Relaxed);
+        // Right after the start: every pass.
+        for _ in 0..3 {
+            assert!(!sm.recreate_returner_connection(&st).await);
+        }
+        assert_eq!(scans(&drbd), 3);
+        // Window over, nothing changed: no read until the interval passed.
+        sm.recreate_scan_until = None;
+        for _ in 0..3 {
+            assert!(!sm.recreate_returner_connection(&st).await);
+        }
+        assert_eq!(scans(&drbd), 3);
+        sm.recreate_scan_at =
+            std::time::Instant::now().checked_sub(RECREATE_SCAN_WINDOW + Duration::from_secs(1));
+        assert!(!sm.recreate_returner_connection(&st).await);
+        assert_eq!(scans(&drbd), 4);
+        // The disk state changes (Consistent to Outdated at a handshake): every
+        // pass again.
+        let consistent = DrbdStatus {
+            disk: DiskState::Consistent,
+            ..st.clone()
+        };
+        sm.recreate_returner_connection(&consistent).await;
+        sm.recreate_returner_connection(&consistent).await;
+        assert_eq!(scans(&drbd), 6);
+        // An open debt with no drop yet keeps it every pass.
+        sm.recreate_scan_until = None;
+        *drbd.skip_scan.lock().unwrap() = Ok(crate::drbd::SkipScan {
+            owed_open: true,
+            owed_openings: 1,
+            owed_drops: 0,
+            ..Default::default()
+        });
+        sm.recreate_scan_at = None;
+        sm.recreate_returner_connection(&consistent).await;
+        sm.recreate_returner_connection(&consistent).await;
+        sm.recreate_returner_connection(&consistent).await;
+        assert_eq!(scans(&drbd), 9);
     }
 
     #[test]
