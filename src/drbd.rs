@@ -36,13 +36,15 @@ pub enum DiskState {
 /// lasts well under a minute, but a promote race can leave one side stuck there
 /// indefinitely while the peer reports Established, so replication silently
 /// runs one way. It is parsed explicitly so the stuck-WFBitMap auto-clear can
-/// see it.
+/// see it. `StartingSyncS` is the source side of a resync the peer asked for
+/// (`drbdadm invalidate` there), before the bitmap exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replication {
     Established,
     SyncSource,
     SyncTarget,
     WFBitMap,
+    StartingSyncS,
     Other,
 }
 
@@ -247,6 +249,20 @@ pub trait DrbdControl: Send + Sync {
             blocks: usize::from(pair.is_some()),
             pair,
         })
+    }
+    /// One bounded read of this boot's kernel log, walked for a resync DRBD
+    /// decided toward this copy and then never ran (see `scan_resync_skip`).
+    /// Default: nothing owed, so test doubles need not implement it.
+    async fn resync_skip_scan(&self) -> Result<SkipScan> {
+        Ok(SkipScan::default())
+    }
+    /// `drbdadm invalidate`: mark this copy Inconsistent with a full bitmap.
+    /// Connected to an UpToDate peer, DRBD starts a full resync with this
+    /// node as the target; disconnected, the copy stays Inconsistent until
+    /// the next connection resyncs it. The data blocks are not touched.
+    /// Default no-op.
+    async fn invalidate(&self) -> Result<()> {
+        Ok(())
     }
     /// This node's current DRBD generation UUID (`drbdadm show-gi`), bit 0
     /// masked. `None` when unreadable. Default `None` so test doubles need not
@@ -734,6 +750,23 @@ impl DrbdControl for DrbdController {
             blocks: handshake_block_count(&text, &self.resource),
         })
     }
+
+    async fn resync_skip_scan(&self) -> Result<SkipScan> {
+        // Bounded like the handshake read: one dmesg per call.
+        let text = crate::cmd::cmd_output_for("dmesg", &[], 10)
+            .await
+            .context("running dmesg for the DRBD resync decisions")?;
+        Ok(scan_resync_skip(&text, &self.resource))
+    }
+
+    async fn invalidate(&self) -> Result<()> {
+        warn!(resource = %self.resource,
+              "drbd invalidate (this copy becomes Inconsistent and is rebuilt by a full resync \
+               from the peer; its data blocks are not touched)");
+        // Bounded through the command choke point. Writing the full bitmap of
+        // a large device takes longer than the usual drbdadm bound.
+        crate::cmd::run_cmd_for("drbdadm", &["invalidate", &self.resource], 60).await
+    }
 }
 
 /// Parse the `path` lines of `drbdsetup events2 --now` output:
@@ -942,6 +975,227 @@ pub fn parse_handshake_gen(dmesg: &str, resource: &str) -> Option<HandshakeGen> 
         }
     }
     latest
+}
+
+/// The `uuid_compare` verdict DRBD 9.2.16 reaches on a reconnect between
+/// nodes with the same current generation, which drops a resync decided on
+/// an earlier connection (evidence only, never the trigger).
+const NO_SYNC_RECONNECTED: &str = "uuid_compare()=no-sync by rule=reconnected";
+
+/// The kernel message DRBD logs when it clears the bitmap and its base
+/// generation (evidence only).
+const CLEARED_BITMAP: &str = "cleared bm UUID and bitmap";
+
+/// The resource-level message DRBD prints when a copy that is not UpToDate
+/// is forced Primary (`drbdadm primary --force`), after it sets the copy
+/// UpToDate. Whoever forced it took that copy as it is: it closes the debt.
+const FORCED_UP_TO_DATE: &str = "Forced to consider local data as UpToDate!";
+
+/// At most this many skip-evidence lines are kept (a flapping link repeats
+/// them on every reconnect).
+const SKIP_EVIDENCE_MAX: usize = 16;
+
+/// What this boot's kernel log says about a resync DRBD decided toward this
+/// copy (see `scan_resync_skip`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkipScan {
+    /// A resync toward this copy was decided (replication into `WFBitMapT`
+    /// or `StartingSyncT` while the local disk was not already Inconsistent)
+    /// and the local disk has not gone Inconsistent since. DRBD only leaves
+    /// Inconsistent through a resync, so a resync that ran always closes it.
+    pub owed_open: bool,
+    /// The latest decision that opened it: the preceding handshake `self`,
+    /// `peer` and `uuid_compare()=` records, then the transition record.
+    /// Empty when nothing is owed.
+    pub owed_evidence: Vec<String>,
+    /// The `no-sync by rule=reconnected` and `cleared bm UUID and bitmap`
+    /// records seen while it was open (evidence only, bounded).
+    pub skip_evidence: Vec<String>,
+    /// `bits:` of the last `self` and `peer` handshake records.
+    pub self_bits: Option<u64>,
+    pub peer_bits: Option<u64>,
+    /// After the last transition into `StartingSyncT` (the start of an
+    /// invalidate's full resync) and before the next transition into
+    /// Inconsistent, a reconnect cleared the bitmap: that full bitmap is
+    /// gone, so a resync that follows is not the full one.
+    pub invalidate_cleared: bool,
+}
+
+impl SkipScan {
+    /// The verdict: the resync was skipped when one is owed and DRBD
+    /// nonetheless calls this copy UpToDate. `disk` must be read before the
+    /// kernel log the scan walked, so a resync that starts in between shows
+    /// in the log (and closes it) rather than being missed.
+    pub fn skipped(&self, disk: DiskState) -> bool {
+        self.owed_open && disk == DiskState::UpToDate
+    }
+
+    /// How many `no-sync by rule=reconnected` records the evidence holds.
+    pub fn no_sync_count(&self) -> usize {
+        self.skip_evidence
+            .iter()
+            .filter(|l| l.ends_with(NO_SYNC_RECONNECTED))
+            .count()
+    }
+
+    /// How many `cleared bm UUID and bitmap` records the evidence holds.
+    pub fn cleared_bm_count(&self) -> usize {
+        self.skip_evidence
+            .iter()
+            .filter(|l| l.contains(CLEARED_BITMAP))
+            .count()
+    }
+
+    /// The decision record and the first skip record, on one line.
+    pub fn evidence_line(&self) -> String {
+        let owed = self.owed_evidence.last().map_or("-", String::as_str);
+        match self.skip_evidence.first() {
+            Some(skip) => format!("{owed} | {skip}"),
+            None => owed.to_string(),
+        }
+    }
+}
+
+/// The `from` and `to` of a kernel state-change field such as
+/// `disk( Outdated -> Inconsistent )` in `message`, for the field token
+/// `field` (`disk(`, `repl(`). Whole tokens only, so `disk(` never matches
+/// `pdsk(`.
+fn state_change<'a>(message: &'a str, field: &str) -> Option<(&'a str, &'a str)> {
+    let toks: Vec<&str> = message.split_whitespace().collect();
+    let i = toks.iter().position(|t| *t == field)?;
+    match toks.get(i + 1..i + 4)? {
+        [from, "->", to] => Some((from, to)),
+        _ => None,
+    }
+}
+
+/// Walk this boot's kernel log in order for a resync DRBD decided toward
+/// this copy that never ran. Only records of `<resource>/0` count, with the
+/// same record filter as `parse_handshake_gen`, so a raw (`[ 13.2] drbd ...`)
+/// and a syslog-prefixed line parse alike.
+///
+/// A local replication transition into `WFBitMapT` or `StartingSyncT` opens
+/// the debt, unless the local disk is already Inconsistent then (a disk that
+/// is Inconsistent can only become UpToDate through a resync). The device's
+/// own transition into Inconsistent (`disk( X -> Inconsistent )`, never the
+/// peer's `pdsk(`) closes it: the resync started. So does any transition out
+/// of Inconsistent (`disk( Inconsistent -> X )`): the disk was Inconsistent,
+/// so a debt opened before it would already have been closed, and one that
+/// reads open was opened on a disk already Inconsistent whose earlier
+/// transition the ring buffer no longer holds. So does a replication
+/// transition into `WFBitMapS`, `StartingSyncS` or `SyncSource` while no
+/// skip record has been seen since the debt opened: a later handshake made
+/// this copy the source and the bitmaps were intact, so the resync covers
+/// the regions owed. After a skip it does not: the cleared bits are gone,
+/// and a later source phase only covers the bits set since. So
+/// does the resource-level `Forced to consider local data as UpToDate!` (an
+/// operator's or the daemon's attested force of this copy). DRBD 9.2.16 can drop an
+/// owed resync on a later reconnect (`no-sync by rule=reconnected`, both
+/// bitmaps cleared, the copy set `Outdated -> UpToDate`); those records are
+/// kept as evidence only, the debt alone decides.
+pub fn scan_resync_skip(dmesg: &str, resource: &str) -> SkipScan {
+    let volume = format!("{resource}/0");
+    let mut scan = SkipScan::default();
+    let mut inconsistent = false;
+    // Inside an invalidate's window: after a StartingSyncT, before the next
+    // transition into Inconsistent.
+    let mut after_starting_sync_t = false;
+    let (mut last_self, mut last_peer, mut last_compare): (
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+    ) = (None, None, None);
+    for line in dmesg.lines() {
+        let Some((_, record)) = line.split_once("drbd ") else {
+            continue;
+        };
+        let Some((context, message)) = record.split_once(": ") else {
+            continue;
+        };
+        let message = message.trim();
+        if context.trim() == resource && message == FORCED_UP_TO_DATE {
+            scan.owed_open = false;
+            scan.owed_evidence.clear();
+            scan.skip_evidence.clear();
+            continue;
+        }
+        if record.split_whitespace().next() != Some(volume.as_str()) {
+            continue;
+        }
+        let record = record.trim();
+        if let Some((is_peer, rec)) = parse_gen_line(message) {
+            if is_peer {
+                last_peer = Some(record);
+                scan.peer_bits = Some(rec.bits);
+            } else {
+                last_self = Some(record);
+                scan.self_bits = Some(rec.bits);
+            }
+            continue;
+        }
+        if message.starts_with("uuid_compare()=") {
+            last_compare = Some(record);
+            if scan.owed_open
+                && message == NO_SYNC_RECONNECTED
+                && scan.skip_evidence.len() < SKIP_EVIDENCE_MAX
+            {
+                scan.skip_evidence.push(record.to_string());
+            }
+            continue;
+        }
+        if message.starts_with(CLEARED_BITMAP) {
+            if after_starting_sync_t {
+                scan.invalidate_cleared = true;
+            }
+            if scan.owed_open && scan.skip_evidence.len() < SKIP_EVIDENCE_MAX {
+                scan.skip_evidence.push(record.to_string());
+            }
+            continue;
+        }
+        // The device's own record (`<res>/0 drbd0:`), not a peer device's.
+        if context.split_whitespace().count() == 2
+            && let Some((from, to)) = state_change(message, "disk(")
+        {
+            inconsistent = to == "Inconsistent";
+            if inconsistent {
+                after_starting_sync_t = false;
+            }
+            if inconsistent || from == "Inconsistent" {
+                scan.owed_open = false;
+                scan.owed_evidence.clear();
+                scan.skip_evidence.clear();
+            }
+        }
+        if let Some((_, to)) = state_change(message, "repl(")
+            && to == "StartingSyncT"
+        {
+            after_starting_sync_t = true;
+            scan.invalidate_cleared = false;
+        }
+        if let Some((_, to)) = state_change(message, "repl(")
+            && matches!(to, "WFBitMapS" | "StartingSyncS" | "SyncSource")
+            && scan.skip_evidence.is_empty()
+        {
+            scan.owed_open = false;
+            scan.owed_evidence.clear();
+            scan.skip_evidence.clear();
+        }
+        if let Some((_, to)) = state_change(message, "repl(")
+            && matches!(to, "WFBitMapT" | "StartingSyncT")
+            && !inconsistent
+        {
+            if !scan.owed_open {
+                scan.skip_evidence.clear();
+            }
+            scan.owed_open = true;
+            scan.owed_evidence = [last_self, last_peer, last_compare, Some(record)]
+                .into_iter()
+                .flatten()
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    scan
 }
 
 /// Parse `drbdadm status` text output. Handles both DRBD 8.4 and 9.x formats:
@@ -1222,6 +1476,7 @@ fn parse_replication(s: &str) -> Option<Replication> {
         "SyncSource" => Some(Replication::SyncSource),
         "SyncTarget" => Some(Replication::SyncTarget),
         "WFBitMapS" | "WFBitMapT" => Some(Replication::WFBitMap),
+        "StartingSyncS" => Some(Replication::StartingSyncS),
         // Connected, WFConnection and the like are connection states, not
         // replication states.
         "Connected" | "Connecting" | "WFConnection" | "WFReportParams" | "StandAlone"
@@ -2146,4 +2401,557 @@ exists path name:twinstor-data peer-node-id:1 conn-name:twinstor-2 local:ipv4:19
             BackingMeta::Destroyed
         );
     }
+
+    use super::resync_skip_fixtures::*;
+
+    /// The raw `dmesg` form of a syslog capture: everything before the
+    /// kernel timestamp dropped.
+    fn raw_dmesg(syslog: &str) -> String {
+        syslog
+            .lines()
+            .map(|l| l.split_once("kernel: ").map_or(l, |(_, raw)| raw))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_resync_dropped_by_a_reconnect_reads_as_skipped() {
+        let scan = scan_resync_skip(RESET_RETURNER, "twinstor-data");
+        assert!(scan.owed_open);
+        assert!(scan.skipped(DiskState::UpToDate));
+        assert_eq!(scan.self_bits, Some(145408));
+        assert_eq!(scan.peer_bits, Some(7));
+        assert_eq!(scan.no_sync_count(), 1);
+        assert_eq!(scan.cleared_bm_count(), 1);
+        // The decision and the handshake that made it.
+        assert_eq!(scan.owed_evidence.len(), 4, "{:?}", scan.owed_evidence);
+        assert!(scan.owed_evidence[0].contains(": self 50290AED3853EBFE:"));
+        assert!(scan.owed_evidence[1].contains(": peer 50290AED3853EBFE:"));
+        assert!(
+            scan.owed_evidence[2]
+                .ends_with("uuid_compare()=target-if-both-failed by rule=lost-quorum")
+        );
+        assert!(scan.owed_evidence[3].ends_with("repl( Off -> WFBitMapT ) [remote]"));
+        let line = scan.evidence_line();
+        assert!(line.contains("WFBitMapT") && line.contains("no-sync by rule=reconnected"));
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn an_owed_resync_on_a_copy_not_uptodate_is_no_skip() {
+        let scan = scan_resync_skip(RESET_RETURNER, "twinstor-data");
+        for disk in [
+            DiskState::Outdated,
+            DiskState::Consistent,
+            DiskState::Inconsistent,
+            DiskState::Diskless,
+            DiskState::Unknown,
+        ] {
+            assert!(!scan.skipped(disk), "{disk:?}");
+        }
+        // Read before the skip: the resync is owed and DRBD still calls the
+        // copy Outdated, which is a resync in progress, not a skip.
+        let before: Vec<&str> = RESET_RETURNER
+            .lines()
+            .take_while(|l| !l.contains("no-sync"))
+            .collect();
+        let scan = scan_resync_skip(&before.join("\n"), "twinstor-data");
+        assert!(scan.owed_open && scan.skip_evidence.is_empty());
+        assert!(!scan.skipped(DiskState::Outdated));
+    }
+
+    #[test]
+    fn the_flap_capture_reads_as_skipped() {
+        let scan = scan_resync_skip(FLAP_RETURNER, "twinstor-data");
+        assert!(scan.skipped(DiskState::UpToDate), "{scan:?}");
+        assert_eq!(scan.self_bits, Some(140288));
+        assert_eq!(scan.no_sync_count(), 1);
+        assert_eq!(scan.cleared_bm_count(), 1);
+    }
+
+    #[test]
+    fn a_resync_that_started_closes_the_debt_whatever_follows() {
+        // The second WFBitMapT finds the disk Inconsistent already: DRBD can
+        // only leave that state through a resync, so it opens nothing, and
+        // the no-sync before it is no evidence.
+        let scan = scan_resync_skip(BROKEN_RESYNC_RETURNER, "twinstor-data");
+        assert!(!scan.owed_open, "{scan:?}");
+        assert!(!scan.skipped(DiskState::UpToDate));
+        assert!(scan.owed_evidence.is_empty() && scan.skip_evidence.is_empty());
+    }
+
+    #[test]
+    fn a_real_resync_reads_clean() {
+        for log in [SURVIVOR_REAL_RESYNC, FS_RETURN] {
+            let scan = scan_resync_skip(log, "twinstor-data");
+            assert!(
+                !scan.owed_open && !scan.skipped(DiskState::UpToDate),
+                "{scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_resync_source_side_owes_nothing() {
+        let scan = scan_resync_skip(RESYNC_SOURCE_SIDE, "twinstor-data");
+        assert!(
+            !scan.owed_open && !scan.skipped(DiskState::UpToDate),
+            "{scan:?}"
+        );
+        assert!(
+            scan.skip_evidence.is_empty(),
+            "no-sync while nothing is owed"
+        );
+        assert_eq!((scan.self_bits, scan.peer_bits), (Some(2), Some(2)));
+    }
+
+    #[test]
+    fn raw_and_syslog_prefixes_read_alike() {
+        for log in [RESET_RETURNER, SURVIVOR_REAL_RESYNC, FS_RETURN] {
+            let raw = raw_dmesg(log);
+            assert!(
+                raw.lines()
+                    .filter(|l| !l.is_empty())
+                    .all(|l| l.starts_with('[')),
+                "{raw}"
+            );
+            assert_eq!(
+                scan_resync_skip(&raw, "twinstor-data"),
+                scan_resync_skip(log, "twinstor-data")
+            );
+        }
+        assert!(
+            scan_resync_skip(&raw_dmesg(RESET_RETURNER), "twinstor-data")
+                .skipped(DiskState::UpToDate)
+        );
+    }
+
+    #[test]
+    fn other_resources_and_volumes_are_ignored() {
+        let clean = SkipScan::default();
+        assert_eq!(scan_resync_skip(RESET_RETURNER, "twinstor-other"), clean);
+        assert_eq!(scan_resync_skip(RESET_RETURNER, "twinstor-dat"), clean);
+        let volume_1 = RESET_RETURNER.replace("twinstor-data/0", "twinstor-data/1");
+        assert_eq!(scan_resync_skip(&volume_1, "twinstor-data"), clean);
+        // A skip on another volume does not leak into volume 0's real resync.
+        let mixed = format!("{volume_1}\n{SURVIVOR_REAL_RESYNC}");
+        assert!(!scan_resync_skip(&mixed, "twinstor-data").owed_open);
+    }
+
+    #[test]
+    fn starting_sync_as_target_opens_the_debt_too() {
+        // The record of the capture with the replication state DRBD enters
+        // first on an invalidate.
+        let log =
+            RESET_RETURNER.replace("repl( Off -> WFBitMapT )", "repl( Off -> StartingSyncT )");
+        assert!(scan_resync_skip(&log, "twinstor-data").skipped(DiskState::UpToDate));
+        // The source side does not.
+        let log =
+            RESET_RETURNER.replace("repl( Off -> WFBitMapT )", "repl( Off -> StartingSyncS )");
+        assert!(!scan_resync_skip(&log, "twinstor-data").owed_open);
+        // A transition out of WFBitMapT is not one into it.
+        assert!(state_change("repl( WFBitMapT -> Off )", "repl(") == Some(("WFBitMapT", "Off")));
+        assert!(
+            state_change(
+                "pdsk( Outdated -> Inconsistent ) repl( WFBitMapS -> SyncSource )",
+                "disk("
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_resync_resumed_on_a_disk_already_inconsistent_reads_clean() {
+        // Before the final transition the debt reads open: nothing in the
+        // buffer says the disk was Inconsistent when WFBitMapT came.
+        let cut: Vec<&str> = WRAPPED_RESUMED_RESYNC
+            .lines()
+            .take_while(|l| !l.contains("Inconsistent -> UpToDate"))
+            .collect();
+        assert!(scan_resync_skip(&cut.join("\n"), "twinstor-data").owed_open);
+        // The transition out of Inconsistent closes it.
+        let scan = scan_resync_skip(WRAPPED_RESUMED_RESYNC, "twinstor-data");
+        assert!(
+            !scan.owed_open && !scan.skipped(DiskState::UpToDate),
+            "{scan:?}"
+        );
+    }
+
+    #[test]
+    fn a_forced_copy_owes_nothing() {
+        // The returner's debt is open (bitmap exchange broken), then the copy
+        // is forced. The force line is spliced from another capture: no
+        // capture holds a force over an open debt.
+        let open: Vec<&str> = RESET_RETURNER
+            .lines()
+            .take_while(|l| !l.contains("no-sync"))
+            .collect();
+        let open = open.join("\n");
+        assert!(scan_resync_skip(&open, "twinstor-data").owed_open);
+        let forced = format!("{open}\n{FORCE_LINE}\n");
+        let scan = scan_resync_skip(&forced, "twinstor-data");
+        assert!(!scan.owed_open && scan.owed_evidence.is_empty(), "{scan:?}");
+        // Another resource's force does not count.
+        let other = format!(
+            "{open}\n{}\n",
+            FORCE_LINE.replace("twinstor-data:", "twinstor-other:")
+        );
+        assert!(scan_resync_skip(&other, "twinstor-data").owed_open);
+    }
+
+    #[test]
+    fn a_copy_a_later_handshake_made_the_source_owes_nothing() {
+        // Before it became the source the debt reads open.
+        let cut: Vec<&str> = LOSER_TURNED_SOURCE
+            .lines()
+            .take_while(|l| !l.contains("WFBitMapS"))
+            .collect();
+        assert!(scan_resync_skip(&cut.join("\n"), "twinstor-data").owed_open);
+        let scan = scan_resync_skip(LOSER_TURNED_SOURCE, "twinstor-data");
+        assert!(
+            !scan.owed_open && !scan.skipped(DiskState::UpToDate),
+            "{scan:?}"
+        );
+    }
+
+    #[test]
+    fn a_skip_stays_owed_through_a_later_source_phase() {
+        // The whole boot: after the skip this copy became the source over
+        // the survivor's bits, which are not the regions the skip cleared.
+        let scan = scan_resync_skip(RESET_RETURNER_WHOLE_BOOT, "twinstor-data");
+        assert!(RESET_RETURNER_WHOLE_BOOT.contains("repl( WFBitMapS -> SyncSource )"));
+        assert!(scan.owed_open, "{scan:?}");
+        assert!(scan.skipped(DiskState::UpToDate));
+        assert!(scan.no_sync_count() >= 1);
+    }
+
+    #[test]
+    fn an_invalidate_whose_bitmap_a_reconnect_cleared_is_marked() {
+        // StartingSyncT (the invalidate) then a reconnect that clears the
+        // bitmap before any Inconsistent: the full bitmap is gone. The
+        // StartingSyncT record is the capture's WFBitMapT record with the
+        // state an invalidate enters (no capture holds one).
+        let cleared =
+            RESET_RETURNER.replace("repl( Off -> WFBitMapT )", "repl( Off -> StartingSyncT )");
+        assert!(scan_resync_skip(&cleared, "twinstor-data").invalidate_cleared);
+        // StartingSyncT then Inconsistent (the full resync started): not.
+        let ran = SURVIVOR_REAL_RESYNC
+            .replace("repl( Off -> WFBitMapT )", "repl( Off -> StartingSyncT )");
+        let scan = scan_resync_skip(&ran, "twinstor-data");
+        assert!(!scan.invalidate_cleared && !scan.owed_open, "{scan:?}");
+        // A clear without an invalidate before it is no invalidate's.
+        assert!(!scan_resync_skip(RESET_RETURNER, "twinstor-data").invalidate_cleared);
+    }
+
+    #[test]
+    fn the_rig_skip_reads_skipped_until_the_invalidate_starts_the_full_resync() {
+        let before: Vec<&str> = RIG_SKIP_THEN_INVALIDATE
+            .lines()
+            .take_while(|l| !l.contains("[invalidate]"))
+            .collect();
+        let scan = scan_resync_skip(&before.join("\n"), "twinstor-data");
+        assert!(scan.skipped(DiskState::UpToDate), "{scan:?}");
+        assert_eq!(scan.self_bits, Some(342016));
+        let scan = scan_resync_skip(RIG_SKIP_THEN_INVALIDATE, "twinstor-data");
+        assert!(!scan.owed_open && !scan.invalidate_cleared, "{scan:?}");
+    }
+
+    #[test]
+    fn starting_sync_source_is_parsed() {
+        assert_eq!(
+            parse_replication("StartingSyncS"),
+            Some(Replication::StartingSyncS)
+        );
+        assert_eq!(parse_replication("StartingSyncT"), Some(Replication::Other));
+    }
+}
+
+/// Kernel-log captures of the lab rigs for the resync-skip scan, shared with
+/// the state machine's tests.
+#[cfg(test)]
+pub(crate) mod resync_skip_fixtures {
+    // Resync-skip scan. Every capture below is copied verbatim from the lab
+    // kernel logs (only records of the resource's volume 0 and the role
+    // changes kept, in order).
+
+    /// Arbitrated rig, a host back from a hard reset while Primary (syslog prefix), up to the skip: WFBitMapT, the link breaks, then no-sync by rule=reconnected sets it Outdated -> UpToDate.
+    pub(crate) const RESET_RETURNER: &str = r#"
+2026-11-20T07:17:19.082307+01:00 twinstor-2 kernel: [    9.329873] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+2026-11-20T07:17:19.090771+01:00 twinstor-2 kernel: [    9.340111] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+2026-11-20T07:17:22.974763+01:00 twinstor-2 kernel: [   13.222885] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+2026-11-20T07:17:22.974777+01:00 twinstor-2 kernel: [   13.222887] drbd twinstor-data/0 drbd0 twinstor-1: self 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:145408 flags:22
+2026-11-20T07:17:22.974778+01:00 twinstor-2 kernel: [   13.222889] drbd twinstor-data/0 drbd0 twinstor-1: peer 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:0 flags:1120
+2026-11-20T07:17:22.974779+01:00 twinstor-2 kernel: [   13.222890] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+2026-11-20T07:17:22.974779+01:00 twinstor-2 kernel: [   13.222892] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+2026-11-20T07:17:22.982760+01:00 twinstor-2 kernel: [   13.232798] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+2026-11-20T07:17:22.982761+01:00 twinstor-2 kernel: [   13.232800] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+2026-11-20T07:17:22.982762+01:00 twinstor-2 kernel: [   13.232806] drbd twinstor-data/0 drbd0: Setting exposed data uuid: 50290AED3853EBFE
+2026-11-20T07:17:23.086970+01:00 twinstor-2 kernel: [   13.336615] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+2026-11-20T07:17:32.379005+01:00 twinstor-2 kernel: [   22.626583] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+2026-11-20T07:17:32.379021+01:00 twinstor-2 kernel: [   22.626586] drbd twinstor-data/0 drbd0 twinstor-1: self 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:145408 flags:122
+2026-11-20T07:17:32.379022+01:00 twinstor-2 kernel: [   22.626588] drbd twinstor-data/0 drbd0 twinstor-1: peer 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:7 flags:1120
+2026-11-20T07:17:32.379023+01:00 twinstor-2 kernel: [   22.626589] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=no-sync by rule=reconnected
+2026-11-20T07:17:32.379026+01:00 twinstor-2 kernel: [   22.628457] drbd twinstor-data/0 drbd0: disk( Outdated -> UpToDate ) [remote]
+2026-11-20T07:17:32.379026+01:00 twinstor-2 kernel: [   22.628458] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> Established ) [remote]
+2026-11-20T07:17:32.379028+01:00 twinstor-2 kernel: [   22.628512] drbd twinstor-data/0 drbd0 twinstor-1: cleared bm UUID and bitmap 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE
+"#;
+
+    /// The same shape in `dmesg -T` format, on a link flap: the daemon promoted mid-WFBitMapT, then the skip.
+    pub(crate) const FLAP_RETURNER: &str = r#"
+[Fri Nov 20 02:47:18 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 02:47:18 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: self E47B9249760CD8E2:0000000000000000:E2EF72A1F642CA8E:AC7E4054D1002E7E bits:140288 flags:22
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer E47B9249760CD8E3:0000000000000000:D5009B67E9E03638:02BB17DE1B18E924 bits:0 flags:1120
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 02:47:23 2026] drbd twinstor-data/0 drbd0: Setting exposed data uuid: E47B9249760CD8E2
+[Fri Nov 20 02:47:24 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 02:47:26 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0 twinstor-1: self E47B9249760CD8E2:0000000000000000:E2EF72A1F642CA8E:AC7E4054D1002E7E bits:140288 flags:122
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer E47B9249760CD8E3:0000000000000000:D5009B67E9E03638:02BB17DE1B18E924 bits:1 flags:1120
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=no-sync by rule=reconnected
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> UpToDate ) [remote]
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> Established ) [remote]
+[Fri Nov 20 02:47:34 2026] drbd twinstor-data/0 drbd0 twinstor-1: cleared bm UUID and bitmap E47B9249760CD8E2:0000000000000000:E2EF72A1F642CA8E:AC7E4054D1002E7E
+"#;
+
+    /// A returner whose resync started (Inconsistent) and broke; the next no-sync by rule=reconnected is rescued by the disk states (Inconsistent/UpToDate).
+    pub(crate) const BROKEN_RESYNC_RETURNER: &str = r#"
+[Fri Nov 20 06:21:07 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 06:21:07 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0 twinstor-2: drbd_sync_handshake:
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0 twinstor-2: self BD1E179E56274F8A:0000000000000000:6C1968AD452C67A6:F2496922BBE15A54 bits:138240 flags:22
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0 twinstor-2: peer BD1E179E56274F8A:0000000000000000:91756489DC0195B4:08A24BC70D31B566 bits:0 flags:1120
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0 twinstor-2: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0 twinstor-2: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [connected]
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [connected]
+[Fri Nov 20 06:21:31 2026] drbd twinstor-data/0 drbd0: Setting exposed data uuid: BD1E179E56274F8A
+[Fri Nov 20 06:21:32 2026] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+[Fri Nov 20 06:21:38 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+[Fri Nov 20 06:21:38 2026] drbd twinstor-data/0 drbd0 twinstor-2: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 06:21:38 2026] drbd twinstor-data/0 drbd0 twinstor-2: Began resync as SyncTarget (will sync 552960 KB [138240 bits set]).
+[Fri Nov 20 06:21:38 2026] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( UpToDate -> DUnknown ) repl( SyncTarget -> Off )
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: drbd_sync_handshake:
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: self BD1E179E56274F8A:0000000000000000:6C1968AD452C67A6:F2496922BBE15A54 bits:138240 flags:126
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: peer BD1E179E56274F8A:0000000000000000:91756489DC0195B4:08A24BC70D31B566 bits:138240 flags:1120
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: uuid_compare()=no-sync by rule=reconnected
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: strategy = target-use-bitmap due to disk states. (Inconsistent/UpToDate)
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [connected]
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0: sending new current UUID: 44F29F9A8FEC839D
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: Began resync as SyncTarget (will sync 552960 KB [138240 bits set]).
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: Resync done (total 1 sec; paused 0 sec; 552960 K/sec)
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: updated UUIDs 44F29F9A8FEC839D:0000000000000000:73810E8073DBD92A:6C1968AD452C67A6
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+[Fri Nov 20 06:21:50 2026] drbd twinstor-data/0 drbd0 twinstor-2: repl( SyncTarget -> Established ) [resync-finished]
+"#;
+
+    /// The survivor's own later return from a reset, with a real resync.
+    pub(crate) const SURVIVOR_REAL_RESYNC: &str = r#"
+2026-11-20T07:18:48.064302+01:00 twinstor-1 kernel: [    6.998326] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+2026-11-20T07:18:48.070749+01:00 twinstor-1 kernel: [    7.011941] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+2026-11-20T07:18:51.234774+01:00 twinstor-1 kernel: [   10.172067] drbd twinstor-data/0 drbd0 twinstor-2: drbd_sync_handshake:
+2026-11-20T07:18:51.234790+01:00 twinstor-1 kernel: [   10.172070] drbd twinstor-data/0 drbd0 twinstor-2: self 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:145408 flags:22
+2026-11-20T07:18:51.234792+01:00 twinstor-1 kernel: [   10.172072] drbd twinstor-data/0 drbd0 twinstor-2: peer 437B2EAE1E737737:50290AED3853EBFE:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:1 flags:1120
+2026-11-20T07:18:51.234793+01:00 twinstor-1 kernel: [   10.172073] drbd twinstor-data/0 drbd0 twinstor-2: uuid_compare()=target-use-bitmap by rule=bitmap-peer
+2026-11-20T07:18:51.234797+01:00 twinstor-1 kernel: [   10.172125] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [connected]
+2026-11-20T07:18:51.234797+01:00 twinstor-1 kernel: [   10.172126] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [connected]
+2026-11-20T07:18:51.234811+01:00 twinstor-1 kernel: [   10.172132] drbd twinstor-data/0 drbd0: Setting exposed data uuid: 437B2EAE1E737736
+2026-11-20T07:18:51.242766+01:00 twinstor-1 kernel: [   10.182834] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+2026-11-20T07:18:51.242767+01:00 twinstor-1 kernel: [   10.182836] drbd twinstor-data/0 drbd0 twinstor-2: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+2026-11-20T07:18:51.242768+01:00 twinstor-1 kernel: [   10.182854] drbd twinstor-data/0 drbd0 twinstor-2: Began resync as SyncTarget (will sync 581632 KB [145408 bits set]).
+2026-11-20T07:18:51.586764+01:00 twinstor-1 kernel: [   10.526960] drbd twinstor-data/0 drbd0 twinstor-2: Resync done (total 1 sec; paused 0 sec; 581632 K/sec)
+2026-11-20T07:18:51.586777+01:00 twinstor-1 kernel: [   10.526966] drbd twinstor-data/0 drbd0 twinstor-2: updated UUIDs 437B2EAE1E737736:0000000000000000:1193ED295377DB10:9E1AF54F5B2CACD2
+2026-11-20T07:18:51.586779+01:00 twinstor-1 kernel: [   10.526970] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+2026-11-20T07:18:51.586779+01:00 twinstor-1 kernel: [   10.526972] drbd twinstor-data/0 drbd0 twinstor-2: repl( SyncTarget -> Established ) [resync-finished]
+2026-11-20T07:18:54.206794+01:00 twinstor-1 kernel: [   13.144189] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+"#;
+
+    /// The survivor side of the first capture: WFBitMapS, the link breaks, then no-sync by rule=reconnected.
+    pub(crate) const RESYNC_SOURCE_SIDE: &str = r#"
+2026-11-20T07:16:26.963108+01:00 twinstor-1 kernel: [  675.136272] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+2026-11-20T07:17:23.774960+01:00 twinstor-1 kernel: [  731.946614] drbd twinstor-data/0 drbd0 twinstor-2: drbd_sync_handshake:
+2026-11-20T07:17:23.774979+01:00 twinstor-1 kernel: [  731.946617] drbd twinstor-data/0 drbd0 twinstor-2: self 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:0 flags:120
+2026-11-20T07:17:23.774980+01:00 twinstor-1 kernel: [  731.946619] drbd twinstor-data/0 drbd0 twinstor-2: peer 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:145408 flags:1022
+2026-11-20T07:17:23.774981+01:00 twinstor-1 kernel: [  731.946621] drbd twinstor-data/0 drbd0 twinstor-2: uuid_compare()=source-if-both-failed by rule=lost-quorum
+2026-11-20T07:17:23.774982+01:00 twinstor-1 kernel: [  731.946622] drbd twinstor-data/0 drbd0 twinstor-2: strategy = source-use-bitmap due to disk states. (UpToDate/Consistent)
+2026-11-20T07:17:23.774987+01:00 twinstor-1 kernel: [  731.946678] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( DUnknown -> Consistent ) repl( Off -> WFBitMapS ) [connected]
+2026-11-20T07:17:23.774989+01:00 twinstor-1 kernel: [  731.947273] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( Consistent -> Outdated ) [peer-state]
+2026-11-20T07:17:23.918808+01:00 twinstor-1 kernel: [  732.092892] drbd twinstor-data/0 drbd0 twinstor-2: repl( WFBitMapS -> Off )
+2026-11-20T07:17:33.170850+01:00 twinstor-1 kernel: [  741.342215] drbd twinstor-data/0 drbd0 twinstor-2: drbd_sync_handshake:
+2026-11-20T07:17:33.170871+01:00 twinstor-1 kernel: [  741.342219] drbd twinstor-data/0 drbd0 twinstor-2: self 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:7 flags:120
+2026-11-20T07:17:33.170872+01:00 twinstor-1 kernel: [  741.342221] drbd twinstor-data/0 drbd0 twinstor-2: peer 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:145408 flags:1122
+2026-11-20T07:17:33.170873+01:00 twinstor-1 kernel: [  741.342223] drbd twinstor-data/0 drbd0 twinstor-2: uuid_compare()=no-sync by rule=reconnected
+2026-11-20T07:17:33.170877+01:00 twinstor-1 kernel: [  741.342272] drbd twinstor-data/0 drbd0 twinstor-2: repl( Off -> Established ) [connected]
+2026-11-20T07:17:33.170877+01:00 twinstor-1 kernel: [  741.342360] drbd twinstor-data/0 drbd0 twinstor-2: cleared bm UUID and bitmap 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A
+2026-11-20T07:17:33.174805+01:00 twinstor-1 kernel: [  741.347881] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( Outdated -> UpToDate ) [peer-state]
+2026-11-20T07:17:41.306796+01:00 twinstor-1 kernel: [  749.480172] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+2026-11-20T07:18:02.881642+01:00 twinstor-1 kernel: [  771.053297] drbd twinstor-data/0 drbd0 twinstor-2: drbd_sync_handshake:
+2026-11-20T07:18:02.881647+01:00 twinstor-1 kernel: [  771.053300] drbd twinstor-data/0 drbd0 twinstor-2: self 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:2 flags:120
+2026-11-20T07:18:02.881647+01:00 twinstor-1 kernel: [  771.053302] drbd twinstor-data/0 drbd0 twinstor-2: peer 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:2 flags:1120
+2026-11-20T07:18:02.881648+01:00 twinstor-1 kernel: [  771.053304] drbd twinstor-data/0 drbd0 twinstor-2: uuid_compare()=no-sync by rule=reconnected
+2026-11-20T07:18:02.881650+01:00 twinstor-1 kernel: [  771.053344] drbd twinstor-data/0 drbd0 twinstor-2: pdsk( DUnknown -> UpToDate ) repl( Off -> Established ) [connected]
+2026-11-20T07:18:02.881650+01:00 twinstor-1 kernel: [  771.053379] drbd twinstor-data/0 drbd0 twinstor-2: cleared bm UUID and bitmap 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A
+"#;
+
+    /// Fate-shared rig, plain syslog prefix, one boot of a returner with a real resync.
+    pub(crate) const FS_RETURN: &str = r#"
+Nov 19 01:20:24 xcp-ng-demo-2 kernel: [   18.986077] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+Nov 19 01:20:25 xcp-ng-demo-2 kernel: [   19.014420] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275084] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: drbd_sync_handshake:
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275087] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: self CA6C70A5DF54FF52:0000000000000000:608C2D6471FC0D04:80C6FEC83D2811EA bits:91136 flags:22
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275088] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: peer 88C0ADAF2C8C3E7F:CA6C70A5DF54FF53:3FE157139A8E4484:83A63FCB570A0670 bits:332 flags:1120
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275090] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: uuid_compare()=target-use-bitmap by rule=bitmap-peer
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275294] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275295] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.275304] drbd twinstor-data/0 drbd0: Setting exposed data uuid: 88C0ADAF2C8C3E7E
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.284321] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [receive-bitmap]
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.284323] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+Nov 19 01:20:28 xcp-ng-demo-2 kernel: [   22.284374] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: Began resync as SyncTarget (will sync 364544 KB [91136 bits set]).
+Nov 19 01:20:29 xcp-ng-demo-2 kernel: [   23.708146] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+Nov 19 01:20:32 xcp-ng-demo-2 kernel: [   26.561569] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: Resync done (total 4 sec; paused 0 sec; 91136 K/sec)
+Nov 19 01:20:32 xcp-ng-demo-2 kernel: [   26.561578] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: updated UUIDs 88C0ADAF2C8C3E7F:0000000000000000:83DD9AA6D30725DA:B4A2D392E9CD7854
+Nov 19 01:20:32 xcp-ng-demo-2 kernel: [   26.561586] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+Nov 19 01:20:32 xcp-ng-demo-2 kernel: [   26.561587] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: repl( SyncTarget -> Established ) [resync-finished]
+"#;
+
+    /// A capture that starts mid-boot, its Inconsistent transition already
+    /// out of the ring buffer: WFBitMapT on a disk already Inconsistent (no
+    /// disk line), SyncTarget, then `Inconsistent -> UpToDate`.
+    pub(crate) const WRAPPED_RESUMED_RESYNC: &str = r#"
+[Sun Oct 25 14:16:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Sun Oct 25 14:16:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 0A89FD7531FA312A:A038742D2EEFD200:40F02073243F31D6:0000000000000000 bits:456 flags:124
+[Sun Oct 25 14:16:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer B50CD052D58A8BFD:A038742D2EEFD201:027BC9BD20D4CACA:F14E3FE666842E70 bits:466 flags:1120
+[Sun Oct 25 14:16:04 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=split-brain-auto-recover by rule=bitmap-both
+[Sun Oct 25 14:16:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Sun Oct 25 14:16:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 0A89FD7531FA312A:A038742D2EEFD200:40F02073243F31D6:0000000000000000 bits:456 flags:125
+[Sun Oct 25 14:16:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer B50CD052D58A8BFD:A038742D2EEFD201:027BC9BD20D4CACA:F14E3FE666842E70 bits:468 flags:1120
+[Sun Oct 25 14:16:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=split-brain-auto-recover by rule=bitmap-both
+[Sun Oct 25 14:16:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Sun Oct 25 14:16:13 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Sun Oct 25 14:16:32 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( SyncTarget -> Off )
+[Sun Oct 25 14:16:59 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Sun Oct 25 14:16:59 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 0A89FD7531FA312A:A038742D2EEFD200:40F02073243F31D6:0000000000000000 bits:370 flags:124
+[Sun Oct 25 14:16:59 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer B50CD052D58A8BFD:A038742D2EEFD201:027BC9BD20D4CACA:F14E3FE666842E70 bits:501 flags:1120
+[Sun Oct 25 14:16:59 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=split-brain-auto-recover by rule=bitmap-both
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 0A89FD7531FA312A:A038742D2EEFD200:40F02073243F31D6:0000000000000000 bits:371 flags:125
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer B50CD052D58A8BFD:A038742D2EEFD201:027BC9BD20D4CACA:F14E3FE666842E70 bits:501 flags:1120
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=split-brain-auto-recover by rule=bitmap-both
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( WFBitMapT -> SyncTarget ) [receive-bitmap]
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0: disk( Inconsistent -> UpToDate ) [resync-finished]
+[Sun Oct 25 14:17:01 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( SyncTarget -> Established ) [resync-finished]
+"#;
+
+    /// DRBD's resource-level line after a forced promote of a copy that was
+    /// not UpToDate (from a lone promote on the arbitrated rig).
+    pub(crate) const FORCE_LINE: &str =
+        "[Thu Nov 19 12:35:31 2026] drbd twinstor-data: Forced to consider local data as UpToDate!";
+
+    /// Fate-shared rig, a split-brain loser: its own discard offer took it
+    /// into WFBitMapT, the link dropped, a later handshake made this copy the
+    /// source (bitmap-self), and the peer's promote set it UpToDate.
+    pub(crate) const LOSER_TURNED_SOURCE: &str = r#"
+[ 4628.228019] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: drbd_sync_handshake:
+[ 4628.228021] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: self 81F4C1EEEC6B23DC:1F7B56AAE66CFDA2:6958EFA353A120C8:EF0CCDB36742D14C bits:1 flags:121
+[ 4628.228023] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: peer 1F7B56AAE66CFDA3:0000000000000000:6958EFA353A120C8:7148574D042CBAA4 bits:0 flags:1120
+[ 4628.228024] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: uuid_compare()=source-use-bitmap by rule=bitmap-self
+[ 4628.228026] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: Resync direction reversed by --discard-my-data. Reverting to older data!
+[ 4628.248318] drbd twinstor-data/0 drbd0: disk( UpToDate -> Outdated ) [connected]
+[ 4628.248320] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: pdsk( Outdated -> UpToDate ) repl( Off -> WFBitMapT ) [connected]
+[ 4628.352308] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[ 4628.964018] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: drbd_sync_handshake:
+[ 4628.964021] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: self 81F4C1EEEC6B23DC:1F7B56AAE66CFDA2:6958EFA353A120C8:EF0CCDB36742D14C bits:1 flags:120
+[ 4628.964022] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: peer 1F7B56AAE66CFDA3:0000000000000000:6958EFA353A120C8:7148574D042CBAA4 bits:32 flags:1120
+[ 4628.964024] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: uuid_compare()=source-use-bitmap by rule=bitmap-self
+[ 4648.339999] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: drbd_sync_handshake:
+[ 4648.340002] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: self 81F4C1EEEC6B23DC:1F7B56AAE66CFDA2:6958EFA353A120C8:EF0CCDB36742D14C bits:1 flags:120
+[ 4648.340003] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: peer 1F7B56AAE66CFDA3:0000000000000000:6958EFA353A120C8:7148574D042CBAA4 bits:32 flags:1120
+[ 4648.340005] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: uuid_compare()=source-use-bitmap by rule=bitmap-self
+[ 4686.135944] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: drbd_sync_handshake:
+[ 4686.135947] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: self 81F4C1EEEC6B23DC:1F7B56AAE66CFDA2:6958EFA353A120C8:EF0CCDB36742D14C bits:1 flags:120
+[ 4686.135948] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: peer 1F7B56AAE66CFDA2:0000000000000000:6958EFA353A120C8:7148574D042CBAA4 bits:34 flags:1121
+[ 4686.135950] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: uuid_compare()=source-use-bitmap by rule=bitmap-self
+[ 4686.135976] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: pdsk( DUnknown -> Consistent ) repl( Off -> WFBitMapS ) [connected]
+[ 4686.144966] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: pdsk( Outdated -> Inconsistent ) repl( WFBitMapS -> SyncSource ) [receive-bitmap]
+[ 4686.182821] drbd twinstor-data/0 drbd0 xcp-ng-demo-1: pdsk( Inconsistent -> Outdated ) repl( SyncSource -> Established ) [resync-finished]
+[ 4727.985602] drbd twinstor-data/0 drbd0: disk( Outdated -> UpToDate ) [remote]
+"#;
+
+    /// The lossy run's returner, its whole boot: the skip, then, after the
+    /// survivor's reset, this stale copy became the resync source over the
+    /// survivor's own bits (WFBitMapS, SyncSource).
+    pub(crate) const RESET_RETURNER_WHOLE_BOOT: &str = r#"
+2026-11-20T07:17:19.082307+01:00 twinstor-2 kernel: [    9.329873] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+2026-11-20T07:17:19.090771+01:00 twinstor-2 kernel: [    9.340111] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+2026-11-20T07:17:22.974763+01:00 twinstor-2 kernel: [   13.222885] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+2026-11-20T07:17:22.974777+01:00 twinstor-2 kernel: [   13.222887] drbd twinstor-data/0 drbd0 twinstor-1: self 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:145408 flags:22
+2026-11-20T07:17:22.974778+01:00 twinstor-2 kernel: [   13.222889] drbd twinstor-data/0 drbd0 twinstor-1: peer 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:0 flags:1120
+2026-11-20T07:17:22.974779+01:00 twinstor-2 kernel: [   13.222890] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+2026-11-20T07:17:22.974779+01:00 twinstor-2 kernel: [   13.222892] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+2026-11-20T07:17:22.982760+01:00 twinstor-2 kernel: [   13.232798] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+2026-11-20T07:17:22.982761+01:00 twinstor-2 kernel: [   13.232800] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+2026-11-20T07:17:23.086970+01:00 twinstor-2 kernel: [   13.336615] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+2026-11-20T07:17:32.379005+01:00 twinstor-2 kernel: [   22.626583] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+2026-11-20T07:17:32.379021+01:00 twinstor-2 kernel: [   22.626586] drbd twinstor-data/0 drbd0 twinstor-1: self 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:145408 flags:122
+2026-11-20T07:17:32.379022+01:00 twinstor-2 kernel: [   22.626588] drbd twinstor-data/0 drbd0 twinstor-1: peer 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:7 flags:1120
+2026-11-20T07:17:32.379023+01:00 twinstor-2 kernel: [   22.626589] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=no-sync by rule=reconnected
+2026-11-20T07:17:32.379026+01:00 twinstor-2 kernel: [   22.628457] drbd twinstor-data/0 drbd0: disk( Outdated -> UpToDate ) [remote]
+2026-11-20T07:17:32.379026+01:00 twinstor-2 kernel: [   22.628458] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> Established ) [remote]
+2026-11-20T07:17:32.379028+01:00 twinstor-2 kernel: [   22.628512] drbd twinstor-data/0 drbd0 twinstor-1: cleared bm UUID and bitmap 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE
+2026-11-20T07:17:33.322779+01:00 twinstor-2 kernel: [   23.571420] drbd twinstor-data: role( Secondary -> Primary ) [primary]
+2026-11-20T07:17:40.490776+01:00 twinstor-2 kernel: [   30.740279] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+2026-11-20T07:18:02.882768+01:00 twinstor-2 kernel: [   52.339277] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+2026-11-20T07:18:02.882777+01:00 twinstor-2 kernel: [   52.339278] drbd twinstor-data/0 drbd0 twinstor-1: self 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:2 flags:120
+2026-11-20T07:18:02.882779+01:00 twinstor-2 kernel: [   52.339280] drbd twinstor-data/0 drbd0 twinstor-1: peer 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:2 flags:1120
+2026-11-20T07:18:02.882780+01:00 twinstor-2 kernel: [   52.339283] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=no-sync by rule=reconnected
+2026-11-20T07:18:02.882783+01:00 twinstor-2 kernel: [   52.339556] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> Established ) [remote]
+2026-11-20T07:18:02.882784+01:00 twinstor-2 kernel: [   52.339586] drbd twinstor-data/0 drbd0 twinstor-1: cleared bm UUID and bitmap 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE
+2026-11-20T07:18:18.402989+01:00 twinstor-2 kernel: [   67.858859] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+2026-11-20T07:18:34.322778+01:00 twinstor-2 kernel: [   83.778374] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> Outdated ) [outdate-async]
+2026-11-20T07:18:50.979074+01:00 twinstor-2 kernel: [  100.433466] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+2026-11-20T07:18:50.979084+01:00 twinstor-2 kernel: [  100.433468] drbd twinstor-data/0 drbd0 twinstor-1: self 437B2EAE1E737737:50290AED3853EBFE:3E0B5D2DA0DF1F2A:F16E34354E46B5CE bits:1 flags:120
+2026-11-20T07:18:50.979085+01:00 twinstor-2 kernel: [  100.433470] drbd twinstor-data/0 drbd0 twinstor-1: peer 50290AED3853EBFE:0000000000000000:44F29F9A8FEC839C:73810E8073DBD92A bits:145408 flags:1022
+2026-11-20T07:18:50.979086+01:00 twinstor-2 kernel: [  100.433471] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=source-use-bitmap by rule=bitmap-self
+2026-11-20T07:18:50.982777+01:00 twinstor-2 kernel: [  100.439821] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( Outdated -> Consistent ) repl( Off -> WFBitMapS ) [remote]
+2026-11-20T07:18:50.986761+01:00 twinstor-2 kernel: [  100.444158] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( Consistent -> Outdated ) [peer-state]
+2026-11-20T07:18:50.994781+01:00 twinstor-2 kernel: [  100.450660] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( Outdated -> Inconsistent ) repl( WFBitMapS -> SyncSource ) [receive-bitmap]
+2026-11-20T07:18:50.994782+01:00 twinstor-2 kernel: [  100.450705] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncSource (will sync 581632 KB [145408 bits set]).
+2026-11-20T07:18:51.342756+01:00 twinstor-2 kernel: [  100.798709] drbd twinstor-data/0 drbd0 twinstor-1: Resync done (total 1 sec; paused 0 sec; 581632 K/sec)
+2026-11-20T07:18:51.342761+01:00 twinstor-2 kernel: [  100.798714] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( Inconsistent -> UpToDate ) repl( SyncSource -> Established ) [resync-finished]
+"#;
+
+    /// The first arbitrated rig trial of the defence, the returner: a
+    /// natural skip (no fault injected), then the daemon's invalidate while
+    /// connected and the start of the full resync.
+    pub(crate) const RIG_SKIP_THEN_INVALIDATE: &str = r#"
+[Fri Nov 20 17:10:53 2026] drbd twinstor-data/0 drbd0: disk( Diskless -> Attaching ) [attach]
+[Fri Nov 20 17:10:53 2026] drbd twinstor-data/0 drbd0: disk( Attaching -> Consistent ) [attach]
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 8BF085A04E3B8428:0000000000000000:A738D79F73A7D33E:D01F11D3FBE8643C bits:342016 flags:22
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 8BF085A04E3B8429:0000000000000000:437B2EAE1E737736:1193ED295377DB10 bits:0 flags:1120
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=target-if-both-failed by rule=lost-quorum
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: strategy = target-use-bitmap due to disk states. (Consistent/UpToDate)
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0: disk( Consistent -> Outdated ) [remote]
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]
+[Fri Nov 20 17:10:57 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( UpToDate -> DUnknown ) repl( WFBitMapT -> Off )
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0 twinstor-1: drbd_sync_handshake:
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0 twinstor-1: self 8BF085A04E3B8428:0000000000000000:A738D79F73A7D33E:D01F11D3FBE8643C bits:342016 flags:122
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0 twinstor-1: peer 8BF085A04E3B8429:0000000000000000:437B2EAE1E737736:1193ED295377DB10 bits:2 flags:1120
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0 twinstor-1: uuid_compare()=no-sync by rule=reconnected
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> UpToDate ) [remote]
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> Established ) [remote]
+[Fri Nov 20 17:11:10 2026] drbd twinstor-data/0 drbd0 twinstor-1: cleared bm UUID and bitmap 8BF085A04E3B8428:0000000000000000:A738D79F73A7D33E:D01F11D3FBE8643C
+[Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0: disk( UpToDate -> Outdated ) [invalidate]
+[Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( Established -> StartingSyncT ) [invalidate]
+[Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0: disk( Outdated -> Inconsistent ) [start-sync]
+[Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0 twinstor-1: repl( StartingSyncT -> SyncTarget ) [start-sync]
+[Fri Nov 20 17:11:11 2026] drbd twinstor-data/0 drbd0 twinstor-1: Began resync as SyncTarget (will sync 488371640 KB [122092910 bits set]).
+"#;
 }

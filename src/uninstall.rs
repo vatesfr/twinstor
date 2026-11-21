@@ -256,6 +256,7 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
         "/var/lib/twinstor/discard-requested.tmp",
         "/var/lib/twinstor/boot-gate-peer-served.tmp",
         "/var/lib/twinstor/boot-gate-yielded.tmp",
+        "/var/lib/twinstor/resync-skipped.tmp",
         "/run/twinstor/discard-offer-parked",
         "/run/twinstor/steer-pending",
         // The recorded SR uuid: the SR is destroyed above, and a stale record
@@ -297,12 +298,13 @@ pub async fn run_uninstall(skip_confirm: bool, keep_data: bool, force: bool) -> 
     }
     // The markers that keep this copy from serving (a pending manual
     // discard; the memory of a peer seen serving, or of this node's own
-    // fence-peer yield) describe the data, which --keep-data preserves: a
-    // reinstall over the same copy must honour them.
+    // fence-peer yield; a resync DRBD skipped) describe the data, which
+    // --keep-data preserves: a reinstall over the same copy must honour them.
     for path in [
         "/var/lib/twinstor/discard-requested",
         "/var/lib/twinstor/boot-gate-peer-served",
         "/var/lib/twinstor/boot-gate-yielded",
+        "/var/lib/twinstor/resync-skipped",
     ] {
         if std::path::Path::new(path).exists() {
             if keep_data {

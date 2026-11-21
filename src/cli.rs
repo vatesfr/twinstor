@@ -1167,6 +1167,7 @@ enum UpgradeBlocker {
     NotUpToDate,
     EpisodeOpen,
     PeerNotAlive,
+    ResyncSkipOpen,
 }
 
 /// The peer daemon is alive if its `twinstor-alive` stamp exists and is no
@@ -1212,12 +1213,15 @@ async fn ensure_pool_default_ha_timeout() {
 /// Which conditions block a rolling-upgrade restart on this node right now;
 /// empty means safe. The peer-alive term serializes the two nodes; the storage
 /// terms ensure a restart cannot strand a resync or interfere with an open
-/// incident.
+/// incident. `resync_skip_open`: this copy is held down until a full resync
+/// rebuilds it (the resync-skip record), which can read Connected and
+/// both-UpToDate while it waits for the connection to settle.
 fn upgrade_apply_blockers(
     connected: bool,
     both_uptodate: bool,
     episode_open: bool,
     peer_alive: bool,
+    resync_skip_open: bool,
 ) -> Vec<UpgradeBlocker> {
     let mut v = Vec::new();
     if !connected {
@@ -1231,6 +1235,9 @@ fn upgrade_apply_blockers(
     }
     if !peer_alive {
         v.push(UpgradeBlocker::PeerNotAlive);
+    }
+    if resync_skip_open {
+        v.push(UpgradeBlocker::ResyncSkipOpen);
     }
     v
 }
@@ -1264,7 +1271,18 @@ async fn run_upgrade_apply(
     let (stamp, _live, ver) = crate::xapi::peer_daemon_alive(&config.node.peer).await;
     let peer_alive = peer_daemon_alive_from_stamp(stamp, now);
 
-    let blockers = upgrade_apply_blockers(connected, both_uptodate, episode_open, peer_alive);
+    // An active record only: the one an operator's force leaves does not
+    // hold the copy down.
+    let resync_skip_open = crate::state_machine::resync_skip_record_active(
+        &crate::state_machine::resync_skip_marker(),
+    );
+    let blockers = upgrade_apply_blockers(
+        connected,
+        both_uptodate,
+        episode_open,
+        peer_alive,
+        resync_skip_open,
+    );
     if !blockers.is_empty() {
         let detail = blockers
             .iter()
@@ -1287,6 +1305,11 @@ async fn run_upgrade_apply(
                     "the peer daemon ({}) is not alive (twinstor-alive stamp stale or missing): \
                      it may be mid-restart; restarting now would risk a dual-master",
                     config.node.peer
+                ),
+                UpgradeBlocker::ResyncSkipOpen => format!(
+                    "this copy is held down until a full resync rebuilds it ({}): DRBD marked it \
+                     current without the resync it had decided",
+                    crate::state_machine::resync_skip_marker()
                 ),
             })
             .collect::<Vec<_>>();
@@ -4236,35 +4259,47 @@ mod tests {
     fn upgrade_apply_gate_matrix() {
         use UpgradeBlocker::*;
         // All healthy (Connected, UpToDate, no episode, peer alive): no blockers.
-        assert!(upgrade_apply_blockers(true, true, false, true).is_empty());
+        assert!(upgrade_apply_blockers(true, true, false, true, false).is_empty());
         // The serialization interlock: peer daemon not alive (restarting) blocks.
         assert_eq!(
-            upgrade_apply_blockers(true, true, false, false),
+            upgrade_apply_blockers(true, true, false, false, false),
             vec![PeerNotAlive]
         );
         // Storage gates.
         assert_eq!(
-            upgrade_apply_blockers(false, true, false, true),
+            upgrade_apply_blockers(false, true, false, true, false),
             vec![NotConnected]
         );
         assert_eq!(
-            upgrade_apply_blockers(true, false, false, true),
+            upgrade_apply_blockers(true, false, false, true, false),
             vec![NotUpToDate]
         );
         assert_eq!(
-            upgrade_apply_blockers(true, true, true, true),
+            upgrade_apply_blockers(true, true, true, true, false),
             vec![EpisodeOpen]
         );
         // Double-restart race: a restarting peer takes DRBD to Connecting and
         // lets its stamp go stale, so both terms fire.
         assert_eq!(
-            upgrade_apply_blockers(false, true, false, false),
+            upgrade_apply_blockers(false, true, false, false, false),
             vec![NotConnected, PeerNotAlive]
         );
-        // Everything wrong: all four, in a fixed order.
+        // A copy held down by the resync-skip record blocks even when DRBD
+        // reads healthy (the repair waits for the connection to settle).
         assert_eq!(
-            upgrade_apply_blockers(false, false, true, false),
-            vec![NotConnected, NotUpToDate, EpisodeOpen, PeerNotAlive]
+            upgrade_apply_blockers(true, true, false, true, true),
+            vec![ResyncSkipOpen]
+        );
+        // Everything wrong: all five, in a fixed order.
+        assert_eq!(
+            upgrade_apply_blockers(false, false, true, false, true),
+            vec![
+                NotConnected,
+                NotUpToDate,
+                EpisodeOpen,
+                PeerNotAlive,
+                ResyncSkipOpen
+            ]
         );
     }
 

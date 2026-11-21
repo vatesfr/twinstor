@@ -215,6 +215,236 @@ fn yielded_behind_path_for_new() -> String {
     yielded_behind_marker()
 }
 
+/// Resync-skip record: DRBD decided a resync toward this copy, the
+/// connection broke before it ran, and a later reconnect marked the copy
+/// UpToDate without it (see `drbd::scan_resync_skip`). The copy may lack
+/// writes the peer acknowledged. While the record exists the daemon neither
+/// promotes this copy nor starts its target, and rebuilds it with
+/// `drbdadm invalidate` (a full resync from the peer). Durable, because the
+/// kernel log that proves the skip does not survive a reboot. Removed once
+/// the copy is Inconsistent or a sync target (the resync is under way) or
+/// once this node is Primary (an operator forced the copy).
+pub(crate) fn resync_skip_marker() -> String {
+    std::env::var("TWINSTOR_RESYNC_SKIP_MARKER")
+        .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/resync-skipped"))
+}
+
+/// The resync-skip record a new state machine uses (see
+/// `peer_served_path_for_new`).
+fn resync_skip_path_for_new() -> String {
+    if cfg!(test) {
+        return test_memory_path("resync-skipped");
+    }
+    resync_skip_marker()
+}
+
+/// The resync-skip record's content: this copy's generation when readable,
+/// when and in which boot the skip was found, and the kernel records that
+/// show it, on one line.
+fn resync_skip_record(current: Option<u64>, at: u64, boot_id: &str, evidence: &str) -> String {
+    let current = current.map_or("unknown".to_string(), |g| format!("{g:016X}"));
+    let evidence: String = evidence
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!(
+        "# DRBD marked this copy current without the resync it had decided; held until rebuilt\n\
+         current={current}\nat={at}\nboot_id={boot_id}\nevidence={evidence}\n"
+    )
+}
+
+/// The record's `invalidated_boot=<boot id>` line: `drbdadm invalidate`
+/// succeeded on this copy in that boot, and the copy did not yet read
+/// Inconsistent right after it. Only with it does a later resync clear the
+/// record (see `resync_skip_repair`).
+const SKIP_RECORD_INVALIDATED: &str = "invalidated_boot=";
+
+/// Whether, and in which boot, the invalidate of an active record succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipInvalidated {
+    No,
+    /// In this boot: this boot's kernel log can tell whether its resync ran.
+    ThisBoot,
+    /// In an earlier boot: the log that could tell is gone.
+    OtherBoot,
+}
+
+/// The record an operator's force leaves (see `SkipRecord::Forced`).
+fn resync_skip_forced_record(current: Option<u64>, boot_id: &str) -> String {
+    let current = current.map_or("unknown".to_string(), |g| format!("{g:016X}"));
+    format!(
+        "# an operator forced this copy over a resync-skip record; not flagged again in this \
+         boot\nforced=1\ncurrent={current}\nboot_id={boot_id}\n"
+    )
+}
+
+/// What the resync-skip record file says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipRecord {
+    Absent,
+    /// The copy is held down until rebuilt by a full resync.
+    /// `invalidated`: see `SKIP_RECORD_INVALIDATED`.
+    Active {
+        invalidated: SkipInvalidated,
+    },
+    /// An operator forced this copy (Primary over an active record).
+    /// `this_boot`: recorded in the running boot; the scans stay off then.
+    /// From another boot it is void.
+    Forced {
+        this_boot: bool,
+    },
+}
+
+/// Read the record. Anything present that is not a well-formed forced
+/// record reads as active (fail closed).
+fn parse_skip_record(text: Option<&str>, boot_id: &str) -> SkipRecord {
+    let Some(text) = text else {
+        return SkipRecord::Absent;
+    };
+    let lines = || text.lines().map(str::trim);
+    if lines().any(|l| l == "forced=1") {
+        let recorded = lines().find_map(|l| l.strip_prefix("boot_id="));
+        return SkipRecord::Forced {
+            // An unreadable boot id never matches: the record then ends at
+            // the next pass instead of outliving a reboot.
+            this_boot: recorded.is_some_and(|b| !b.is_empty() && b != "unknown" && b == boot_id),
+        };
+    }
+    SkipRecord::Active {
+        invalidated: match lines().find_map(|l| l.strip_prefix(SKIP_RECORD_INVALIDATED)) {
+            None => SkipInvalidated::No,
+            Some(b) if !b.is_empty() && b != "unknown" && b == boot_id => SkipInvalidated::ThisBoot,
+            Some(_) => SkipInvalidated::OtherBoot,
+        },
+    }
+}
+
+/// Whether the resync-skip record at `path` holds the copy down (an active
+/// record; a forced one does not). For `upgrade-apply`.
+pub(crate) fn resync_skip_record_active(path: &str) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(t) => matches!(parse_skip_record(Some(&t), ""), SkipRecord::Active { .. }),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// This boot's id (`unknown` when unreadable).
+fn read_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// The resync-skip record for the startup line: `-`, `forced`, or the
+/// generation it holds (`+invalidated` once the full resync is set up).
+fn resync_skip_brief(path: &str) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "-".to_string();
+    };
+    match parse_skip_record(Some(&text), "") {
+        SkipRecord::Forced { .. } => "forced".to_string(),
+        SkipRecord::Active { invalidated } => {
+            let generation = memory_brief(path);
+            if invalidated != SkipInvalidated::No {
+                format!("{generation}+invalidated")
+            } else {
+                generation
+            }
+        }
+        SkipRecord::Absent => "-".to_string(),
+    }
+}
+
+/// The alert raised when a resync skip is found.
+/// The alert raised when a resync skip is found. `held`: why the rebuild
+/// cannot start yet (see `resync_skip_repair`), `None` while it runs.
+fn resync_skip_alert_text(peer: &str, drbd_res: &str, held: Option<&str>) -> String {
+    let rebuild = match held {
+        None => format!("it is being rebuilt by a full resync from {peer}. Nothing to do."),
+        Some(SKIP_HELD_PEER) => format!(
+            "it will be rebuilt by a full resync from {peer}, which starts once {peer}'s copy is \
+             UpToDate again. Nothing to do unless {peer} stays degraded."
+        ),
+        Some(SKIP_HELD_SPLIT_BRAIN) => format!(
+            "it will be rebuilt by a full resync from {peer} once the split-brain on this pair is \
+             resolved (see the split-brain alert)."
+        ),
+        Some(_) => format!(
+            "an operator discard of this copy is pending; it is resynced from {peer} when that \
+             completes."
+        ),
+    };
+    format!(
+        "After this host restarted, DRBD marked its copy current without running the resync it \
+         had decided. This copy may lack writes the peer acknowledged, so this host does not \
+         serve it; {rebuild} Only if {peer} is lost for good: `drbdadm primary --force \
+         twinstor-{drbd_res}` on this host, accepting that recent writes may be missing."
+    )
+}
+
+/// The alert for a skip whose full resync is already running: the usual
+/// case while connected, where the invalidate succeeds at once and the
+/// record ends a moment after it was written.
+fn resync_skip_repaired_alert_text(peer: &str) -> String {
+    format!(
+        "After a connection drop, DRBD skipped the resync this host's copy needed. TwinStor \
+         detected it and is rebuilding this host's copy with a full resync from {peer}. Until \
+         that resync completes the pool runs on a single copy, the one on {peer}. No action \
+         needed; do not power off or restart {peer} meanwhile."
+    )
+}
+
+/// The record's line naming the alert variant XAPI already has for it, so
+/// a daemon restart does not send it again.
+const SKIP_RECORD_ALERTED: &str = "alerted=";
+
+/// The alert variant a record says was delivered (see
+/// `SKIP_RECORD_ALERTED`): `""` for the plain one.
+fn skip_record_alerted(text: &str) -> Option<&'static str> {
+    let v = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(SKIP_RECORD_ALERTED))?;
+    [
+        ("rebuilding", ""),
+        (SKIP_HELD_SPLIT_BRAIN, SKIP_HELD_SPLIT_BRAIN),
+        (SKIP_HELD_DISCARD, SKIP_HELD_DISCARD),
+        (SKIP_HELD_PEER, SKIP_HELD_PEER),
+    ]
+    .into_iter()
+    .find_map(|(k, variant)| (k == v).then_some(variant))
+}
+
+/// Why the resync-skip repair cannot invalidate yet (see
+/// `resync_skip_repair`).
+const SKIP_HELD_SPLIT_BRAIN: &str = "split-brain marker";
+const SKIP_HELD_DISCARD: &str = "operator discard pending";
+const SKIP_HELD_PEER: &str = "peer not UpToDate";
+
+/// A kernel log that cannot be read holds the resync-skip check (no
+/// promote) for at most this long from the first failure of a failure
+/// streak; after it the check proceeds without the log, with a warning. A
+/// successful read ends the streak.
+const SKIP_SCAN_FAIL_HOLD: Duration = Duration::from_secs(60);
+
+/// The resync-skip alert is sent again when its text changes (the reason
+/// the rebuild waits for), at most once per this interval.
+const SKIP_ALERT_RESEND: Duration = Duration::from_secs(600);
+
+/// Whether the resync-skip alert for `variant` is to be sent: never
+/// delivered for this record, or delivered with another variant at least
+/// `SKIP_ALERT_RESEND` ago.
+fn skip_alert_due(
+    delivered: Option<&str>,
+    delivered_at: Option<std::time::Instant>,
+    variant: &str,
+) -> bool {
+    match delivered {
+        None => true,
+        Some(v) if v == variant => false,
+        Some(_) => delivered_at.is_none_or(|t| t.elapsed() >= SKIP_ALERT_RESEND),
+    }
+}
+
 /// Marker written by the fence-peer handler when it yields (no ping target
 /// reachable: it suspends this node's I/O and exits 1). A node frozen since
 /// its own yield served nobody, so the resolver uses this to overrule a stale
@@ -414,6 +644,39 @@ const LEFTOVER_LIFT_STABLE: Duration = Duration::from_secs(5);
 /// still guard each lift.
 const LEFTOVER_LIFT_SHORT: Duration = Duration::from_secs(1);
 const LIFT_PRESSURE_MARGIN: Duration = Duration::from_secs(20);
+
+/// Resync-skip repair: at most one `drbdadm invalidate` per this interval.
+const SKIP_INVALIDATE_EVERY: Duration = Duration::from_secs(30);
+
+/// The pending-resync hold (see `resync_pending`) is warned about once it
+/// has lasted this long: a resync normally starts within seconds of the
+/// reconnect, or once the survivor's freeze lift lets the bitmap exchange
+/// finish.
+const RESYNC_PENDING_WARN_AFTER: Duration = Duration::from_secs(120);
+
+/// DRBD has made this copy the target of a resync that has not started yet:
+/// Connected, this copy Outdated or Consistent (behind, not yet
+/// Inconsistent), the peer UpToDate. The copy turns Inconsistent the moment
+/// the resync starts, so this shape lasts only through the bitmap exchange
+/// (WFBitMapT, StartingSyncT), unless DRBD then drops the resync on a
+/// reconnect. Bring-up never promotes in this shape.
+fn resync_pending(st: &DrbdStatus) -> bool {
+    st.connection == ConnectionState::Connected
+        && matches!(st.disk, DiskState::Outdated | DiskState::Consistent)
+        && st.peer_disk == Some(DiskState::UpToDate)
+}
+
+/// One kernel-log check for a resync skip (see `check_resync_skip`).
+#[derive(Debug, Clone)]
+enum SkipCheck {
+    /// No skip (or no readable evidence): proceed.
+    Clean,
+    /// A skip, confirmed by the status read after the log.
+    Skipped(crate::drbd::SkipScan, DrbdStatus),
+    /// The log shows a skip but the copy no longer reads UpToDate in the
+    /// same role: a resync may have just begun; hold this pass, no record.
+    Unsure,
+}
 
 /// Arbitrated mode, a copy frozen by its own yield that DRBD has made the
 /// resync source: once only the connection hold (or the second sample in a
@@ -10875,6 +11138,41 @@ pub struct StateMachine {
     /// The record carries the lift mark (see `yielded_behind_record`).
     yielded_behind_lift: bool,
     yield_in_force_since: Option<std::time::Instant>,
+    /// Resync-skip record (see `resync_skip_marker`).
+    resync_skip_path: String,
+    /// The last `drbdadm invalidate` the resync-skip repair ran.
+    resync_skip_invalidate_at: Option<std::time::Instant>,
+    /// The resync-skip alert variant (its hold reason, `""` for the plain
+    /// one) that reached XAPI for the current record.
+    resync_skip_alerted: Option<&'static str>,
+    /// An invalidate refusal was logged at warn in the current streak.
+    resync_skip_refusal_logged: bool,
+    /// The first failed kernel-log read of the current failure streak (see
+    /// `SKIP_SCAN_FAIL_HOLD`), and whether its switch to proceeding without
+    /// the log was logged.
+    skip_scan_failed_at: Option<std::time::Instant>,
+    skip_scan_fail_open_logged: bool,
+    /// When the resync-skip alert last reached XAPI.
+    resync_skip_alert_at: Option<std::time::Instant>,
+    /// A skip found but not recorded (see `resync_skip_step`) was alerted;
+    /// reset by a clean check.
+    skip_unrecorded_alerted: bool,
+    /// Tests: the resync-skip alerts sent, and whether they reach XAPI.
+    #[cfg(test)]
+    skip_alerts: Vec<String>,
+    #[cfg(test)]
+    skip_alert_delivers: bool,
+    /// The once-per-run resync-skip check of a copy already Primary at
+    /// bring-up ran (see `serving_skip_check`).
+    serving_skip_checked: bool,
+    /// This boot's id, read once (a forced resync-skip record holds only in
+    /// the boot it was written in).
+    boot_id: String,
+    /// Since when bring-up holds the promote of a copy whose resync from the
+    /// peer has not started yet (see `resync_pending`), and whether that
+    /// hold was warned about as long.
+    resync_pending_since: Option<std::time::Instant>,
+    resync_pending_warned: bool,
     // Arbitrated mode (a direct replication link exists) vs fate-shared. Cached at
     // construction from DIRECT_PEER_PATH; the mode is a setup-time property. Gates
     // the fate-shared-only lone-survivor holds. Overridable in tests.
@@ -11807,6 +12105,22 @@ impl StateMachine {
             yielded_behind_gen: None,
             yielded_behind_lift: false,
             yield_in_force_since: None,
+            resync_skip_path: resync_skip_path_for_new(),
+            resync_skip_invalidate_at: None,
+            resync_skip_alerted: None,
+            resync_skip_refusal_logged: false,
+            skip_scan_failed_at: None,
+            skip_scan_fail_open_logged: false,
+            resync_skip_alert_at: None,
+            skip_unrecorded_alerted: false,
+            #[cfg(test)]
+            skip_alerts: Vec::new(),
+            #[cfg(test)]
+            skip_alert_delivers: false,
+            serving_skip_checked: false,
+            boot_id: read_boot_id(),
+            resync_pending_since: None,
+            resync_pending_warned: false,
             arbitrated: std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists(),
             episode: None,
             episode_path: open_episode_marker(),
@@ -12068,6 +12382,7 @@ impl StateMachine {
               boundary_record = %file_brief(&self.boundary_path),
               boot_gate_peer_served = %memory_brief(&self.peer_served_path),
               boot_gate_yielded = %memory_brief(&self.yielded_behind_path),
+              resync_skip = %resync_skip_brief(&self.resync_skip_path),
               steer_pending = %file_brief(&self.steer_pending_path),
               fs_freeze_off = %file_brief(&self.fs_freeze_off_path),
               peer_fs_freeze = %file_brief(&self.peer_fs_freeze_path),
@@ -12947,6 +13262,9 @@ impl StateMachine {
                 return;
             }
         };
+        // A resync-skip record is governed on every pass, Online too (no
+        // detection here; one file read when there is no record).
+        let _ = self.resync_skip_step(&status, false).await;
 
         // Log DRBD state changes (disk, peer_disk, connection)
         if let Some(old) = self.last_disk
@@ -14223,6 +14541,7 @@ impl StateMachine {
                 return;
             }
         };
+        let _ = self.resync_skip_step(&status, false).await;
 
         if status.disk != DiskState::Diskless {
             info!("local disk back, going online");
@@ -16238,7 +16557,9 @@ impl StateMachine {
         // bitmap exchange itself waits for the resume, so WFBitMap counts
         // once the peer's disk is known to be behind. Two reads in a row past
         // the hold (two passes, or in the arbitrated source shape two in-place
-        // reads a second apart).
+        // reads a second apart). StartingSyncS is the first step of a resync
+        // the peer asked for (its `drbdadm invalidate`, the resync-skip
+        // repair), before the bitmap exchange; it counts on the same terms.
         let peer_behind = matches!(
             s.peer_disk,
             Some(DiskState::Outdated | DiskState::Inconsistent | DiskState::Consistent)
@@ -16247,7 +16568,9 @@ impl StateMachine {
             && s.disk == DiskState::UpToDate
             && match s.replication {
                 Some(crate::drbd::Replication::SyncSource) => true,
-                Some(crate::drbd::Replication::WFBitMap) => peer_behind,
+                Some(
+                    crate::drbd::Replication::WFBitMap | crate::drbd::Replication::StartingSyncS,
+                ) => peer_behind,
                 None | Some(crate::drbd::Replication::Established) => {
                     s.peer_disk == Some(DiskState::UpToDate)
                 }
@@ -17364,6 +17687,20 @@ impl StateMachine {
                 false
             }
             CdAction::ForcePrimary => {
+                // Never over an active resync-skip record: nothing written,
+                // alerted or forced.
+                if self.skip_record_blocks() {
+                    if self
+                        .log_pace
+                        .due("cd_force_skip_record", Duration::from_secs(600))
+                    {
+                        warn!(
+                            heal_event = "consistent_diskless_force",
+                            "not force-promoting: a resync-skip record holds this copy down"
+                        );
+                    }
+                    return false;
+                }
                 // Both clocks must agree: the persisted continuous-Destroyed
                 // window and the in-process monotonic shape floor.
                 if !destroyed_matured || shape_since.elapsed() < CD_MONO_FLOOR {
@@ -17637,6 +17974,12 @@ impl StateMachine {
             }
         }
 
+        // Resync-skip step, ahead of every other hold (see
+        // `resync_skip_step`): detection, the record, and the invalidate run
+        // here whatever holds below. It never returns by itself; the hold
+        // before the promote and the guard before the target start read it.
+        let skip_hold = self.resync_skip_step(&status, true).await;
+
         // Init-side StandAlone heal: a node that boots StandAlone with a
         // non-promotable disk (Inconsistent, from a resync interrupted by a
         // fence) can never reach Online through the promote below, so the
@@ -17779,6 +18122,10 @@ impl StateMachine {
                     OutdatedTiebreak::None => {}
                     // Non-destructive hold: let the keeper promote first.
                     OutdatedTiebreak::WaitForKeeper => return Ok(false),
+                    // Never over an active resync-skip record.
+                    OutdatedTiebreak::ForcePrimary if matured && self.skip_record_blocks() => {
+                        return Ok(false);
+                    }
                     OutdatedTiebreak::ForcePrimary if matured => {
                         // A misidentified keeper would turn this force-promote
                         // into data loss. The keeper is `node.name < node.peer`;
@@ -17871,6 +18218,24 @@ impl StateMachine {
                     self.forget_yielded_behind("connected");
                 }
                 self.clear_boot_gate();
+            }
+            // Resync-skip hold (both topologies): an active record (or a
+            // skip this pass could not record) keeps the copy from every
+            // promote below, Connected or not. The repair already ran in the
+            // early step.
+            if skip_hold || self.skip_record_blocks() {
+                if status.connection != ConnectionState::Connected {
+                    // Not Connected: the sole-survivor wedge shape is broken;
+                    // reset its clocks (see the init_standalone_tick Hold arm).
+                    self.cd_reset();
+                }
+                return Ok(false);
+            }
+            // Pending-resync hold: never promote a copy DRBD has made the
+            // target of a resync that has not started yet (see
+            // `resync_pending_holds`). Connected, so it needs no clock reset.
+            if self.resync_pending_holds(&status) {
+                return Ok(false);
             }
             // Fate-shared lone-survivor promote hold. Every boot and heal
             // promote path goes through here (StandAlone, the startup
@@ -18118,6 +18483,11 @@ impl StateMachine {
         // case (Primary and UpToDate with the peer gone); see the readiness
         // module docs.
         let status = self.drbd.status().await?;
+        // Whatever the role, no target while an active resync-skip record
+        // holds this copy down.
+        if self.skip_record_blocks() {
+            return Ok(false);
+        }
         let host_enabled = xapi::is_host_enabled().await;
         // Path health is None here: before the target is up there are no
         // initiator sessions or maps, so gating on it would deadlock
@@ -18529,6 +18899,608 @@ impl StateMachine {
             why,
             "boot gate: peer-served memory cleared"
         );
+    }
+
+    /// The resync-skip record as this boot reads it. A record that exists but
+    /// cannot be read holds the copy (fail closed).
+    fn skip_record(&self) -> SkipRecord {
+        match std::fs::read_to_string(&self.resync_skip_path) {
+            Ok(text) => parse_skip_record(Some(&text), &self.boot_id),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => SkipRecord::Absent,
+            Err(_) => SkipRecord::Active {
+                invalidated: SkipInvalidated::No,
+            },
+        }
+    }
+
+    /// An active resync-skip record holds this copy down: no promote and no
+    /// target start, by bring-up or by any internal heal path.
+    fn skip_record_blocks(&self) -> bool {
+        matches!(self.skip_record(), SkipRecord::Active { .. })
+    }
+
+    /// The resync-skip step, early in `try_go_online` (right after the
+    /// operator-discard block, before every other hold, so a hold such as the
+    /// boot gate's can never keep the repair from running), and on every
+    /// Online and Degraded pass (`detect` false there). It never holds by
+    /// itself: the hold before the promote and the guard before the target
+    /// start read the record. Returns `true` when this pass must not promote
+    /// although no record exists (a skip found but not recorded, a resync
+    /// that may have just begun, or a kernel log not readable yet, see
+    /// `check_resync_skip`).
+    ///
+    /// An active record governs, whatever a new scan would read: over a
+    /// Primary it is an operator's force (`mark_resync_skip_forced`; no
+    /// daemon path promotes over one), over a Secondary it is repaired
+    /// (`resync_skip_repair`). A record an operator's force left in this boot
+    /// keeps detection off; one from an earlier boot is dropped. With no
+    /// record, detection: a Secondary whose copy DRBD calls UpToDate is
+    /// scanned; a copy already Primary gets the alert-only check once per run
+    /// (`serving_skip_check`).
+    async fn resync_skip_step(&mut self, status: &DrbdStatus, detect: bool) -> bool {
+        match self.skip_record() {
+            SkipRecord::Active { invalidated } => {
+                match status.role {
+                    Role::Primary => self.mark_resync_skip_forced().await,
+                    Role::Secondary => self.resync_skip_repair(status, invalidated).await,
+                    Role::Unknown => {}
+                }
+                return false;
+            }
+            SkipRecord::Forced { this_boot: true } => {
+                if status.disk == DiskState::Inconsistent {
+                    self.forget_resync_skip("resyncing");
+                }
+                return false;
+            }
+            SkipRecord::Forced { this_boot: false } => self.forget_resync_skip("previous boot"),
+            SkipRecord::Absent => {}
+        }
+        if !detect || status.disk != DiskState::UpToDate {
+            return false;
+        }
+        if status.role == Role::Primary {
+            self.serving_skip_check(status).await;
+            return false;
+        }
+        if status.role != Role::Secondary {
+            return false;
+        }
+        match self.check_resync_skip(status).await {
+            SkipCheck::Clean => {
+                self.skip_unrecorded_alerted = false;
+                false
+            }
+            SkipCheck::Unsure => true,
+            SkipCheck::Skipped(scan, now) => {
+                if self.record_resync_skip(&scan).await {
+                    self.resync_skip_repair(&now, SkipInvalidated::No).await;
+                    return false;
+                }
+                // No record. Disconnected, invalidate anyway: DRBD's
+                // Inconsistent state is durable by itself and holds the copy
+                // down until a full resync. Connected, hold and retry the
+                // record (the next pass finds the skip again). One alert for
+                // the streak.
+                let repaired = now.connection != ConnectionState::Connected
+                    && self.skip_invalidate(false).await;
+                if !self.skip_unrecorded_alerted {
+                    self.skip_unrecorded_alerted = true;
+                    let peer = self.config.node.peer.clone();
+                    let alert = if repaired {
+                        resync_skip_repaired_alert_text(&peer)
+                    } else {
+                        resync_skip_alert_text(&peer, &self.config.storage.drbd_resource, None)
+                    };
+                    let _ = self.send_skip_alert("resync-skip", &alert).await;
+                }
+                true
+            }
+        }
+    }
+
+    /// This boot's kernel log, or why not: `Err(true)` while a failed read
+    /// still holds (see `SKIP_SCAN_FAIL_HOLD`), `Err(false)` once it no
+    /// longer does.
+    async fn read_skip_scan(&mut self) -> std::result::Result<crate::drbd::SkipScan, bool> {
+        match self.drbd.resync_skip_scan().await {
+            Ok(scan) => {
+                self.skip_scan_failed_at = None;
+                self.skip_scan_fail_open_logged = false;
+                Ok(scan)
+            }
+            Err(e) => {
+                let first = *self
+                    .skip_scan_failed_at
+                    .get_or_insert_with(std::time::Instant::now);
+                let holding = first.elapsed() < SKIP_SCAN_FAIL_HOLD;
+                if !holding && !self.skip_scan_fail_open_logged {
+                    self.skip_scan_fail_open_logged = true;
+                    warn!(heal_event = "resync_skip", error = %e, failing_secs = first.elapsed().as_secs(),
+                          "resync-skip check: the kernel log is still unreadable; proceeding \
+                           without it until a read succeeds");
+                } else if holding
+                    && self
+                        .log_pace
+                        .due("resync_skip_scan", Duration::from_secs(600))
+                {
+                    warn!(heal_event = "resync_skip", error = %e,
+                          "resync-skip check: the kernel log could not be read; holding the \
+                           promote for at most {}s, then proceeding without it",
+                          SKIP_SCAN_FAIL_HOLD.as_secs());
+                }
+                Err(holding)
+            }
+        }
+    }
+
+    /// Scan this boot's kernel log for a skip on a copy `status` read as
+    /// UpToDate (read before the log). A log that cannot be read is unsure
+    /// for at most `SKIP_SCAN_FAIL_HOLD` from the first failure in this run,
+    /// then no evidence. A skip is confirmed by a second status read after
+    /// the log: a resync toward this copy that began after the first read
+    /// shows in the log (WFBitMapT) but not in it, so unless the copy still
+    /// reads UpToDate in the same role, the check is unsure.
+    async fn check_resync_skip(&mut self, status: &DrbdStatus) -> SkipCheck {
+        let scan = match self.read_skip_scan().await {
+            Ok(scan) => scan,
+            Err(true) => return SkipCheck::Unsure,
+            Err(false) => return SkipCheck::Clean,
+        };
+        if !scan.skipped(status.disk) {
+            return SkipCheck::Clean;
+        }
+        match self.drbd.status().await {
+            Ok(s) if s.disk == DiskState::UpToDate && s.role == status.role => {
+                SkipCheck::Skipped(scan, s)
+            }
+            _ => SkipCheck::Unsure,
+        }
+    }
+
+    /// A copy already Primary at bring-up whose kernel log shows a skipped
+    /// resync: a release without the pending-resync hold promoted it into
+    /// the resync before the skip, and this daemon took over after (an
+    /// upgrade in place). Checked once per daemon run, alert only: the copy
+    /// may be serving guests (its target can outlive the daemon), so nothing
+    /// is recorded, held, demoted or invalidated automatically. A forced copy
+    /// is not flagged: DRBD's force line closes the debt in the scan. An
+    /// unsure check is retried on a later pass.
+    async fn serving_skip_check(&mut self, status: &DrbdStatus) {
+        if self.serving_skip_checked {
+            return;
+        }
+        self.serving_skip_checked = true;
+        let scan = match self.check_resync_skip(status).await {
+            SkipCheck::Skipped(scan, _) => scan,
+            SkipCheck::Unsure => {
+                self.serving_skip_checked = false;
+                return;
+            }
+            SkipCheck::Clean => return,
+        };
+        warn!(
+            heal_event = "resync_skip",
+            serving = true,
+            owed = %scan.owed_evidence.last().map_or("-", String::as_str),
+            skip = scan.no_sync_count(),
+            cleared_bm = scan.cleared_bm_count(),
+            "resync skipped on a copy that is already Primary: it may lack writes the peer \
+             acknowledged; not changed automatically, see the alert"
+        );
+        let res = &self.config.storage.drbd_resource;
+        let alert = format!(
+            "TwinStor found that DRBD on this host decided a resync toward this host's copy and \
+             then skipped it (a reconnect marked the copy current without the resync). The copy \
+             was already Primary and may be serving, so TwinStor does not change it \
+             automatically. It may lack writes the peer acknowledged. In a maintenance window: \
+             compare the copies with `drbdadm verify twinstor-{res}`, or move the guests off \
+             this host, demote it and run `drbdadm invalidate twinstor-{res}` here while the \
+             peer is UpToDate (a full resync from the peer)."
+        );
+        let _ = self.send_skip_alert("resync-skip-serving", &alert).await;
+    }
+
+    /// Write the resync-skip record (durably, before anything acts on it).
+    /// `false` when it could not be written.
+    async fn record_resync_skip(&mut self, scan: &crate::drbd::SkipScan) -> bool {
+        let current = self.drbd.local_current_uuid().await;
+        let content = resync_skip_record(
+            current,
+            unix_now_secs(),
+            &self.boot_id,
+            &scan.evidence_line(),
+        );
+        if let Err(e) = write_file_durably(&self.resync_skip_path, &content) {
+            if self
+                .log_pace
+                .due("resync_skip_write", Duration::from_secs(600))
+            {
+                warn!(heal_event = "resync_skip", error = %e,
+                      "resync-skip: could not persist the record; holding this copy down \
+                       (invalidating it if disconnected) and retrying");
+            }
+            return false;
+        }
+        self.resync_skip_alerted = None;
+        self.resync_skip_refusal_logged = false;
+        self.resync_skip_invalidate_at = None;
+        warn!(
+            heal_event = "resync_skip",
+            memory = "set",
+            owed = %scan.owed_evidence.last().map_or("-", String::as_str),
+            skip = scan.no_sync_count(),
+            cleared_bm = scan.cleared_bm_count(),
+            self_bits = ?scan.self_bits,
+            peer_bits = ?scan.peer_bits,
+            generation = %current.map_or("unknown".to_string(), |g| format!("{g:016X}")),
+            "resync skipped: DRBD decided a resync toward this copy, the connection broke before \
+             it ran, and a later reconnect marked the copy UpToDate without it; this copy may lack \
+             writes the peer acknowledged and is not served until a full resync rebuilds it"
+        );
+        true
+    }
+
+    /// While the copy is held for a resync skip: the heal stage, and the
+    /// alert until XAPI has the variant for `held` (why the rebuild cannot
+    /// start yet; `None` while it runs). Called after the repair's own DRBD
+    /// work: XAPI may block when it is down.
+    async fn resync_skip_notice(&mut self, held: Option<&'static str>) {
+        let peer = self.config.node.peer.clone();
+        let res = self.config.storage.drbd_resource.clone();
+        self.heal_state_update(
+            "resync_skip_repair",
+            "DRBD marked this copy current without running the resync it had decided: held down \
+             (Secondary, no target) until a full resync from the peer rebuilds it",
+            Some(&format!(
+                "the full resync from {peer} is set up by itself (at once while disconnected, \
+                 or once connected to an UpToDate {peer}). Only if {peer} is lost for good: \
+                 `drbdadm primary --force twinstor-{res}` on this host, accepting that recent \
+                 writes may be missing"
+            )),
+        );
+        let variant = held.unwrap_or("");
+        if skip_alert_due(
+            self.skip_alert_delivered(),
+            self.resync_skip_alert_at,
+            variant,
+        ) {
+            let alert = resync_skip_alert_text(&peer, &res, held);
+            if self.send_skip_alert("resync-skip", &alert).await {
+                self.note_skip_alerted(variant);
+            }
+        }
+    }
+
+    /// The resync-skip alert variant XAPI already has for the current
+    /// record: noted in memory, or in the record by an earlier daemon run.
+    fn skip_alert_delivered(&self) -> Option<&'static str> {
+        self.resync_skip_alerted.or_else(|| {
+            std::fs::read_to_string(&self.resync_skip_path)
+                .ok()
+                .as_deref()
+                .and_then(skip_record_alerted)
+        })
+    }
+
+    /// The alert `variant` reached XAPI for the current record: noted in
+    /// memory and in the record (`SKIP_RECORD_ALERTED`).
+    fn note_skip_alerted(&mut self, variant: &'static str) {
+        self.resync_skip_alerted = Some(variant);
+        self.resync_skip_alert_at = Some(std::time::Instant::now());
+        let Ok(text) = std::fs::read_to_string(&self.resync_skip_path) else {
+            return;
+        };
+        let mut kept: String = text
+            .lines()
+            .filter(|l| !l.trim().starts_with(SKIP_RECORD_ALERTED))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let value = if variant.is_empty() {
+            "rebuilding"
+        } else {
+            variant
+        };
+        kept.push_str(&format!("{SKIP_RECORD_ALERTED}{value}\n"));
+        let _ = write_file_durably(&self.resync_skip_path, &kept);
+    }
+
+    /// Our full resync is running and the record is about to end: the
+    /// skip's one alert, unless XAPI already has one for this record (the
+    /// record lived across passes). While connected this is the usual case:
+    /// the record ends a moment after it was written, before any notice.
+    async fn alert_skip_repaired(&mut self) {
+        if self.skip_alert_delivered().is_some() {
+            return;
+        }
+        let alert = resync_skip_repaired_alert_text(&self.config.node.peer);
+        let _ = self.send_skip_alert("resync-skip", &alert).await;
+    }
+
+    /// Send a resync-skip alert (keyed: an undelivered one waits for XAPI
+    /// and a later send of the same key replaces it). Tests record it.
+    async fn send_skip_alert(&mut self, key: &'static str, body: &str) -> bool {
+        #[cfg(test)]
+        {
+            let _ = key;
+            self.skip_alerts.push(body.to_string());
+            self.skip_alert_delivers
+        }
+        #[cfg(not(test))]
+        {
+            xapi::send_xapi_alert_keyed(key, body).await
+        }
+    }
+
+    /// Repair a Secondary under an active record. The record ends only with
+    /// our own full resync:
+    /// - once `drbdadm invalidate` succeeded, a copy that reads Inconsistent
+    ///   or sync target is under that full resync, which DRBD keeps until
+    ///   done; right after the invalidate this is checked at once;
+    /// - an invalidate in this boot whose copy is UpToDate again: this
+    ///   boot's kernel log tells (`scan_resync_skip`): the debt closed, our
+    ///   resync ran; still open, the invalidate's own resync was skipped
+    ///   (its StartingSyncT dropped by a reconnect), so invalidate again;
+    /// - an invalidate in an earlier boot, copy UpToDate: invalidate again.
+    ///
+    /// Any other resync (a bitmap resync after another reset of this host, a
+    /// reconnect after a short flap) leaves out the regions whose bits the
+    /// skip cleared: without the flag the record holds, and the copy is
+    /// invalidated again, also once such a resync left it UpToDate.
+    /// Invalidate at once (paced, one per `SKIP_INVALIDATE_EVERY`) unless a
+    /// split-brain or operator-discard marker owns the copy, or the pair is
+    /// Connected to a peer that is not UpToDate (no source).
+    async fn resync_skip_repair(&mut self, status: &DrbdStatus, invalidated: SkipInvalidated) {
+        let resyncing = |st: &DrbdStatus| {
+            st.disk == DiskState::Inconsistent
+                || st.replication == Some(crate::drbd::Replication::SyncTarget)
+        };
+        // Credited only while the invalidate's full bitmap was not itself
+        // cleared by a reconnect before the resync started
+        // (`SkipScan::invalidate_cleared`).
+        let mut reinvalidate = false;
+        if invalidated != SkipInvalidated::No && resyncing(status) {
+            match self.read_skip_scan().await {
+                Ok(scan) if !scan.invalidate_cleared => {
+                    self.alert_skip_repaired().await;
+                    self.forget_resync_skip("full resync");
+                    return;
+                }
+                Ok(_) | Err(false) => reinvalidate = true,
+                Err(true) => {
+                    self.resync_skip_notice(None).await;
+                    return;
+                }
+            }
+        }
+        if invalidated == SkipInvalidated::ThisBoot && status.disk == DiskState::UpToDate {
+            match self.read_skip_scan().await {
+                Ok(scan) if !scan.owed_open && !scan.invalidate_cleared => {
+                    self.alert_skip_repaired().await;
+                    self.forget_resync_skip("full resync done");
+                    return;
+                }
+                Ok(_) | Err(false) => reinvalidate = true,
+                Err(true) => {
+                    self.resync_skip_notice(None).await;
+                    return;
+                }
+            }
+        }
+        let connected = status.connection == ConnectionState::Connected;
+        let held = if std::path::Path::new(&self.marker_path).exists() {
+            Some(SKIP_HELD_SPLIT_BRAIN)
+        } else if std::path::Path::new(&self.discard_request_path).exists() {
+            Some(SKIP_HELD_DISCARD)
+        } else if connected && status.peer_disk != Some(DiskState::UpToDate) {
+            Some(SKIP_HELD_PEER)
+        } else {
+            None
+        };
+        if let Some(why) = held {
+            if self
+                .log_pace
+                .due("resync_skip_hold", Duration::from_secs(60))
+            {
+                info!(heal_event = "resync_skip", why, connection = ?status.connection,
+                      peer_disk = ?status.peer_disk,
+                      "resync-skip: holding this copy down without an invalidate");
+            }
+        } else if reinvalidate
+            && self.skip_invalidate_due()
+            && self
+                .log_pace
+                .due("resync_skip_reinvalidate", Duration::from_secs(600))
+        {
+            warn!(
+                heal_event = "resync_skip",
+                action = "reinvalidate",
+                "resync-skip: this boot's kernel log does not show the invalidate's full \
+                 resync (dropped or its bitmap cleared by a reconnect, or the log is \
+                 unreadable); invalidating again"
+            );
+        }
+        if held.is_none() && self.skip_invalidate(connected).await {
+            match self.drbd.status().await {
+                Ok(st) if resyncing(&st) => {
+                    self.alert_skip_repaired().await;
+                    self.forget_resync_skip("full resync");
+                    return;
+                }
+                _ => self.mark_skip_invalidated(),
+            }
+        }
+        self.resync_skip_notice(held).await;
+    }
+
+    /// Whether the paced invalidate may run now.
+    fn skip_invalidate_due(&self) -> bool {
+        self.resync_skip_invalidate_at
+            .is_none_or(|t| t.elapsed() >= SKIP_INVALIDATE_EVERY)
+    }
+
+    /// `drbdadm invalidate`, paced to one per `SKIP_INVALIDATE_EVERY`.
+    /// `true` when it ran and succeeded. A refusal is warned once per streak
+    /// (DRBD refuses it while a resync runs, which can last a while).
+    async fn skip_invalidate(&mut self, connected: bool) -> bool {
+        if !self.skip_invalidate_due() {
+            return false;
+        }
+        self.resync_skip_invalidate_at = Some(std::time::Instant::now());
+        match self.drbd.invalidate().await {
+            Ok(()) => {
+                self.resync_skip_refusal_logged = false;
+                warn!(
+                    heal_event = "resync_skip",
+                    action = "invalidate",
+                    connected,
+                    result = "ok",
+                    "resync-skip: invalidated this copy; it is rebuilt by a full resync from \
+                     the peer"
+                );
+                true
+            }
+            Err(e) => {
+                if self.resync_skip_refusal_logged {
+                    debug!(heal_event = "resync_skip", action = "invalidate", connected,
+                           result = "failed", error = %e, "resync-skip: invalidate refused again");
+                } else {
+                    self.resync_skip_refusal_logged = true;
+                    warn!(heal_event = "resync_skip", action = "invalidate", connected,
+                          result = "failed", error = %e,
+                          "resync-skip: invalidate refused; retrying every {}s (logged once)",
+                          SKIP_INVALIDATE_EVERY.as_secs());
+                }
+                false
+            }
+        }
+    }
+
+    /// Note in the record that the invalidate succeeded in this boot (see
+    /// `SKIP_RECORD_INVALIDATED`), replacing an earlier boot's note. A failed
+    /// write leaves the record as it was: the copy is invalidated again
+    /// later, which costs a resync, never data.
+    fn mark_skip_invalidated(&mut self) {
+        let Ok(text) = std::fs::read_to_string(&self.resync_skip_path) else {
+            return;
+        };
+        let mut kept: String = text
+            .lines()
+            .filter(|l| !l.trim().starts_with(SKIP_RECORD_INVALIDATED))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        kept.push_str(&format!("{SKIP_RECORD_INVALIDATED}{}\n", self.boot_id));
+        if let Err(e) = write_file_durably(&self.resync_skip_path, &kept) {
+            warn!(heal_event = "resync_skip", error = %e,
+                  "resync-skip: could not note the invalidate in the record");
+        }
+    }
+
+    /// An operator forced this copy over an active record (this node is
+    /// Primary, and no daemon path promotes over an active record). The
+    /// force wins: the record becomes a forced record for this boot, so the
+    /// copy, whose kernel log may still show the skipped resync (a force of
+    /// a copy already UpToDate prints no force line), is not flagged again
+    /// in this boot. It ends at the next boot, or when the copy goes
+    /// Inconsistent (a resync ran). If it cannot be written the record is
+    /// removed instead: the force must win either way.
+    async fn mark_resync_skip_forced(&mut self) {
+        let current = self.drbd.local_current_uuid().await;
+        let content = resync_skip_forced_record(current, &self.boot_id);
+        let kept = match write_file_durably(&self.resync_skip_path, &content) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(heal_event = "resync_skip", error = %e,
+                      "resync-skip: could not write the forced record; removing the record");
+                let _ = std::fs::remove_file(&self.resync_skip_path);
+                false
+            }
+        };
+        self.resync_skip_alerted = None;
+        self.resync_skip_refusal_logged = false;
+        self.resync_skip_invalidate_at = None;
+        warn!(
+            heal_event = "resync_skip",
+            memory = "cleared",
+            why = "primary",
+            forced_record = kept,
+            "resync-skip record cleared: an operator forced this copy; not flagged again in this \
+             boot"
+        );
+        self.clear_heal_state_if_stage("resync_skip_repair");
+    }
+
+    /// End the resync-skip record (active or forced): our full resync is
+    /// under way, a forced copy resynced, or a forced record from an earlier
+    /// boot.
+    fn forget_resync_skip(&mut self, why: &'static str) {
+        if !std::path::Path::new(&self.resync_skip_path).exists() {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&self.resync_skip_path) {
+            warn!(heal_event = "resync_skip", error = %e,
+                  "resync-skip: could not remove the record; retrying");
+            return;
+        }
+        self.resync_skip_alerted = None;
+        self.resync_skip_refusal_logged = false;
+        self.resync_skip_invalidate_at = None;
+        info!(
+            heal_event = "resync_skip",
+            memory = "cleared",
+            why,
+            "resync-skip record cleared"
+        );
+        self.clear_heal_state_if_stage("resync_skip_repair");
+    }
+
+    /// Pending-resync hold, in `try_go_online`'s non-Primary branch after
+    /// the resync-skip gate: never promote a copy that DRBD has made the
+    /// target of a resync that has not started yet (see `resync_pending`).
+    /// Promoting it there is what let a reconnect that skipped the resync
+    /// leave a Primary serving a stale copy. No record and no alert: the
+    /// resync normally starts within seconds, and the copy is promoted as
+    /// soon as it is Inconsistent (the readiness gate then holds the target
+    /// until it is UpToDate, as before). Logged once per hold, warned once
+    /// it has lasted `RESYNC_PENDING_WARN_AFTER`, then every 10 minutes.
+    fn resync_pending_holds(&mut self, status: &DrbdStatus) -> bool {
+        if !resync_pending(status) {
+            if let Some(since) = self.resync_pending_since.take() {
+                info!(heal_event = "resync_skip", hold = "resync_pending", released = true,
+                      held_secs = since.elapsed().as_secs(), disk = ?status.disk,
+                      "bring-up: the resync toward this copy started (or the shape ended); \
+                       promote no longer held");
+            }
+            self.resync_pending_warned = false;
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let since = match self.resync_pending_since {
+            Some(t) => t,
+            None => {
+                self.resync_pending_since = Some(now);
+                info!(heal_event = "resync_skip", hold = "resync_pending", disk = ?status.disk,
+                      replication = ?status.replication,
+                      "bring-up: not promoting this copy until the resync from the peer has \
+                       started (it is behind the peer)");
+                now
+            }
+        };
+        if since.elapsed() >= RESYNC_PENDING_WARN_AFTER
+            && (!self.resync_pending_warned
+                || self
+                    .log_pace
+                    .due("resync_pending_long", Duration::from_secs(600)))
+        {
+            self.resync_pending_warned = true;
+            warn!(heal_event = "resync_skip", hold = "resync_pending",
+                  held_secs = since.elapsed().as_secs(), disk = ?status.disk,
+                  replication = ?status.replication, peer_disk = ?status.peer_disk,
+                  "bring-up: the resync toward this copy has not started for a long time; it \
+                   stays Secondary with no target until it does (check the peer's freeze and \
+                   the replication link)");
+        }
+        true
     }
 
     /// Record, durably, that this node's copy may be behind its peer: a
@@ -21396,14 +22368,39 @@ impl StateMachine {
         }
     }
 
+    /// Whether the stand-down rejoin may force this copy Primary and start
+    /// its target: not over an active resync-skip record, nor into a resync
+    /// that has not started (`resync_pending`).
+    async fn standdown_promote_allowed(&self) -> bool {
+        !self.skip_record_blocks() && !self.drbd.status().await.is_ok_and(|st| resync_pending(&st))
+    }
+
+    /// The stand-down rejoin's promote and target start, or, when
+    /// `standdown_promote_allowed` refuses them, the hand-back to bring-up:
+    /// a stand-down without a reboot never left `Online`, and nothing else
+    /// sends an Online Secondary back to `Init`.
+    async fn standdown_promote_or_hand_back(&mut self) {
+        if self.standdown_promote_allowed().await {
+            let _ = self.drbd.force_primary().await;
+            let _ = tokio::time::timeout(ISCSI_STOP_TIMEOUT, self.iscsi.start(&self.config)).await;
+            return;
+        }
+        warn!(
+            "stand-down rejoin: not promoting this copy or starting its target (resync-skip \
+             record, or a resync toward it pending); handing back to bring-up"
+        );
+        self.set_state(NodeState::Init);
+    }
+
     /// Bottom-up storage restore for the isolated stand-down rejoin (see the
     /// caller): promote, restart the local iSCSI target, then log in to both
     /// initiator portals (local loopback and peer) so the multipath block
     /// device, and the HA statefile on it, comes back. None of this needs
     /// XAPI, which may be wedged on the statefile being restored.
     async fn restore_storage_after_standdown(&mut self) {
-        let _ = self.drbd.force_primary().await;
-        let _ = tokio::time::timeout(ISCSI_STOP_TIMEOUT, self.iscsi.start(&self.config)).await;
+        // The initiator logins below run either way (through the peer's
+        // portal when this copy is held down).
+        self.standdown_promote_or_hand_back().await;
         let peer_ip = self.config.network.peer_address.to_string();
         let port = self.config.iscsi.portal_port;
         let local_ip = crate::multipath::local_ip_toward(&peer_ip).await;
@@ -32745,11 +33742,16 @@ impl StateMachine {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(PROMOTE_AFTER_RECONNECT_SECS);
         while tokio::time::Instant::now() < deadline {
+            // Never over an active resync-skip record (bring-up holds it).
+            if self.skip_record_blocks() {
+                return false;
+            }
             match self.drbd.status().await {
                 Ok(s) if s.role == Role::Primary => return true,
                 Ok(s)
                     if s.connection == ConnectionState::Connected
-                        && s.replication != Some(crate::drbd::Replication::WFBitMap) =>
+                        && s.replication != Some(crate::drbd::Replication::WFBitMap)
+                        && !resync_pending(&s) =>
                 {
                     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if matches!(
@@ -34363,6 +35365,17 @@ mod tests {
         // The generation `resume_io` starts (None = unchanged): DRBD resuming
         // a fencing-suspended Primary starts a new current generation.
         uuid_after_resume: Mutex<Option<u64>>,
+        // What `resync_skip_scan` returns (Err: the kernel log unreadable),
+        // and how many times it ran.
+        skip_scan: Mutex<std::result::Result<crate::drbd::SkipScan, String>>,
+        skip_scans: std::sync::atomic::AtomicUsize,
+        // The status `invalidate` leaves behind (None = unchanged).
+        status_after_invalidate: Mutex<Option<DrbdStatus>>,
+        // A file `invalidate` checks for, and whether it existed at each call.
+        skip_marker_probe: Mutex<Option<String>>,
+        marker_at_invalidate: Mutex<Vec<bool>>,
+        // `invalidate` fails (DRBD refuses it, for example during a resync).
+        fail_invalidate: AtomicBool,
     }
 
     impl MockDrbd {
@@ -34378,6 +35391,12 @@ mod tests {
                 fail_status_after_resume: AtomicBool::new(false),
                 status_script: Mutex::new(std::collections::VecDeque::new()),
                 uuid_after_resume: Mutex::new(None),
+                skip_scan: Mutex::new(Ok(crate::drbd::SkipScan::default())),
+                skip_scans: std::sync::atomic::AtomicUsize::new(0),
+                status_after_invalidate: Mutex::new(None),
+                skip_marker_probe: Mutex::new(None),
+                marker_at_invalidate: Mutex::new(Vec::new()),
+                fail_invalidate: AtomicBool::new(false),
                 handshake: Mutex::new(None),
                 reads: Mutex::new(Vec::new()),
                 primary_called: AtomicBool::new(false),
@@ -34416,6 +35435,30 @@ mod tests {
         async fn handshake_gen(&self) -> Result<Option<crate::drbd::HandshakeGen>> {
             self.reads.lock().unwrap().push("handshake_gen");
             Ok(*self.handshake.lock().unwrap())
+        }
+        async fn resync_skip_scan(&self) -> Result<crate::drbd::SkipScan> {
+            self.skip_scans.fetch_add(1, Ordering::Relaxed);
+            self.skip_scan
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        async fn invalidate(&self) -> Result<()> {
+            self.record("invalidate");
+            if self.fail_invalidate.load(Ordering::Relaxed) {
+                anyhow::bail!("mock DRBD invalidate refused");
+            }
+            if let Some(path) = self.skip_marker_probe.lock().unwrap().clone() {
+                self.marker_at_invalidate
+                    .lock()
+                    .unwrap()
+                    .push(std::path::Path::new(&path).exists());
+            }
+            if let Some(after) = self.status_after_invalidate.lock().unwrap().take() {
+                *self.status.lock().unwrap() = after;
+            }
+            Ok(())
         }
         async fn status(&self) -> Result<DrbdStatus> {
             self.reads.lock().unwrap().push("status");
@@ -34590,6 +35633,9 @@ mod tests {
             self.start_called.store(true, Ordering::Relaxed);
             Ok(())
         }
+        fn is_active(&self) -> bool {
+            self.start_called.load(Ordering::Relaxed)
+        }
         async fn stop(&mut self) -> Result<()> {
             self.stop_called.store(true, Ordering::Relaxed);
             Ok(())
@@ -34605,6 +35651,12 @@ mod tests {
         }
         async fn handshake_gen(&self) -> Result<Option<crate::drbd::HandshakeGen>> {
             self.0.handshake_gen().await
+        }
+        async fn resync_skip_scan(&self) -> Result<crate::drbd::SkipScan> {
+            self.0.resync_skip_scan().await
+        }
+        async fn invalidate(&self) -> Result<()> {
+            self.0.invalidate().await
         }
         async fn local_current_uuid(&self) -> Option<u64> {
             self.0.local_current_uuid().await
@@ -55952,6 +57004,1393 @@ poll_interval_ms = 10
         sm.release_winner_freeze().await;
         held(&sm, &drbd, "one read");
         cleanup(&sm);
+    }
+
+    /// The source side of a resync the peer asked for (its `drbdadm
+    /// invalidate`, the resync-skip repair) lifts on the same terms as the
+    /// other source shapes: peer behind, everything else unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn the_lift_takes_starting_sync_source_toward_a_peer_behind() {
+        use crate::drbd::Replication::StartingSyncS;
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-sss", Some(StartingSyncS), DiskState::Inconsistent);
+        two_passes(&mut sm).await;
+        assert!(drbd.calls().contains(&"resume_io"), "{:?}", drbd.calls());
+        cleanup(&sm);
+        let held = |sm: &StateMachine, drbd: &MockDrbd, why: &str| {
+            assert!(
+                !drbd.calls().contains(&"resume_io"),
+                "{why}: calls {:?}",
+                drbd.calls()
+            );
+            assert!(std::path::Path::new(&sm.yield_path).exists(), "{why}");
+        };
+        // The peer not behind.
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-sss1", Some(StartingSyncS), DiskState::UpToDate);
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "peer UpToDate");
+        cleanup(&sm);
+        // Local copy not UpToDate.
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-sss2", Some(StartingSyncS), DiskState::Inconsistent);
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.disk = DiskState::Outdated;
+        drbd.set_status(st);
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "local not UpToDate");
+        cleanup(&sm);
+        // The split-brain resolver's marker.
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-sss3", Some(StartingSyncS), DiskState::Inconsistent);
+        std::fs::write(&sm.marker_path, "resource=data").unwrap();
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "split-brain marker");
+        cleanup(&sm);
+        // Connection younger than the hold.
+        let (mut sm, drbd) =
+            arb_frozen_winner("arb-sss4", Some(StartingSyncS), DiskState::Inconsistent);
+        sm.connected_since = Some(std::time::Instant::now());
+        two_passes(&mut sm).await;
+        held(&sm, &drbd, "connection not held");
+        cleanup(&sm);
+    }
+
+    /// The returner as DRBD leaves it after the skip: Secondary, Connected
+    /// and Established to an UpToDate Primary peer, its own copy UpToDate.
+    fn skipped_returner() -> DrbdStatus {
+        DrbdStatus {
+            role: Role::Secondary,
+            peer_role: Some(Role::Primary),
+            connection: ConnectionState::Connected,
+            disk: DiskState::UpToDate,
+            peer_disk: Some(DiskState::UpToDate),
+            suspended_user: false,
+            suspended_fencing: false,
+            suspended_any: false,
+            replication: None,
+            resync_done: None,
+        }
+    }
+
+    /// The scan of that returner's kernel log (records from the lab capture).
+    fn skipped_scan() -> crate::drbd::SkipScan {
+        crate::drbd::SkipScan {
+            owed_open: true,
+            owed_evidence: vec![
+                "twinstor-data/0 drbd0 twinstor-1: pdsk( DUnknown -> UpToDate ) repl( Off -> WFBitMapT ) [remote]"
+                    .to_string(),
+            ],
+            skip_evidence: vec![
+                "twinstor-data/0 drbd0 twinstor-1: uuid_compare()=no-sync by rule=reconnected"
+                    .to_string(),
+                "twinstor-data/0 drbd0 twinstor-1: cleared bm UUID and bitmap 50290AED3853EBFE:0000000000000000:3E0B5D2DA0DF1F2A:F16E34354E46B5CE"
+                    .to_string(),
+            ],
+            self_bits: Some(145408),
+            peer_bits: Some(7),
+            invalidate_cleared: false,
+        }
+    }
+
+    /// A state machine over `drbd` with private marker paths, and the flag
+    /// its iSCSI target start sets.
+    fn skip_sm(drbd: &std::sync::Arc<MockDrbd>) -> (StateMachine, std::sync::Arc<AtomicBool>) {
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let (mut sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(SharedIscsi {
+                start_called: started.clone(),
+                stop_called: std::sync::Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        sm.marker_path = test_memory_path("skip-split-brain");
+        *drbd.skip_marker_probe.lock().unwrap() = Some(sm.resync_skip_path.clone());
+        (sm, started)
+    }
+
+    fn write_skip_record(sm: &StateMachine) {
+        write_file_durably(
+            &sm.resync_skip_path,
+            &resync_skip_record(Some(0x10), 1, "test-boot", "evidence"),
+        )
+        .unwrap();
+    }
+
+    fn invalidates(drbd: &MockDrbd) -> usize {
+        drbd.calls().iter().filter(|c| **c == "invalidate").count()
+    }
+
+    #[tokio::test]
+    async fn a_skipped_resync_is_recorded_and_invalidated_never_served() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        *drbd.current_uuid.lock().unwrap() = Some(0x5029_0AED_3853_EBFE);
+        // Right after the invalidate the copy is still in the bitmap exchange.
+        *drbd.status_after_invalidate.lock().unwrap() = Some(DrbdStatus {
+            disk: DiskState::Outdated,
+            replication: Some(crate::drbd::Replication::WFBitMap),
+            ..skipped_returner()
+        });
+        let (mut sm, started) = skip_sm(&drbd);
+        // Recorded, then invalidated at once (no settle), record first.
+        assert!(!sm.try_go_online().await.unwrap());
+        let record = std::fs::read_to_string(&sm.resync_skip_path).unwrap();
+        assert_eq!(
+            parse_peer_served(&record),
+            Some(Some(0x5029_0AED_3853_EBFE)),
+            "{record}"
+        );
+        for field in ["\nat=", "\nboot_id=", "\nevidence=", "\ninvalidated_boot="] {
+            assert!(record.contains(field), "{record}");
+        }
+        assert!(
+            record.contains("WFBitMapT") && record.contains("no-sync"),
+            "{record}"
+        );
+        assert_eq!(*drbd.marker_at_invalidate.lock().unwrap(), vec![true]);
+        assert!(
+            !drbd.calls().contains(&"primary") && !drbd.calls().contains(&"force_primary"),
+            "{:?}",
+            drbd.calls()
+        );
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "no target on a skipped copy"
+        );
+        // Our full resync runs: the record ends; promoted, the target still
+        // down while the copy is Inconsistent.
+        drbd.set_status(resyncing(&skipped_returner()));
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        assert!(drbd.calls().contains(&"primary"));
+        assert!(!started.load(Ordering::Relaxed));
+        assert_eq!(invalidates(&drbd), 1);
+    }
+
+    #[tokio::test]
+    async fn the_repair_invalidates_unless_another_flow_owns_the_copy_or_there_is_no_source() {
+        let base = skipped_returner();
+        let alone = DrbdStatus {
+            connection: ConnectionState::StandAlone,
+            peer_disk: None,
+            peer_role: None,
+            ..base.clone()
+        };
+        // Connected to a peer that is not UpToDate: no source, no invalidate.
+        for (why, st) in [
+            (
+                "peer behind",
+                DrbdStatus {
+                    peer_disk: Some(DiskState::Outdated),
+                    ..base.clone()
+                },
+            ),
+            (
+                "peer disk unknown",
+                DrbdStatus {
+                    peer_disk: None,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            let (mut sm, _) = skip_sm(&drbd);
+            write_skip_record(&sm);
+            assert!(
+                !sm.resync_skip_step(&st, false).await,
+                "{why}: no hold by itself"
+            );
+            assert_eq!(invalidates(&drbd), 0, "{why}");
+            assert!(sm.skip_record_blocks(), "{why}: the record holds");
+        }
+        // A split-brain or an operator discard owns the copy, even
+        // disconnected.
+        for owner in ["split-brain", "discard"] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(alone.clone()));
+            let (mut sm, _) = skip_sm(&drbd);
+            write_skip_record(&sm);
+            let path = if owner == "split-brain" {
+                sm.marker_path.clone()
+            } else {
+                sm.discard_request_path.clone()
+            };
+            std::fs::write(&path, "x").unwrap();
+            assert!(!sm.resync_skip_step(&alone, false).await, "{owner}");
+            assert_eq!(invalidates(&drbd), 0, "{owner}");
+            let _ = std::fs::remove_file(&path);
+        }
+        // Everything else invalidates at once: during a bitmap exchange, with
+        // local I/O suspended, disconnected.
+        for (why, st) in [
+            (
+                "bitmap exchange",
+                DrbdStatus {
+                    replication: Some(crate::drbd::Replication::WFBitMap),
+                    ..base.clone()
+                },
+            ),
+            (
+                "local I/O suspended",
+                DrbdStatus {
+                    suspended_user: true,
+                    suspended_any: true,
+                    ..base.clone()
+                },
+            ),
+            ("disconnected", alone.clone()),
+        ] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            let (mut sm, _) = skip_sm(&drbd);
+            write_skip_record(&sm);
+            let _ = sm.resync_skip_step(&st, false).await;
+            assert_eq!(invalidates(&drbd), 1, "{why}");
+        }
+        // Paced: none again inside the interval, another after it (this
+        // boot's log still showing the debt, so the invalidate's resync did
+        // not run).
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        let _ = sm.resync_skip_step(&base, false).await;
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 1);
+        sm.resync_skip_invalidate_at =
+            std::time::Instant::now().checked_sub(SKIP_INVALIDATE_EVERY + Duration::from_secs(1));
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 2);
+        assert!(sm.skip_record_blocks(), "held until our full resync runs");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_copy_with_a_skip_invalidates_at_once() {
+        for connection in [ConnectionState::StandAlone, ConnectionState::Connecting] {
+            let st = DrbdStatus {
+                connection,
+                peer_disk: None,
+                peer_role: None,
+                ..skipped_returner()
+            };
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+            let (mut sm, _) = skip_sm(&drbd);
+            assert!(!sm.resync_skip_step(&st, true).await, "{connection:?}");
+            assert_eq!(
+                *drbd.marker_at_invalidate.lock().unwrap(),
+                vec![true],
+                "{connection:?}: invalidated at once, the record written first"
+            );
+            assert_eq!(
+                sm.skip_record(),
+                SkipRecord::Active {
+                    invalidated: SkipInvalidated::ThisBoot
+                }
+            );
+        }
+    }
+
+    /// The lossy run's shape: disconnected, the boot gate holding on a live
+    /// peer (`HoldPeerAlive`). The early step still records and invalidates.
+    #[tokio::test]
+    async fn a_holding_boot_gate_does_not_keep_the_repair_from_running() {
+        let alone = DrbdStatus {
+            connection: ConnectionState::StandAlone,
+            peer_disk: None,
+            peer_role: None,
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(alone));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        let (mut sm, started) = skip_sm(&drbd);
+        sm.boot_gate_cache = Some((
+            std::time::Instant::now(),
+            PeerLifeEvidence {
+                portal: true,
+                ..Default::default()
+            },
+        ));
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(sm.boot_gate_last, Some(BootGate::HoldPeerAlive));
+        assert_eq!(*drbd.marker_at_invalidate.lock().unwrap(), vec![true]);
+        assert!(!drbd.calls().contains(&"primary"));
+        assert!(!started.load(Ordering::Relaxed));
+        let _ = std::fs::remove_file(&sm.peer_served_path);
+    }
+
+    /// A split-brain marker owns the copy: the early step holds nothing by
+    /// itself, so the StandAlone heal still runs (no deadlock), and no
+    /// invalidate.
+    #[tokio::test]
+    async fn a_skip_record_under_a_split_brain_leaves_the_standalone_heal_running() {
+        let alone = DrbdStatus {
+            connection: ConnectionState::StandAlone,
+            peer_disk: None,
+            peer_role: None,
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(alone));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        std::fs::write(&sm.marker_path, "resource=data").unwrap();
+        assert!(!sm.try_go_online().await.unwrap());
+        assert!(sm.standalone_since.is_some(), "the StandAlone heal ran");
+        assert_eq!(invalidates(&drbd), 0);
+        let _ = std::fs::remove_file(&sm.marker_path);
+    }
+
+    #[tokio::test]
+    async fn a_skip_record_holds_across_a_new_state_machine() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        *drbd.current_uuid.lock().unwrap() = Some(0x10);
+        drbd.fail_invalidate.store(true, Ordering::Relaxed);
+        let (mut sm, _) = skip_sm(&drbd);
+        assert!(!sm.try_go_online().await.unwrap());
+        let path = sm.resync_skip_path.clone();
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::No
+            }
+        );
+        // A daemon restart or a reboot: the kernel log no longer shows the
+        // skip, the record governs.
+        *drbd.skip_scan.lock().unwrap() = Ok(crate::drbd::SkipScan::default());
+        let (mut again, started) = skip_sm(&drbd);
+        again.resync_skip_path = path.clone();
+        again.boot_id = "another-boot".to_string();
+        assert_eq!(resync_skip_brief(&path), "0000000000000010");
+        for _ in 0..3 {
+            assert!(!again.try_go_online().await.unwrap());
+        }
+        assert!(!drbd.calls().contains(&"primary"), "{:?}", drbd.calls());
+        assert!(!started.load(Ordering::Relaxed));
+        assert_eq!(
+            drbd.skip_scans.load(Ordering::Relaxed),
+            1,
+            "no scan under a record"
+        );
+        assert!(again.skip_record_blocks());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_skip_record_turns_forced_when_this_node_is_primary() {
+        // An operator forced this copy (`drbdadm primary --force`).
+        let forced = DrbdStatus {
+            role: Role::Primary,
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(forced));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        let _ = sm.try_go_online().await;
+        assert_eq!(sm.skip_record(), SkipRecord::Forced { this_boot: true });
+        assert_eq!(invalidates(&drbd), 0);
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_kernel_log_holds_the_promote_for_a_bounded_time() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        *drbd.skip_scan.lock().unwrap() = Err("dmesg did not return".to_string());
+        let (mut sm, _) = skip_sm(&drbd);
+        // Within the hold: no promote.
+        for _ in 0..3 {
+            assert!(!sm.try_go_online().await.unwrap());
+        }
+        assert!(!drbd.calls().contains(&"primary"), "{:?}", drbd.calls());
+        // Past it (from the first failure in this run): proceed without the
+        // log.
+        sm.skip_scan_failed_at =
+            std::time::Instant::now().checked_sub(SKIP_SCAN_FAIL_HOLD + Duration::from_secs(1));
+        let _ = sm.try_go_online().await;
+        assert!(drbd.calls().contains(&"primary"), "{:?}", drbd.calls());
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+    }
+
+    #[tokio::test]
+    async fn a_copy_not_uptodate_is_not_scanned_and_a_resync_starting_is_no_skip() {
+        // Outdated during the bitmap exchange: a resync in progress.
+        let exchanging = DrbdStatus {
+            disk: DiskState::Outdated,
+            replication: Some(crate::drbd::Replication::WFBitMap),
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(exchanging.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        let (mut sm, _) = skip_sm(&drbd);
+        assert!(!sm.resync_skip_step(&exchanging, true).await);
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 0);
+        // UpToDate at the first read, but a resync toward it began before
+        // the log was read: the re-read shows it, so no record, and this
+        // pass holds the promote.
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        drbd.status_script.lock().unwrap().push_back(exchanging);
+        let (mut sm, _) = skip_sm(&drbd);
+        assert!(sm.resync_skip_step(&skipped_returner(), true).await);
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        assert_eq!(invalidates(&drbd), 0);
+        // A clean scan: the copy proceeds.
+        let drbd = std::sync::Arc::new(MockDrbd::new(skipped_returner()));
+        let (mut sm, _) = skip_sm(&drbd);
+        assert!(!sm.resync_skip_step(&skipped_returner(), true).await);
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 1);
+    }
+
+    // Status samples the lab harness captured on the returners
+    // (`drbdsetup status -v`, once a second), verbatim.
+
+    /// Flap capture, returner: the second the old daemon logged
+    /// `try_go_online: promoting to Primary heal_event="promote" alone=false
+    /// connection=Connected disk=Outdated peer_disk=Some(UpToDate)`.
+    const SAMPLE_PENDING_RESYNC: &str =
+        "twinstor-data node-id:1 role:Secondary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:Outdated
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:0 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:upper
+  twinstor-1 node-id:0 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:WFBitMapT peer-disk:UpToDate resync-suspended:no
+        received:0 sent:0 out-of-sync:561152 pending:0 unacked:0
+";
+
+    /// The same shape on the other host of the second flap run, the second
+    /// before the old daemon promoted it.
+    const SAMPLE_PENDING_RESYNC_2: &str =
+        "twinstor-data node-id:0 role:Secondary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:Outdated
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800171 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:0 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:upper
+  twinstor-2 node-id:1 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:WFBitMapT peer-disk:UpToDate resync-suspended:no
+        received:0 sent:0 out-of-sync:552960 pending:0 unacked:0
+";
+
+    /// Flap capture, returner, after the reconnect that skipped the resync:
+    /// Primary (promoted mid-WFBitMapT), UpToDate, its target not started yet.
+    const SAMPLE_PRIMARY_AFTER_SKIP: &str =
+        "twinstor-data node-id:1 role:Primary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:UpToDate
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:45 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-1 node-id:0 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+        received:0 sent:0 out-of-sync:0 pending:0 unacked:0
+";
+
+    /// Reset capture, returner still Secondary: the link dropped during the
+    /// bitmap exchange.
+    const SAMPLE_DROPPED_SECONDARY: &str =
+        "twinstor-data node-id:1 role:Secondary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:Outdated
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:0 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-1 node-id:0 connection:Connecting role:Unknown tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Off peer-disk:DUnknown resync-suspended:no
+        received:0 sent:0 out-of-sync:581632 pending:0 unacked:0
+";
+
+    /// Reset capture, returner still Secondary, after the reconnect that
+    /// skipped the resync (the second before the old daemon promoted it).
+    const SAMPLE_SKIPPED_SECONDARY: &str =
+        "twinstor-data node-id:1 role:Secondary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:UpToDate
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:59 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-1 node-id:0 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+        received:0 sent:0 out-of-sync:0 pending:0 unacked:0
+";
+
+    /// The second flap run's other host after its real resync: Primary,
+    /// UpToDate, nothing skipped.
+    const SAMPLE_PRIMARY_AFTER_RESYNC: &str =
+        "twinstor-data node-id:0 role:Primary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:UpToDate
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800171 quorum:yes
+      open:no
+      size:488371640 read:0 written:552960 al-writes:0 bm-writes:57 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-2 node-id:1 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+        received:552960 sent:0 out-of-sync:0 pending:0 unacked:0
+";
+
+    fn sample(text: &str) -> DrbdStatus {
+        crate::drbd::parse_drbdadm_text(text).unwrap()
+    }
+
+    /// The kernel-log scan of a lab capture (see `drbd::resync_skip_fixtures`).
+    fn capture_scan(log: &str) -> crate::drbd::SkipScan {
+        crate::drbd::scan_resync_skip(log, "twinstor-data")
+    }
+
+    /// The same copy once its resync has started.
+    fn resyncing(st: &DrbdStatus) -> DrbdStatus {
+        DrbdStatus {
+            disk: DiskState::Inconsistent,
+            replication: Some(crate::drbd::Replication::SyncTarget),
+            ..st.clone()
+        }
+    }
+
+    #[test]
+    fn the_samples_read_as_captured() {
+        let p = sample(SAMPLE_PENDING_RESYNC);
+        assert_eq!(
+            (p.role, p.connection, p.disk, p.peer_disk, p.replication),
+            (
+                Role::Secondary,
+                ConnectionState::Connected,
+                DiskState::Outdated,
+                Some(DiskState::UpToDate),
+                Some(crate::drbd::Replication::WFBitMap)
+            )
+        );
+        let s = sample(SAMPLE_PRIMARY_AFTER_SKIP);
+        assert_eq!(
+            (s.role, s.disk, s.replication),
+            (
+                Role::Primary,
+                DiskState::UpToDate,
+                Some(crate::drbd::Replication::Established)
+            )
+        );
+        assert_eq!(
+            sample(SAMPLE_DROPPED_SECONDARY).connection,
+            ConnectionState::Connecting
+        );
+    }
+
+    #[test]
+    fn resync_pending_is_only_a_target_whose_resync_has_not_started() {
+        assert!(resync_pending(&sample(SAMPLE_PENDING_RESYNC)));
+        assert!(resync_pending(&sample(SAMPLE_PENDING_RESYNC_2)));
+        let consistent = DrbdStatus {
+            disk: DiskState::Consistent,
+            ..sample(SAMPLE_PENDING_RESYNC)
+        };
+        assert!(resync_pending(&consistent));
+        // Started, done, disconnected, or no UpToDate peer: not pending.
+        assert!(!resync_pending(&resyncing(&sample(SAMPLE_PENDING_RESYNC))));
+        assert!(!resync_pending(&sample(SAMPLE_SKIPPED_SECONDARY)));
+        assert!(!resync_pending(&sample(SAMPLE_DROPPED_SECONDARY)));
+        let both_outdated = DrbdStatus {
+            peer_disk: Some(DiskState::Outdated),
+            ..sample(SAMPLE_PENDING_RESYNC)
+        };
+        assert!(!resync_pending(&both_outdated));
+        let diskless_peer = DrbdStatus {
+            peer_disk: Some(DiskState::Diskless),
+            ..consistent
+        };
+        assert!(!resync_pending(&diskless_peer));
+    }
+
+    #[tokio::test]
+    async fn a_copy_awaiting_its_resync_is_promoted_only_once_it_is_inconsistent() {
+        for pending in [SAMPLE_PENDING_RESYNC, SAMPLE_PENDING_RESYNC_2] {
+            let st = sample(pending);
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            let (mut sm, started) = skip_sm(&drbd);
+            for _ in 0..3 {
+                assert!(!sm.try_go_online().await.unwrap());
+            }
+            assert!(!drbd.calls().contains(&"primary"), "{:?}", drbd.calls());
+            assert!(sm.resync_pending_since.is_some());
+            assert_eq!(
+                drbd.skip_scans.load(Ordering::Relaxed),
+                0,
+                "not UpToDate: no scan"
+            );
+            // The resync starts: promoted, the target still down until the
+            // copy is UpToDate.
+            drbd.set_status(resyncing(&st));
+            assert!(!sm.try_go_online().await.unwrap());
+            assert!(drbd.calls().contains(&"primary"), "{:?}", drbd.calls());
+            assert!(!started.load(Ordering::Relaxed));
+            assert!(sm.resync_pending_since.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_pending_resync_is_warned_about_once() {
+        let st = sample(SAMPLE_PENDING_RESYNC);
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        assert!(sm.resync_pending_holds(&st));
+        assert!(!sm.resync_pending_warned);
+        sm.resync_pending_since = std::time::Instant::now()
+            .checked_sub(RESYNC_PENDING_WARN_AFTER + Duration::from_secs(1));
+        assert!(sm.resync_pending_holds(&st));
+        assert!(sm.resync_pending_warned);
+        assert!(!sm.resync_pending_holds(&resyncing(&st)));
+        assert!(!sm.resync_pending_warned && sm.resync_pending_since.is_none());
+    }
+
+    /// The reset sequence as the returner sees it: bitmap exchange (held),
+    /// the link drops, the reconnect skips the resync. Never promoted, never
+    /// exported: recorded and invalidated on that pass, promoted only once
+    /// our full resync runs.
+    #[tokio::test]
+    async fn the_skip_sequence_ends_in_a_record_and_an_invalidate_never_a_target() {
+        let mut config = (*test_config()).clone();
+        config.network.peer_address = "127.0.0.1".parse().unwrap();
+        let drbd = std::sync::Arc::new(MockDrbd::new(sample(SAMPLE_PENDING_RESYNC)));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(
+            crate::drbd::resync_skip_fixtures::RESET_RETURNER,
+        ));
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let (mut sm, _) = StateMachine::new(
+            std::sync::Arc::new(config),
+            Box::new(ArcDrbd(drbd.clone())),
+            Box::new(SharedIscsi {
+                start_called: started.clone(),
+                stop_called: std::sync::Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        sm.marker_path = test_memory_path("skip-seq-split-brain");
+        *drbd.skip_marker_probe.lock().unwrap() = Some(sm.resync_skip_path.clone());
+        sm.connect_waited = true;
+        sm.rejoin_rearm_used = true;
+        // Bitmap exchange: held by the pending-resync hold.
+        assert!(!sm.try_go_online().await.unwrap());
+        // The link drops.
+        drbd.set_status(sample(SAMPLE_DROPPED_SECONDARY));
+        sm.boot_gate_cache = Some((std::time::Instant::now(), PeerLifeEvidence::default()));
+        sm.fs_serve_hold_since = Some(std::time::Instant::now());
+        assert!(!sm.try_go_online().await.unwrap());
+        // The reconnect skipped the resync: recorded and invalidated.
+        drbd.set_status(sample(SAMPLE_SKIPPED_SECONDARY));
+        *drbd.status_after_invalidate.lock().unwrap() =
+            Some(resyncing(&sample(SAMPLE_SKIPPED_SECONDARY)));
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(*drbd.marker_at_invalidate.lock().unwrap(), vec![true]);
+        // The copy read Inconsistent right after our invalidate: the record
+        // ended at once, and the pass promoted the copy now under the full
+        // resync (status read after the step), still with no target.
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        let calls = drbd.calls();
+        let inv = calls.iter().position(|c| *c == "invalidate").unwrap();
+        assert!(
+            calls
+                .iter()
+                .position(|c| *c == "primary")
+                .is_some_and(|p| p > inv),
+            "promoted only after the invalidate: {calls:?}"
+        );
+        assert!(!sm.try_go_online().await.unwrap());
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "never a target on the skipped copy"
+        );
+    }
+
+    /// Another resync than ours (a bitmap resync after another reset of this
+    /// host, the peer having written meanwhile) leaves the cleared regions
+    /// out: the record holds through it, and the copy is invalidated once
+    /// DRBD accepts it, also when that resync left it UpToDate.
+    #[tokio::test]
+    async fn a_resync_other_than_ours_never_clears_the_record() {
+        let base = skipped_returner();
+        let drbd = std::sync::Arc::new(MockDrbd::new(resyncing(&base)));
+        // DRBD refuses an invalidate during a resync.
+        drbd.fail_invalidate.store(true, Ordering::Relaxed);
+        let (mut sm, started) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        for _ in 0..2 {
+            assert!(!sm.try_go_online().await.unwrap());
+            sm.resync_skip_invalidate_at = None;
+        }
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::No
+            }
+        );
+        assert!(
+            !drbd.calls().contains(&"primary"),
+            "an Inconsistent copy under a record is not promoted either: {:?}",
+            drbd.calls()
+        );
+        // That resync finished: UpToDate, the record still holds.
+        drbd.set_status(base.clone());
+        assert!(!sm.try_go_online().await.unwrap());
+        assert!(sm.skip_record_blocks());
+        // DRBD accepts the invalidate now: our full resync.
+        drbd.fail_invalidate.store(false, Ordering::Relaxed);
+        sm.resync_skip_invalidate_at = None;
+        *drbd.status_after_invalidate.lock().unwrap() = Some(resyncing(&base));
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Absent,
+            "the copy read Inconsistent right after our invalidate"
+        );
+        assert!(!started.load(Ordering::Relaxed));
+    }
+
+    /// The returner rebooted with an active record (no invalidate yet) and
+    /// came back into a bitmap resync (`target-use-bitmap by
+    /// rule=bitmap-peer`): its kernel log reads clean and is not consulted;
+    /// held through it, then invalidated.
+    #[tokio::test]
+    async fn a_rebooted_returner_with_a_record_is_held_through_a_bitmap_resync() {
+        let base = skipped_returner();
+        let drbd = std::sync::Arc::new(MockDrbd::new(resyncing(&base)));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(
+            crate::drbd::resync_skip_fixtures::SURVIVOR_REAL_RESYNC,
+        ));
+        drbd.fail_invalidate.store(true, Ordering::Relaxed);
+        let (mut sm, started) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        sm.boot_id = "the-boot-after".to_string();
+        assert!(!sm.try_go_online().await.unwrap());
+        assert!(sm.skip_record_blocks());
+        drbd.set_status(base.clone());
+        drbd.fail_invalidate.store(false, Ordering::Relaxed);
+        sm.resync_skip_invalidate_at = None;
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::ThisBoot
+            }
+        );
+        assert_eq!(
+            drbd.skip_scans.load(Ordering::Relaxed),
+            0,
+            "the record governs"
+        );
+        assert!(!drbd.calls().contains(&"primary"));
+        assert!(!started.load(Ordering::Relaxed));
+    }
+
+    /// An operator forced an Outdated returner whose survivor was lost after
+    /// the bitmap exchange: DRBD's force line closes the debt. Never demoted
+    /// or invalidated, not after a later demote nor a daemon restart in the
+    /// same boot.
+    #[tokio::test]
+    async fn an_operator_force_on_an_outdated_returner_is_never_undone() {
+        use crate::drbd::resync_skip_fixtures::{FORCE_LINE, RESET_RETURNER};
+        let open: Vec<&str> = RESET_RETURNER
+            .lines()
+            .take_while(|l| !l.contains("no-sync"))
+            .collect();
+        let forced_log = format!("{}\n{FORCE_LINE}\n", open.join("\n"));
+        let forced = sample(SAMPLE_PRIMARY_AFTER_SKIP);
+        let drbd = std::sync::Arc::new(MockDrbd::new(forced.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(&forced_log));
+        let (mut sm, started) = skip_sm(&drbd);
+        assert!(sm.try_go_online().await.unwrap(), "the forced copy serves");
+        assert!(started.load(Ordering::Relaxed));
+        // Demoted later by some other flow, back through bring-up.
+        drbd.set_status(DrbdStatus {
+            role: Role::Secondary,
+            ..forced.clone()
+        });
+        sm.set_state(NodeState::Init);
+        let _ = sm.try_go_online().await;
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        // A daemon restart in the same boot.
+        drbd.set_status(forced.clone());
+        let (mut again, _) = skip_sm(&drbd);
+        let _ = again.try_go_online().await;
+        assert_eq!(again.skip_record(), SkipRecord::Absent);
+        assert_eq!(invalidates(&drbd), 0);
+        assert!(!drbd.calls().contains(&"secondary"), "{:?}", drbd.calls());
+    }
+
+    /// A daemon restart on a serving Primary whose kernel log shows a skip
+    /// (an upgrade in place after an older release promoted it early, its
+    /// target still exported by LIO): no record, no hold, no demote, no
+    /// invalidate; one scan per run, the alert at most.
+    #[tokio::test]
+    async fn a_restart_on_a_serving_primary_only_alerts() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(sample(SAMPLE_PRIMARY_AFTER_SKIP)));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(
+            crate::drbd::resync_skip_fixtures::FLAP_RETURNER,
+        ));
+        let (mut sm, started) = skip_sm(&drbd);
+        assert!(sm.try_go_online().await.unwrap());
+        assert!(started.load(Ordering::Relaxed));
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 1);
+        sm.set_state(NodeState::Init);
+        assert!(sm.try_go_online().await.unwrap());
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 1, "once per run");
+        assert_eq!(invalidates(&drbd), 0);
+        assert!(!drbd.calls().contains(&"secondary"), "{:?}", drbd.calls());
+        // A copy that resynced for real reads clean and serves the same way.
+        let drbd = std::sync::Arc::new(MockDrbd::new(sample(SAMPLE_PRIMARY_AFTER_RESYNC)));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(
+            crate::drbd::resync_skip_fixtures::BROKEN_RESYNC_RETURNER,
+        ));
+        let (mut sm, started) = skip_sm(&drbd);
+        assert!(sm.try_go_online().await.unwrap());
+        assert!(started.load(Ordering::Relaxed));
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 1);
+    }
+
+    /// An operator forces the held copy (already UpToDate: no force line):
+    /// it serves, and its kernel log, which still shows the skip, does not
+    /// flag it again in this boot, not after a daemon restart nor a demote.
+    /// The forced record ends at the next boot.
+    #[tokio::test]
+    async fn an_operator_force_wins_for_the_rest_of_the_boot() {
+        let forced = sample(SAMPLE_PRIMARY_AFTER_SKIP);
+        let drbd = std::sync::Arc::new(MockDrbd::new(forced.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(
+            crate::drbd::resync_skip_fixtures::FLAP_RETURNER,
+        ));
+        let (mut sm, started) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        assert!(sm.try_go_online().await.unwrap(), "the forced copy serves");
+        assert!(started.load(Ordering::Relaxed));
+        assert_eq!(sm.skip_record(), SkipRecord::Forced { this_boot: true });
+        assert!(!resync_skip_record_active(&sm.resync_skip_path));
+        assert_eq!(resync_skip_brief(&sm.resync_skip_path), "forced");
+        let path = sm.resync_skip_path.clone();
+        // A daemon restart in the same boot.
+        let (mut again, started) = skip_sm(&drbd);
+        again.resync_skip_path = path.clone();
+        again.boot_id = sm.boot_id.clone();
+        assert!(again.try_go_online().await.unwrap());
+        assert!(started.load(Ordering::Relaxed));
+        // Demoted later in the same boot: still not flagged.
+        let demoted = DrbdStatus {
+            role: Role::Secondary,
+            ..forced.clone()
+        };
+        assert!(!again.resync_skip_step(&demoted, true).await);
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 0);
+        assert_eq!(invalidates(&drbd), 0);
+        // The next boot: the forced record ends; a Secondary with a new skip
+        // is flagged again.
+        drbd.set_status(demoted.clone());
+        let (mut rebooted, _) = skip_sm(&drbd);
+        rebooted.resync_skip_path = path.clone();
+        rebooted.boot_id = "another-boot".to_string();
+        assert!(!rebooted.resync_skip_step(&demoted, true).await);
+        assert!(rebooted.skip_record_blocks());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_forced_record_ends_once_the_copy_resyncs() {
+        let st = resyncing(&sample(SAMPLE_SKIPPED_SECONDARY));
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_file_durably(
+            &sm.resync_skip_path,
+            &resync_skip_forced_record(Some(0x10), &sm.boot_id.clone()),
+        )
+        .unwrap();
+        assert!(!sm.resync_skip_step(&st, true).await);
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+    }
+
+    /// The daemon's own promote paths outside bring-up never promote over an
+    /// active record, and the reconnect and stand-down promotes never into a
+    /// resync that has not started; a refused stand-down rejoin goes back to
+    /// bring-up.
+    #[tokio::test(start_paused = true)]
+    async fn internal_promotes_refuse_over_a_record_or_a_pending_resync() {
+        let pending = sample(SAMPLE_PENDING_RESYNC);
+        let started_resync = resyncing(&pending);
+        // promote_after_reconnect.
+        let drbd = std::sync::Arc::new(MockDrbd::new(started_resync.clone()));
+        let (sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        assert!(!sm.promote_after_reconnect().await);
+        let _ = std::fs::remove_file(&sm.resync_skip_path);
+        drbd.set_status(pending.clone());
+        assert!(!sm.promote_after_reconnect().await);
+        assert!(!drbd.calls().contains(&"primary"), "{:?}", drbd.calls());
+        drbd.set_status(started_resync.clone());
+        assert!(
+            sm.promote_after_reconnect().await,
+            "control: a started resync promotes"
+        );
+        // The stand-down rejoin's promote.
+        let drbd = std::sync::Arc::new(MockDrbd::new(started_resync.clone()));
+        let (sm, _) = skip_sm(&drbd);
+        assert!(sm.standdown_promote_allowed().await);
+        write_skip_record(&sm);
+        assert!(!sm.standdown_promote_allowed().await);
+        let _ = std::fs::remove_file(&sm.resync_skip_path);
+        drbd.set_status(pending.clone());
+        assert!(!sm.standdown_promote_allowed().await);
+        // The stand-down rejoin without a reboot, still Online: refused, it
+        // hands back to bring-up instead of staying an Online Secondary.
+        let drbd = std::sync::Arc::new(MockDrbd::new(started_resync.clone()));
+        let (mut sm, started) = skip_sm(&drbd);
+        sm.set_state(NodeState::Online);
+        write_skip_record(&sm);
+        sm.standdown_promote_or_hand_back().await;
+        assert_eq!(sm.state(), NodeState::Init);
+        assert!(
+            !drbd.calls().contains(&"force_primary"),
+            "{:?}",
+            drbd.calls()
+        );
+        assert!(!started.load(Ordering::Relaxed));
+        let _ = std::fs::remove_file(&sm.resync_skip_path);
+        sm.set_state(NodeState::Online);
+        sm.standdown_promote_or_hand_back().await;
+        assert_eq!(sm.state(), NodeState::Online, "control");
+        assert!(drbd.calls().contains(&"force_primary"));
+        assert!(started.load(Ordering::Relaxed));
+    }
+
+    /// The both-Outdated keeper force, through bring-up (configured as this
+    /// host so the hostname guard passes).
+    #[tokio::test]
+    async fn the_both_outdated_keeper_force_refuses_over_a_record() {
+        let host = hostname::get().unwrap().to_string_lossy().into_owned();
+        let both = DrbdStatus {
+            disk: DiskState::Outdated,
+            peer_disk: Some(DiskState::Outdated),
+            ..skipped_returner()
+        };
+        for record in [true, false] {
+            let mut config = (*test_config()).clone();
+            config.node.name = host.clone();
+            config.node.peer = "~peer".to_string();
+            let drbd = std::sync::Arc::new(MockDrbd::new(both.clone()));
+            let (mut sm, _) = StateMachine::new(
+                std::sync::Arc::new(config),
+                Box::new(ArcDrbd(drbd.clone())),
+                Box::new(MockIscsi::new()),
+            );
+            sm.marker_path = test_memory_path("skip-tiebreak-split-brain");
+            if record {
+                write_skip_record(&sm);
+            }
+            sm.both_outdated_since =
+                std::time::Instant::now().checked_sub(BOTH_OUTDATED_GRACE + Duration::from_secs(1));
+            assert!(!sm.try_go_online().await.unwrap());
+            assert_eq!(
+                drbd.calls().contains(&"force_primary"),
+                !record,
+                "record {record}: {:?}",
+                drbd.calls()
+            );
+            assert_eq!(invalidates(&drbd), 0, "no UpToDate peer to resync from");
+            let _ = std::fs::remove_file(&sm.resync_skip_path);
+        }
+    }
+
+    fn write_invalidated_record(sm: &StateMachine, boot: &str) {
+        let text = format!(
+            "{}{SKIP_RECORD_INVALIDATED}{boot}\n",
+            resync_skip_record(Some(0x10), 1, "b0", "evidence")
+        );
+        write_file_durably(&sm.resync_skip_path, &text).unwrap();
+    }
+
+    /// After a successful invalidate, a copy back at UpToDate is read by the
+    /// boot of the invalidate: this boot's kernel log tells whether its
+    /// resync ran; from another boot it is invalidated again.
+    #[tokio::test]
+    async fn an_invalidated_record_is_cleared_only_by_its_own_resync() {
+        use SkipInvalidated::{OtherBoot, ThisBoot};
+        let base = skipped_returner();
+        // This boot, the log shows the resync ran (debt closed): cleared.
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, &sm.boot_id.clone());
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: ThisBoot
+            }
+        );
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        assert_eq!(invalidates(&drbd), 0);
+        // This boot, the debt still open (the invalidate's own StartingSyncT
+        // dropped by a reconnect): invalidated again.
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(skipped_scan());
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, &sm.boot_id.clone());
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 1);
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: ThisBoot
+            }
+        );
+        // This boot, the log unreadable: held within the bound, then
+        // invalidated again.
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        *drbd.skip_scan.lock().unwrap() = Err("dmesg did not return".to_string());
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, &sm.boot_id.clone());
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 0);
+        assert!(sm.skip_record_blocks());
+        sm.skip_scan_failed_at =
+            std::time::Instant::now().checked_sub(SKIP_SCAN_FAIL_HOLD + Duration::from_secs(1));
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 1);
+        // Another boot, UpToDate: invalidated again, now noted for this boot.
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, "an-earlier-boot");
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: OtherBoot
+            }
+        );
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 1);
+        assert_eq!(drbd.skip_scans.load(Ordering::Relaxed), 0, "no log to ask");
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Active {
+                invalidated: ThisBoot
+            }
+        );
+        // Another boot, the copy under its resync (Inconsistent is durable):
+        // cleared.
+        let drbd = std::sync::Arc::new(MockDrbd::new(resyncing(&base)));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, "an-earlier-boot");
+        let _ = sm.resync_skip_step(&resyncing(&base), false).await;
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+    }
+
+    #[tokio::test]
+    async fn a_refused_invalidate_is_warned_once_per_streak() {
+        let base = skipped_returner();
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        drbd.fail_invalidate.store(true, Ordering::Relaxed);
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        for _ in 0..3 {
+            let _ = sm.resync_skip_step(&base, false).await;
+            assert!(sm.resync_skip_refusal_logged);
+            sm.resync_skip_invalidate_at = None;
+        }
+        assert_eq!(invalidates(&drbd), 3);
+        drbd.fail_invalidate.store(false, Ordering::Relaxed);
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert!(!sm.resync_skip_refusal_logged, "a success ends the streak");
+    }
+
+    #[tokio::test]
+    async fn a_record_is_repaired_only_on_a_secondary() {
+        let unknown = DrbdStatus {
+            role: Role::Unknown,
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(unknown.clone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_skip_record(&sm);
+        let _ = sm.resync_skip_step(&unknown, false).await;
+        assert_eq!(invalidates(&drbd), 0);
+        assert!(
+            sm.skip_record_blocks(),
+            "neither repaired nor taken for a force"
+        );
+    }
+
+    #[test]
+    fn the_skip_alert_says_what_the_rebuild_waits_for() {
+        let plain = resync_skip_alert_text("node-b", "data", None);
+        assert!(plain.contains("being rebuilt") && plain.contains("Nothing to do."));
+        let peer = resync_skip_alert_text("node-b", "data", Some(SKIP_HELD_PEER));
+        assert!(peer.contains("UpToDate again") && !peer.contains("Nothing to do."));
+        for held in [SKIP_HELD_SPLIT_BRAIN, SKIP_HELD_DISCARD] {
+            let t = resync_skip_alert_text("node-b", "data", Some(held));
+            assert!(!t.contains("Nothing to do"), "{t}");
+        }
+        for t in [plain, peer] {
+            assert!(t.contains("drbdadm primary --force twinstor-data"), "{t}");
+        }
+    }
+
+    /// The 60 s hold runs per failure streak: a successful read ends it, so
+    /// a later failure holds again for its own 60 s.
+    #[tokio::test]
+    async fn a_kernel_log_failure_streak_ends_on_a_successful_read() {
+        let st = skipped_returner();
+        let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+        *drbd.skip_scan.lock().unwrap() = Err("dmesg did not return".to_string());
+        let (mut sm, _) = skip_sm(&drbd);
+        assert!(sm.resync_skip_step(&st, true).await, "first failure holds");
+        sm.skip_scan_failed_at =
+            std::time::Instant::now().checked_sub(SKIP_SCAN_FAIL_HOLD + Duration::from_secs(1));
+        assert!(
+            !sm.resync_skip_step(&st, true).await,
+            "past the bound: proceed"
+        );
+        assert!(sm.skip_scan_fail_open_logged);
+        // A successful read ends the streak.
+        *drbd.skip_scan.lock().unwrap() = Ok(crate::drbd::SkipScan::default());
+        assert!(!sm.resync_skip_step(&st, true).await);
+        assert!(sm.skip_scan_failed_at.is_none() && !sm.skip_scan_fail_open_logged);
+        // A failure hours later holds again.
+        *drbd.skip_scan.lock().unwrap() = Err("dmesg did not return".to_string());
+        assert!(
+            sm.resync_skip_step(&st, true).await,
+            "a new streak holds again"
+        );
+    }
+
+    /// Our resync is credited only while the invalidate's full bitmap was not
+    /// cleared by a reconnect before it started.
+    #[tokio::test]
+    async fn an_invalidate_whose_bitmap_was_cleared_is_not_credited() {
+        let base = skipped_returner();
+        let cleared = crate::drbd::SkipScan {
+            invalidate_cleared: true,
+            ..Default::default()
+        };
+        // Resyncing after the invalidate, its bitmap cleared: the record
+        // holds (DRBD refuses the new invalidate while that resync runs).
+        let drbd = std::sync::Arc::new(MockDrbd::new(resyncing(&base)));
+        *drbd.skip_scan.lock().unwrap() = Ok(cleared.clone());
+        drbd.fail_invalidate.store(true, Ordering::Relaxed);
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, &sm.boot_id.clone());
+        let _ = sm.resync_skip_step(&resyncing(&base), false).await;
+        assert!(sm.skip_record_blocks());
+        assert_eq!(invalidates(&drbd), 1, "tried again");
+        // The same with the bitmap intact: credited.
+        let drbd = std::sync::Arc::new(MockDrbd::new(resyncing(&base)));
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, &sm.boot_id.clone());
+        let _ = sm.resync_skip_step(&resyncing(&base), false).await;
+        assert_eq!(sm.skip_record(), SkipRecord::Absent);
+        assert_eq!(invalidates(&drbd), 0);
+        // Back at UpToDate, debt closed but the bitmap had been cleared:
+        // invalidated again.
+        let drbd = std::sync::Arc::new(MockDrbd::new(base.clone()));
+        *drbd.skip_scan.lock().unwrap() = Ok(cleared);
+        let (mut sm, _) = skip_sm(&drbd);
+        write_invalidated_record(&sm, &sm.boot_id.clone());
+        let _ = sm.resync_skip_step(&base, false).await;
+        assert_eq!(invalidates(&drbd), 1);
+        assert!(sm.skip_record_blocks());
+    }
+
+    #[test]
+    fn the_skip_alert_is_resent_for_a_new_reason_at_most_every_ten_minutes() {
+        let now = std::time::Instant::now();
+        assert!(skip_alert_due(None, None, ""));
+        assert!(!skip_alert_due(Some(""), Some(now), ""), "same text");
+        assert!(
+            !skip_alert_due(Some(""), Some(now), SKIP_HELD_PEER),
+            "new reason, too soon"
+        );
+        let old = now.checked_sub(SKIP_ALERT_RESEND + Duration::from_secs(1));
+        assert!(skip_alert_due(Some(""), old, SKIP_HELD_PEER));
+    }
+
+    /// The rig trial's returner after the natural skip: Secondary, Connected,
+    /// UpToDate, Established (`drbdsetup status -v`, verbatim).
+    const SAMPLE_RIG_SKIPPED: &str =
+        "twinstor-data node-id:1 role:Secondary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:UpToDate
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:64 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-1 node-id:0 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+        received:0 sent:0 out-of-sync:0 pending:0 unacked:0
+";
+
+    /// The same returner a second later, under the full resync (already
+    /// promoted there, see `rig_resyncing`).
+    const SAMPLE_RIG_RESYNCING: &str =
+        "twinstor-data node-id:1 role:Primary suspended:no force-io-failures:no
+    write-ordering:flush
+  volume:0 minor:0 disk:Inconsistent
+      backing_dev:/dev/disk/by-id/nvme-WDS500G1X0E-00AFY0_22050C800217 quorum:yes
+      open:no
+      size:488371640 read:0 written:0 al-writes:0 bm-writes:3790 upper-pending:0
+      lower-pending:0 al-suspended:no blocked:no
+  twinstor-1 node-id:0 connection:Connected role:Primary tls:no congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:SyncTarget peer-disk:UpToDate done:0.00 resync-suspended:no
+        received:0 sent:0 out-of-sync:488371640 pending:0 unacked:0 dbdt1:0.00 eta:nan
+";
+
+    /// The state right after the invalidate, before the promote that
+    /// followed it on the rig.
+    fn rig_resyncing() -> DrbdStatus {
+        DrbdStatus {
+            role: Role::Secondary,
+            ..sample(SAMPLE_RIG_RESYNCING)
+        }
+    }
+
+    /// The rig trial's natural skip with the returner connected: recorded,
+    /// invalidated, the record gone in the same pass. Exactly one alert,
+    /// the repaired text, and none again on later passes, after the resync,
+    /// or after a daemon restart.
+    #[tokio::test]
+    async fn a_skip_repaired_at_once_raises_exactly_one_alert() {
+        use crate::drbd::resync_skip_fixtures::RIG_SKIP_THEN_INVALIDATE;
+        let before: Vec<&str> = RIG_SKIP_THEN_INVALIDATE
+            .lines()
+            .take_while(|l| !l.contains("[invalidate]"))
+            .collect();
+        let drbd = std::sync::Arc::new(MockDrbd::new(sample(SAMPLE_RIG_SKIPPED)));
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(&before.join("\n")));
+        *drbd.status_after_invalidate.lock().unwrap() = Some(rig_resyncing());
+        let (mut sm, started) = skip_sm(&drbd);
+        assert!(!sm.try_go_online().await.unwrap());
+        assert_eq!(*drbd.marker_at_invalidate.lock().unwrap(), vec![true]);
+        assert_eq!(
+            sm.skip_record(),
+            SkipRecord::Absent,
+            "cleared in the same pass"
+        );
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        let alert = &sm.skip_alerts[0];
+        for part in [
+            "After a connection drop, DRBD skipped the resync",
+            "full resync from node-b",
+            "single copy",
+            "No action needed",
+            "do not power off",
+        ] {
+            assert!(alert.contains(part), "{alert}");
+        }
+        assert!(!alert.contains('\u{2014}'));
+        // The kernel log now shows the full resync; later passes, then the
+        // copy UpToDate and Primary after it.
+        *drbd.skip_scan.lock().unwrap() = Ok(capture_scan(RIG_SKIP_THEN_INVALIDATE));
+        for _ in 0..3 {
+            let _ = sm.try_go_online().await;
+        }
+        drbd.set_status(DrbdStatus {
+            disk: DiskState::UpToDate,
+            replication: Some(crate::drbd::Replication::Established),
+            ..sample(SAMPLE_RIG_RESYNCING)
+        });
+        let _ = sm.try_go_online().await;
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert!(started.load(Ordering::Relaxed), "served once UpToDate");
+        // A daemon restart in the same boot: nothing again.
+        drbd.set_status(rig_resyncing());
+        let (mut again, _) = skip_sm(&drbd);
+        let _ = again.try_go_online().await;
+        assert!(again.skip_alerts.is_empty(), "{:?}", again.skip_alerts);
+        assert_eq!(invalidates(&drbd), 1);
+    }
+
+    /// A held record's alert that reached XAPI is noted in the record, so a
+    /// daemon restart does not send it again.
+    #[tokio::test]
+    async fn a_delivered_skip_alert_is_not_sent_again_after_a_restart() {
+        let held = DrbdStatus {
+            peer_disk: Some(DiskState::Outdated),
+            ..skipped_returner()
+        };
+        let drbd = std::sync::Arc::new(MockDrbd::new(held.clone()));
+        let (mut sm, _) = skip_sm(&drbd);
+        sm.skip_alert_delivers = true;
+        write_skip_record(&sm);
+        for _ in 0..3 {
+            let _ = sm.resync_skip_step(&held, false).await;
+        }
+        assert_eq!(sm.skip_alerts.len(), 1, "{:?}", sm.skip_alerts);
+        assert!(sm.skip_alerts[0].contains("UpToDate again"));
+        let record = std::fs::read_to_string(&sm.resync_skip_path).unwrap();
+        assert!(record.contains("alerted=peer not UpToDate"), "{record}");
+        let (mut again, _) = skip_sm(&drbd);
+        again.resync_skip_path = sm.resync_skip_path.clone();
+        let _ = again.resync_skip_step(&held, false).await;
+        assert!(again.skip_alerts.is_empty(), "{:?}", again.skip_alerts);
+        // Our full resync then runs: no second alert either.
+        let resync = resyncing(&skipped_returner());
+        *drbd.status_after_invalidate.lock().unwrap() = Some(resync);
+        let _ = again.resync_skip_step(&skipped_returner(), false).await;
+        assert_eq!(again.skip_record(), SkipRecord::Absent);
+        assert!(again.skip_alerts.is_empty(), "{:?}", again.skip_alerts);
+        let _ = std::fs::remove_file(&sm.resync_skip_path);
+    }
+
+    #[test]
+    fn skip_records_parse_fail_closed() {
+        assert_eq!(parse_skip_record(None, "b1"), SkipRecord::Absent);
+        let active = resync_skip_record(Some(0x10), 1, "b1", "e");
+        assert_eq!(
+            parse_skip_record(Some(&active), "b1"),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::No
+            }
+        );
+        let invalidated = format!("{active}{SKIP_RECORD_INVALIDATED}b1\n");
+        assert_eq!(
+            parse_skip_record(Some(&invalidated), "b1"),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::ThisBoot
+            }
+        );
+        assert_eq!(
+            parse_skip_record(Some(&invalidated), "b2"),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::OtherBoot
+            },
+            "the invalidate is remembered across a reboot"
+        );
+        let forced = resync_skip_forced_record(Some(0x10), "b1");
+        assert_eq!(
+            parse_skip_record(Some(&forced), "b1"),
+            SkipRecord::Forced { this_boot: true }
+        );
+        assert_eq!(
+            parse_skip_record(Some(&forced), "b2"),
+            SkipRecord::Forced { this_boot: false }
+        );
+        let unknown = resync_skip_forced_record(None, "unknown");
+        assert_eq!(
+            parse_skip_record(Some(&unknown), "unknown"),
+            SkipRecord::Forced { this_boot: false },
+            "an unreadable boot id never keeps a forced record"
+        );
+        assert_eq!(
+            parse_skip_record(Some("garbage"), "b1"),
+            SkipRecord::Active {
+                invalidated: SkipInvalidated::No
+            }
+        );
     }
 
     /// A scheduled re-admission dance on a host that has just rejoined the
