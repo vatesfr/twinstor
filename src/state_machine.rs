@@ -109,6 +109,65 @@ fn peer_served_still_applies(recorded: Option<Option<u64>>, current: Option<u64>
     }
 }
 
+/// The yielded-behind record (see `yielded_behind_marker`). `lift`: the
+/// daemon itself was about to resume this copy's I/O while it stood aside
+/// (the loser crash boundary's lift, the discard's teardown), which starts a
+/// new generation without this copy serving anyone; the record then holds
+/// whatever the generation reads (see `yielded_record_drop`).
+fn yielded_behind_record(current: u64, at: u64, lift: bool) -> String {
+    let lift = if lift { "lift=1\n" } else { "" };
+    format!(
+        "# fence-peer yield in force; not connected since\ncurrent={current:016X}\nat={at}\n{lift}"
+    )
+}
+
+/// Whether a yielded-behind record carries the lift mark (`lift=1`). A
+/// record without that line (as written before the mark existed) reads as
+/// unmarked.
+fn yielded_record_lifted(text: &str) -> bool {
+    text.lines().any(|l| l.trim() == "lift=1")
+}
+
+/// Why the boot gate drops a yielded-behind record, if it does. `text`: the
+/// record file (None: unreadable); `current`: this copy's generation now. A
+/// record without a generation falls back to the plain path; one whose
+/// generation moved is void (this copy served or resynced since), unless it
+/// carries the lift mark: then the daemon moved the generation itself while
+/// standing aside, and the copy is as far behind as before.
+fn yielded_record_drop(text: Option<&str>, current: Option<u64>) -> Option<&'static str> {
+    let Some(text) = text else {
+        return Some("record unreadable");
+    };
+    let recorded = parse_peer_served(text);
+    if !matches!(recorded, Some(Some(_))) {
+        return Some("record unreadable");
+    }
+    if !yielded_record_lifted(text) && !peer_served_still_applies(recorded, current) {
+        return Some("generation changed");
+    }
+    None
+}
+
+/// A boot-gate memory file for the startup line, as one token: "-" when
+/// absent, else the generation it holds (`+lift` when marked, see
+/// `yielded_behind_record`), "unknown" for one recorded without a
+/// generation, "unreadable" when it does not parse.
+fn memory_brief(path: &str) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "-".to_string();
+    };
+    let lift = if yielded_record_lifted(&text) {
+        "+lift"
+    } else {
+        ""
+    };
+    match parse_peer_served(&text) {
+        Some(Some(g)) => format!("{g:016X}{lift}"),
+        Some(None) => format!("unknown{lift}"),
+        None => "unreadable".to_string(),
+    }
+}
+
 /// Boot-gate memory: this node's fence-peer handler yielded (froze, served
 /// nothing) while the pair was disconnected, so the peer could keep serving
 /// without it. Recorded by the daemon once the yield has held for
@@ -116,7 +175,9 @@ fn peer_served_still_applies(recorded: Option<Option<u64>>, current: Option<u64>
 /// node's DRBD current generation and void once that moves (this node served
 /// or resynced since). Durable, so a host fenced during the yield cannot come
 /// back and promote a copy its peer may have moved past. Cleared once the
-/// pair is Connected again.
+/// pair is Connected again. Before the daemon itself resumes this copy's I/O
+/// while it stands aside (which moves the generation), the record is marked
+/// so that move does not void it (see `mark_yielded_behind_lift`).
 fn yielded_behind_marker() -> String {
     std::env::var("TWINSTOR_YIELDED_BEHIND_MARKER")
         .unwrap_or_else(|_| crate::heal_state::state_path("/var/lib/twinstor/boot-gate-yielded"))
@@ -10811,6 +10872,8 @@ pub struct StateMachine {
     yielded_behind_path: String,
     /// The generation the yielded-behind record holds, when readable.
     yielded_behind_gen: Option<u64>,
+    /// The record carries the lift mark (see `yielded_behind_record`).
+    yielded_behind_lift: bool,
     yield_in_force_since: Option<std::time::Instant>,
     // Arbitrated mode (a direct replication link exists) vs fate-shared. Cached at
     // construction from DIRECT_PEER_PATH; the mode is a setup-time property. Gates
@@ -11742,6 +11805,7 @@ impl StateMachine {
             yielded_behind: false,
             yielded_behind_path: String::new(),
             yielded_behind_gen: None,
+            yielded_behind_lift: false,
             yield_in_force_since: None,
             arbitrated: std::path::Path::new(crate::setup::DIRECT_PEER_PATH).exists(),
             episode: None,
@@ -12002,8 +12066,8 @@ impl StateMachine {
               give_way_taken = %file_brief(&give_way_taken_path(&self.give_way_path)),
               split_guests = %file_brief(&self.split_guests_path),
               boundary_record = %file_brief(&self.boundary_path),
-              boot_gate_peer_served = %file_brief(&self.peer_served_path),
-              boot_gate_yielded = %file_brief(&self.yielded_behind_path),
+              boot_gate_peer_served = %memory_brief(&self.peer_served_path),
+              boot_gate_yielded = %memory_brief(&self.yielded_behind_path),
               steer_pending = %file_brief(&self.steer_pending_path),
               fs_freeze_off = %file_brief(&self.fs_freeze_off_path),
               peer_fs_freeze = %file_brief(&self.peer_fs_freeze_path),
@@ -18472,8 +18536,10 @@ impl StateMachine {
     /// disconnected (see `yielded_behind_marker`). Only a readable generation
     /// is recorded, so the memory is bound to this exact copy; an unreadable
     /// one is retried next pass. A record of another generation (this copy
-    /// served, then yielded again) is rewritten. Runs every pass and costs
-    /// one stat unless the handler's yield marker exists.
+    /// served, then yielded again, or the daemon's own lift moved it) or one
+    /// with the lift mark is rewritten plain: the yield is in force again,
+    /// on this generation. Runs every pass and costs one stat unless the
+    /// handler's yield marker exists.
     async fn note_yield_in_force(&mut self) {
         let marker = std::path::Path::new(&self.yield_path).exists();
         let in_force = marker
@@ -18495,16 +18561,13 @@ impl StateMachine {
         let Some(current) = self.drbd.local_current_uuid().await else {
             return;
         };
-        if self.yielded_behind && self.yielded_behind_gen == Some(current) {
+        if self.yielded_behind
+            && self.yielded_behind_gen == Some(current)
+            && !self.yielded_behind_lift
+        {
             return;
         }
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let content = format!(
-            "# fence-peer yield in force; not connected since\ncurrent={current:016X}\nat={at}\n"
-        );
+        let content = yielded_behind_record(current, unix_now_secs(), false);
         if let Err(e) = write_file_durably(&self.yielded_behind_path, &content) {
             if self
                 .log_pace
@@ -18516,6 +18579,7 @@ impl StateMachine {
         }
         self.yielded_behind = true;
         self.yielded_behind_gen = Some(current);
+        self.yielded_behind_lift = false;
         warn!(
             heal_event = "boot_gate_yielded",
             memory = "set",
@@ -18526,14 +18590,85 @@ impl StateMachine {
         );
     }
 
+    /// Before the daemon resumes this copy's I/O while it stands aside (the
+    /// loser crash boundary's lift, the discard's teardown): that resume
+    /// starts a new generation, and a host fenced before the recorder
+    /// rewrites the record would come back with a record the boot gate
+    /// drops as "generation changed". Mark the record durably first so the
+    /// move does not void it (`yielded_record_drop`); with no record yet
+    /// (the yield had not held `YIELD_BEHIND_AFTER`, or its write failed),
+    /// write a marked one when the yield is in force. The recorder rewrites
+    /// it plain once the yield is in force again. A failed write is retried
+    /// at the next such resume; the resume itself goes ahead.
+    async fn mark_yielded_behind_lift(&mut self) {
+        let existing = std::fs::read_to_string(&self.yielded_behind_path)
+            .ok()
+            .and_then(|t| match parse_peer_served(&t) {
+                Some(Some(g)) => Some((g, t)),
+                _ => None,
+            });
+        let (current, at) = match existing {
+            Some((_, t)) if yielded_record_lifted(&t) => {
+                self.yielded_behind = true;
+                self.yielded_behind_lift = true;
+                return;
+            }
+            Some((g, t)) => {
+                let at = t
+                    .lines()
+                    .find_map(|l| l.strip_prefix("at="))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or_else(unix_now_secs);
+                (g, at)
+            }
+            None => {
+                let marker = std::path::Path::new(&self.yield_path).exists();
+                let in_force = marker
+                    && self
+                        .drbd
+                        .status()
+                        .await
+                        .is_ok_and(|st| yield_in_force(true, &st));
+                if !in_force {
+                    return;
+                }
+                let Some(current) = self.drbd.local_current_uuid().await else {
+                    return;
+                };
+                (current, unix_now_secs())
+            }
+        };
+        let content = yielded_behind_record(current, at, true);
+        if let Err(e) = write_file_durably(&self.yielded_behind_path, &content) {
+            if self
+                .log_pace
+                .due("yielded_behind_write", Duration::from_secs(600))
+            {
+                warn!(error = %e, "boot gate: could not persist the yielded-behind memory before \
+                                   lifting this copy's I/O; retrying");
+            }
+            return;
+        }
+        self.yielded_behind = true;
+        self.yielded_behind_gen = Some(current);
+        self.yielded_behind_lift = true;
+        warn!(
+            heal_event = "boot_gate_yielded",
+            memory = "lift",
+            generation = %format!("{current:016X}"),
+            "boot gate: this node resumes its own I/O while standing aside, which moves its \
+               generation; the yielded-behind memory is kept across that move, so it will not \
+               serve alone until it has reconnected (or an operator forces it)"
+        );
+    }
+
     /// Read the yielded-behind memory back at startup: it survives a daemon
     /// restart and a reboot.
     fn load_yielded_behind(&mut self, path: String) {
+        let text = std::fs::read_to_string(&path).ok();
         self.yielded_behind = std::path::Path::new(&path).exists();
-        self.yielded_behind_gen = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| parse_peer_served(&t))
-            .flatten();
+        self.yielded_behind_gen = text.as_deref().and_then(parse_peer_served).flatten();
+        self.yielded_behind_lift = text.as_deref().is_some_and(yielded_record_lifted);
         self.yielded_behind_path = path;
     }
 
@@ -18545,6 +18680,7 @@ impl StateMachine {
         }
         self.yielded_behind = false;
         self.yielded_behind_gen = None;
+        self.yielded_behind_lift = false;
         let _ = std::fs::remove_file(&self.yielded_behind_path);
         info!(
             heal_event = "boot_gate_yielded",
@@ -18636,17 +18772,15 @@ impl StateMachine {
                 self.forget_peer_served("generation changed");
             }
         }
-        // The same for this node's own yield. Its record always holds a
-        // generation; one that cannot be read back falls back to the plain
-        // path (an unreadable current generation still holds this pass).
+        // The same for this node's own yield (see `yielded_record_drop`): a
+        // record that cannot be read back falls back to the plain path, an
+        // unreadable current generation still holds this pass, and a record
+        // marked before the daemon's own lift holds whatever the generation.
         if self.yielded_behind {
-            let recorded = std::fs::read_to_string(&self.yielded_behind_path)
-                .ok()
-                .and_then(|t| parse_peer_served(&t));
-            if !matches!(recorded, Some(Some(_))) {
-                self.forget_yielded_behind("record unreadable");
-            } else if !peer_served_still_applies(recorded, self.drbd.local_current_uuid().await) {
-                self.forget_yielded_behind("generation changed");
+            let text = std::fs::read_to_string(&self.yielded_behind_path).ok();
+            let current = self.drbd.local_current_uuid().await;
+            if let Some(why) = yielded_record_drop(text.as_deref(), current) {
+                self.forget_yielded_behind(why);
             }
         }
         let yielded_before = yielded_behind_holds(self.yielded_behind, disk);
@@ -31344,8 +31478,10 @@ impl StateMachine {
     /// yield is bound to, if it is the live one, recorded durably next to
     /// the latch so a daemon restart before `end_latched_resume` can still
     /// finish the re-latch (`finish_pending_relatch`). None: no latch bound
-    /// to the live generation, nothing to follow.
+    /// to the live generation, nothing to follow. The yielded-behind record
+    /// is marked first, latch or not (`mark_yielded_behind_lift`).
     async fn begin_latched_resume(&mut self) -> Option<u64> {
+        self.mark_yielded_behind_lift().await;
         let Some(Some(latched)) = read_fork_record(&self.latch_path) else {
             return None;
         };
@@ -37874,6 +38010,309 @@ poll_interval_ms = 10
         assert!(sm.boot_gate_holds(DiskState::Consistent).await);
         assert!(sm.yielded_behind);
         let _ = std::fs::remove_file(&sm.yielded_behind_path);
+    }
+
+    /// The record as the fate-shared rig wrote it (whole-host cut of the
+    /// master, generation before the crash boundary's lift).
+    const RIG_YIELD_RECORD: &str = "# fence-peer yield in force; not connected since\ncurrent=F9943FFFBAF688D0\nat=1795143172\n";
+    const RIG_GEN_BEFORE_LIFT: u64 = 0xF994_3FFF_BAF6_88D0;
+    /// Kernel "new current UUID: 1604D432FADC4E4D" at the lift, as the daemon
+    /// reads it (the low flag bit clear, as in `relatched_after_lift ...
+    /// to=B09AF815C25743C4` for the kernel's ...C5).
+    const RIG_GEN_AFTER_LIFT: u64 = 0x1604_D432_FADC_4E4C;
+
+    #[test]
+    fn a_lift_marked_yield_record_survives_the_generation_move() {
+        let marked = yielded_behind_record(RIG_GEN_BEFORE_LIFT, 1_795_143_172, true);
+        assert_eq!(
+            marked,
+            format!("{RIG_YIELD_RECORD}lift=1\n"),
+            "the rig's format plus one line"
+        );
+        assert_eq!(
+            yielded_behind_record(RIG_GEN_BEFORE_LIFT, 1_795_143_172, false),
+            RIG_YIELD_RECORD
+        );
+        // Unmarked, as today: same generation holds, a moved one is dropped.
+        assert_eq!(
+            yielded_record_drop(Some(RIG_YIELD_RECORD), Some(RIG_GEN_BEFORE_LIFT)),
+            None
+        );
+        assert_eq!(
+            yielded_record_drop(Some(RIG_YIELD_RECORD), Some(RIG_GEN_AFTER_LIFT)),
+            Some("generation changed")
+        );
+        // Marked: kept across the move, and with the generation unreadable.
+        for current in [Some(RIG_GEN_BEFORE_LIFT), Some(RIG_GEN_AFTER_LIFT), None] {
+            assert_eq!(yielded_record_drop(Some(&marked), current), None);
+        }
+        // A record without a generation (or none) falls back to the plain
+        // path, marked or not.
+        for corrupt in [
+            "garbage\n",
+            "current=unknown\n",
+            "",
+            "lift=1\n",
+            "current=unknown\nlift=1\n",
+        ] {
+            assert_eq!(
+                yielded_record_drop(Some(corrupt), Some(RIG_GEN_AFTER_LIFT)),
+                Some("record unreadable"),
+                "{corrupt:?}"
+            );
+        }
+        assert_eq!(yielded_record_drop(None, None), Some("record unreadable"));
+        // A reader that only knows `current=` (the line it keys on) still
+        // finds the generation in a marked record.
+        assert_eq!(parse_peer_served(&marked), Some(Some(RIG_GEN_BEFORE_LIFT)));
+        assert!(!yielded_record_lifted(RIG_YIELD_RECORD));
+        assert!(!yielded_record_lifted("current=F9943FFFBAF688D0\nlift=0\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_fenced_inside_the_crash_boundary_still_holds_at_a_peer_dark_boot() {
+        use crate::peer_signal::PeerClaim;
+        for (marked_at_lift, tag) in [(true, "fz-yield-lift"), (false, "fz-yield-nolift")] {
+            let (mut sm, drbd) = freeze_node(tag, PeerClaim::Unreachable, true);
+            *drbd.current_uuid.lock().unwrap() = Some(RIG_GEN_BEFORE_LIFT);
+            write_file_durably(&sm.yielded_behind_path, RIG_YIELD_RECORD).unwrap();
+            let path = sm.yielded_behind_path.clone();
+            sm.load_yielded_behind(path.clone());
+            let mut fake =
+                crate::loser_boundary::fake::FakeGuests::with_guests(vec![lb_guest(1, "web")]);
+            *fake.suspended.lock().unwrap() = true;
+            // A leftover tapdisk the boundary closes: it lifts the suspend
+            // for that, and the lift moves the generation.
+            *fake.taps.lock().unwrap() = vec![crate::loser_boundary::Tapdisk {
+                pid: 34167,
+                minor: 0,
+                path: "/dev/VG_XenStorage-5e5e000f-0000-4000-8000-00000000000f/VHD-0b1c2d3e-0000-0000-0000-000000000000".into(),
+            }];
+            let d = drbd.clone();
+            let at_lift = path.clone();
+            fake.on_lift = Some(Box::new(move || {
+                // The mark is on disk before the lift moves the generation.
+                assert_eq!(
+                    std::fs::read_to_string(&at_lift).unwrap(),
+                    format!("{RIG_YIELD_RECORD}lift=1\n"),
+                    "the record is marked before the lift"
+                );
+                *d.current_uuid.lock().unwrap() = Some(RIG_GEN_AFTER_LIFT)
+            }));
+            let fake = std::sync::Arc::new(fake);
+            sm.guests = fake.clone();
+            let mut st = drbd.status.lock().unwrap().clone();
+            st.connection = ConnectionState::Connecting;
+            drbd.set_status(st);
+            if marked_at_lift {
+                // The freeze budget runs out: the step-down's crash boundary.
+                let old_t =
+                    std::time::SystemTime::now() - FREEZE_GUEST_BUDGET - Duration::from_secs(1);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&sm.yield_path)
+                    .unwrap()
+                    .set_modified(old_t)
+                    .unwrap();
+                sm.freeze_tick().await;
+                assert!(
+                    fake.calls.lock().unwrap().iter().any(|c| c == "resume-io"),
+                    "the boundary lifted the suspend; guests {:?} drbd {:?}",
+                    fake.calls.lock().unwrap(),
+                    drbd.calls()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    format!("{RIG_YIELD_RECORD}lift=1\n"),
+                    "marked before the lift, the recorded generation and time kept"
+                );
+            } else {
+                // The same generation move with no daemon lift involved (and
+                // so no mark): dropped at boot, as before.
+                *drbd.current_uuid.lock().unwrap() = Some(RIG_GEN_AFTER_LIFT);
+            }
+            // XHA fences the host before the recorder runs again; it boots
+            // with the peer dark: Secondary, Consistent, Connecting.
+            let rebooted = DrbdStatus {
+                role: Role::Secondary,
+                connection: ConnectionState::Connecting,
+                disk: DiskState::Consistent,
+                peer_disk: None,
+                suspended_user: false,
+                suspended_any: false,
+                ..yield_frozen_status()
+            };
+            let boot = std::sync::Arc::new(MockDrbd::new(rebooted));
+            *boot.current_uuid.lock().unwrap() = Some(RIG_GEN_AFTER_LIFT);
+            let (mut again, _) = StateMachine::new(
+                test_config(),
+                Box::new(ArcDrbd(boot.clone())),
+                Box::new(MockIscsi::new()),
+            );
+            again.arbitrated = false;
+            again.load_yielded_behind(path.clone());
+            assert_eq!(again.yielded_behind_lift, marked_at_lift);
+            again.boot_gate_cache = Some((std::time::Instant::now(), PeerLifeEvidence::default()));
+            again.boot_gate_evidence_at = None;
+            again.fs_serve_hold_since = Some(std::time::Instant::now());
+            let held = again.boot_gate_holds(DiskState::Consistent).await;
+            if marked_at_lift {
+                assert!(held);
+                assert_eq!(again.boot_gate_last, Some(BootGate::HoldYieldedBefore));
+                assert!(again.yielded_behind && std::path::Path::new(&path).exists());
+            } else {
+                assert_ne!(again.boot_gate_last, Some(BootGate::HoldYieldedBefore));
+                assert!(!again.yielded_behind && !std::path::Path::new(&path).exists());
+            }
+            let _ = std::fs::remove_file(&path);
+            freeze_cleanup(&sm);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lift_before_the_yield_record_writes_a_marked_one() {
+        use crate::peer_signal::PeerClaim;
+        let (mut sm, drbd) = freeze_node("fz-yield-lift-new", PeerClaim::Unreachable, true);
+        *drbd.current_uuid.lock().unwrap() = Some(RIG_GEN_BEFORE_LIFT);
+        let path = sm.yielded_behind_path.clone();
+        assert!(!sm.yielded_behind && !std::path::Path::new(&path).exists());
+        // No yield in force (the suspend is gone): nothing written.
+        let mut st = drbd.status.lock().unwrap().clone();
+        st.connection = ConnectionState::Connecting;
+        drbd.set_status(DrbdStatus {
+            suspended_user: false,
+            ..st.clone()
+        });
+        sm.mark_yielded_behind_lift().await;
+        assert!(!sm.yielded_behind && !std::path::Path::new(&path).exists());
+        // In force, the 20 s recorder not run yet: a marked record.
+        drbd.set_status(st);
+        sm.mark_yielded_behind_lift().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with(
+                "# fence-peer yield in force; not connected since\ncurrent=F9943FFFBAF688D0\nat="
+            ) && text.ends_with("\nlift=1\n"),
+            "{text:?}"
+        );
+        assert!(sm.yielded_behind && sm.yielded_behind_lift);
+        assert_eq!(sm.yielded_behind_gen, Some(RIG_GEN_BEFORE_LIFT));
+        // Marking again leaves it as it is.
+        std::fs::write(&path, format!("{RIG_YIELD_RECORD}lift=1\n")).unwrap();
+        sm.mark_yielded_behind_lift().await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{RIG_YIELD_RECORD}lift=1\n")
+        );
+        // The lift moved the generation and the yield is in force again: the
+        // recorder rewrites the record plain on the new generation, without
+        // waiting for the generation to differ.
+        *drbd.current_uuid.lock().unwrap() = Some(RIG_GEN_AFTER_LIFT);
+        sm.yield_in_force_since = std::time::Instant::now().checked_sub(YIELD_BEHIND_AFTER);
+        sm.note_yield_in_force().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\ncurrent=1604D432FADC4E4C\n") && !yielded_record_lifted(&text),
+            "{text:?}"
+        );
+        assert!(!sm.yielded_behind_lift);
+        // A marked record on an unchanged generation is rewritten plain too.
+        std::fs::write(&path, yielded_behind_record(RIG_GEN_AFTER_LIFT, 1, true)).unwrap();
+        sm.load_yielded_behind(path.clone());
+        assert!(sm.yielded_behind_lift);
+        sm.note_yield_in_force().await;
+        assert!(!yielded_record_lifted(
+            &std::fs::read_to_string(&path).unwrap()
+        ));
+        let _ = std::fs::remove_file(&path);
+        freeze_cleanup(&sm);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lift_marked_yield_record_still_ends_on_a_decided_link_or_a_serving_copy() {
+        let decided = DrbdStatus {
+            role: Role::Secondary,
+            ..online_with_peer()
+        };
+        let serving_alone = DrbdStatus {
+            connection: ConnectionState::Connecting,
+            peer_role: None,
+            peer_disk: None,
+            ..online_with_peer()
+        };
+        let undecided = DrbdStatus {
+            role: Role::Secondary,
+            disk: DiskState::Consistent,
+            peer_disk: None,
+            ..online_with_peer()
+        };
+        for (st, cleared) in [
+            (decided, true),
+            (serving_alone, true),
+            (yield_frozen_status(), false),
+            (undecided, false),
+        ] {
+            let drbd = std::sync::Arc::new(MockDrbd::new(st.clone()));
+            *drbd.current_uuid.lock().unwrap() = Some(RIG_GEN_AFTER_LIFT);
+            let (mut sm, _) = StateMachine::new(
+                test_config(),
+                Box::new(ArcDrbd(drbd.clone())),
+                Box::new(MockIscsi::new()),
+            );
+            write_file_durably(
+                &sm.yielded_behind_path,
+                &format!("{RIG_YIELD_RECORD}lift=1\n"),
+            )
+            .unwrap();
+            let path = sm.yielded_behind_path.clone();
+            sm.load_yielded_behind(path.clone());
+            sm.check_health().await;
+            assert_eq!(
+                !sm.yielded_behind && !std::path::Path::new(&path).exists(),
+                cleared,
+                "{st:?}"
+            );
+            assert_eq!(sm.yielded_behind_lift, !cleared);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn the_startup_line_shows_the_yield_records_generation() {
+        let drbd = std::sync::Arc::new(MockDrbd::new(yield_frozen_status()));
+        let (sm, _) = StateMachine::new(
+            test_config(),
+            Box::new(ArcDrbd(drbd)),
+            Box::new(MockIscsi::new()),
+        );
+        let path = sm.yielded_behind_path.clone();
+        assert_eq!(memory_brief(&path), "-");
+        write_file_durably(&path, RIG_YIELD_RECORD).unwrap();
+        assert_eq!(memory_brief(&path), "F9943FFFBAF688D0");
+        let cap = LogCapture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || sm.log_startup_state());
+        let out = cap.text();
+        assert!(
+            out.contains("boot_gate_yielded=F9943FFFBAF688D0 ")
+                && out.contains("boot_gate_peer_served=- "),
+            "{out}"
+        );
+        write_file_durably(&path, &format!("{RIG_YIELD_RECORD}lift=1\n")).unwrap();
+        assert_eq!(memory_brief(&path), "F9943FFFBAF688D0+lift");
+        std::fs::write(&path, "garbage\n").unwrap();
+        assert_eq!(memory_brief(&path), "unreadable");
+        // The peer-served memory, recorded without a generation.
+        std::fs::write(
+            &path,
+            "# peer seen serving; not connected since\ncurrent=unknown\n",
+        )
+        .unwrap();
+        assert_eq!(memory_brief(&path), "unknown");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test(start_paused = true)]
