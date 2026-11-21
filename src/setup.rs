@@ -39,7 +39,23 @@ pub(crate) fn parse_ping_targets(text: &str) -> Vec<String> {
 // template changes via `regenerate-config` (a live disk-options adjust).
 // Version 7: fate-shared pools wait 3 s instead of 0.5 s for a DRBD ping reply
 // (see `drbd_ping_timeout`); applied live by the same adjust.
-pub(crate) const CONFIG_VERSION: u32 = 7;
+// Version 8: `max-buffers` raised (see `DRBD_MAX_BUFFERS`) so the resync is no
+// longer paced below the fill target; a net option, applied live by the same
+// adjust (DRBD changes it on a connected resource without a reconnect).
+pub(crate) const CONFIG_VERSION: u32 = 8;
+
+/// DRBD `max-buffers` (pages of 4 KiB) for the `.res` net section, both
+/// modes. DRBD's default, 2048 pages (8 MiB), sits below the 10M
+/// `c-fill-target` used on fast links: the sync target keeps no more than
+/// `max-buffers` worth of resync requests in flight (drbd_sender.c,
+/// make_resync_request), and a receiver whose page pool is at `max-buffers`
+/// sleeps 100 ms before each further allocation (drbd_receiver.c,
+/// drbd_alloc_pages). A full resync then ran at about 110 MB/s on a 40 Gb
+/// direct link. 16384 pages (64 MiB) lifts that cap; it is also the most
+/// the page pool of the connection may hold, from dom0 memory. Each node
+/// applies its own value (it is not negotiated), so a pair mid-upgrade with
+/// different values is fine. The value is still to be confirmed on the rig.
+pub(crate) const DRBD_MAX_BUFFERS: u32 = 16384;
 const DRBD_CONF_DIR: &str = "/etc/drbd.d";
 
 /// Single source of truth for the arbitrated-mode caveat, shown by both the
@@ -1673,6 +1689,10 @@ resource {res} {{
         ping-int 2;
         ping-timeout {ping_timeout};
         ko-count 3;
+        # Resync throughput: DRBD's default (2048 pages, 8 MiB) is below the
+        # c-fill-target above and paces the resync at about 110 MB/s; see
+        # DRBD_MAX_BUFFERS. Changeable live (drbdadm adjust, no reconnect).
+        max-buffers {DRBD_MAX_BUFFERS};
         # Never let DRBD silently auto-discard a diverged copy. In all split-brain
         # cases, including 0-primary (both nodes Secondary at reconnect, which the
         # heal/demote path transiently creates), DRBD disconnects and fires the
@@ -4284,11 +4304,13 @@ mod tests {
         }
     }
     use super::{
+        DRBD_MAX_BUFFERS, tiebreaker_gate, validate_local_name_matches_xapi, validate_node_names,
+    };
+    use super::{
         SharedSetup, chap_check_value, drbd_ping_timeout, drbd_topology, ha_timeout_secs,
         iqn_is_lio_compatible, patch_lvm_global_filter, peer_uuid_from_pool, render_res_file,
         resync_fill_target, resync_min_rate, resync_sizing, sanitize_iqn,
     };
-    use super::{tiebreaker_gate, validate_local_name_matches_xapi, validate_node_names};
 
     #[test]
     fn duplicate_hostnames_are_refused() {
@@ -4689,6 +4711,31 @@ mod tests {
         };
         assert!(render(false).contains("        ping-timeout 30;\n"));
         assert!(render(true).contains("        ping-timeout 5;\n"));
+    }
+
+    #[test]
+    fn both_modes_raise_max_buffers_in_the_net_section() {
+        for arbitrated in [false, true] {
+            let res = render_res_file(
+                "twinstor-data",
+                "resource-only",
+                drbd_ping_timeout(arbitrated),
+                "10M",
+                "800M",
+                "",
+            );
+            let net = res.split("    net {").nth(1).unwrap();
+            let net = &net[..net.find("\n    }").unwrap()];
+            assert!(
+                net.contains(&format!("        max-buffers {DRBD_MAX_BUFFERS};\n")),
+                "{net}"
+            );
+            assert!(res.starts_with(&format!("# twinstor-config-version: {CONFIG_VERSION}\n")));
+        }
+        // Within DRBD's limits (drbd_limits.h: 32 to 131072 pages), and
+        // above the largest fill target (10M = 2560 pages).
+        const { assert!(DRBD_MAX_BUFFERS >= 32 && DRBD_MAX_BUFFERS <= 131_072) };
+        const { assert!(DRBD_MAX_BUFFERS > 10 * 1024 / 4) };
     }
 
     #[test]
